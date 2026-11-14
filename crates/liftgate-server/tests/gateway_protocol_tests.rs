@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use liftgate_server::{
     acp_client::AcpBackend,
     error::AcpError,
-    routes::{AppState, build_router},
+    routes::{ADMIN_SHUTDOWN_HEADER, AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router},
     session_pool::SessionPool,
     telemetry::TelemetryHub,
     turn_runner::GatewayRuntimeConfig,
@@ -316,6 +316,8 @@ fn test_app_with_key(
             limits,
         },
         ui_dist_dir: None,
+        embedded_ui: &[],
+        admin_shutdown: None,
     })
 }
 
@@ -2182,4 +2184,99 @@ async fn malformed_empty_function_call_retry_after_xml_tool_call_short_circuits_
     let content = body["content"].as_array().unwrap();
     assert_eq!(content.len(), 3);
     assert_eq!(backend.aborted_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
+    static MOCK_UI: &[EmbeddedUiAsset] = &[
+        ("index.html", b"<!doctype html><title>Liftgate</title>"),
+        ("assets/app.js", b"console.log('ready');"),
+    ];
+
+    let backend = Arc::new(MockAcpBackend::new(Vec::new()));
+    let limits =
+        GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, 30).unwrap();
+    let (shutdown_handle, shutdown_rx) = AdminShutdownHandle::new(Arc::from("secret-stop-token"));
+    let app = build_router(AppState {
+        backend,
+        pool: Arc::new(SessionPool::new(limits)),
+        telemetry: Arc::new(TelemetryHub::new()),
+        config: GatewayRuntimeConfig {
+            default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
+            acp_mode: AcpModeId::try_new("auto").unwrap(),
+            api_key: None,
+            limits,
+        },
+        ui_dist_dir: None,
+        embedded_ui: MOCK_UI,
+        admin_shutdown: Some(shutdown_handle),
+    });
+
+    let root_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(root_resp.status(), StatusCode::OK);
+    assert_eq!(
+        root_resp.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+
+    let js_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(js_resp.status(), StatusCode::OK);
+    assert_eq!(
+        js_resp.headers().get("content-type").unwrap(),
+        "application/javascript; charset=utf-8"
+    );
+
+    let unknown_api_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/nonexistent-endpoint")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_api_resp.status(), StatusCode::NOT_FOUND);
+
+    let bad_shutdown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/shutdown")
+                .header(ADMIN_SHUTDOWN_HEADER, "wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_shutdown.status(), StatusCode::UNAUTHORIZED);
+    assert!(!*shutdown_rx.borrow());
+
+    let ok_shutdown = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/shutdown")
+                .header(ADMIN_SHUTDOWN_HEADER, "secret-stop-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_shutdown.status(), StatusCode::OK);
+    assert!(*shutdown_rx.borrow());
 }

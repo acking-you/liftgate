@@ -17,9 +17,7 @@ pub fn resolve_agy_binary(explicit: Option<PathBuf>) -> Option<PathBuf> {
         return is_executable_file(&path).then(|| canonicalize_clean(&path));
     }
 
-    if let Some(path_var) = std::env::var_os("PATH")
-        && let Some(found) = search_path_entries(std::env::split_paths(&path_var))
-    {
+    if let Some(found) = search_path_entries(split_expanded_path_var()) {
         return Some(found);
     }
 
@@ -30,6 +28,69 @@ pub fn resolve_agy_binary(explicit: Option<PathBuf>) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Splits the current `PATH` environment variable into directories, expanding `%VAR%` placeholders
+/// on Windows when unexpanded user/system registry entries are present.
+#[must_use]
+pub fn split_expanded_path_var() -> Vec<PathBuf> {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    #[cfg(windows)]
+    {
+        std::env::split_paths(&path_var)
+            .map(|entry| {
+                if let Some(raw) = entry.to_str()
+                    && raw.contains('%')
+                {
+                    return PathBuf::from(expand_percent_env_vars(raw));
+                }
+                entry
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(&path_var).collect()
+    }
+}
+
+/// Expands `%VAR%` tokens using process environment variables, preserving unknown or malformed
+/// tokens unchanged.
+#[must_use]
+pub fn expand_percent_env_vars(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some((before, after_first)) = rest.split_once('%') {
+        out.push_str(before);
+        if let Some((var_name, after_second)) = after_first.split_once('%') {
+            if var_name.is_empty() {
+                out.push_str("%%");
+                rest = after_second;
+                continue;
+            }
+            if !var_name.contains([' ', '\t', '/', '\\'])
+                && let Ok(val) = std::env::var(var_name)
+            {
+                out.push_str(&val);
+                rest = after_second;
+                continue;
+            }
+            out.push('%');
+            rest = after_first;
+        } else {
+            out.push('%');
+            out.push_str(after_first);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn search_path_entries(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -238,7 +299,9 @@ pub fn configure_acp_child_env(cmd: &mut tokio::process::Command) {
     }
 }
 
-fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
+/// Ensures `127.0.0.1`, `localhost`, and `::1` are present in a comma-separated `NO_PROXY` value.
+#[must_use]
+pub fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
     let mut entries: Vec<String> = existing
         .unwrap_or_default()
         .split(',')
@@ -252,6 +315,29 @@ fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
         }
     }
     entries.join(",")
+}
+
+/// Detects the effective outbound HTTP(S) proxy URL from environment variables or, on Windows,
+/// the active WinINet `Internet Settings` registry configuration.
+#[must_use]
+pub fn detect_effective_proxy_url() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Some(val) = std::env::var_os(key)
+            .and_then(|v| v.into_string().ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(val);
+        }
+    }
+    #[cfg(windows)]
+    {
+        detect_windows_system_proxy()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -459,5 +545,17 @@ mod tests {
             Some("http://127.0.0.1:8443")
         );
         assert!(parse_windows_registry_proxy(disabled_out, simple_srv).is_none());
+    }
+
+    #[test]
+    fn expands_percent_env_tokens_safely() {
+        let path_val = std::env::var("PATH").unwrap_or_default();
+        let expanded = expand_percent_env_vars(
+            "100% %PATH%/bin/%DEFINITELY_MISSING_VAR_XYZ_999%/%%tail%unclosed",
+        );
+        assert_eq!(
+            expanded,
+            format!("100% {path_val}/bin/%DEFINITELY_MISSING_VAR_XYZ_999%/%%tail%unclosed")
+        );
     }
 }

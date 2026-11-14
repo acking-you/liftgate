@@ -54,15 +54,28 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ## 快速开始
 
-需要 Antigravity CLI（`agy`）、Rust 1.85+，以及用于构建监控面板的 [Bun](https://bun.sh)（可选）。
+使用 Antigravity CLI（`agy`）完成一次登录，全局安装单个 `liftgate` 二进制（预编译发行版或 `cargo install`），即可通过同一命令完成全部管理与启动：
 
 ```bash
-agy acp --login     # 首次使用时登录 Antigravity
-./run-gateway.sh    # 编译并在 http://127.0.0.1:8787 启动（Ctrl+C 停止）
-./start-agy.sh      # 在另一个终端：经 Liftgate 启动 Claude Code（加 --codex 启动 Codex）
+agy acp --login                         # 首次使用时登录 Antigravity
+cargo install --path crates/liftgate    # 若本机装有 Bun 会自动编译并内嵌 Web 监控面板
+
+liftgate start --open                   # 后台启动网关服务并打开监控面板（http://127.0.0.1:8787/）
+liftgate codex                          # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
+liftgate claude                         # 或在当前目录直接启动 Claude Code（退出后 0 副作用）
 ```
 
-Windows 下使用 `.\run-gateway.cmd` 与 `.\start-agy.cmd`（`-Codex`）。`start-agy` 的配置只作用于它启动的智能体，不改动 `~/.codex/config.toml` 和当前终端。后台运行、全部参数以及手动接入 Codex / Claude Code 见[使用指南](docs/usage.zh-CN.md)。
+在任意目录下管理后台服务、查看日志，或生成/卸载项目级与全局客户端配置：
+
+```bash
+liftgate status          # 查看健康状态、PID、会话池、Token 用量与模型数
+liftgate logs -f         # 实时追踪后台网关日志
+liftgate ui              # 在浏览器打开内嵌 Web 监控面板
+liftgate config          # 生成/合并 .claude/ 与 .codex/ 配置（--global 写全局，--uninstall 卸载）
+liftgate stop            # 优雅停止后台网关服务
+```
+
+在源码仓库中继续使用 `./run-gateway.{sh,cmd}` 与 `./start-agy.{sh,cmd}` 同样完全兼容。完整子命令说明、参数列表与 SDK 接入方式见[使用指南](docs/usage.zh-CN.md)。
 
 ## 文档
 

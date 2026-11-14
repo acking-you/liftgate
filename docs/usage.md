@@ -11,11 +11,77 @@ client at it. Every address below assumes the default
 - **Antigravity CLI (`agy`)**, installed and signed in once with
   `agy acp --login`. Liftgate finds it on `PATH` and in the standard install
   locations; otherwise pass `--agy-bin <path>`.
-- **Rust 1.85+** to build the gateway.
-- **Bun** (optional) to build the dashboard into `web/dist`. Without it every
-  API still works.
+- **Liftgate (`liftgate`)**, installed globally from a GitHub Release archive or
+  built from source with **Rust 1.85+**:
+  ```bash
+  cargo install --path crates/liftgate
+  ```
+  When **Bun** is installed at build time, `build.rs` compiles `web/` and embeds
+  the production React dashboard directly into the single `liftgate` binary (no
+  external `web/dist` folder needed at runtime). Without Bun, every API still
+  works and `/` serves a lightweight built-in SSE telemetry page.
 
-## Run the gateway
+## Manage the gateway service (`liftgate` CLI)
+
+Once `liftgate` is on your `PATH`, manage the background gateway and embedded
+Web UI from any directory (state and logs live in `~/.liftgate`, configurable
+via `--state-dir` or `LIFTGATE_HOME`):
+
+```bash
+liftgate start                  # start background gateway + embedded Web UI
+liftgate start --open           # start and open http://127.0.0.1:8787/ in your browser
+liftgate status                 # live health, PID, session pool, tokens & model count (--json supported)
+liftgate logs -n 100 -f         # tail and follow ~/.liftgate/gateway.log (--acp includes agy stderr)
+liftgate ui                     # open the dashboard (--print prints the URL)
+liftgate models                 # list live models discovered from agy acp
+liftgate doctor                 # check agy, claude, codex, embedded UI & auth readiness
+liftgate restart                # restart preserving (or overriding) settings
+liftgate stop                   # gracefully stop the background service and ACP process tree
+liftgate serve                  # run in the foreground (same as bare `liftgate`)
+```
+
+## Zero-side-effect launch (`liftgate codex` / `liftgate claude`)
+
+Run Codex CLI or Claude Code inside **any** project directory without modifying
+project files, `~/.claude/settings.json`, `~/.codex/config.toml`, or your caller
+shell environment:
+
+```bash
+cd /path/to/your/project
+liftgate codex                              # interactive Codex CLI routed through Liftgate
+liftgate claude                             # interactive Claude Code routed through Liftgate
+liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
+liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
+```
+
+- If the background gateway is not running yet, `liftgate codex` and
+  `liftgate claude` start it automatically.
+- Scoped environment variables and temporary settings/catalog files (under
+  `~/.liftgate/ephemeral/`) apply **only** to the spawned child process and are
+  deleted immediately when the CLI exits.
+- By default both launch in autonomous mode (`--dangerously-bypass-approvals-and-sandbox`
+  for Codex, `--dangerously-skip-permissions` for Claude Code); pass
+  `--no-bypass` (or explicit permission/sandbox flags) to keep standard prompts.
+
+## Configure local or global client files (`liftgate config`)
+
+If you prefer running bare `claude` or `codex` directly, let `liftgate config`
+(alias `liftgate setup`) generate or non-destructively merge the live model
+catalog and provider config for you:
+
+```bash
+liftgate config                     # write .claude/settings.local.json + .codex/{config.toml,agy-models.json}
+liftgate config claude --global     # merge into ~/.claude/settings.json
+liftgate config codex --global      # merge [model_providers.agy] + catalog into ~/.codex/
+liftgate config --print             # preview generated config without writing files
+liftgate config --uninstall         # remove only Liftgate-managed keys (--global for ~/)
+```
+
+Existing unrelated user settings (`mcpServers`, `hooks`, `[mcp_servers.*]`,
+`[projects.*]`, custom `env` entries) are preserved, and a one-time
+`*.liftgate.bak` backup is created before updating an existing file.
+
+## Source-checkout scripts
 
 `run-gateway` builds `web/dist` when Bun is present and the bundle is missing,
 builds `liftgate` with `cargo build --release --locked`, then starts it.
@@ -164,23 +230,27 @@ Messages client at `http://127.0.0.1:8787` ([API](api.md)).
 
 ## Dashboard
 
-When `web/dist` is built, Liftgate serves the dashboard at
-`http://127.0.0.1:8787/`: in-flight and recent turns with their tool calls and
-token counts, the session pool (idle sessions can be closed by hand), the model
-catalog and the last lines of `agy` stderr. With `--api-key`, enter the key in
-the dashboard's connection settings. Serve another build with `--ui-dir <dir>`.
+Liftgate serves the observability dashboard directly at `http://127.0.0.1:8787/`
+(embedded inside release binaries at compile time, or opened via `liftgate ui`):
+in-flight and recent turns with their tool calls and token counts, the session
+pool (idle sessions can be closed by hand), the model catalog and the last lines
+of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
+(or enter it in the dashboard's connection settings). Serve an extra dedicated
+UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir>`.
 
 ## Flags and environment
 
 | Flag | Environment | Default |
 | --- | --- | --- |
+| `--state-dir` | `LIFTGATE_HOME` | `~/.liftgate` |
 | `--listen` | `AGY_GATEWAY_LISTEN` | `127.0.0.1:8787` |
+| `--ui-listen` | `AGY_UI_LISTEN` | none (served on `--listen`) |
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |
 | `--api-key` (required as `Authorization: Bearer` or `x-api-key`) | `AGY_GATEWAY_API_KEY` | none: no check |
-| `--ui-dir` | `AGY_UI_DIR` | `./web/dist` when present |
+| `--ui-dir` | `AGY_UI_DIR` | embedded `web/dist` bundle |
 | `--max-idle-sessions` | | `64` |
 | `--max-stored-responses` | | `256` |
 | `--turn-timeout-secs` | | `600` |
@@ -201,5 +271,5 @@ Logs follow `RUST_LOG` (default `info`). `liftgate --help` prints the same list.
   Antigravity account or model quota is exhausted (the error includes the reset
   countdown when `agy` reports one); switch models with `/model` or wait for the
   reset window.
-- **Logs from a background run** — `.agy-runtime/gateway.out.log` and
-  `.agy-runtime/gateway.err.log`.
+- **Logs from a background run** — run `liftgate logs -f` (`~/.liftgate/gateway.log`),
+  or check `.agy-runtime/gateway.{out,err}.log` when using `./run-gateway`.

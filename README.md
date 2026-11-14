@@ -74,19 +74,32 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 ## Get started
 
-You need the Antigravity CLI (`agy`), Rust 1.85+ and, for the dashboard,
-[Bun](https://bun.sh) (optional).
+Sign in once with the Antigravity CLI (`agy`), install `liftgate` globally
+(prebuilt release binary or `cargo install`), and manage everything from one
+command:
 
 ```bash
-agy acp --login     # once, to sign in to Antigravity
-./run-gateway.sh    # build and serve http://127.0.0.1:8787 (Ctrl+C to stop)
-./start-agy.sh      # in another terminal: Claude Code through Liftgate (--codex for Codex)
+agy acp --login                         # once, to sign in to Antigravity
+cargo install --path crates/liftgate    # embeds Web UI automatically when Bun is installed
+
+liftgate start --open                   # start background gateway + dashboard (http://127.0.0.1:8787/)
+liftgate codex                          # launch Codex CLI in current dir (0 side effects on exit)
+liftgate claude                         # or launch Claude Code in current dir (0 side effects on exit)
 ```
 
-On Windows use `.\run-gateway.cmd` and `.\start-agy.cmd` (`-Codex`).
-`start-agy` keeps its settings to the agent it launches: `~/.codex/config.toml`
-and your shell stay untouched. Background mode, every flag and manual Codex or
-Claude Code setup: [usage guide](docs/usage.md).
+Manage the service, inspect logs, or write local/global client configs from anywhere:
+
+```bash
+liftgate status          # health, PID, session pool, token usage & model count
+liftgate logs -f         # tail / follow background service logs
+liftgate ui              # open the embedded Web dashboard
+liftgate config          # write/merge .claude/ & .codex/ configs (--global for ~/, --uninstall to remove)
+liftgate stop            # gracefully stop the background gateway
+```
+
+Running straight from a source checkout via `./run-gateway.{sh,cmd}` and
+`./start-agy.{sh,cmd}` continues to work as well. Full command reference and
+SDK examples: [usage guide](docs/usage.md).
 
 ## Documentation
 

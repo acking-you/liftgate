@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Turned `liftgate` into a full cross-platform management CLI (`start` / `stop` / `restart` / `status` / `logs` / `ui` / `models` / `doctor` / `config` / `claude` / `codex` / `serve`) while keeping bare `liftgate` foreground server flags 100% backwards-compatible.
+- Embedded the companion React observability dashboard (`web/dist`) directly into `liftgate` at compile time (`crates/liftgate/build.rs`), with an SSE live-telemetry fallback page when built without Bun, optional `--ui-listen` dedicated port binding, and automatic `#api_key` / `#base_url` bootstrap handoff via `liftgate ui`.
+- Added `liftgate claude` and `liftgate codex` zero-side-effect launchers that auto-start the background gateway if needed, inject process-scoped environment variables and auto-cleaned ephemeral settings/catalogs (`~/.liftgate/ephemeral/`), forward native arguments directly, and leave project directories, `~/.claude`, `~/.codex`, and the caller shell completely untouched on exit.
+- Added `liftgate config` (`all` / `claude` / `codex`, `--global`, `--dir`, `--print`, `--uninstall`) to non-destructively generate, merge, back up (`*.liftgate.bak`), or cleanly remove local/global Claude Code and Codex CLI configurations.
+
 ### Fixed
 - Surfaced upstream Antigravity quota exhaustion (`⚠ Individual quota reached...` and quota-related ACP errors) directly to clients as non-retryable Anthropic `400 invalid_request_error` / SSE `event: error` and OpenAI `429 insufficient_quota` / SSE `response.failed` instead of returning blank `end_turn` replies or poisoning pooled sessions.
 - Guarded against silent zero-output upstream turns by evicting the affected session and returning an explicit upstream error rather than fabricating an empty assistant message.

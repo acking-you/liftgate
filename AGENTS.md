@@ -16,8 +16,8 @@ Rules for changing this repository.
 ## Architecture
 
 - One-way workspace dependency graph (`resolver = "3"`, `edition = "2024"`, `rust-version = "1.85"`):
-  `liftgate` (thin CLI binary) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
-- `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). When `web/dist` is built, `liftgate` serves it directly at `/`.
+  `liftgate` (management CLI binary: daemon lifecycle, embedded UI, config sync & zero-side-effect `claude`/`codex` launchers) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
+- `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). Release builds embed `web/dist` directly into the `liftgate` binary via `crates/liftgate/build.rs` and serve it at `/`.
 - Cross-platform child supervision (`crates/liftgate-server/src/job.rs`): Win32 Job Object (`KILL_ON_JOB_CLOSE`) on Windows; `process_group(0)` + `killpg` on Unix plus `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux, backed by a chained panic hook.
 
 ## Protocol & Session Invariants

@@ -15,6 +15,7 @@ without the `/v1` prefix.
 | `GET /healthz` | liveness |
 | `GET /api/telemetry/snapshot`, `GET /api/telemetry/events` | dashboard data (snapshot and SSE stream) |
 | `POST /api/telemetry/sessions/{id}/close` | close an idle pooled session |
+| `POST /api/admin/shutdown` | graceful shutdown for managed background daemons (requires `x-liftgate-shutdown-token`) |
 
 ## Authentication
 

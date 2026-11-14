@@ -84,8 +84,8 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | --- | --- |
 | `crates/liftgate-types` | protocol, wire and config types: no async runtime, HTTP or I/O |
 | `crates/liftgate-server` | HTTP/SSE routes, ACP transport, `SessionPool`, process supervision, `web_fetch`, telemetry |
-| `crates/liftgate` | the `liftgate` binary: CLI flags and serving `web/dist` |
-| `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui) |
+| `crates/liftgate` | the `liftgate` CLI binary: global daemon lifecycle (`start`/`stop`/`restart`/`status`/`logs`/`ui`/`models`/`doctor`), embedded `web/dist` assets, non-destructive `config` sync, and zero-side-effect `claude` / `codex` launchers |
+| `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release `liftgate` builds via `crates/liftgate/build.rs` |
 | `run-gateway.{sh,ps1,cmd}` | build and run the gateway |
 | `start-agy.{sh,ps1,cmd}` | launch Claude Code or Codex through the gateway |
 

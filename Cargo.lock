@@ -384,12 +384,18 @@ name = "liftgate"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dunce",
+ "libc",
  "liftgate-server",
  "liftgate-types",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

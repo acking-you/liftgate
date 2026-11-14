@@ -49,6 +49,48 @@ use crate::{
     web_fetch::WebFetchOutcome,
 };
 
+/// Header name required by `POST /api/admin/shutdown` for managed daemon lifecycle control.
+pub const ADMIN_SHUTDOWN_HEADER: &str = "x-liftgate-shutdown-token";
+
+/// Compile-time `(relative_slash_path, bytes)` entry for embedded companion web assets.
+pub type EmbeddedUiAsset = (&'static str, &'static [u8]);
+
+/// Token-authenticated graceful shutdown trigger exposed to the local `liftgate` CLI.
+#[derive(Clone, Debug)]
+pub struct AdminShutdownHandle {
+    token: Arc<str>,
+    trigger: tokio::sync::watch::Sender<bool>,
+}
+
+impl AdminShutdownHandle {
+    /// Creates a new shutdown handle paired with a `watch::Receiver<bool>` that resolves to `true`
+    /// once an authenticated `POST /api/admin/shutdown` request arrives.
+    #[must_use]
+    pub fn new(token: Arc<str>) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (trigger, rx) = tokio::sync::watch::channel(false);
+        (Self { token, trigger }, rx)
+    }
+
+    fn verify_and_trigger(&self, provided: &str) -> bool {
+        if self.token.is_empty() || !constant_time_eq(self.token.as_bytes(), provided.as_bytes()) {
+            return false;
+        }
+        let _ = self.trigger.send_replace(true);
+        true
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (&lhs, &rhs) in a.iter().zip(b.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    diff == 0
+}
+
 /// Shared application state parameterized statically over `B: AcpBackend`.
 pub struct AppState<B: AcpBackend> {
     pub backend: Arc<B>,
@@ -56,6 +98,8 @@ pub struct AppState<B: AcpBackend> {
     pub telemetry: Arc<TelemetryHub>,
     pub config: GatewayRuntimeConfig,
     pub ui_dist_dir: Option<PathBuf>,
+    pub embedded_ui: &'static [EmbeddedUiAsset],
+    pub admin_shutdown: Option<AdminShutdownHandle>,
 }
 
 impl<B: AcpBackend> Clone for AppState<B> {
@@ -66,6 +110,8 @@ impl<B: AcpBackend> Clone for AppState<B> {
             telemetry: Arc::clone(&self.telemetry),
             config: self.config.clone(),
             ui_dist_dir: self.ui_dist_dir.clone(),
+            embedded_ui: self.embedded_ui,
+            admin_shutdown: self.admin_shutdown.clone(),
         }
     }
 }
@@ -107,6 +153,7 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             "/api/telemetry/sessions/{session_id}/close",
             post(handle_close_idle_session::<B>),
         )
+        .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn(cors_middleware))
@@ -2902,6 +2949,24 @@ async fn handle_close_idle_session<B: AcpBackend>(
     Json(json!({ "closed": closed, "session_id": session_id })).into_response()
 }
 
+async fn handle_admin_shutdown<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(handle) = &state.admin_shutdown else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let provided = headers
+        .get(ADMIN_SHUTDOWN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if !handle.verify_and_trigger(provided) {
+        return GatewayError::Unauthorized.into_openai_response();
+    }
+    Json(json!({ "status": "shutting_down" })).into_response()
+}
+
 async fn handle_ui_static<B: AcpBackend>(
     State(state): State<AppState<B>>,
     method: Method,
@@ -2910,58 +2975,100 @@ async fn handle_ui_static<B: AcpBackend>(
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(base_dir) = &state.ui_dist_dir else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": "UI static bundle not built yet. Run `bun run dev` inside `web/` for development or `bun run build` inside `web/` to serve the dashboard here.",
-                    "type": "not_found"
-                }
-            })),
-        )
-            .into_response();
-    };
 
     let req_path = uri.path().trim_start_matches('/');
-    let relative = if req_path.is_empty() {
-        PathBuf::from("index.html")
+    let is_api_prefix = req_path.starts_with("v1/")
+        || req_path == "v1"
+        || req_path.starts_with("api/")
+        || req_path == "api";
+
+    let (relative, relative_slash) = if req_path.is_empty() {
+        (PathBuf::from("index.html"), "index.html".to_owned())
     } else {
         let candidate = StdPath::new(req_path);
         let mut clean = PathBuf::new();
+        let mut slash_parts: Vec<&str> = Vec::new();
         for comp in candidate.components() {
             match comp {
-                Component::Normal(part) => clean.push(part),
+                Component::Normal(part) => {
+                    let Some(s) = part.to_str() else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    clean.push(part);
+                    slash_parts.push(s);
+                }
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
             }
         }
-        clean
+        if slash_parts.is_empty() {
+            (PathBuf::from("index.html"), "index.html".to_owned())
+        } else {
+            (clean, slash_parts.join("/"))
+        }
     };
 
-    let full_path = base_dir.join(&relative);
-    let target_file = if tokio::fs::metadata(&full_path)
-        .await
-        .is_ok_and(|m| m.is_file())
-    {
-        full_path
-    } else if !req_path.starts_with("v1/") && !req_path.starts_with("api/") {
-        base_dir.join("index.html")
-    } else {
+    if let Some(base_dir) = &state.ui_dist_dir {
+        let full_path = base_dir.join(&relative);
+        let target_file = if tokio::fs::metadata(&full_path)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
+            full_path
+        } else if !is_api_prefix {
+            base_dir.join("index.html")
+        } else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        let Ok(bytes) = tokio::fs::read(&target_file).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        let mime = guess_mime_type(&target_file);
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime)],
+            Bytes::from(bytes),
+        )
+            .into_response();
+    }
+
+    if !state.embedded_ui.is_empty() {
+        let found = state
+            .embedded_ui
+            .iter()
+            .find(|(path, _)| *path == relative_slash)
+            .or_else(|| {
+                (!is_api_prefix).then(|| {
+                    state
+                        .embedded_ui
+                        .iter()
+                        .find(|(path, _)| *path == "index.html")
+                })?
+            });
+        if let Some((matched_path, bytes)) = found {
+            let mime = guess_mime_type(StdPath::new(matched_path));
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime)],
+                Bytes::from_static(bytes),
+            )
+                .into_response();
+        }
         return StatusCode::NOT_FOUND.into_response();
-    };
+    }
 
-    let Ok(bytes) = tokio::fs::read(&target_file).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let mime = guess_mime_type(&target_file);
     (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, mime)],
-        Bytes::from(bytes),
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": "UI static bundle not built yet. Run `bun run dev` inside `web/` for development or `bun run build` inside `web/` to serve the dashboard here.",
+                "type": "not_found"
+            }
+        })),
     )
         .into_response()
 }
