@@ -1,0 +1,613 @@
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, value::RawValue};
+
+use crate::acp::AcpUsage;
+use crate::canonical::{
+    CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
+    NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task,
+};
+use crate::error::ProtocolError;
+use crate::session_key::strip_unstable_harness_noise;
+
+pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
+
+/// Incoming `POST /v1/messages` request body.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicMessagesRequest {
+    pub model: String,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub system: Option<AnthropicSystemPrompt>,
+    #[serde(default)]
+    pub messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    pub tools: Vec<AnthropicToolSpec>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub thinking: Option<AnthropicThinkingConfig>,
+    #[serde(default)]
+    pub output_config: Option<AnthropicOutputConfig>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicOutputConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub format: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicSystemPrompt {
+    Text(String),
+    Blocks(Vec<AnthropicSystemBlock>),
+}
+
+impl AnthropicSystemPrompt {
+    #[must_use]
+    pub fn into_joined_text(self) -> String {
+        match self {
+            Self::Text(s) => sanitize_system_segment(&s).unwrap_or_default(),
+            Self::Blocks(blocks) => blocks
+                .into_iter()
+                .filter_map(|b| b.text.and_then(|t| sanitize_system_segment(&t)))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
+}
+
+fn sanitize_system_segment(raw: &str) -> Option<String> {
+    let cleaned = strip_unstable_harness_noise(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+        return Some("You are a coding agent assisting the user via their CLI harness.".to_owned());
+    }
+    Some(cleaned)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicSystemBlock {
+    #[serde(rename = "type", default)]
+    pub block_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicMessage {
+    pub role: String,
+    pub content: AnthropicMessageContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicMessageContent {
+    Text(String),
+    Blocks(Vec<AnthropicInputBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicInputBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Option<AnthropicToolResultContent>,
+        #[serde(default)]
+        is_error: Option<bool>,
+    },
+    ServerToolUse {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    WebSearchToolResult {
+        #[serde(default)]
+        tool_use_id: String,
+        #[serde(default)]
+        content: Value,
+    },
+    WebFetchToolResult {
+        #[serde(default)]
+        tool_use_id: String,
+        #[serde(default)]
+        content: Value,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    #[serde(default)]
+    pub media_type: String,
+    #[serde(default)]
+    pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicToolResultBlock>),
+}
+
+impl AnthropicToolResultContent {
+    #[must_use]
+    pub fn to_plain_string(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicToolResultBlock {
+    #[serde(rename = "type", default)]
+    pub block_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicToolSpec {
+    #[serde(rename = "type", default)]
+    pub tool_type: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<Box<RawValue>>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
+    #[serde(default)]
+    pub display: Option<String>,
+}
+
+/// Normalizes an `AnthropicMessagesRequest` into a `NormalizedTurnRequest`.
+pub fn normalize_anthropic_request(
+    req: AnthropicMessagesRequest,
+) -> Result<NormalizedTurnRequest, ProtocolError> {
+    let mut system_instructions = req
+        .system
+        .map(AnthropicSystemPrompt::into_joined_text)
+        .filter(|s| !s.trim().is_empty());
+
+    if let Some(schema) = req
+        .output_config
+        .as_ref()
+        .and_then(|cfg| cfg.format.as_ref())
+        .filter(|fmt| fmt.get("type").and_then(Value::as_str) == Some("json_schema"))
+        .and_then(|fmt| fmt.get("schema"))
+        && let Ok(schema_json) = serde_json::to_string(schema)
+    {
+        let directive = format!(
+            "Respond ONLY with valid JSON conforming strictly to this JSON schema:\n{schema_json}"
+        );
+        match &mut system_instructions {
+            Some(existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&directive);
+            }
+            None => system_instructions = Some(directive),
+        }
+    }
+
+    let mut messages = Vec::with_capacity(req.messages.len());
+    for msg in req.messages {
+        let role = if msg.role == "assistant" {
+            CanonicalRole::Assistant
+        } else {
+            CanonicalRole::User
+        };
+
+        let mut parts = Vec::new();
+        match msg.content {
+            AnthropicMessageContent::Text(s) => {
+                parts.push(CanonicalPart::Text(s));
+            }
+            AnthropicMessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        AnthropicInputBlock::Text { text } => {
+                            parts.push(CanonicalPart::Text(text));
+                        }
+                        AnthropicInputBlock::Image { source } => {
+                            if source.source_type == "base64"
+                                && !source.media_type.is_empty()
+                                && !source.data.is_empty()
+                            {
+                                parts.push(CanonicalPart::ImageBase64 {
+                                    media_type: source.media_type,
+                                    data: source.data,
+                                });
+                            } else {
+                                return Err(ProtocolError::UnsupportedImageUrl);
+                            }
+                        }
+                        AnthropicInputBlock::Thinking { thinking, .. } => {
+                            parts.push(CanonicalPart::Reasoning(thinking));
+                        }
+                        AnthropicInputBlock::ToolUse { id, name, input } => {
+                            let arguments = serde_json::to_string(&input)?;
+                            parts.push(CanonicalPart::ToolCall {
+                                call_id: id,
+                                name,
+                                arguments,
+                                is_custom: false,
+                            });
+                        }
+                        AnthropicInputBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            let output = content
+                                .as_ref()
+                                .map(AnthropicToolResultContent::to_plain_string)
+                                .unwrap_or_default();
+                            parts.push(CanonicalPart::ToolResult {
+                                call_id: tool_use_id,
+                                output,
+                                is_error: is_error.unwrap_or(false),
+                            });
+                        }
+                        AnthropicInputBlock::RedactedThinking { .. }
+                        | AnthropicInputBlock::ServerToolUse { .. }
+                        | AnthropicInputBlock::WebSearchToolResult { .. }
+                        | AnthropicInputBlock::WebFetchToolResult { .. }
+                        | AnthropicInputBlock::Unknown => {}
+                    }
+                }
+            }
+        }
+
+        if !parts.is_empty() {
+            messages.push(CanonicalMessage { role, parts });
+        }
+    }
+
+    if messages.is_empty() {
+        return Err(ProtocolError::EmptyInput);
+    }
+
+    let choice_type = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str);
+    let choice_tool_name = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str);
+    let tool_choice_is_none = choice_type == Some("none");
+
+    let mut client_tools = Vec::new();
+    let mut enable_native_web_search = false;
+    let mut enable_native_web_fetch = false;
+    let mut web_fetch_max_uses = None;
+    let mut web_fetch_allowed_domains = Vec::new();
+    let mut web_fetch_blocked_domains = Vec::new();
+
+    if !tool_choice_is_none {
+        for tool in req.tools {
+            if let Some(tt) = &tool.tool_type {
+                if tt.starts_with("web_search") {
+                    enable_native_web_search = true;
+                    continue;
+                }
+                if tt.starts_with("web_fetch") {
+                    enable_native_web_fetch = true;
+                    if tool.max_uses.is_some() {
+                        web_fetch_max_uses = tool.max_uses;
+                    }
+                    web_fetch_allowed_domains.extend(tool.allowed_domains);
+                    web_fetch_blocked_domains.extend(tool.blocked_domains);
+                    continue;
+                }
+            }
+            if !tool.name.trim().is_empty() {
+                let schema_json = tool.input_schema.as_ref().map_or_else(
+                    || "{\"type\":\"object\"}".to_owned(),
+                    |r| r.get().to_owned(),
+                );
+                client_tools.push(CanonicalToolSpec {
+                    name: tool.name,
+                    description: tool.description,
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: schema_json,
+                    },
+                });
+            }
+        }
+    }
+
+    let auxiliary_task = detect_auxiliary_task(
+        system_instructions.as_deref(),
+        &messages,
+        &client_tools,
+        enable_native_web_search,
+        enable_native_web_fetch,
+    );
+
+    let force_native_web_search = enable_native_web_search
+        && (choice_tool_name == Some("web_search")
+            || auxiliary_task == Some(crate::canonical::AuxiliaryTaskKind::WebSearchSubrequest)
+            || (choice_type == Some("any") && client_tools.is_empty() && !enable_native_web_fetch));
+
+    let force_native_web_fetch = enable_native_web_fetch
+        && (choice_tool_name == Some("web_fetch")
+            || (choice_type == Some("any")
+                && client_tools.is_empty()
+                && !enable_native_web_search));
+
+    let omit_thinking_text =
+        req.thinking.as_ref().and_then(|cfg| cfg.display.as_deref()) == Some("omitted");
+
+    let explicit_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|cfg| cfg.effort.as_deref())
+        .and_then(ReasoningEffort::from_effort_str);
+
+    let (include_thinking, reasoning_effort) = if auxiliary_task.is_some() {
+        (false, Some(ReasoningEffort::Low))
+    } else {
+        match &req.thinking {
+            Some(cfg) if cfg.thinking_type == "enabled" || cfg.thinking_type == "adaptive" => {
+                let effort = explicit_effort.unwrap_or_else(|| {
+                    cfg.budget_tokens
+                        .map_or(ReasoningEffort::High, ReasoningEffort::from_budget_tokens)
+                });
+                (true, Some(effort))
+            }
+            _ => (false, explicit_effort),
+        }
+    };
+
+    Ok(NormalizedTurnRequest {
+        requested_model: Some(req.model),
+        system_instructions,
+        messages,
+        client_tools,
+        enable_native_web_search,
+        force_native_web_search,
+        enable_native_web_fetch,
+        force_native_web_fetch,
+        web_fetch_max_uses,
+        web_fetch_allowed_domains,
+        web_fetch_blocked_domains,
+        auxiliary_task,
+        previous_response_id: None,
+        reasoning_effort,
+        include_thinking,
+        omit_thinking_text,
+        include_encrypted_reasoning: false,
+        stream: req.stream.unwrap_or(false),
+    })
+}
+
+/// Estimates token count for `POST /v1/messages/count_tokens`.
+#[must_use]
+pub fn estimate_anthropic_tokens(req: &AnthropicMessagesRequest) -> u64 {
+    let mut chars: usize = 0;
+    if let Some(sys) = &req.system {
+        match sys {
+            AnthropicSystemPrompt::Text(s) => chars = chars.saturating_add(s.len()),
+            AnthropicSystemPrompt::Blocks(blocks) => {
+                for b in blocks {
+                    if let Some(t) = &b.text {
+                        chars = chars.saturating_add(t.len());
+                    }
+                }
+            }
+        }
+    }
+    for msg in &req.messages {
+        match &msg.content {
+            AnthropicMessageContent::Text(s) => chars = chars.saturating_add(s.len()),
+            AnthropicMessageContent::Blocks(blocks) => {
+                for b in blocks {
+                    match b {
+                        AnthropicInputBlock::Text { text } => {
+                            chars = chars.saturating_add(text.len());
+                        }
+                        AnthropicInputBlock::Image { source } => {
+                            chars = chars.saturating_add(source.data.len() / 16 + 1024);
+                        }
+                        AnthropicInputBlock::Thinking { thinking, .. } => {
+                            chars = chars.saturating_add(thinking.len());
+                        }
+                        AnthropicInputBlock::ToolUse { name, input, .. }
+                        | AnthropicInputBlock::ServerToolUse { name, input, .. } => {
+                            chars = chars.saturating_add(name.len() + input.to_string().len());
+                        }
+                        AnthropicInputBlock::ToolResult { content, .. } => {
+                            if let Some(c) = content {
+                                chars = chars.saturating_add(c.to_plain_string().len());
+                            }
+                        }
+                        AnthropicInputBlock::WebSearchToolResult { content, .. }
+                        | AnthropicInputBlock::WebFetchToolResult { content, .. } => {
+                            chars = chars.saturating_add(content.to_string().len());
+                        }
+                        AnthropicInputBlock::RedactedThinking { .. }
+                        | AnthropicInputBlock::Unknown => {}
+                    }
+                }
+            }
+        }
+    }
+    for tool in &req.tools {
+        chars = chars.saturating_add(tool.name.len() + 32);
+        if let Some(desc) = &tool.description {
+            chars = chars.saturating_add(desc.len());
+        }
+        if let Some(schema) = &tool.input_schema {
+            chars = chars.saturating_add(schema.get().len());
+        }
+    }
+    ((chars / 4) as u64).max(1)
+}
+
+// ============================================================================
+// Outgoing Anthropic `/v1/messages` Wire Objects
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnthropicMessagesResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub object_type: Cow<'static, str>,
+    pub role: Cow<'static, str>,
+    pub model: String,
+    pub content: Vec<AnthropicOutputBlock>,
+    pub stop_reason: Option<Cow<'static, str>>,
+    pub stop_sequence: Option<String>,
+    pub usage: AnthropicUsage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnthropicWebSearchResultItem {
+    #[serde(rename = "type")]
+    pub item_type: Cow<'static, str>,
+    pub title: String,
+    pub url: String,
+    pub encrypted_content: String,
+    pub page_age: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicOutputBlock {
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Vec<AnthropicWebSearchResultItem>,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct AnthropicServerToolUsage {
+    pub web_search_requests: u64,
+    #[serde(default)]
+    pub web_fetch_requests: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<AnthropicServerToolUsage>,
+}
+
+impl From<AcpUsage> for AnthropicUsage {
+    fn from(u: AcpUsage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            cache_creation_input_tokens: u.cached_write_tokens,
+            cache_read_input_tokens: u.cached_read_tokens,
+            output_tokens: u.output_tokens.saturating_add(u.thought_tokens),
+            server_tool_use: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AnthropicCountTokensResponse {
+    pub input_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AnthropicErrorEnvelope {
+    #[serde(rename = "type")]
+    pub envelope_type: &'static str,
+    pub error: AnthropicErrorBody,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    pub error_type: &'static str,
+    pub message: String,
+}

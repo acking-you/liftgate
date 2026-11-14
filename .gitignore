@@ -1,0 +1,8 @@
+/target/
+/web/node_modules/
+/web/dist/
+/.claude/
+/.agy-runtime/
+/claude-carbon.settings.json
+*.tsbuildinfo
+.DS_Store

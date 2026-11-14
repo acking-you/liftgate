@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agy-gateway-types",
+    "crates/agy-gateway-server",
+    "crates/agy-acp-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/acking-you/antigravity-gateway"
+
+[workspace.dependencies]
+agy-gateway-types = { path = "crates/agy-gateway-types", default-features = false }
+agy-gateway-server = { path = "crates/agy-gateway-server", default-features = false }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+bytes = { version = "1", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+dunce = { version = "1", default-features = false }
+http-body-util = { version = "0.1", default-features = false }
+libc = { version = "0.2", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "std", "rc"] }
+serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false }
+tokio-stream = { version = "0.1", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+tower = { version = "0.5", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
+uuid = { version = "1", default-features = false, features = ["v4", "fast-rng", "std"] }
+windows-sys = { version = "0.59", default-features = false }
