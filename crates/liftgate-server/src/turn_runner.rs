@@ -31,7 +31,7 @@ use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
     session_pool::{SessionLeaseGuard, SessionPool},
-    telemetry::{ActiveTaskGuard, TelemetryHub},
+    telemetry::{ActiveTaskGuard, TelemetryHub, unix_timestamp_ms},
     web_fetch::WebFetchOutcome,
 };
 
@@ -282,6 +282,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     let (lease, session_reused, prompt_blocks, base_messages) = match setup_res {
         Ok(t) => t,
         Err(err) => {
+            let err = upgrade_gateway_error(err, &resolved_model);
             task_guard.fail(err.to_string());
             return Err(err);
         }
@@ -421,8 +422,12 @@ async fn run_turn_pipeline<B: AcpBackend>(
     let mut final_stop_reason = "end_turn".to_owned();
     let mut current_prompt_blocks = initial_prompt_blocks;
     let mut state = TurnStreamState::new();
+    let mut last_step_started_ms: u64;
+    let mut last_suppressed_banners: Vec<String>;
+    let mut last_turn_error: Option<String>;
 
     loop {
+        last_step_started_ms = unix_timestamp_ms();
         state.halted_post_tool_runaway = false;
         state.post_tool_spill_buf.clear();
 
@@ -466,13 +471,24 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         ).await {
                             return;
                         }
+                        if banner_filter.take_malformed_retry()
+                            && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
+                        {
+                            tracing::info!(
+                                "short-circuiting internal ACP malformed-call retry because XML tool call was already captured"
+                            );
+                            state.halted_post_tool_runaway = true;
+                        }
                         if let Some((sig, detail)) = banner_filter.take_signal() {
                             let no_output_yet = state.text_accumulator.is_empty()
                                 && state.assistant_parts.is_empty()
                                 && !state.emitted_client_tool
                                 && state.seen_search_ids.is_empty()
                                 && completed_web_fetches == 0;
-                            if no_output_yet {
+                            if no_output_yet
+                                || (sig == UpstreamBannerSignal::QuotaExhausted
+                                    && !state.emitted_client_tool)
+                            {
                                 upstream_abort = Some((sig, detail));
                                 break;
                             }
@@ -494,6 +510,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                     prompt_outcome = Some(Ok(PromptTurnResult {
                                         stop_reason: "end_turn".to_owned(),
                                         usage: AcpUsage::default(),
+                                        error: None,
                                     }));
                                 }
                             } else {
@@ -508,6 +525,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                         "end_turn".to_owned()
                                     },
                                     usage: AcpUsage::default(),
+                                    error: None,
                                 }));
                             }
                             break;
@@ -543,13 +561,24 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 {
                     return;
                 }
+                if banner_filter.take_malformed_retry()
+                    && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
+                {
+                    tracing::info!(
+                        "short-circuiting internal ACP malformed-call retry because XML tool call was already captured"
+                    );
+                    state.halted_post_tool_runaway = true;
+                }
                 if let Some((sig, detail)) = banner_filter.take_signal() {
                     let no_output_yet = state.text_accumulator.is_empty()
                         && state.assistant_parts.is_empty()
                         && !state.emitted_client_tool
                         && state.seen_search_ids.is_empty()
                         && completed_web_fetches == 0;
-                    if no_output_yet {
+                    if no_output_yet
+                        || (sig == UpstreamBannerSignal::QuotaExhausted
+                            && !state.emitted_client_tool)
+                    {
                         upstream_abort = Some((sig, detail));
                         break;
                     }
@@ -572,11 +601,16 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     && state.seen_search_ids.is_empty()
                     && completed_web_fetches == 0
                     && filter_out.trim().is_empty();
-                if no_output_yet {
+                if no_output_yet
+                    || (sig == UpstreamBannerSignal::QuotaExhausted
+                        && !state.emitted_client_tool
+                        && filter_out.trim().is_empty())
+                {
                     upstream_abort = Some((sig, detail));
                 }
             }
         }
+        last_suppressed_banners = banner_filter.take_suppressed_banners();
 
         if let Some((sig, detail)) = upstream_abort {
             if let Some(old_lease) = lease.take() {
@@ -647,6 +681,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         continue;
                     }
                     Err(err) => {
+                        let err = upgrade_acp_error(err, &backup_model);
                         task_guard.fail(err.to_string());
                         let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
                         return;
@@ -655,6 +690,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
             }
 
             let err = match sig {
+                UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
+                    model: active_model.as_str().to_owned(),
+                    detail,
+                },
                 UpstreamBannerSignal::RateLimited => AcpError::UpstreamRateLimited {
                     model: active_model.as_str().to_owned(),
                     detail,
@@ -663,7 +702,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     AcpError::UpstreamAgentTerminated { detail }
                 }
             };
-            tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream fatal/rate-limit banner");
+            tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream quota/rate-limit/fatal banner");
             task_guard.fail(err.to_string());
             let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
             return;
@@ -671,6 +710,12 @@ async fn run_turn_pipeline<B: AcpBackend>(
 
         match prompt_outcome {
             Some(Ok(turn_res)) => {
+                last_turn_error = turn_res
+                    .error
+                    .as_ref()
+                    .map(|raw| raw.get().trim().to_owned())
+                    .filter(|s| !s.is_empty() && s != "null" && s != "{}");
+
                 if !state.halted_post_tool_runaway {
                     if !filter_out.is_empty() {
                         state.parsed_buf.clear();
@@ -776,6 +821,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 break;
             }
             Some(Err(err)) => {
+                if let Some(old_lease) = lease.take() {
+                    old_lease.finish_ephemeral();
+                }
+                let err = upgrade_acp_error(err, &active_model);
                 tracing::error!(error = ?err, "ACP prompt turn failed");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -787,7 +836,42 @@ async fn run_turn_pipeline<B: AcpBackend>(
 
     if !state.emitted_client_tool && !state.text_accumulator.is_empty() {
         let trailing = std::mem::take(&mut state.text_accumulator);
-        state.assistant_parts.push(CanonicalPart::Text(trailing));
+        if !trailing.trim().is_empty() {
+            state.assistant_parts.push(CanonicalPart::Text(trailing));
+        }
+    }
+
+    let has_non_ws_part = state.assistant_parts.iter().any(|part| match part {
+        CanonicalPart::Text(t) => !t.trim().is_empty(),
+        CanonicalPart::ToolCall { .. }
+        | CanonicalPart::ImageBase64 { .. }
+        | CanonicalPart::Reasoning(_)
+        | CanonicalPart::ToolResult { .. } => true,
+    });
+    let produced_any_output = has_non_ws_part
+        || state.emitted_client_tool
+        || !state.seen_search_ids.is_empty()
+        || completed_web_fetches > 0;
+
+    if !produced_any_output {
+        if let Some(empty_lease) = lease.take() {
+            empty_lease.finish_ephemeral();
+        }
+        let recent_stderr = backend.recent_stderr_since(last_step_started_ms);
+        let err = build_zero_output_error(
+            &active_model,
+            &final_stop_reason,
+            last_turn_error.as_deref(),
+            &last_suppressed_banners,
+            &recent_stderr,
+        );
+        tracing::error!(
+            error = ?err,
+            "upstream ACP prompt completed with zero assistant output; failing turn instead of returning empty reply"
+        );
+        task_guard.fail(err.to_string());
+        let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+        return;
     }
 
     if let Some(final_lease) = lease.take() {
@@ -990,7 +1074,136 @@ async fn forward_acp_update(
             parser.feed(filter_out, &mut state.parsed_buf);
             emit_parsed_items(req, task_guard, state, events_tx, cancel).await
         }
+        SessionUpdatePayload::Error { message, error } => {
+            let detail = format_update_error_detail(&message, error.as_deref());
+            if !detail.is_empty() {
+                let sig = classify_upstream_error_text(&detail)
+                    .unwrap_or(UpstreamBannerSignal::FatalAgentError);
+                banner_filter.record_external_signal(sig, detail);
+            }
+            true
+        }
         SessionUpdatePayload::UsageUpdate { .. } | SessionUpdatePayload::Unknown => true,
+    }
+}
+
+fn format_update_error_detail(message: &str, error: Option<&RawValue>) -> String {
+    let trimmed_msg = message.trim();
+    let raw_err = error
+        .map(|r| r.get().trim())
+        .filter(|s| !s.is_empty() && *s != "null" && *s != "{}");
+    match (trimmed_msg.is_empty(), raw_err) {
+        (false, Some(raw)) if !trimmed_msg.contains(raw) => format!("{trimmed_msg} — {raw}"),
+        (false, _) => trimmed_msg.to_owned(),
+        (true, Some(raw)) => raw.to_owned(),
+        (true, None) => String::new(),
+    }
+}
+
+fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
+    match err {
+        GatewayError::Acp { source } => GatewayError::Acp {
+            source: upgrade_acp_error(source, model),
+        },
+        GatewayError::SharedAcp { source } => {
+            if let AcpError::Rpc { message, .. } = source.as_ref()
+                && let Some(sig) = classify_upstream_error_text(message)
+            {
+                let upgraded = signal_to_acp_error(sig, model, message.clone());
+                return GatewayError::SharedAcp {
+                    source: Arc::new(upgraded),
+                };
+            }
+            GatewayError::SharedAcp { source }
+        }
+        GatewayError::Unauthorized
+        | GatewayError::NotFound { .. }
+        | GatewayError::BadJson { .. }
+        | GatewayError::Protocol { .. } => err,
+    }
+}
+
+fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
+    match err {
+        AcpError::Rpc {
+            method,
+            code,
+            message,
+        } => {
+            if let Some(sig) = classify_upstream_error_text(&message) {
+                signal_to_acp_error(sig, model, message)
+            } else {
+                AcpError::Rpc {
+                    method,
+                    code,
+                    message,
+                }
+            }
+        }
+        AcpError::SpawnProcess { .. }
+        | AcpError::ProcessGroup { .. }
+        | AcpError::MissingStdioPipe { .. }
+        | AcpError::TransportClosed
+        | AcpError::LineCodec { .. }
+        | AcpError::EncodeJson { .. }
+        | AcpError::DecodeJson { .. }
+        | AcpError::TurnTimeout { .. }
+        | AcpError::UpstreamRateLimited { .. }
+        | AcpError::UpstreamQuotaExhausted { .. }
+        | AcpError::UpstreamAgentTerminated { .. }
+        | AcpError::EmptyUpstreamResponse { .. }
+        | AcpError::Cancelled => err,
+    }
+}
+
+fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: String) -> AcpError {
+    match sig {
+        UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
+            model: model.as_str().to_owned(),
+            detail,
+        },
+        UpstreamBannerSignal::RateLimited => AcpError::UpstreamRateLimited {
+            model: model.as_str().to_owned(),
+            detail,
+        },
+        UpstreamBannerSignal::FatalAgentError => AcpError::UpstreamAgentTerminated { detail },
+    }
+}
+
+fn build_zero_output_error(
+    model: &ModelId,
+    stop_reason: &str,
+    turn_error: Option<&str>,
+    suppressed_banners: &[String],
+    recent_stderr: &[String],
+) -> AcpError {
+    let mut first_hint: Option<String> = None;
+    let candidates = turn_error
+        .into_iter()
+        .chain(suppressed_banners.iter().map(String::as_str))
+        .chain(recent_stderr.iter().rev().map(String::as_str));
+
+    for raw in candidates {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if first_hint.is_none() {
+            first_hint = Some(trimmed.to_owned());
+        }
+        if let Some(sig) = classify_upstream_error_text(trimmed) {
+            return signal_to_acp_error(sig, model, trimmed.to_owned());
+        }
+    }
+
+    AcpError::EmptyUpstreamResponse {
+        model: model.as_str().to_owned(),
+        stop_reason: if stop_reason.trim().is_empty() {
+            "end_turn".to_owned()
+        } else {
+            stop_reason.to_owned()
+        },
+        detail: first_hint,
     }
 }
 
@@ -1250,24 +1463,105 @@ async fn send_cancel_safe(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpstreamBannerSignal {
+    QuotaExhausted,
     RateLimited,
     FatalAgentError,
+}
+
+const MAX_SUPPRESSED_BANNERS: usize = 8;
+
+/// Classifies an upstream `agy acp` banner, JSON-RPC error message, or stderr diagnostic line.
+#[must_use]
+pub fn classify_upstream_error_text(text: &str) -> Option<UpstreamBannerSignal> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // 1. Account / subscription / model-tier quota exhaustion (must stop immediately without
+    //    silent failover or retry loops).
+    if lower.contains("individual quota")
+        || lower.contains("quota reached")
+        || lower.contains("quota_exhausted")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exhausted")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota limit")
+        || lower.contains("quota will reset")
+        || lower.contains("exhausted your quota")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("upgrade your subscription")
+        || lower.contains("increase your limits")
+        || lower.contains("usage limit")
+        || lower.contains("daily limit")
+        || lower.contains("monthly limit")
+        || lower.contains("credit balance")
+        || lower.contains("billing hard limit")
+        || (lower.contains("quota") && lower.contains("reset"))
+        || trimmed.contains("额度")
+        || trimmed.contains("配额")
+    {
+        return Some(UpstreamBannerSignal::QuotaExhausted);
+    }
+
+    // 2. Server-side capacity / rate-limit congestion (eligible for immediate model failover).
+    //    Note: transient internal `agy acp` retry notices like `transient 503 — retrying in 1s...`
+    //    are intentionally NOT matched here so recoverable 1s retries can complete normally.
+    if trimmed.contains("RESOURCE_EXHAUSTED")
+        || trimmed.contains("(code 429)")
+        || trimmed.contains("MODEL_CAPACITY_EXHAUSTED")
+        || lower.contains("no capacity available")
+        || trimmed.contains("(code 503)")
+        || trimmed.contains("Service Unavailable")
+    {
+        return Some(UpstreamBannerSignal::RateLimited);
+    }
+
+    // 3. Fatal agent / authentication errors.
+    if trimmed.contains("Agent execution terminated due to error")
+        || trimmed.contains("UNAUTHENTICATED")
+        || trimmed.contains("PERMISSION_DENIED")
+        || lower.contains("authentication failed")
+        || lower.contains("not logged in")
+        || lower.contains("please sign in")
+    {
+        return Some(UpstreamBannerSignal::FatalAgentError);
+    }
+
+    None
+}
+
+fn is_malformed_function_call_banner(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("Your previous response contained an improperly formatted function call")
+        || trimmed.contains("Malformed function call:")
+        || trimmed.starts_with("Please retry with a properly formatted function call")
+        || trimmed.starts_with("Retries remaining:")
+}
+
+fn is_secondary_retry_continuation_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("Please retry with a properly formatted function call")
+        || trimmed.starts_with("Retries remaining:")
 }
 
 /// Stateful streaming filter that strips:
 /// 1) transient `agy acp` retry / `MALFORMED_FUNCTION_CALL` banners across chunk splits,
 /// 2) stray echoed transcript wrapper lines (`</client_tool_result>`, `</user>`, `<assistant>`)
 ///    at the start of an assistant reply before real content begins, AND
-/// 3) surfaces upstream `429 RESOURCE_EXHAUSTED` / fatal agent termination banners immediately
-///    (0ms wait) so `run_turn_pipeline` can fail over to a healthy model instead of hanging 158s.
+/// 3) surfaces upstream quota exhaustion, `429 RESOURCE_EXHAUSTED`, and fatal agent termination
+///    banners immediately (0ms wait) so `run_turn_pipeline` can halt or fail over cleanly.
 #[derive(Debug, Default)]
 pub struct AcpBannerFilter {
     at_line_start: bool,
     suppressing_line: bool,
     has_emitted_non_ws: bool,
+    saw_malformed_function_call_retry: bool,
     hold_buf: String,
     dropped_line_buf: String,
     signal: Option<(UpstreamBannerSignal, String)>,
+    suppressed_banners: Vec<String>,
 }
 
 const ACP_BANNER_LINE_PREFIXES: [&str; 4] = [
@@ -1296,9 +1590,11 @@ impl AcpBannerFilter {
             at_line_start: true,
             suppressing_line: false,
             has_emitted_non_ws: false,
+            saw_malformed_function_call_retry: false,
             hold_buf: String::new(),
             dropped_line_buf: String::new(),
             signal: None,
+            suppressed_banners: Vec::new(),
         }
     }
 
@@ -1306,41 +1602,90 @@ impl AcpBannerFilter {
         self.signal.take()
     }
 
+    pub fn take_malformed_retry(&mut self) -> bool {
+        std::mem::replace(&mut self.saw_malformed_function_call_retry, false)
+    }
+
+    pub fn take_suppressed_banners(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.suppressed_banners)
+    }
+
+    pub fn record_external_signal(&mut self, sig: UpstreamBannerSignal, detail: String) {
+        let should_replace = match self.signal.as_ref() {
+            None => true,
+            Some((existing, _)) => {
+                *existing != UpstreamBannerSignal::QuotaExhausted
+                    && sig == UpstreamBannerSignal::QuotaExhausted
+            }
+        };
+        if should_replace {
+            self.signal = Some((sig, detail));
+        }
+    }
+
     fn inspect_banner_line(banner: &str) -> Option<(UpstreamBannerSignal, String)> {
         let trimmed = banner.trim();
-        if trimmed.contains("RESOURCE_EXHAUSTED")
-            || trimmed.contains("(code 429)")
-            || trimmed.contains("QUOTA_EXHAUSTED")
-            || trimmed.contains("MODEL_CAPACITY_EXHAUSTED")
-            || trimmed.contains("(code 503)")
-            || trimmed.contains("Service Unavailable")
-        {
-            Some((UpstreamBannerSignal::RateLimited, trimmed.to_owned()))
-        } else if trimmed.contains("Agent execution terminated due to error")
-            || trimmed.contains("UNAUTHENTICATED")
-            || trimmed.contains("PERMISSION_DENIED")
-        {
-            Some((UpstreamBannerSignal::FatalAgentError, trimmed.to_owned()))
-        } else {
-            None
+        classify_upstream_error_text(trimmed).map(|sig| (sig, trimmed.to_owned()))
+    }
+
+    fn record_dropped_banner(&mut self, raw_banner: &str) {
+        let dropped = raw_banner.trim();
+        if dropped.is_empty() {
+            return;
         }
+        if !is_secondary_retry_continuation_line(dropped)
+            && self.suppressed_banners.len() < MAX_SUPPRESSED_BANNERS
+        {
+            self.suppressed_banners.push(dropped.to_owned());
+        }
+
+        if let Some((sig, detail)) = Self::inspect_banner_line(dropped) {
+            self.record_external_signal(sig, detail);
+            match sig {
+                UpstreamBannerSignal::QuotaExhausted => {
+                    tracing::warn!(
+                        banner = %dropped,
+                        "detected upstream Antigravity quota exhaustion banner"
+                    );
+                }
+                UpstreamBannerSignal::RateLimited | UpstreamBannerSignal::FatalAgentError => {
+                    tracing::warn!(
+                        banner = %dropped,
+                        "detected upstream ACP rate-limit or fatal error banner"
+                    );
+                }
+            }
+            return;
+        }
+
+        if is_malformed_function_call_banner(dropped) {
+            self.saw_malformed_function_call_retry = true;
+            if is_secondary_retry_continuation_line(dropped) {
+                tracing::debug!(
+                    banner = %dropped,
+                    "filtered continuation line of internal `agy acp` malformed-call retry banner"
+                );
+            } else {
+                tracing::warn!(
+                    banner = %dropped,
+                    "filtered internal `agy acp` malformed-function-call retry banner"
+                );
+            }
+            return;
+        }
+
+        tracing::warn!(
+            banner = %dropped,
+            "filtered internal `agy acp` retry/diagnostic banner from assistant stream"
+        );
     }
 
     pub fn feed(&mut self, chunk: &str, out: &mut String) {
         for ch in chunk.chars() {
             if self.suppressing_line {
                 if ch == '\n' {
-                    let dropped = self.dropped_line_buf.trim();
-                    if !dropped.is_empty() {
-                        if self.signal.is_none() {
-                            self.signal = Self::inspect_banner_line(dropped);
-                        }
-                        tracing::warn!(
-                            banner = %dropped,
-                            "filtered internal `agy acp` retry/diagnostic banner from assistant stream"
-                        );
-                    }
-                    self.dropped_line_buf.clear();
+                    let line = std::mem::take(&mut self.dropped_line_buf);
+                    self.record_dropped_banner(&line);
                     self.suppressing_line = false;
                     self.at_line_start = true;
                 } else if self.dropped_line_buf.len() < 512 {
@@ -1397,15 +1742,8 @@ impl AcpBannerFilter {
                     .any(|pat| trimmed_start.starts_with(pat))
                 {
                     if ch == '\n' {
-                        let dropped = trimmed_start.trim();
-                        if self.signal.is_none() {
-                            self.signal = Self::inspect_banner_line(dropped);
-                        }
-                        tracing::warn!(
-                            banner = %dropped,
-                            "filtered internal `agy acp` retry/diagnostic banner from assistant stream"
-                        );
-                        self.hold_buf.clear();
+                        let line = std::mem::take(&mut self.hold_buf);
+                        self.record_dropped_banner(&line);
                         self.at_line_start = true;
                     } else {
                         self.dropped_line_buf.clear();
@@ -1441,43 +1779,45 @@ impl AcpBannerFilter {
         }
 
         // Also inspect in-progress suppressed banner lines immediately (even if `agy acp`
-        // emitted the `⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429)` chunk
-        // without a trailing newline right before sleeping!).
-        if self.suppressing_line && self.signal.is_none() {
-            self.signal = Self::inspect_banner_line(&self.dropped_line_buf);
+        // emitted a quota / `429` / malformed-call chunk without a trailing newline right
+        // before sleeping!).
+        if self.suppressing_line {
+            if self.signal.is_none()
+                && let Some((sig, detail)) = Self::inspect_banner_line(&self.dropped_line_buf)
+            {
+                self.signal = Some((sig, detail));
+            }
+            if !self.saw_malformed_function_call_retry
+                && is_malformed_function_call_banner(&self.dropped_line_buf)
+            {
+                self.saw_malformed_function_call_retry = true;
+            }
         }
     }
 
     pub fn finish(&mut self, out: &mut String) {
         if self.suppressing_line {
-            let dropped = self.dropped_line_buf.trim();
-            if !dropped.is_empty() {
-                if self.signal.is_none() {
-                    self.signal = Self::inspect_banner_line(dropped);
-                }
-                tracing::warn!(
-                    banner = %dropped,
-                    "filtered trailing `agy acp` diagnostic banner at end of turn"
-                );
-            }
-            self.dropped_line_buf.clear();
+            let line = std::mem::take(&mut self.dropped_line_buf);
+            self.record_dropped_banner(&line);
             self.suppressing_line = false;
         }
         if !self.hold_buf.is_empty() {
             let trimmed = self.hold_buf.trim();
-            let is_complete_banner = ACP_BANNER_LINE_PREFIXES
+            let is_banner = ACP_BANNER_LINE_PREFIXES
                 .iter()
-                .any(|pat| trimmed.starts_with(pat))
-                || (!self.has_emitted_non_ws && LEADING_STRAY_WRAPPER_LINES.contains(&trimmed));
-            if is_complete_banner {
-                if self.signal.is_none() {
-                    self.signal = Self::inspect_banner_line(trimmed);
-                }
+                .any(|pat| trimmed.starts_with(pat));
+            let is_wrapper =
+                !self.has_emitted_non_ws && LEADING_STRAY_WRAPPER_LINES.contains(&trimmed);
+            if is_banner {
+                let line = std::mem::take(&mut self.hold_buf);
+                self.record_dropped_banner(&line);
+            } else if is_wrapper {
+                self.hold_buf.clear();
             } else {
                 self.has_emitted_non_ws = true;
                 out.push_str(&self.hold_buf);
+                self.hold_buf.clear();
             }
-            self.hold_buf.clear();
         }
         self.at_line_start = true;
     }
@@ -1508,5 +1848,35 @@ mod tests {
         }
         filter.finish(&mut out);
         assert_eq!(out, "Checking files.\nReal answer line!\nYes, it works.");
+        assert!(filter.take_malformed_retry());
+        assert_eq!(filter.take_signal(), None);
+    }
+
+    #[test]
+    fn classifies_individual_quota_banner_distinct_from_transient_capacity_and_retry() {
+        assert_eq!(
+            classify_upstream_error_text(
+                "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 48m36s."
+            ),
+            Some(UpstreamBannerSignal::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_upstream_error_text(
+                "⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429): No capacity available"
+            ),
+            Some(UpstreamBannerSignal::RateLimited)
+        );
+        assert_eq!(
+            classify_upstream_error_text(
+                "⚠ API error (attempt 1): transient 503 — retrying in 1s..."
+            ),
+            None
+        );
+        assert_eq!(
+            classify_upstream_error_text(
+                "⚠ Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse."
+            ),
+            None
+        );
     }
 }

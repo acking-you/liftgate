@@ -17,6 +17,8 @@
   .\run-gateway.cmd --listen 127.0.0.1:8787 --default-model gemini-4-carbon-high --api-key local-agy
 #>
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+$IsWin = ($IsWindows -or $env:OS -eq "Windows_NT")
 
 $RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RuntimeDir = Join-Path $RootDir ".agy-runtime"
@@ -30,22 +32,30 @@ $Daemon = $false
 $Stop = $false
 $SkipBuild = $false
 $RebuildWeb = $false
+$ShowHelp = $false
 $HasListen = $false
 $HasDefaultModel = $false
 $HasAcpMode = $false
-$ListenAddr = "127.0.0.1:8787"
+$ListenAddr = if (-not [string]::IsNullOrWhiteSpace($env:AGY_GATEWAY_LISTEN)) { $env:AGY_GATEWAY_LISTEN } else { "127.0.0.1:8787" }
+$DefaultModel = if (-not [string]::IsNullOrWhiteSpace($env:AGY_DEFAULT_MODEL)) { $env:AGY_DEFAULT_MODEL } else { "gemini-4-carbon-high" }
+$AcpMode = if (-not [string]::IsNullOrWhiteSpace($env:AGY_ACP_MODE)) { $env:AGY_ACP_MODE } else { "auto" }
 $ForwardArgs = [System.Collections.Generic.List[string]]::new()
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $tok = [string]$args[$i]
     switch ($tok) {
-        "-Daemon"     { $Daemon = $true; continue }
-        "--daemon"    { $Daemon = $true; continue }
-        "-Stop"       { $Stop = $true; continue }
-        "--stop"      { $Stop = $true; continue }
-        "-SkipBuild"  { $SkipBuild = $true; continue }
-        "--skip-build" { $SkipBuild = $true; continue }
-        "-RebuildWeb" { $RebuildWeb = $true; continue }
+        "-h"            { $ShowHelp = $true; continue }
+        "--help"        { $ShowHelp = $true; continue }
+        "-Help"         { $ShowHelp = $true; continue }
+        "-?"            { $ShowHelp = $true; continue }
+        "/?"            { $ShowHelp = $true; continue }
+        "-Daemon"       { $Daemon = $true; continue }
+        "--daemon"      { $Daemon = $true; continue }
+        "-Stop"         { $Stop = $true; continue }
+        "--stop"        { $Stop = $true; continue }
+        "-SkipBuild"    { $SkipBuild = $true; continue }
+        "--skip-build"  { $SkipBuild = $true; continue }
+        "-RebuildWeb"   { $RebuildWeb = $true; continue }
         "--rebuild-web" { $RebuildWeb = $true; continue }
         default {
             if ($tok -eq "--listen") {
@@ -73,6 +83,44 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
 }
 
+if ($ShowHelp) {
+    Write-Host "Usage: .\run-gateway.cmd [script-options] [liftgate-flags...]"
+    Write-Host ""
+    Write-Host "Script options:"
+    Write-Host "  -Daemon, --daemon          Build release and run liftgate in the background"
+    Write-Host "  -Stop, --stop              Stop background gateway (.agy-runtime/gateway.pid)"
+    Write-Host "  -SkipBuild, --skip-build   Start existing release binary without building"
+    Write-Host "  -RebuildWeb, --rebuild-web Force rebuild of web/dist via Bun"
+    Write-Host "  -h, --help                 Show this help message"
+    Write-Host ""
+    Write-Host "Any other flags (--listen, --default-model, --acp-mode, --api-key, --agy-bin, ...) pass through to liftgate."
+    return
+}
+
+function Stop-ProcessTree([int]$ProcId) {
+    if ($IsWin) {
+        & taskkill /PID $ProcId /T /F >$null 2>&1
+    }
+    Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+}
+
+function Format-Win32Arg([string]$Value) {
+    if ($null -eq $Value) { return '""' }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $escaped = ($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'
+    return "`"$escaped`""
+}
+
+function Join-Win32Args([System.Collections.Generic.IEnumerable[string]]$Values) {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($v in $Values) {
+        $parts.Add((Format-Win32Arg $v))
+    }
+    return ($parts -join " ")
+}
+
 if ($Stop) {
     if (Test-Path $PidFile) {
         $rawPid = (Get-Content $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
@@ -80,7 +128,7 @@ if ($Stop) {
             $procId = [int]$rawPid
             $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
             if ($null -ne $proc) {
-                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                Stop-ProcessTree -ProcId $procId
                 Write-Host "[STOP] Stopped liftgate (PID $procId)." -ForegroundColor Yellow
             }
         }
@@ -92,15 +140,47 @@ if ($Stop) {
 }
 
 function Resolve-BunExecutable {
-    $cmd = Get-Command bun -ErrorAction SilentlyContinue
-    if ($null -ne $cmd) { return $cmd.Source }
-    $candidates = @(
-        "C:\nvm4w\nodejs\node_modules\bun\bin\bun.exe",
-        (Join-Path $HOME ".bun\bin\bun.exe"),
-        (Join-Path $HOME ".bun/bin/bun")
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
+    if ($IsWin) {
+        $exeCmd = Get-Command bun.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $exeCmd -and -not [string]::IsNullOrWhiteSpace($exeCmd.Source) -and (Test-Path $exeCmd.Source)) {
+            return $exeCmd.Source
+        }
+        foreach ($c in (Get-Command bun -All -ErrorAction SilentlyContinue)) {
+            if (-not [string]::IsNullOrWhiteSpace($c.Source)) {
+                $shimDir = Split-Path -Parent $c.Source
+                $nestedExe = Join-Path $shimDir "node_modules\bun\bin\bun.exe"
+                if (Test-Path $nestedExe) {
+                    return $nestedExe
+                }
+            }
+        }
+        $winCandidates = @(
+            (Join-Path $HOME ".bun\bin\bun.exe"),
+            $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".bun\bin\bun.exe" }),
+            $(if ($env:APPDATA) { Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe" }),
+            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\bun.exe" }),
+            "C:\nvm4w\nodejs\node_modules\bun\bin\bun.exe"
+        )
+        foreach ($cand in $winCandidates) {
+            if (-not [string]::IsNullOrWhiteSpace($cand) -and (Test-Path $cand)) {
+                return $cand
+            }
+        }
+        $cmdShim = Get-Command bun.cmd,bun.bat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $cmdShim -and (Test-Path $cmdShim.Source)) {
+            return $cmdShim.Source
+        }
+        return $null
+    }
+
+    $unixCmd = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $unixCmd -and (Test-Path $unixCmd.Source)) {
+        return $unixCmd.Source
+    }
+    foreach ($cand in @((Join-Path $HOME ".bun/bin/bun"), "/opt/homebrew/bin/bun", "/usr/local/bin/bun")) {
+        if (Test-Path $cand) {
+            return $cand
+        }
     }
     return $null
 }
@@ -135,7 +215,7 @@ if (-not $SkipBuild) {
     }
 }
 
-$binName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "liftgate.exe" } else { "liftgate" }
+$binName = if ($IsWin) { "liftgate.exe" } else { "liftgate" }
 $gwBin = Join-Path $RootDir "target\release\$binName"
 if (-not (Test-Path $gwBin)) {
     throw "Release binary not found at $gwBin"
@@ -148,11 +228,11 @@ if (-not $HasListen) {
 }
 if (-not $HasDefaultModel) {
     $finalArgs.Add("--default-model")
-    $finalArgs.Add("gemini-4-carbon-high")
+    $finalArgs.Add($DefaultModel)
 }
 if (-not $HasAcpMode) {
     $finalArgs.Add("--acp-mode")
-    $finalArgs.Add("auto")
+    $finalArgs.Add($AcpMode)
 }
 foreach ($a in $ForwardArgs) {
     $finalArgs.Add($a)
@@ -168,39 +248,51 @@ Write-Host ""
 
 if ($Daemon) {
     Write-Host "[3/3] Starting liftgate in background ..." -ForegroundColor Cyan
-    $startParams = @{
-        FilePath               = $gwBin
-        ArgumentList           = $finalArgs
-        WorkingDirectory       = $RootDir
-        RedirectStandardOutput = $LogOut
-        RedirectStandardError  = $LogErr
-        PassThru               = $true
-    }
-    if ($IsWindows -or $env:OS -eq "Windows_NT") {
-        $startParams["WindowStyle"] = "Hidden"
-    }
-    $proc = Start-Process @startParams
-    Set-Content -Path $PidFile -Value "$($proc.Id)" -NoNewline
-
-    $ready = $false
-    for ($i = 0; $i -lt 40; $i++) {
-        Start-Sleep -Milliseconds 300
-        if ($proc.HasExited) {
-            $errTail = if (Test-Path $LogErr) { (Get-Content $LogErr -Tail 20) -join "`n" } else { "" }
-            throw "liftgate exited unexpectedly (code $($proc.ExitCode)):`n$errTail"
+    $savedNoProxy = $env:NO_PROXY
+    $env:NO_PROXY = "127.0.0.1,localhost,::1"
+    try {
+        $startParams = @{
+            FilePath               = $gwBin
+            WorkingDirectory       = $RootDir
+            RedirectStandardOutput = $LogOut
+            RedirectStandardError  = $LogErr
+            PassThru               = $true
         }
-        try {
-            $resp = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 2
-            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
-                $ready = $true
-                break
+        if ($finalArgs.Count -gt 0) {
+            $startParams["ArgumentList"] = (Join-Win32Args $finalArgs)
+        }
+        if ($IsWin) {
+            $startParams["WindowStyle"] = "Hidden"
+        }
+        $proc = Start-Process @startParams
+        Set-Content -Path $PidFile -Value "$($proc.Id)" -NoNewline
+
+        $ready = $false
+        for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 300
+            if ($proc.HasExited) {
+                $errTail = if (Test-Path $LogErr) { (Get-Content $LogErr -Tail 20) -join "`n" } else { "" }
+                throw "liftgate exited unexpectedly (code $($proc.ExitCode)):`n$errTail"
             }
-        } catch {}
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
+                    $ready = $true
+                    break
+                }
+            } catch {}
+        }
+        if (-not $ready) {
+            throw "Timed out waiting for $baseUrl/healthz"
+        }
+        Write-Host "[OK] Gateway daemon running (PID $($proc.Id)). Stop with: .\run-gateway.cmd -Stop" -ForegroundColor Green
+    } finally {
+        if ($null -eq $savedNoProxy) {
+            Remove-Item Env:\NO_PROXY -ErrorAction SilentlyContinue
+        } else {
+            $env:NO_PROXY = $savedNoProxy
+        }
     }
-    if (-not $ready) {
-        throw "Timed out waiting for $baseUrl/healthz"
-    }
-    Write-Host "[OK] Gateway daemon running (PID $($proc.Id)). Stop with: .\run-gateway.cmd -Stop" -ForegroundColor Green
     return
 }
 

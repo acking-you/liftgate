@@ -1328,6 +1328,7 @@ fn stream_openai_responses(
 
         if let Some(acp_err) = failed_err {
             let gw_err = GatewayError::SharedAcp { source: acp_err };
+            tracing::error!(error = ?gw_err, "OpenAI Responses SSE stream failed");
             let (_, code) = gw_err.stable_kind();
             resp.status = Cow::Borrowed("failed");
             resp.error = Some(ResponseInlineError {
@@ -1945,33 +1946,7 @@ fn stream_anthropic_messages(
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Bytes, Infallible>>(channel_cap);
 
     tokio::spawn(async move {
-        if !send_sse_frame(
-            &sse_tx,
-            "message_start",
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model_name,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 1
-                    }
-                }
-            }),
-        )
-        .await
-        {
-            return;
-        }
-
+        let mut message_started = false;
         let mut next_block_idx: usize = 0;
         let mut active_thinking_idx: Option<usize> = None;
         let mut active_text_idx: Option<usize> = None;
@@ -2005,6 +1980,16 @@ fn stream_anthropic_messages(
                     let idx = match active_thinking_idx {
                         Some(idx) => idx,
                         None => {
+                            if !ensure_anthropic_message_started(
+                                &sse_tx,
+                                &mut message_started,
+                                &msg_id,
+                                &model_name,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             let idx = next_block_idx;
                             next_block_idx += 1;
                             active_thinking_idx = Some(idx);
@@ -2044,6 +2029,16 @@ fn stream_anthropic_messages(
                     if opts.emit_web_search {
                         let srv_id = ensure_srvtoolu_id(&call_id);
                         if emitted_search_srv_ids.insert(srv_id.clone()) {
+                            if !ensure_anthropic_message_started(
+                                &sse_tx,
+                                &mut message_started,
+                                &msg_id,
+                                &model_name,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
                             close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
@@ -2067,6 +2062,16 @@ fn stream_anthropic_messages(
                     }
                 }
                 TurnEvent::WebFetchStart { call_id, url } => {
+                    if !ensure_anthropic_message_started(
+                        &sse_tx,
+                        &mut message_started,
+                        &msg_id,
+                        &model_name,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     flush_pending_anthropic_searches(
                         &sse_tx,
                         &mut next_block_idx,
@@ -2091,6 +2096,16 @@ fn stream_anthropic_messages(
                     web_fetch_requests = web_fetch_requests.saturating_add(1);
                 }
                 TurnEvent::WebFetchComplete { call_id, outcome } => {
+                    if !ensure_anthropic_message_started(
+                        &sse_tx,
+                        &mut message_started,
+                        &msg_id,
+                        &model_name,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     let srv_id = ensure_srvtoolu_id(&call_id);
                     let result_content = build_anthropic_web_fetch_result_content(&outcome);
                     let idx = next_block_idx;
@@ -2128,6 +2143,16 @@ fn stream_anthropic_messages(
                         && web_search_requests == 0
                         && pending_search_result_srv_ids.is_empty()
                     {
+                        if !ensure_anthropic_message_started(
+                            &sse_tx,
+                            &mut message_started,
+                            &msg_id,
+                            &model_name,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         close_anthropic_text(&sse_tx, &mut active_text_idx).await;
                         let srv_id = format!("srvtoolu_{}", generate_short_nonce());
                         let q = opts.query_hint.clone().unwrap_or_default();
@@ -2166,6 +2191,16 @@ fn stream_anthropic_messages(
                     let idx = match active_text_idx {
                         Some(idx) => idx,
                         None => {
+                            if !ensure_anthropic_message_started(
+                                &sse_tx,
+                                &mut message_started,
+                                &msg_id,
+                                &model_name,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             let idx = next_block_idx;
                             next_block_idx += 1;
                             active_text_idx = Some(idx);
@@ -2203,6 +2238,16 @@ fn stream_anthropic_messages(
                     arguments,
                     ..
                 } => {
+                    if !ensure_anthropic_message_started(
+                        &sse_tx,
+                        &mut message_started,
+                        &msg_id,
+                        &model_name,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     leading_ws.clear();
                     flush_pending_anthropic_searches(
                         &sse_tx,
@@ -2268,7 +2313,12 @@ fn stream_anthropic_messages(
                 }
                 TurnEvent::Failed(acp_err) => {
                     let gw_err = GatewayError::SharedAcp { source: acp_err };
-                    let (error_type, _) = gw_err.stable_kind();
+                    tracing::error!(
+                        error = ?gw_err,
+                        message_started,
+                        "Anthropic Messages SSE stream failed"
+                    );
+                    let error_type = gw_err.anthropic_error_type();
                     let _ = send_sse_frame(
                         &sse_tx,
                         "error",
@@ -2284,6 +2334,12 @@ fn stream_anthropic_messages(
                     return;
                 }
             }
+        }
+
+        if !ensure_anthropic_message_started(&sse_tx, &mut message_started, &msg_id, &model_name)
+            .await
+        {
+            return;
         }
 
         flush_pending_anthropic_searches(
@@ -2355,6 +2411,41 @@ fn stream_anthropic_messages(
     });
 
     sse_body_response(sse_rx)
+}
+
+async fn ensure_anthropic_message_started(
+    sse_tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    message_started: &mut bool,
+    msg_id: &str,
+    model_name: &str,
+) -> bool {
+    if *message_started {
+        return true;
+    }
+    *message_started = true;
+    send_sse_frame(
+        sse_tx,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model_name,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }
+            }
+        }),
+    )
+    .await
 }
 
 async fn emit_anthropic_server_tool_use(

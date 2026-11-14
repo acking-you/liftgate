@@ -467,11 +467,11 @@ pub fn build_session_system_append(
          inert gateway sandbox folder. External `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, \
          `Grep`, `Glob`, etc.) execute directly in the caller's actual workspace directory described \
          in `<caller_system_instructions>` and caller environment blocks.\n\
-         - CRITICAL: NEVER attempt to call external `<client_tools>` names (such as `Bash`, `Read`, \
-         `Edit`, `Write`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, `Agent`, `apply_patch`, etc.) \
-         through your native function-calling tool channel! They are NOT native function declarations; \
-         calling them natively causes a malformed function-call error. External `<client_tools>` may \
-         ONLY be invoked by writing `{open_tag}...{close_tag}` XML blocks in plain assistant text.\n\
+         - CRITICAL: NEVER emit any native tool/function call (not even an empty one) for external \
+         `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, \
+         `Agent`, `apply_patch`, etc.) or after writing XML tool blocks; doing so triggers a \
+         `Malformed function call` error. External `<client_tools>` may ONLY be invoked by writing \
+         `{open_tag}...{close_tag}` XML blocks in plain assistant text.\n\
          - NEVER emit transcript or role wrapper markers such as `<user>`, `</user>`, `<assistant>`, \
          `</assistant>`, `<client_tool_result>`, `</client_tool_result>`, or `[Client Tool Result`. \
          Generate ONLY the current single assistant turn.\n"
@@ -508,10 +508,11 @@ pub fn build_session_system_append(
     if need_xml_protocol {
         out.push_str(
             "- Whenever you want to invoke one or more XML-bridged tools below (including parallel calls \
-             in a single turn), optionally write a brief one-sentence status note first, then emit one XML \
-             block per tool call in this EXACT format (no XML attributes on the tag), and IMMEDIATELY \
-             STOP generating output right after the closing tag — NEVER guess, fabricate, or simulate \
-             tool outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
+             in a single turn), optionally write a brief one-sentence status note before the first XML \
+             block, then emit one XML block per tool call in this EXACT format (no XML attributes on \
+             the tag), and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
+             function calls after the final closing tag — NEVER guess, fabricate, or simulate tool \
+             outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
         );
         out.push_str(&open_tag);
         out.push('\n');

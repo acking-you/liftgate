@@ -256,6 +256,8 @@ pub struct PromptTurnResult {
     pub stop_reason: String,
     #[serde(default)]
     pub usage: AcpUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Box<RawValue>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -346,6 +348,12 @@ pub enum SessionUpdatePayload {
         used: u64,
         #[serde(default)]
         size: u64,
+    },
+    Error {
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        error: Option<Box<RawValue>>,
     },
     #[serde(other)]
     Unknown,

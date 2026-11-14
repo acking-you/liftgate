@@ -68,11 +68,31 @@ pub enum AcpError {
     #[error("upstream ACP model `{model}` rate-limited or capacity exhausted: {detail}")]
     UpstreamRateLimited { model: String, detail: String },
 
+    #[error("upstream Antigravity quota exhausted on `{model}`: {detail}")]
+    UpstreamQuotaExhausted { model: String, detail: String },
+
     #[error("upstream ACP agent terminated with fatal error: {detail}")]
     UpstreamAgentTerminated { detail: String },
 
+    #[error(
+        "upstream ACP model `{model}` returned an empty response (stop_reason={stop_reason}){}",
+        format_optional_detail(detail.as_deref())
+    )]
+    EmptyUpstreamResponse {
+        model: String,
+        stop_reason: String,
+        detail: Option<String>,
+    },
+
     #[error("ACP prompt turn was cancelled")]
     Cancelled,
+}
+
+fn format_optional_detail(detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => format!(": {text}"),
+        None => String::new(),
+    }
 }
 
 /// Top-level gateway request error mapped cleanly at HTTP boundaries.
@@ -118,10 +138,49 @@ impl GatewayError {
         }
     }
 
+    /// HTTP status code for Anthropic `/v1/messages` responses.
+    ///
+    /// Exhausted account quota and empty upstream responses map to `400 Bad Request`
+    /// (`invalid_request_error`) so `@anthropic-ai/sdk` and Claude Code halt immediately
+    /// and display the diagnostic message rather than entering multi-attempt retry loops.
+    #[must_use]
+    pub fn anthropic_status_code(&self) -> StatusCode {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::NotFound { .. } => StatusCode::NOT_FOUND,
+            Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
+            Self::Acp { source } => Self::acp_anthropic_status(source),
+            Self::SharedAcp { source } => Self::acp_anthropic_status(source),
+        }
+    }
+
     const fn acp_status(source: &AcpError) -> StatusCode {
         match source {
             AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::EmptyUpstreamResponse { .. }
+            | AcpError::Cancelled
+            | AcpError::SpawnProcess { .. }
+            | AcpError::ProcessGroup { .. }
+            | AcpError::MissingStdioPipe { .. }
+            | AcpError::TransportClosed
+            | AcpError::LineCodec { .. }
+            | AcpError::EncodeJson { .. }
+            | AcpError::DecodeJson { .. }
+            | AcpError::Rpc { .. } => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    const fn acp_anthropic_status(source: &AcpError) -> StatusCode {
+        match source {
+            AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             AcpError::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             AcpError::UpstreamAgentTerminated { .. }
             | AcpError::Cancelled
             | AcpError::SpawnProcess { .. }
@@ -148,11 +207,25 @@ impl GatewayError {
         }
     }
 
+    /// Anthropic wire `error.type` string for HTTP JSON envelopes and SSE `event: error` frames.
+    #[must_use]
+    pub fn anthropic_error_type(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "authentication_error",
+            Self::NotFound { .. } => "not_found_error",
+            Self::BadJson { .. } | Self::Protocol { .. } => "invalid_request_error",
+            Self::Acp { source } => Self::acp_anthropic_error_type(source),
+            Self::SharedAcp { source } => Self::acp_anthropic_error_type(source),
+        }
+    }
+
     const fn acp_kind(source: &AcpError) -> (&'static str, &'static str) {
         match source {
             AcpError::TurnTimeout { .. } => ("api_error", "upstream_timeout"),
             AcpError::UpstreamRateLimited { .. } => ("rate_limit_error", "rate_limit_exceeded"),
+            AcpError::UpstreamQuotaExhausted { .. } => ("insufficient_quota", "insufficient_quota"),
             AcpError::UpstreamAgentTerminated { .. } => ("api_error", "upstream_agent_error"),
+            AcpError::EmptyUpstreamResponse { .. } => ("api_error", "empty_upstream_response"),
             AcpError::Rpc { .. } => ("api_error", "acp_rpc_error"),
             AcpError::SpawnProcess { .. }
             | AcpError::ProcessGroup { .. }
@@ -162,6 +235,26 @@ impl GatewayError {
             | AcpError::EncodeJson { .. }
             | AcpError::DecodeJson { .. }
             | AcpError::Cancelled => ("api_error", "acp_transport_error"),
+        }
+    }
+
+    const fn acp_anthropic_error_type(source: &AcpError) -> &'static str {
+        match source {
+            AcpError::UpstreamRateLimited { .. } => "rate_limit_error",
+            AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
+                "invalid_request_error"
+            }
+            AcpError::TurnTimeout { .. }
+            | AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::Rpc { .. }
+            | AcpError::SpawnProcess { .. }
+            | AcpError::ProcessGroup { .. }
+            | AcpError::MissingStdioPipe { .. }
+            | AcpError::TransportClosed
+            | AcpError::LineCodec { .. }
+            | AcpError::EncodeJson { .. }
+            | AcpError::DecodeJson { .. }
+            | AcpError::Cancelled => "api_error",
         }
     }
 
@@ -196,8 +289,8 @@ impl GatewayError {
     #[must_use]
     pub fn into_anthropic_response(self) -> Response {
         tracing::error!(error = ?self, "Anthropic endpoint request failed");
-        let status = self.status_code();
-        let (error_type, _) = self.stable_kind();
+        let status = self.anthropic_status_code();
+        let error_type = self.anthropic_error_type();
         let body = AnthropicErrorEnvelope {
             envelope_type: "error",
             error: AnthropicErrorBody {

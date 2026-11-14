@@ -33,6 +33,7 @@
 | `--stop` · `-Stop` | 停止后台网关 |
 | `--skip-build` · `-SkipBuild` | 不重新编译，直接启动现有 Release 二进制 |
 | `--rebuild-web` · `-RebuildWeb` | 即使 `web/dist` 已存在也重新构建 |
+| `-h` · `--help` | 查看脚本帮助 |
 
 其它参数原样传给 `liftgate`（见[参数与环境变量](#参数与环境变量)）。用 `curl http://127.0.0.1:8787/healthz` 确认已启动，用 `curl http://127.0.0.1:8787/v1/models` 查看可用模型。
 
@@ -44,11 +45,13 @@
 | --- | --- | --- |
 | Claude Code | `./start-agy.sh` | `.\start-agy.cmd` |
 | Codex CLI | `./start-agy.sh --codex` | `.\start-agy.cmd -Codex` |
+| 标准权限确认模式 | `./start-agy.sh --no-bypass` | `.\start-agy.cmd -NoBypass` |
 | 只启动服务 | `./start-agy.sh --services-only` | `.\start-agy.cmd -BackgroundOnly` |
 | 停止服务 | `./start-agy.sh --stop` | `.\start-agy.cmd -StopServices` |
 
+- 默认以全自动免确认模式启动 Claude Code（`--dangerously-skip-permissions`）与 Codex（`--dangerously-bypass-approvals-and-sandbox`）；加 `--no-bypass` / `-NoBypass`（或显式传入 `--permission-mode` / `--sandbox`）即可保留常规权限确认。
 - 其余参数原样传给 `claude` 或 `codex`（如 `./start-agy.sh -p "你好"`）。
-- 修改默认值：Linux / macOS 用环境变量 `AGY_MODEL`、`AGY_FAST_MODEL`、`AGY_HOST`、`AGY_PORT`、`AGY_WEB_PORT`、`AGY_API_KEY`；Windows 用 `-GatewayModel`、`-FastModel`、`-ListenHost`、`-ListenPort`、`-UiPort`、`-ApiKey`。
+- 修改默认值：可用参数 `--gateway-model`（`-GatewayModel`）、`--fast-model`（`-FastModel`）、`--host`（`-ListenHost`）、`--port`（`-ListenPort`）、`--ui-port`（`-UiPort`）、`--api-key`（`-ApiKey`），或环境变量 `AGY_MODEL`、`AGY_FAST_MODEL`、`AGY_HOST`、`AGY_PORT`、`AGY_WEB_PORT`、`AGY_API_KEY`。
 - 装有 Bun 时还会在 `5173` 端口启动监控面板的开发服务器。
 - 只在仓库目录内写文件：`.agy-runtime/`（日志、PID、Codex 模型目录）、`claude-carbon.settings.json` 与 `.claude/settings.local.json`。
 - Windows 上可显式加 `-InstallEnv` 把变量写入用户环境，之后新开终端里的 `claude` 都走 Liftgate；`-UninstallEnv` 清除它们。
@@ -163,4 +166,5 @@ OpenAI Responses 客户端指向 `http://127.0.0.1:8787/v1`，Anthropic Messages
 - **请求卡住或被转发到代理**：把 `127.0.0.1,localhost,::1` 加入 `NO_PROXY`。
 - **`could not locate agy executable`**：传入 `--agy-bin <路径>` 或设置 `AGY_BIN`。
 - **`401`**：客户端密钥与 `--api-key` 不一致。
+- **额度耗尽（`Individual quota reached` / `insufficient_quota`）**：当前 Antigravity 账号或模型的配额已用完（`agy` 返回重置倒计时时会一并展示），可用 `/model` 切换模型或等待配额重置。
 - **后台运行的日志**：`.agy-runtime/gateway.out.log` 与 `.agy-runtime/gateway.err.log`。

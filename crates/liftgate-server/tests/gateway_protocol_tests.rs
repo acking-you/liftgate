@@ -201,6 +201,7 @@ impl AcpBackend for MockAcpBackend {
                 Ok(PromptTurnResult {
                     stop_reason: "end_turn".to_owned(),
                     usage: mock_acp_usage(100, 25, 10),
+                    error: None,
                 })
             }
             MockScript::ChunksThenHang { chunks_template } => {
@@ -254,6 +255,7 @@ impl AcpBackend for MockAcpBackend {
                 Ok(PromptTurnResult {
                     stop_reason: "end_turn".to_owned(),
                     usage: mock_acp_usage(80, 20, 0),
+                    error: None,
                 })
             }
             MockScript::HangForever => {
@@ -1898,4 +1900,286 @@ async fn codex_web_search_live_enables_server_side_open_page_web_fetch() {
     assert!(!sse.contains("fake"));
     assert!(sse.contains("Singapore forecast from [MSS]"));
     assert!(sse.contains("\"type\":\"url_citation\""));
+}
+
+#[tokio::test(start_paused = true)]
+async fn individual_quota_reached_banner_exposes_non_retryable_error_without_empty_session_poisoning()
+ {
+    let quota_banner = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 48m36s.\n".to_owned();
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. Claude Code streaming turn hits individual quota -> must emit `event: error`
+        //    (`invalid_request_error`), skip failover, and NOT poison SessionPool!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![quota_banner.clone()],
+        },
+        // 2. Non-streaming `/v1/messages` turn hits individual quota -> 400 `invalid_request_error`
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![quota_banner.clone()],
+        },
+        // 3. Codex streaming `/v1/responses` turn hits individual quota -> `response.failed` (`insufficient_quota`)
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![quota_banner.clone()],
+        },
+        // 4. Codex non-streaming `/v1/responses` turn -> 429 `insufficient_quota`
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![quota_banner],
+        },
+        // 5. After quota resets, same Claude Code session history recovers cleanly on a fresh session!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Quota reset; committed and pushed!".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 30);
+
+    // 1. Streaming `/v1/messages` (Claude Code interactive turn)
+    let cc_stream_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "你问他解决完了就帮忙提交并推送啊" }]
+    });
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages?beta=true")
+                .header("content-type", "application/json")
+                .body(Body::from(cc_stream_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let sse1 =
+        String::from_utf8(r1.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        !sse1.contains("event: message_start"),
+        "pre-output quota error must not emit an empty message_start: {sse1}"
+    );
+    assert!(sse1.contains("event: error"));
+    assert!(sse1.contains("\"type\":\"invalid_request_error\""));
+    assert!(sse1.contains("Individual quota reached"));
+    assert!(sse1.contains("Resets in 48m36s."));
+
+    // Verify no silent model failover occurred (`recorded_models` has only the 1 requested model)
+    // and SessionPool has 0 idle sessions (never committed an empty assistant turn!).
+    assert_eq!(
+        backend.recorded_models.lock().unwrap().len(),
+        1,
+        "account quota exhaustion must stop immediately without failing over across models"
+    );
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap: Value =
+        serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(snap["session_pool"]["idle_cached_sessions"], 0);
+    assert_eq!(snap["metrics"]["failed_requests"], 1);
+
+    // 2. Non-streaming `/v1/messages`
+    let cc_sync_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "check quota sync" }]
+    });
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(cc_sync_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+    let b2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(b2["error"]["type"], "invalid_request_error");
+    assert!(
+        b2["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Resets in 48m36s.")
+    );
+
+    // 3. Streaming `/v1/responses` (Codex CLI)
+    let codex_stream_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": true,
+        "input": [{ "role": "user", "content": "check codex stream quota" }]
+    });
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(codex_stream_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let sse3 =
+        String::from_utf8(r3.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(sse3.contains("event: response.failed"));
+    assert!(sse3.contains("\"code\":\"insufficient_quota\""));
+    assert!(sse3.contains("Resets in 48m36s."));
+
+    // 4. Non-streaming `/v1/responses`
+    let codex_sync_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "input": [{ "role": "user", "content": "check codex sync quota" }]
+    });
+    let r4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(codex_sync_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::TOO_MANY_REQUESTS);
+    let b4: Value =
+        serde_json::from_slice(&r4.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(b4["error"]["type"], "insufficient_quota");
+    assert_eq!(b4["error"]["code"], "insufficient_quota");
+
+    // 5. Subsequent retry after quota resets works cleanly
+    let r5 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(
+                    Body::from(
+                        json!({
+                            "model": "gemini-4-carbon-high",
+                            "stream": false,
+                            "messages": [{ "role": "user", "content": "你问他解决完了就帮忙提交并推送啊" }]
+                        })
+                        .to_string(),
+                    ),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r5.status(), StatusCode::OK);
+    let b5: Value =
+        serde_json::from_slice(&r5.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        b5["content"][0]["text"],
+        "Quota reset; committed and pushed!"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_empty_upstream_turn_fails_cleanly_instead_of_returning_blank_reply() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
+        thoughts: vec![],
+        chunks_template: vec!["   \n  ".to_owned()],
+    }]));
+    let app = test_app(Arc::clone(&backend), 30);
+
+    let req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello?" }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("returned an empty response")
+    );
+    assert_eq!(backend.aborted_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_empty_function_call_retry_after_xml_tool_call_short_circuits_in_zero_ms() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::ChunksThenHang {
+        chunks_template: vec![
+            "<agy_tool_call_{NONCE}>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"a.rs\"}}</agy_tool_call_{NONCE}>\n\
+             <agy_tool_call_{NONCE}>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"b.rs\"}}</agy_tool_call_{NONCE}>\n\
+             <agy_tool_call_{NONCE}>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"c.rs\"}}</agy_tool_call_{NONCE}>\n"
+                .to_owned(),
+            "⚠ Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse.\nPlease retry with a properly formatted function call\nRetries remaining: 3\n".to_owned(),
+        ],
+    }]));
+
+    // `ChunksThenHang` sleeps 3600s after Chunk 2; 120s timeout proves Liftgate cuts off in 0ms
+    // right when the internal malformed-call retry banner arrives, without waiting for ACP retry!
+    let app = test_app(Arc::clone(&backend), 120);
+    let req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "tools": [
+            {
+                "name": "Read",
+                "description": "Read file",
+                "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } }
+            }
+        ],
+        "messages": [{ "role": "user", "content": "Read a.rs, b.rs, and c.rs" }]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(backend.aborted_count.load(Ordering::SeqCst), 1);
 }

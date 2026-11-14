@@ -23,7 +23,7 @@ use liftgate_types::{
     config::{AcpModeId, GatewayLimits, ModelId, SessionId},
     telemetry::{AcpProcessTelemetry, StderrLogEntry},
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use tokio::{
     io::AsyncWriteExt,
@@ -92,6 +92,11 @@ pub trait AcpBackend: Send + Sync + 'static {
         &self,
         session_id: &SessionId,
     ) -> impl Future<Output = Result<(), AcpError>> + Send;
+
+    /// Returns recent `agy acp` stderr lines emitted at or after `since_unix_ms`.
+    fn recent_stderr_since(&self, _since_unix_ms: u64) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Performs a server-managed URL fetch for `web_fetch_20250910` / `web_fetch` tool turns.
     fn fetch_web_url(
@@ -706,6 +711,19 @@ impl AcpBackend for Arc<LiveAcpClient> {
         self.close_session_inner(session_id).await
     }
 
+    fn recent_stderr_since(&self, since_unix_ms: u64) -> Vec<String> {
+        let active = self.active_gen();
+        let guard = match active.inner.stderr_log.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .iter()
+            .filter(|entry| entry.timestamp_unix_ms >= since_unix_ms)
+            .map(|entry| entry.line.clone())
+            .collect()
+    }
+
     fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
         (**self).process_telemetry(default_model, acp_mode)
     }
@@ -804,7 +822,7 @@ impl LiveAcpInner {
             Err(rpc_err) => Err(AcpError::Rpc {
                 method,
                 code: rpc_err.code,
-                message: rpc_err.message,
+                message: format_rpc_error_message(rpc_err),
             }),
         }
     }
@@ -887,7 +905,12 @@ async fn run_stdout_reader(
                     .fetch_add(1, Ordering::Relaxed);
                 if let Some(params_raw) = frame.params {
                     match serde_json::from_str::<SessionUpdateNotification>(params_raw.get()) {
-                        Ok(notif) => {
+                        Ok(mut notif) => {
+                            if matches!(notif.update, SessionUpdatePayload::Unknown)
+                                && let Some(rescued) = rescue_unknown_error_update(params_raw.get())
+                            {
+                                notif.update = rescued;
+                            }
                             let sender = match session_streams.lock() {
                                 Ok(guard) => guard.get(&notif.session_id).cloned(),
                                 Err(poisoned) => {
@@ -1016,6 +1039,73 @@ async fn run_abort_worker(
 
 fn canonicalize_or_keep(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn truncate_snippet(input: &str, max_chars: usize) -> String {
+    let Some((byte_idx, _)) = input.char_indices().nth(max_chars) else {
+        return input.to_owned();
+    };
+    let Some((head, _)) = input.split_at_checked(byte_idx) else {
+        return input.to_owned();
+    };
+    let mut out = head.trim_end().to_owned();
+    out.push_str("...");
+    out
+}
+
+fn format_rpc_error_message(rpc_err: JsonRpcErrorPayload) -> String {
+    let base = rpc_err.message.trim();
+    let Some(data) = rpc_err.data else {
+        return base.to_owned();
+    };
+    let raw = data.get().trim();
+    if raw.is_empty() || raw == "null" || raw == "{}" {
+        return base.to_owned();
+    }
+    let snippet = truncate_snippet(raw, 512);
+    if base.is_empty() {
+        snippet
+    } else if base.contains(&snippet) {
+        base.to_owned()
+    } else {
+        format!("{base} — {snippet}")
+    }
+}
+
+#[derive(Deserialize)]
+struct RawUpdateNotificationProbe<'a> {
+    #[serde(default, borrow)]
+    update: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UntaggedUpdateErrorFields {
+    #[serde(default)]
+    session_update: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    error: Option<Box<RawValue>>,
+}
+
+fn rescue_unknown_error_update(params_json: &str) -> Option<SessionUpdatePayload> {
+    let outer: RawUpdateNotificationProbe<'_> = serde_json::from_str(params_json).ok()?;
+    let update_raw = outer.update?;
+    let fields: UntaggedUpdateErrorFields = serde_json::from_str(update_raw.get()).ok()?;
+    let kind_lower = fields.session_update.to_ascii_lowercase();
+    let has_non_null_error = fields
+        .error
+        .as_ref()
+        .is_some_and(|raw| !matches!(raw.get().trim(), "" | "null" | "{}"));
+    if kind_lower.contains("error") || kind_lower.contains("fail") || has_non_null_error {
+        Some(SessionUpdatePayload::Error {
+            message: fields.message,
+            error: fields.error,
+        })
+    } else {
+        None
+    }
 }
 
 const fn supervision_strategy_name() -> &'static str {

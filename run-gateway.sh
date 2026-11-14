@@ -21,6 +21,7 @@ DAEMON=0
 STOP=0
 SKIP_BUILD=0
 REBUILD_WEB=0
+SHOW_HELP=0
 HAS_LISTEN=0
 HAS_DEFAULT_MODEL=0
 HAS_ACP_MODE=0
@@ -31,6 +32,10 @@ FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help|-Help)
+      SHOW_HELP=1
+      shift
+      ;;
     --daemon|-Daemon)
       DAEMON=1
       shift
@@ -79,6 +84,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${SHOW_HELP}" -eq 1 ]]; then
+  echo "Usage: ./run-gateway.sh [script-options] [liftgate-flags...]"
+  echo ""
+  echo "Script options:"
+  echo "  --daemon, -Daemon          Build release and run liftgate in the background"
+  echo "  --stop, -Stop              Stop background gateway (.agy-runtime/gateway.pid)"
+  echo "  --skip-build, -SkipBuild   Start existing release binary without building"
+  echo "  --rebuild-web, -RebuildWeb Force rebuild of web/dist via Bun"
+  echo "  -h, --help                 Show this help message"
+  echo ""
+  echo "Any other flags (--listen, --default-model, --acp-mode, --api-key, --agy-bin, ...) pass through to liftgate."
+  exit 0
+fi
 
 if [[ "${STOP}" -eq 1 ]]; then
   if [[ -f "${PID_FILE}" ]]; then
@@ -150,7 +169,7 @@ if [[ "${DAEMON}" -eq 1 ]]; then
       tail -n 20 "${LOG_ERR}" >&2 || true
       exit 1
     fi
-    if curl -fsS "${BASE_URL}/healthz" >/dev/null 2>&1; then
+    if NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1" curl -fsS "${BASE_URL}/healthz" >/dev/null 2>&1; then
       ready=1
       break
     fi

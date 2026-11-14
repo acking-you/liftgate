@@ -39,6 +39,7 @@ builds `liftgate` with `cargo build --release --locked`, then starts it.
 | `--stop` · `-Stop` | stop the background gateway |
 | `--skip-build` · `-SkipBuild` | start the existing release binary without building |
 | `--rebuild-web` · `-RebuildWeb` | rebuild `web/dist` even when it exists |
+| `-h` · `--help` | show script help |
 
 Any other argument goes to `liftgate` unchanged ([flags](#flags-and-environment)).
 Check it is up with `curl http://127.0.0.1:8787/healthz`, and list your models
@@ -54,15 +55,20 @@ to the process it launches; when that exits, your shell is as it was.
 | --- | --- | --- |
 | Claude Code | `./start-agy.sh` | `.\start-agy.cmd` |
 | Codex CLI | `./start-agy.sh --codex` | `.\start-agy.cmd -Codex` |
+| Standard permissions | `./start-agy.sh --no-bypass` | `.\start-agy.cmd -NoBypass` |
 | Services only | `./start-agy.sh --services-only` | `.\start-agy.cmd -BackgroundOnly` |
 | Stop services | `./start-agy.sh --stop` | `.\start-agy.cmd -StopServices` |
 
+- By default `start-agy` passes `--dangerously-skip-permissions` to Claude Code
+  and `--dangerously-bypass-approvals-and-sandbox` to Codex; pass
+  `--no-bypass` / `-NoBypass` (or your own `--permission-mode` / `--sandbox`
+  flag) to keep standard prompts.
 - Remaining arguments pass through to `claude` or `codex`
   (`./start-agy.sh -p "hello"`).
-- Change the defaults with `AGY_MODEL`, `AGY_FAST_MODEL`, `AGY_HOST`,
-  `AGY_PORT`, `AGY_WEB_PORT` and `AGY_API_KEY` on Linux / macOS, or
-  `-GatewayModel`, `-FastModel`, `-ListenHost`, `-ListenPort`, `-UiPort` and
-  `-ApiKey` on Windows.
+- Change the defaults with `--gateway-model` (`-GatewayModel`), `--fast-model`
+  (`-FastModel`), `--host` (`-ListenHost`), `--port` (`-ListenPort`),
+  `--ui-port` (`-UiPort`) and `--api-key` (`-ApiKey`), or with `AGY_MODEL`,
+  `AGY_FAST_MODEL`, `AGY_HOST`, `AGY_PORT`, `AGY_WEB_PORT` and `AGY_API_KEY`.
 - With Bun installed it also starts the dashboard dev server on port `5173`.
 - It writes only inside the repository: `.agy-runtime/` (logs, PIDs, the Codex
   catalog), `claude-carbon.settings.json` and `.claude/settings.local.json`.
@@ -191,5 +197,9 @@ Logs follow `RUST_LOG` (default `info`). `liftgate --help` prints the same list.
 - **`could not locate agy executable`** — pass `--agy-bin <path>` or set
   `AGY_BIN`.
 - **`401`** — the client's key does not match `--api-key`.
+- **Quota exhausted (`Individual quota reached` / `insufficient_quota`)** — your
+  Antigravity account or model quota is exhausted (the error includes the reset
+  countdown when `agy` reports one); switch models with `/model` or wait for the
+  reset window.
 - **Logs from a background run** — `.agy-runtime/gateway.out.log` and
   `.agy-runtime/gateway.err.log`.
