@@ -20,7 +20,10 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $IsWin = ($IsWindows -or $env:OS -eq "Windows_NT")
 
-$RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RootDir = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if ($IsWin -and -not [string]::IsNullOrWhiteSpace($env:PATH) -and $env:PATH.Contains("%")) {
+    $env:PATH = [System.Environment]::ExpandEnvironmentVariables($env:PATH)
+}
 $RuntimeDir = Join-Path $RootDir ".agy-runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -68,14 +71,14 @@ for ($i = 0; $i -lt $args.Count; $i++) {
                 }
                 continue
             }
-            if ($tok.StartsWith("--listen=")) {
+            if ($tok.StartsWith("--listen=", [System.StringComparison]::OrdinalIgnoreCase)) {
                 $HasListen = $true
                 $ListenAddr = $tok.Substring("--listen=".Length)
             }
-            if ($tok -eq "--default-model" -or $tok.StartsWith("--default-model=")) {
+            if ($tok -eq "--default-model" -or $tok.StartsWith("--default-model=", [System.StringComparison]::OrdinalIgnoreCase)) {
                 $HasDefaultModel = $true
             }
-            if ($tok -eq "--acp-mode" -or $tok.StartsWith("--acp-mode=")) {
+            if ($tok -eq "--acp-mode" -or $tok.StartsWith("--acp-mode=", [System.StringComparison]::OrdinalIgnoreCase)) {
                 $HasAcpMode = $true
             }
             $ForwardArgs.Add($tok)
@@ -98,8 +101,16 @@ if ($ShowHelp) {
 }
 
 function Stop-ProcessTree([int]$ProcId) {
+    try {
+        $proc = [System.Diagnostics.Process]::GetProcessById($ProcId)
+        $killTree = $proc.GetType().GetMethod("Kill", [type[]]@([bool]))
+        if ($null -ne $killTree) {
+            $proc.Kill($true)
+            return
+        }
+    } catch {}
     if ($IsWin) {
-        & taskkill /PID $ProcId /T /F >$null 2>&1
+        Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", "$ProcId", "/T", "/F") -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
     }
     Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
 }
@@ -139,17 +150,28 @@ if ($Stop) {
     return
 }
 
+function Test-SafePath([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        return $false
+    }
+    try {
+        return [bool](Test-Path -LiteralPath $Candidate -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 function Resolve-BunExecutable {
     if ($IsWin) {
         $exeCmd = Get-Command bun.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $exeCmd -and -not [string]::IsNullOrWhiteSpace($exeCmd.Source) -and (Test-Path $exeCmd.Source)) {
+        if ($null -ne $exeCmd -and (Test-SafePath $exeCmd.Source)) {
             return $exeCmd.Source
         }
         foreach ($c in (Get-Command bun -All -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrWhiteSpace($c.Source)) {
                 $shimDir = Split-Path -Parent $c.Source
                 $nestedExe = Join-Path $shimDir "node_modules\bun\bin\bun.exe"
-                if (Test-Path $nestedExe) {
+                if (Test-SafePath $nestedExe) {
                     return $nestedExe
                 }
             }
@@ -162,23 +184,23 @@ function Resolve-BunExecutable {
             "C:\nvm4w\nodejs\node_modules\bun\bin\bun.exe"
         )
         foreach ($cand in $winCandidates) {
-            if (-not [string]::IsNullOrWhiteSpace($cand) -and (Test-Path $cand)) {
+            if (Test-SafePath $cand) {
                 return $cand
             }
         }
         $cmdShim = Get-Command bun.cmd,bun.bat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $cmdShim -and (Test-Path $cmdShim.Source)) {
+        if ($null -ne $cmdShim -and (Test-SafePath $cmdShim.Source)) {
             return $cmdShim.Source
         }
         return $null
     }
 
     $unixCmd = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $unixCmd -and (Test-Path $unixCmd.Source)) {
+    if ($null -ne $unixCmd -and (Test-SafePath $unixCmd.Source)) {
         return $unixCmd.Source
     }
     foreach ($cand in @((Join-Path $HOME ".bun/bin/bun"), "/opt/homebrew/bin/bun", "/usr/local/bin/bun")) {
-        if (Test-Path $cand) {
+        if (Test-SafePath $cand) {
             return $cand
         }
     }
@@ -275,7 +297,11 @@ if ($Daemon) {
                 throw "liftgate exited unexpectedly (code $($proc.ExitCode)):`n$errTail"
             }
             try {
-                $resp = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 2
+                $hcParams = @{ Uri = "$baseUrl/healthz"; UseBasicParsing = $true; TimeoutSec = 2 }
+                if ($PSVersionTable.PSVersion.Major -ge 6) {
+                    $hcParams["NoProxy"] = $true
+                }
+                $resp = Invoke-WebRequest @hcParams
                 if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
                     $ready = $true
                     break

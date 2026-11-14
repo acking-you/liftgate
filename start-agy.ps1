@@ -70,6 +70,7 @@ for ($idx = 0; $idx -lt $args.Count; $idx++) {
         "-ListenHost"        { $idx++; if ($idx -lt $args.Count) { $ListenHost = [string]$args[$idx] }; continue }
         "--host"             { $idx++; if ($idx -lt $args.Count) { $ListenHost = [string]$args[$idx] }; continue }
         "-ListenPort"        { $idx++; if ($idx -lt $args.Count) { $ListenPort = [int]$args[$idx] }; continue }
+        "-Port"              { $idx++; if ($idx -lt $args.Count) { $ListenPort = [int]$args[$idx] }; continue }
         "--port"             { $idx++; if ($idx -lt $args.Count) { $ListenPort = [int]$args[$idx] }; continue }
         "-UiPort"            { $idx++; if ($idx -lt $args.Count) { $UiPort = [int]$args[$idx] }; continue }
         "--ui-port"          { $idx++; if ($idx -lt $args.Count) { $UiPort = [int]$args[$idx] }; continue }
@@ -91,7 +92,39 @@ for ($idx = 0; $idx -lt $args.Count; $idx++) {
         "--codex"            { $LaunchCodex = $true; continue }
         "-NoBypass"          { $NoBypass = $true; continue }
         "--no-bypass"        { $NoBypass = $true; continue }
-        default              { $ClaudeArgs.Add($tok) }
+        default {
+            if ($tok.StartsWith("--gateway-model=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $GatewayModel = $tok.Substring("--gateway-model=".Length)
+                continue
+            }
+            if ($tok.StartsWith("--fast-model=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $FastModel = $tok.Substring("--fast-model=".Length)
+                $ExplicitFastModel = $true
+                continue
+            }
+            if ($tok.StartsWith("--host=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $ListenHost = $tok.Substring("--host=".Length)
+                continue
+            }
+            if ($tok.StartsWith("--port=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $ListenPort = [int]$tok.Substring("--port=".Length)
+                continue
+            }
+            if ($tok.StartsWith("--ui-port=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $UiPort = [int]$tok.Substring("--ui-port=".Length)
+                continue
+            }
+            if ($tok.StartsWith("--web-port=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $UiPort = [int]$tok.Substring("--web-port=".Length)
+                continue
+            }
+            if ($tok.StartsWith("--api-key=", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $ApiKey = $tok.Substring("--api-key=".Length)
+                $ExplicitApiKey = $true
+                continue
+            }
+            $ClaudeArgs.Add($tok)
+        }
     }
 }
 
@@ -117,7 +150,7 @@ if ($ShowHelp) {
     return
 }
 
-$RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RootDir = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $RuntimeDir = Join-Path $RootDir ".agy-runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -166,8 +199,16 @@ if ($UninstallEnv) {
 }
 
 function Stop-ProcessTree([int]$ProcId) {
+    try {
+        $proc = [System.Diagnostics.Process]::GetProcessById($ProcId)
+        $killTree = $proc.GetType().GetMethod("Kill", [type[]]@([bool]))
+        if ($null -ne $killTree) {
+            $proc.Kill($true)
+            return
+        }
+    } catch {}
     if ($IsWin) {
-        & taskkill /PID $ProcId /T /F >$null 2>&1
+        Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", "$ProcId", "/T", "/F") -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
     }
     Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
 }
@@ -240,10 +281,44 @@ function Start-BackgroundProcess(
     return (Start-Process @startParams)
 }
 
+function Invoke-LoopbackWebRequest([hashtable]$Params) {
+    $callParams = @{}
+    foreach ($kv in $Params.GetEnumerator()) {
+        $callParams[$kv.Key] = $kv.Value
+    }
+    $callParams["UseBasicParsing"] = $true
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $callParams["NoProxy"] = $true
+    }
+    return (Invoke-WebRequest @callParams)
+}
+
+function Invoke-LoopbackRestMethod([hashtable]$Params) {
+    $callParams = @{}
+    foreach ($kv in $Params.GetEnumerator()) {
+        $callParams[$kv.Key] = $kv.Value
+    }
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $callParams["NoProxy"] = $true
+    }
+    return (Invoke-RestMethod @callParams)
+}
+
 function Test-HttpOk([string]$Url) {
     try {
-        $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
+        $resp = Invoke-LoopbackWebRequest @{ Uri = $Url; TimeoutSec = 2 }
         return ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300)
+    } catch {
+        return $false
+    }
+}
+
+function Test-SafePath([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        return $false
+    }
+    try {
+        return [bool](Test-Path -LiteralPath $Candidate -ErrorAction SilentlyContinue)
     } catch {
         return $false
     }
@@ -252,14 +327,14 @@ function Test-HttpOk([string]$Url) {
 function Resolve-BunExecutable {
     if ($IsWin) {
         $exeCmd = Get-Command bun.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $exeCmd -and -not [string]::IsNullOrWhiteSpace($exeCmd.Source) -and (Test-Path $exeCmd.Source)) {
+        if ($null -ne $exeCmd -and (Test-SafePath $exeCmd.Source)) {
             return $exeCmd.Source
         }
         foreach ($c in (Get-Command bun -All -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrWhiteSpace($c.Source)) {
                 $shimDir = Split-Path -Parent $c.Source
                 $nestedExe = Join-Path $shimDir "node_modules\bun\bin\bun.exe"
-                if (Test-Path $nestedExe) {
+                if (Test-SafePath $nestedExe) {
                     return $nestedExe
                 }
             }
@@ -272,23 +347,23 @@ function Resolve-BunExecutable {
             "C:\nvm4w\nodejs\node_modules\bun\bin\bun.exe"
         )
         foreach ($cand in $winCandidates) {
-            if (-not [string]::IsNullOrWhiteSpace($cand) -and (Test-Path $cand)) {
+            if (Test-SafePath $cand) {
                 return $cand
             }
         }
         $cmdShim = Get-Command bun.cmd,bun.bat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $cmdShim -and (Test-Path $cmdShim.Source)) {
+        if ($null -ne $cmdShim -and (Test-SafePath $cmdShim.Source)) {
             return $cmdShim.Source
         }
         return $null
     }
 
     $unixCmd = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $unixCmd -and (Test-Path $unixCmd.Source)) {
+    if ($null -ne $unixCmd -and (Test-SafePath $unixCmd.Source)) {
         return $unixCmd.Source
     }
     foreach ($cand in @((Join-Path $HOME ".bun/bin/bun"), "/opt/homebrew/bin/bun", "/usr/local/bin/bun")) {
-        if (Test-Path $cand) {
+        if (Test-SafePath $cand) {
             return $cand
         }
     }
@@ -298,12 +373,12 @@ function Resolve-BunExecutable {
 function Resolve-AgyExecutable {
     if ($IsWin) {
         $exeCmd = Get-Command agy.exe,agy.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $exeCmd -and (Test-Path $exeCmd.Source)) {
+        if ($null -ne $exeCmd -and (Test-SafePath $exeCmd.Source)) {
             return $exeCmd.Source
         }
     } else {
         $unixCmd = Get-Command agy -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $unixCmd -and (Test-Path $unixCmd.Source)) {
+        if ($null -ne $unixCmd -and (Test-SafePath $unixCmd.Source)) {
             return $unixCmd.Source
         }
     }
@@ -315,7 +390,7 @@ function Resolve-AgyExecutable {
         "/usr/local/bin/agy"
     )
     foreach ($c in $candidates) {
-        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path $c)) {
+        if (Test-SafePath $c) {
             return $c
         }
     }
@@ -323,85 +398,139 @@ function Resolve-AgyExecutable {
 }
 
 function Resolve-NodeExecutable([string]$PreferredDir) {
+    $nodeBin = if ($IsWin) { "node.exe" } else { "node" }
     if (-not [string]::IsNullOrWhiteSpace($PreferredDir)) {
-        $localNode = Join-Path $PreferredDir (if ($IsWin) { "node.exe" } else { "node" })
-        if (Test-Path $localNode) {
+        $localNode = Join-Path $PreferredDir $nodeBin
+        if (Test-SafePath $localNode) {
             return $localNode
         }
     }
-    $nodeCmd = Get-Command (if ($IsWin) { "node.exe" } else { "node" }) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $nodeCmd -and (Test-Path $nodeCmd.Source)) {
+    $nodeCmd = Get-Command $nodeBin -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $nodeCmd -and (Test-SafePath $nodeCmd.Source)) {
         return $nodeCmd.Source
+    }
+    if ($IsWin) {
+        $winNodeCandidates = @(
+            $(if ($env:NVM_SYMLINK) { Join-Path $env:NVM_SYMLINK "node.exe" }),
+            "C:\nvm4w\nodejs\node.exe",
+            $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles "nodejs\node.exe" }),
+            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe" }),
+            $(if ($env:VOLTA_HOME) { Join-Path $env:VOLTA_HOME "bin\node.exe" }),
+            $(if ($env:FNM_MULTISHELL_PATH) { Join-Path $env:FNM_MULTISHELL_PATH "node.exe" })
+        )
+        foreach ($cand in $winNodeCandidates) {
+            if (Test-SafePath $cand) {
+                return $cand
+            }
+        }
     }
     return $null
 }
 
-function Invoke-ClaudeCli([System.Collections.Generic.List[string]]$CliArgs) {
+function Resolve-ClaudeCommand {
     if ($IsWin) {
         $exeCmd = Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $exeCmd -and (Test-Path $exeCmd.Source)) {
-            & $exeCmd.Source @CliArgs
-            return $LASTEXITCODE
+        if ($null -ne $exeCmd -and (Test-SafePath $exeCmd.Source)) {
+            return @{ Exe = $exeCmd.Source; PrefixArgs = @() }
         }
         foreach ($cand in @(
             (Join-Path $HOME ".local\bin\claude.exe"),
             $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".local\bin\claude.exe" }),
-            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Programs\claude\claude.exe" })
+            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Programs\claude\claude.exe" }),
+            (Join-Path $HOME ".bun\bin\claude.exe"),
+            $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".bun\bin\claude.exe" })
         )) {
-            if (-not [string]::IsNullOrWhiteSpace($cand) -and (Test-Path $cand)) {
-                & $cand @CliArgs
-                return $LASTEXITCODE
+            if (Test-SafePath $cand) {
+                return @{ Exe = $cand; PrefixArgs = @() }
             }
         }
+        $shimDirs = [System.Collections.Generic.List[string]]::new()
         foreach ($c in (Get-Command claude -All -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrWhiteSpace($c.Source)) {
-                $shimDir = Split-Path -Parent $c.Source
-                $cliJs = Join-Path $shimDir "node_modules\@anthropic-ai\claude-code\cli.js"
-                if (Test-Path $cliJs) {
-                    $nodeExe = Resolve-NodeExecutable -PreferredDir $shimDir
-                    if ($null -ne $nodeExe) {
-                        & $nodeExe $cliJs @CliArgs
-                        return $LASTEXITCODE
-                    }
+                $shimDirs.Add((Split-Path -Parent $c.Source))
+            }
+        }
+        foreach ($extraDir in @(
+            $(if ($env:APPDATA) { Join-Path $env:APPDATA "npm" }),
+            $env:NVM_SYMLINK,
+            "C:\nvm4w\nodejs"
+        )) {
+            if (-not [string]::IsNullOrWhiteSpace($extraDir)) {
+                $shimDirs.Add($extraDir)
+            }
+        }
+        foreach ($shimDir in $shimDirs) {
+            $cliJs = Join-Path $shimDir "node_modules\@anthropic-ai\claude-code\cli.js"
+            if (Test-SafePath $cliJs) {
+                $nodeExe = Resolve-NodeExecutable -PreferredDir $shimDir
+                if ($null -ne $nodeExe) {
+                    return @{ Exe = $nodeExe; PrefixArgs = @($cliJs) }
                 }
             }
+        }
+        $cmdShim = Get-Command claude.cmd,claude.bat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $cmdShim -and (Test-SafePath $cmdShim.Source)) {
+            return @{ Exe = $cmdShim.Source; PrefixArgs = @() }
         }
     }
     $fallback = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $fallback) {
+    if ($null -eq $fallback -or [string]::IsNullOrWhiteSpace($fallback.Source)) {
         throw "Claude Code CLI ('claude') was not found in PATH or ~/.local/bin."
     }
-    & claude @CliArgs
-    return $LASTEXITCODE
+    return @{ Exe = $fallback.Source; PrefixArgs = @() }
 }
 
-function Invoke-CodexCli([System.Collections.Generic.List[string]]$CliArgs) {
+function Resolve-CodexCommand {
     if ($IsWin) {
         $exeCmd = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $exeCmd -and (Test-Path $exeCmd.Source)) {
-            & $exeCmd.Source @CliArgs
-            return $LASTEXITCODE
+        if ($null -ne $exeCmd -and (Test-SafePath $exeCmd.Source)) {
+            return @{ Exe = $exeCmd.Source; PrefixArgs = @() }
         }
+        foreach ($cand in @(
+            (Join-Path $HOME ".bun\bin\codex.exe"),
+            $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".bun\bin\codex.exe" }),
+            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\codex.exe" }),
+            (Join-Path $HOME ".cargo\bin\codex.exe"),
+            (Join-Path $HOME ".local\bin\codex.exe")
+        )) {
+            if (Test-SafePath $cand) {
+                return @{ Exe = $cand; PrefixArgs = @() }
+            }
+        }
+        $shimDirs = [System.Collections.Generic.List[string]]::new()
         foreach ($c in (Get-Command codex -All -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrWhiteSpace($c.Source)) {
-                $shimDir = Split-Path -Parent $c.Source
-                $codexJs = Join-Path $shimDir "node_modules\@openai\codex\bin\codex.js"
-                if (Test-Path $codexJs) {
-                    $nodeExe = Resolve-NodeExecutable -PreferredDir $shimDir
-                    if ($null -ne $nodeExe) {
-                        & $nodeExe $codexJs @CliArgs
-                        return $LASTEXITCODE
-                    }
+                $shimDirs.Add((Split-Path -Parent $c.Source))
+            }
+        }
+        foreach ($extraDir in @(
+            $(if ($env:APPDATA) { Join-Path $env:APPDATA "npm" }),
+            $env:NVM_SYMLINK,
+            "C:\nvm4w\nodejs"
+        )) {
+            if (-not [string]::IsNullOrWhiteSpace($extraDir)) {
+                $shimDirs.Add($extraDir)
+            }
+        }
+        foreach ($shimDir in $shimDirs) {
+            $codexJs = Join-Path $shimDir "node_modules\@openai\codex\bin\codex.js"
+            if (Test-SafePath $codexJs) {
+                $nodeExe = Resolve-NodeExecutable -PreferredDir $shimDir
+                if ($null -ne $nodeExe) {
+                    return @{ Exe = $nodeExe; PrefixArgs = @($codexJs) }
                 }
             }
         }
+        $cmdShim = Get-Command codex.cmd,codex.bat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $cmdShim -and (Test-SafePath $cmdShim.Source)) {
+            return @{ Exe = $cmdShim.Source; PrefixArgs = @() }
+        }
     }
     $fallback = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $fallback) {
+    if ($null -eq $fallback -or [string]::IsNullOrWhiteSpace($fallback.Source)) {
         throw "Codex CLI ('codex') was not found in PATH."
     }
-    & codex @CliArgs
-    return $LASTEXITCODE
+    return @{ Exe = $fallback.Source; PrefixArgs = @() }
 }
 
 function Get-WindowsSystemProxyUrl {
@@ -447,7 +576,8 @@ $TrackedSessionEnvKeys = @(
     "VITE_GATEWAY_PROXY",
     "NO_PROXY",
     "HTTP_PROXY",
-    "HTTPS_PROXY"
+    "HTTPS_PROXY",
+    "PATH"
 )
 $SavedProcessEnv = @{}
 foreach ($k in $TrackedSessionEnvKeys) {
@@ -468,8 +598,14 @@ function Restore-CallerProcessEnv {
 $cliExitCode = 0
 $keepEnvInProcess = $false
 try {
+    if ($IsWin -and -not [string]::IsNullOrWhiteSpace($env:PATH) -and $env:PATH.Contains("%")) {
+        $env:PATH = [System.Environment]::ExpandEnvironmentVariables($env:PATH)
+    }
+
     # Ensure loopback checks never route through a local HTTP proxy
     $env:NO_PROXY = "127.0.0.1,localhost,::1"
+    Remove-Item Env:\HTTP_PROXY -ErrorAction SilentlyContinue
+    Remove-Item Env:\HTTPS_PROXY -ErrorAction SilentlyContinue
 
     # ============================================================================
     # 1. Ensure liftgate is running
@@ -595,7 +731,11 @@ try {
     # 3. Dynamic Model Discovery (/v1/models) -> Claude Code & Codex CLI
     # ============================================================================
     Write-Host "[3/4] Discovering live models from $GatewayBaseUrl/v1/models ..." -ForegroundColor Cyan
-    $modelsResp = Invoke-RestMethod -Uri "$GatewayBaseUrl/v1/models" -Headers @{ Authorization = "Bearer $ApiKey" } -TimeoutSec 15
+    $modelsResp = Invoke-LoopbackRestMethod @{
+        Uri        = "$GatewayBaseUrl/v1/models"
+        Headers    = @{ Authorization = "Bearer $ApiKey" }
+        TimeoutSec = 15
+    }
 
     if ($modelsResp.data.Count -le 1) {
         $agyExe = Resolve-AgyExecutable
@@ -608,7 +748,13 @@ try {
             }
             Remove-Item Env:\AGY_API_KEY -ErrorAction SilentlyContinue
             & $agyExe acp --login
-            $modelsResp = Invoke-RestMethod -Uri "$GatewayBaseUrl/v1/models" -Headers @{ Authorization = "Bearer $ApiKey" } -TimeoutSec 15
+            Remove-Item Env:\HTTP_PROXY -ErrorAction SilentlyContinue
+            Remove-Item Env:\HTTPS_PROXY -ErrorAction SilentlyContinue
+            $modelsResp = Invoke-LoopbackRestMethod @{
+                Uri        = "$GatewayBaseUrl/v1/models"
+                Headers    = @{ Authorization = "Bearer $ApiKey" }
+                TimeoutSec = 15
+            }
         }
     }
 
@@ -712,7 +858,12 @@ try {
     $codexCatalogPath = Join-Path $RuntimeDir "codex-model-catalog.json"
     $codexCatalogSlash = $codexCatalogPath.Replace('\', '/')
     $encodedDefaultModel = [uri]::EscapeDataString($GatewayModel)
-    Invoke-WebRequest -Uri "$GatewayBaseUrl/v1/codex-models?default_model=$encodedDefaultModel" -Headers @{ Authorization = "Bearer $ApiKey" } -UseBasicParsing -TimeoutSec 15 -OutFile $codexCatalogPath
+    Invoke-LoopbackWebRequest @{
+        Uri        = "$GatewayBaseUrl/v1/codex-models?default_model=$encodedDefaultModel"
+        Headers    = @{ Authorization = "Bearer $ApiKey" }
+        TimeoutSec = 15
+        OutFile    = $codexCatalogPath
+    } | Out-Null
 
     $codexConfigPath = Join-Path $RuntimeDir "codex-config.toml"
     $codexBypassLines = if (-not $NoBypass) {
@@ -813,21 +964,34 @@ wire_api = "responses"
         $hasExplicitCodexModel = $false
         $hasExplicitCodexApproval = $false
         foreach ($ca in $ClaudeArgs) {
-            if ($ca -eq "-m" -or $ca -eq "--model" -or $ca.StartsWith("-m=") -or $ca.StartsWith("--model=")) {
+            if (
+                $ca -eq "-m" -or
+                $ca -eq "--model" -or
+                $ca.StartsWith("-m=", [System.StringComparison]::OrdinalIgnoreCase) -or
+                $ca.StartsWith("--model=", [System.StringComparison]::OrdinalIgnoreCase)
+            ) {
                 $hasExplicitCodexModel = $true
             }
             if (
                 $ca -eq "--dangerously-bypass-approvals-and-sandbox" -or
                 $ca -eq "--yolo" -or
-                $ca -eq "-s" -or $ca -eq "--sandbox" -or $ca.StartsWith("-s=") -or $ca.StartsWith("--sandbox=") -or
-                $ca -eq "-a" -or $ca -eq "--ask-for-approval" -or $ca.StartsWith("-a=") -or $ca.StartsWith("--ask-for-approval=") -or
+                $ca -eq "-s" -or $ca -eq "--sandbox" -or
+                $ca.StartsWith("-s=", [System.StringComparison]::OrdinalIgnoreCase) -or
+                $ca.StartsWith("--sandbox=", [System.StringComparison]::OrdinalIgnoreCase) -or
+                $ca -eq "-a" -or $ca -eq "--ask-for-approval" -or
+                $ca.StartsWith("-a=", [System.StringComparison]::OrdinalIgnoreCase) -or
+                $ca.StartsWith("--ask-for-approval=", [System.StringComparison]::OrdinalIgnoreCase) -or
                 $ca -eq "--approve-for-me" -or $ca -eq "--full-auto"
             ) {
                 $hasExplicitCodexApproval = $true
             }
         }
 
+        $codexCmd = Resolve-CodexCommand
         $codexLaunchArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($pa in $codexCmd.PrefixArgs) {
+            $codexLaunchArgs.Add([string]$pa)
+        }
         if (-not $NoBypass -and -not $hasExplicitCodexApproval) {
             $codexLaunchArgs.Add("--dangerously-bypass-approvals-and-sandbox")
         }
@@ -856,25 +1020,35 @@ wire_api = "responses"
         foreach ($ca in $ClaudeArgs) {
             $codexLaunchArgs.Add($ca)
         }
-        $cliExitCode = Invoke-CodexCli -CliArgs $codexLaunchArgs
+
+        # Invoke directly in top-level scope (never via `$x = Function`) so the
+        # child TUI inherits the real console stdin/stdout handles (isTTY = true).
+        $global:LASTEXITCODE = 0
+        & $codexCmd.Exe @codexLaunchArgs
+        $cliExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
     } else {
         $hasExplicitModel = $false
         $hasExplicitClaudePerm = $false
         foreach ($ca in $ClaudeArgs) {
-            if ($ca -eq "--model" -or $ca.StartsWith("--model=")) {
+            if ($ca -eq "--model" -or $ca.StartsWith("--model=", [System.StringComparison]::OrdinalIgnoreCase)) {
                 $hasExplicitModel = $true
             }
             if (
                 $ca -eq "--dangerously-skip-permissions" -or
                 $ca -eq "--allow-dangerously-skip-permissions" -or
-                $ca -eq "--permission-mode" -or $ca.StartsWith("--permission-mode=") -or
+                $ca -eq "--permission-mode" -or
+                $ca.StartsWith("--permission-mode=", [System.StringComparison]::OrdinalIgnoreCase) -or
                 $ca -eq "--safe-mode" -or $ca -eq "--restricted"
             ) {
                 $hasExplicitClaudePerm = $true
             }
         }
 
+        $claudeCmd = Resolve-ClaudeCommand
         $claudeLaunchArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($pa in $claudeCmd.PrefixArgs) {
+            $claudeLaunchArgs.Add([string]$pa)
+        }
         if (-not $NoBypass -and -not $hasExplicitClaudePerm) {
             $claudeLaunchArgs.Add("--dangerously-skip-permissions")
         }
@@ -889,7 +1063,12 @@ wire_api = "responses"
         foreach ($ca in $ClaudeArgs) {
             $claudeLaunchArgs.Add($ca)
         }
-        $cliExitCode = Invoke-ClaudeCli -CliArgs $claudeLaunchArgs
+
+        # Invoke directly in top-level scope (never via `$x = Function`) so the
+        # child TUI inherits the real console stdin/stdout handles (isTTY = true).
+        $global:LASTEXITCODE = 0
+        & $claudeCmd.Exe @claudeLaunchArgs
+        $cliExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
     }
 } finally {
     if (-not $keepEnvInProcess) {
