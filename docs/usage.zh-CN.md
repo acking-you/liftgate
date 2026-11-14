@@ -9,7 +9,7 @@
 - **Antigravity CLI（`agy`）**：安装后执行一次 `agy acp --login` 完成登录。Liftgate 会在 `PATH` 和标准安装位置查找它，找不到时用 `--agy-bin <路径>` 指定。
 - **全局安装 `liftgate`**：从 GitHub Releases 下载单文件可执行程序放入 `PATH`，或使用 **Rust 1.85+** 从源码全局安装：
   ```bash
-  cargo install --path crates/liftgate
+  cargo install --path crates/liftgate --locked
   ```
   编译 Release 时若本机装有 **Bun**，`build.rs` 会自动构建 `web/` 并将完整 React 监控面板直接内嵌进 `liftgate` 单二进制中（运行时无需外部 `web/dist` 目录）；未安装 Bun 时所有 API 照常可用，且 `/` 仍提供内置的轻量级实时遥测页面。
 

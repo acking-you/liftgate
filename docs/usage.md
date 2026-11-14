@@ -14,7 +14,7 @@ client at it. Every address below assumes the default
 - **Liftgate (`liftgate`)**, installed globally from a GitHub Release archive or
   built from source with **Rust 1.85+**:
   ```bash
-  cargo install --path crates/liftgate
+  cargo install --path crates/liftgate --locked
   ```
   When **Bun** is installed at build time, `build.rs` compiles `web/` and embeds
   the production React dashboard directly into the single `liftgate` binary (no

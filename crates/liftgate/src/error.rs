@@ -80,8 +80,12 @@ pub enum CliError {
     #[error("timed out waiting for gateway health check at `{url}` (inspect logs at `{}`)", log_path.display())]
     DaemonHealthTimeout { url: String, log_path: PathBuf },
 
-    #[error("failed to stop background gateway (PID {pid}): {detail}")]
-    DaemonStopFailed { pid: u32, detail: String },
+    #[error("failed to stop background gateway (PID {pid})")]
+    DaemonStopFailed {
+        pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("gateway is not running or unreachable at `{url}`")]
     GatewayUnreachable {

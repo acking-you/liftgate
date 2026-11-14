@@ -80,7 +80,7 @@ command:
 
 ```bash
 agy acp --login                         # once, to sign in to Antigravity
-cargo install --path crates/liftgate    # embeds Web UI automatically when Bun is installed
+cargo install --path crates/liftgate --locked  # embeds Web UI automatically when Bun is installed
 
 liftgate start --open                   # start background gateway + dashboard (http://127.0.0.1:8787/)
 liftgate codex                          # launch Codex CLI in current dir (0 side effects on exit)

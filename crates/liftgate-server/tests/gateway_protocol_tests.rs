@@ -2197,10 +2197,11 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
     let limits =
         GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, 30).unwrap();
     let (shutdown_handle, shutdown_rx) = AdminShutdownHandle::new(Arc::from("secret-stop-token"));
+    let telemetry = Arc::new(TelemetryHub::new());
     let app = build_router(AppState {
         backend,
         pool: Arc::new(SessionPool::new(limits)),
-        telemetry: Arc::new(TelemetryHub::new()),
+        telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
@@ -2267,6 +2268,7 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
     assert!(!*shutdown_rx.borrow());
 
     let ok_shutdown = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2279,4 +2281,17 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
         .unwrap();
     assert_eq!(ok_shutdown.status(), StatusCode::OK);
     assert!(*shutdown_rx.borrow());
+
+    let sse_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/telemetry/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let sse_bytes = sse_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(sse_bytes.is_empty());
 }

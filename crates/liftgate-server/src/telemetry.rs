@@ -7,7 +7,7 @@ use liftgate_types::{
     canonical::{CanonicalMessage, CanonicalPart, CanonicalRole},
     telemetry::{GatewayMetricsSummary, TaskPhase, TaskProtocol, TaskSnapshot},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 const MAX_RECENT_TASKS: usize = 100;
 const MAX_PROMPT_PREVIEW_CHARS: usize = 180;
@@ -17,6 +17,7 @@ const MAX_OUTPUT_PREVIEW_CHARS: usize = 240;
 pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
     notify_tx: broadcast::Sender<()>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 struct TelemetryInner {
@@ -35,6 +36,7 @@ impl TelemetryHub {
     #[must_use]
     pub fn new() -> Self {
         let (notify_tx, _) = broadcast::channel(64);
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             inner: Mutex::new(TelemetryInner {
                 metrics: GatewayMetricsSummary::default(),
@@ -42,6 +44,7 @@ impl TelemetryHub {
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
             }),
             notify_tx,
+            shutdown_tx,
         }
     }
 
@@ -52,6 +55,18 @@ impl TelemetryHub {
 
     pub fn notify_change(&self) {
         let _ = self.notify_tx.send(());
+    }
+
+    /// Subscribes to gateway shutdown so long-lived telemetry SSE streams close immediately
+    /// instead of blocking `axum`'s graceful connection drain.
+    #[must_use]
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Signals all open telemetry SSE streams to close cleanly.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send_replace(true);
     }
 
     /// Registers a newly arrived API turn and returns an RAII `ActiveTaskGuard` that guarantees

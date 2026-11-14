@@ -9,7 +9,9 @@ use liftgate_types::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::cli::{ConfigArgs, ConfigTarget, ServeArgs};
+use crate::cli::{
+    ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, normalize_optional_api_key,
+};
 use crate::client::DiscoveredModel;
 use crate::daemon::{ensure_gateway_ready, resolve_client_api_key};
 use crate::error::CliError;
@@ -100,11 +102,24 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         let perms = existing
             .entry("permissions".to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
+        if !perms.is_object() {
+            *perms = Value::Object(Map::new());
+        }
         if let Value::Object(perm_map) = perms {
             perm_map.insert(
                 "defaultMode".to_owned(),
                 Value::String("bypassPermissions".to_owned()),
             );
+        }
+    } else {
+        existing.remove("skipDangerousModePermissionPrompt");
+        if let Some(Value::Object(perm_map)) = existing.get_mut("permissions") {
+            if perm_map.get("defaultMode").and_then(Value::as_str) == Some("bypassPermissions") {
+                perm_map.remove("defaultMode");
+            }
+            if perm_map.is_empty() {
+                existing.remove("permissions");
+            }
         }
     }
 
@@ -168,6 +183,9 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         if let Some(proxy) = proxy_url {
             env_map.insert("HTTP_PROXY".to_owned(), Value::String(proxy.clone()));
             env_map.insert("HTTPS_PROXY".to_owned(), Value::String(proxy));
+        } else {
+            env_map.remove("HTTP_PROXY");
+            env_map.remove("HTTPS_PROXY");
         }
     }
 
@@ -586,14 +604,12 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
     };
 
     let configured_api_key = if let Some(t) = &live_target {
-        t.api_key.clone()
+        normalize_optional_api_key(t.api_key.as_deref())
     } else {
         resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), resolved_listen)
     };
     let require_env_key = configured_api_key.is_some();
-    let claude_auth_token = configured_api_key
-        .clone()
-        .unwrap_or_else(|| "local-agy".to_owned());
+    let claude_auth_token = configured_api_key.unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let primary_model = args
         .model
@@ -828,6 +844,13 @@ mod tests {
             "http://127.0.0.1:8787"
         );
         assert_eq!(existing["model"], "gemini-4-carbon-high");
+        assert_eq!(existing["skipDangerousModePermissionPrompt"], true);
+
+        let mut standard_perms = params.clone();
+        standard_perms.no_bypass = true;
+        merged_claude_settings_into(&mut existing, &standard_perms);
+        assert!(existing.get("skipDangerousModePermissionPrompt").is_none());
+        assert!(existing.get("permissions").is_none());
 
         strip_claude_settings(&mut existing);
         assert_eq!(existing["alwaysThinkingEnabled"], true);

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use liftgate_server::{
     acp_client::{LiveAcpClient, LiveAcpConfig},
@@ -14,8 +15,9 @@ use liftgate_server::{
 };
 use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
-use crate::cli::ServeArgs;
+use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -51,12 +53,18 @@ static FALLBACK_DASHBOARD_HTML: &[u8] = r#"<!doctype html>
   </div>
   <script>
     const hash = new URLSearchParams(location.hash.slice(1));
-    if (hash.get('api_key')) {
-      localStorage.setItem('agy_gateway_api_key', hash.get('api_key'));
+    let bootKey = hash.get('api_key') || '';
+    let bootBase = (hash.get('base_url') || '').replace(/\/+$/, '');
+    if (bootKey || bootBase) {
+      try {
+        if (bootKey) localStorage.setItem('agy_gateway_api_key', bootKey);
+        if (bootBase) localStorage.setItem('agy_gateway_base_url', bootBase);
+      } catch {}
       history.replaceState(null, '', location.pathname + location.search);
     }
-    const key = localStorage.getItem('agy_gateway_api_key') || '';
-    const sseUrl = '/api/telemetry/events' + (key ? '?api_key=' + encodeURIComponent(key) : '');
+    let key = bootKey, base = bootBase;
+    try { key = key || localStorage.getItem('agy_gateway_api_key') || ''; base = base || localStorage.getItem('agy_gateway_base_url') || ''; } catch {}
+    const sseUrl = base + '/api/telemetry/events' + (key ? '?api_key=' + encodeURIComponent(key) : '');
     const es = new EventSource(sseUrl);
     es.addEventListener('snapshot', (e) => {
       document.getElementById('status').textContent = 'Connected · Live SSE';
@@ -144,11 +152,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     let telemetry = Arc::new(TelemetryHub::new());
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();
-    let api_key = args
-        .api_key
-        .map(|k| k.trim().to_owned())
-        .filter(|k| !k.is_empty())
-        .map(Arc::<str>::from);
+    let api_key = normalize_optional_api_key(args.api_key.as_deref()).map(Arc::<str>::from);
 
     let shutdown_token = std::env::var(ENV_SHUTDOWN_TOKEN)
         .ok()
@@ -165,7 +169,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     let app_state = AppState {
         backend: Arc::new(Arc::clone(&live_client)),
         pool,
-        telemetry,
+        telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
             default_model,
             acp_mode,
@@ -179,8 +183,10 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
 
     let router = build_router(app_state.clone());
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut bg_tasks = JoinSet::new();
 
-    tokio::spawn(async move {
+    let shutdown_telemetry = Arc::clone(&telemetry);
+    bg_tasks.spawn(async move {
         tokio::select! {
             biased;
             () = wait_admin_shutdown(&mut admin_rx), if admin_rx.is_some() => {
@@ -188,6 +194,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
             }
             () = wait_for_shutdown_signal() => {}
         }
+        shutdown_telemetry.signal_shutdown();
         let _ = stop_tx.send_replace(true);
     });
 
@@ -202,28 +209,39 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         "gateway listening and ready"
     );
 
-    let mut ui_task = None;
     if let Some(extra_listener) = ui_listener {
         let ui_router = build_router(app_state);
         let mut ui_stop_rx = stop_rx.clone();
-        ui_task = Some(tokio::spawn(async move {
-            serve_router(extra_listener, ui_router, async move {
+        bg_tasks.spawn(async move {
+            let _ = serve_router(extra_listener, ui_router, async move {
                 let _ = ui_stop_rx.wait_for(|&stop| stop).await;
             })
-            .await
-        }));
+            .await;
+        });
     }
 
-    let mut main_stop_rx = stop_rx;
-    serve_router(listener, router, async move {
+    let mut main_stop_rx = stop_rx.clone();
+    let serve_fut = serve_router(listener, router, async move {
         let _ = main_stop_rx.wait_for(|&stop| stop).await;
-    })
-    .await
-    .map_err(|source| CliError::Serve { source })?;
+    });
+    tokio::pin!(serve_fut);
 
-    if let Some(handle) = ui_task {
-        let _ = handle.await;
+    let mut drain_stop_rx = stop_rx;
+    tokio::select! {
+        biased;
+        res = &mut serve_fut => {
+            res.map_err(|source| CliError::Serve { source })?;
+        }
+        () = async {
+            let _ = drain_stop_rx.wait_for(|&stop| stop).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        } => {
+            tracing::info!("graceful HTTP drain budget elapsed; closing remaining connections");
+        }
     }
+
+    bg_tasks.abort_all();
+    while bg_tasks.join_next().await.is_some() {}
 
     tracing::info!("shutting down ACP subprocess tree");
     if let Ok(owned) = Arc::try_unwrap(live_client) {

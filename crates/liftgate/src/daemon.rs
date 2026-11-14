@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::cli::{
     DoctorArgs, LogsArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs,
+    normalize_optional_api_key,
 };
 use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
 use crate::config_sync::resolve_fast_model;
@@ -59,12 +60,24 @@ pub async fn start_daemon_inner(
             if force_restart {
                 let _ = stop_daemon(state_paths, true).await?;
             } else {
+                let requested_key = normalize_optional_api_key(serve.api_key.as_deref());
+                let config_matches = existing.listen == serve.listen
+                    && existing.ui_listen == serve.ui_listen
+                    && existing.default_model == serve.default_model
+                    && existing.acp_mode == serve.acp_mode
+                    && existing.api_key == requested_key;
                 if !quiet_banner {
                     println!(
                         "[OK] Liftgate gateway is already running (PID {}, API & Web UI: {}/)",
                         existing.pid,
                         existing.dashboard_base_url()
                     );
+                    if !config_matches {
+                        println!(
+                            "  [Note] Active daemon uses listen={} model={}; run `liftgate restart ...` or `liftgate start --force ...` to apply new settings.",
+                            existing.listen, existing.default_model
+                        );
+                    }
                 }
                 return Ok(existing);
             }
@@ -99,12 +112,7 @@ pub async fn start_daemon_inner(
 
     let exe_path = std::env::current_exe().map_err(|source| CliError::DaemonSpawn { source })?;
     let shutdown_token = Uuid::new_v4().to_string();
-    let clean_api_key = serve
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    let clean_api_key = normalize_optional_api_key(serve.api_key.as_deref());
 
     let mut cmd = Command::new(&exe_path);
     cmd.arg("serve")
@@ -268,7 +276,10 @@ pub async fn stop_daemon(state_paths: &StatePaths, quiet: bool) -> Result<bool, 
             if is_pid_alive(pid) {
                 return Err(CliError::DaemonStopFailed {
                     pid,
-                    detail: "process remained alive after termination signal".to_owned(),
+                    source: io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "process remained alive after termination signal",
+                    ),
                 });
             }
         }
@@ -337,19 +348,16 @@ pub fn resolve_client_api_key(
     managed_daemon: Option<&DaemonState>,
     target_listen: SocketAddr,
 ) -> Option<String> {
-    if let Some(explicit) = explicit_cli_key.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(explicit.to_owned());
+    if let Some(explicit) = normalize_optional_api_key(explicit_cli_key) {
+        return Some(explicit);
     }
     if let Some(d) = managed_daemon
         && d.listen == target_listen
         && is_pid_alive(d.pid)
     {
-        return d.api_key.clone();
+        return normalize_optional_api_key(d.api_key.as_deref());
     }
-    std::env::var("AGY_GATEWAY_API_KEY")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
+    normalize_optional_api_key(std::env::var("AGY_GATEWAY_API_KEY").ok().as_deref())
 }
 
 pub async fn ensure_gateway_ready(
@@ -364,14 +372,28 @@ pub async fn ensure_gateway_ready(
         let key = resolve_client_api_key(explicit_api_key.as_deref(), daemon.as_ref(), addr);
         let client = GatewayClient::new(addr, key.clone());
         if client.check_health(Duration::from_millis(800)).await {
+            let matching_daemon = daemon
+                .as_ref()
+                .filter(|d| d.listen == addr && is_pid_alive(d.pid));
+            let dash_url = matching_daemon.map_or_else(
+                || format!("{}/", client.base_url()),
+                |d| format!("{}/", d.dashboard_base_url()),
+            );
+            let model_fallback = matching_daemon
+                .map(|d| d.default_model.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("gemini-4-carbon-high");
             return Ok(ActiveGatewayTarget {
-                dashboard_url: format!("{}/", client.base_url()),
-                default_model: preferred_model.unwrap_or("gemini-4-carbon-high").to_owned(),
+                dashboard_url: dash_url,
+                default_model: preferred_model.unwrap_or(model_fallback).to_owned(),
                 api_key: key,
                 client,
             });
         }
-        if !auto_start {
+        let conflicting_managed_daemon = daemon
+            .as_ref()
+            .is_some_and(|d| d.listen != addr && is_pid_alive(d.pid));
+        if !auto_start || conflicting_managed_daemon {
             return Err(CliError::GatewayUnreachable {
                 url: format!("{}/healthz", client.base_url()),
                 source: io::Error::new(io::ErrorKind::ConnectionRefused, "gateway is not running"),
@@ -417,11 +439,7 @@ pub async fn ensure_gateway_ready(
     }
 
     let default_serve = ServeArgs::default();
-    let fallback_key = explicit_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+    let fallback_key = normalize_optional_api_key(explicit_api_key.as_deref())
         .or_else(|| default_serve.api_key.clone());
     let fallback_client = GatewayClient::new(default_serve.listen, fallback_key.clone());
     if fallback_client
@@ -607,10 +625,13 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
         return Ok(());
     }
 
-    if args.acp
-        && let Ok(Some(daemon)) = state_paths.read_daemon()
-    {
-        let client = GatewayClient::new(daemon.listen, daemon.api_key);
+    if args.acp {
+        let daemon = state_paths.read_daemon().ok().flatten();
+        let listen = daemon
+            .as_ref()
+            .map_or_else(|| ServeArgs::default().listen, |d| d.listen);
+        let api_key = resolve_client_api_key(None, daemon.as_ref(), listen);
+        let client = GatewayClient::new(listen, api_key);
         if let Ok(snap) = client.fetch_telemetry().await
             && !snap.acp_process.recent_stderr.is_empty()
         {
@@ -826,19 +847,27 @@ fn build_authenticated_dashboard_url(
 fn open_browser(url: &str) -> Result<(), CliError> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-        Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| CliError::BrowserOpen {
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        const OPEN_VERB: &[u16] = &[b'o' as u16, b'p' as u16, b'e' as u16, b'n' as u16, 0];
+        let mut wide_url: Vec<u16> = url.encode_utf16().collect();
+        wide_url.push(0);
+        // SAFETY: `OPEN_VERB` and `wide_url` are valid null-terminated UTF-16 buffers outliving the call.
+        let rc = unsafe {
+            ShellExecuteW(
+                core::ptr::null_mut(),
+                OPEN_VERB.as_ptr(),
+                wide_url.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (rc as isize) <= 32 {
+            return Err(CliError::BrowserOpen {
                 url: url.to_owned(),
-                source,
-            })?;
+                source: io::Error::last_os_error(),
+            });
+        }
         Ok(())
     }
 
@@ -1039,17 +1068,14 @@ fn terminate_pid_fallback(pid: u32) -> Result<(), CliError> {
             if handle.is_null() {
                 return Err(CliError::DaemonStopFailed {
                     pid,
-                    detail: io::Error::last_os_error().to_string(),
+                    source: io::Error::last_os_error(),
                 });
             }
             let ok = TerminateProcess(handle, 1);
             let err = io::Error::last_os_error();
             let _ = CloseHandle(handle);
             if ok == 0 && is_pid_alive(pid) {
-                return Err(CliError::DaemonStopFailed {
-                    pid,
-                    detail: err.to_string(),
-                });
+                return Err(CliError::DaemonStopFailed { pid, source: err });
             }
         }
         Ok(())
@@ -1059,17 +1085,14 @@ fn terminate_pid_fallback(pid: u32) -> Result<(), CliError> {
     {
         let raw_pid = i32::try_from(pid).map_err(|_| CliError::DaemonStopFailed {
             pid,
-            detail: "PID exceeds i32".to_owned(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds i32"),
         })?;
         // SAFETY: Sends SIGTERM to verified `liftgate` process.
         let rc = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
         if rc != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(CliError::DaemonStopFailed {
-                    pid,
-                    detail: err.to_string(),
-                });
+                return Err(CliError::DaemonStopFailed { pid, source: err });
             }
         }
         Ok(())
@@ -1138,6 +1161,10 @@ mod tests {
         assert_eq!(
             resolve_client_api_key(Some("cli-override"), Some(&daemon), listen).as_deref(),
             Some("cli-override")
+        );
+        assert_eq!(
+            resolve_client_api_key(Some("local-agy"), None, listen),
+            None
         );
     }
 }

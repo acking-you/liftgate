@@ -6,25 +6,52 @@ export type StreamConnectionState = "connecting" | "live" | "reconnecting" | "er
 const STORAGE_BASE_URL = "agy_gateway_base_url";
 const STORAGE_API_KEY = "agy_gateway_api_key";
 
-function consumeBootstrapHashParams(): { baseUrl?: string; apiKey?: string } {
+interface BootstrapParams {
+  baseUrl?: string;
+  apiKey?: string;
+}
+
+let cachedBootstrapParams: BootstrapParams | null = null;
+
+function safeGetStorage(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetStorage(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage write errors in restricted privacy contexts.
+  }
+}
+
+function getBootstrapHashParams(): BootstrapParams {
+  if (cachedBootstrapParams !== null) {
+    return cachedBootstrapParams;
+  }
   if (typeof window === "undefined" || !window.location.hash.startsWith("#")) {
-    return {};
+    cachedBootstrapParams = {};
+    return cachedBootstrapParams;
   }
   const params = new URLSearchParams(window.location.hash.slice(1));
   const rawKey = params.get("api_key");
   const rawBase = params.get("base_url");
   if (rawKey === null && rawBase === null) {
-    return {};
+    cachedBootstrapParams = {};
+    return cachedBootstrapParams;
   }
-  if (rawKey !== null && rawKey.trim().length > 0) {
-    window.localStorage.setItem(STORAGE_API_KEY, rawKey.trim());
+  const cleanKey = rawKey?.trim() || undefined;
+  const cleanBase = rawBase?.trim().replace(/\/+$/, "") || undefined;
+  if (cleanKey) {
+    safeSetStorage(STORAGE_API_KEY, cleanKey);
     params.delete("api_key");
   }
-  if (rawBase !== null && rawBase.trim().length > 0) {
-    window.localStorage.setItem(
-      STORAGE_BASE_URL,
-      rawBase.trim().replace(/\/+$/, ""),
-    );
+  if (cleanBase) {
+    safeSetStorage(STORAGE_BASE_URL, cleanBase);
     params.delete("base_url");
   }
   const remaining = params.toString();
@@ -33,21 +60,19 @@ function consumeBootstrapHashParams(): { baseUrl?: string; apiKey?: string } {
     window.location.search +
     (remaining.length > 0 ? `#${remaining}` : "");
   window.history.replaceState(null, "", nextUrl);
-  return {
-    baseUrl: rawBase?.trim().replace(/\/+$/, "") || undefined,
-    apiKey: rawKey?.trim() || undefined,
-  };
+  cachedBootstrapParams = { baseUrl: cleanBase, apiKey: cleanKey };
+  return cachedBootstrapParams;
 }
 
 function defaultGatewayBaseUrl(): string {
   if (typeof window === "undefined") {
     return "http://127.0.0.1:8787";
   }
-  const boot = consumeBootstrapHashParams();
+  const boot = getBootstrapHashParams();
   if (boot.baseUrl) {
     return boot.baseUrl;
   }
-  const saved = window.localStorage.getItem(STORAGE_BASE_URL);
+  const saved = safeGetStorage(STORAGE_BASE_URL);
   if (saved !== null && saved.trim().length > 0) {
     return saved.trim().replace(/\/+$/, "");
   }
@@ -74,9 +99,9 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
   const [baseUrl, setBaseUrl] = useState<string>(defaultGatewayBaseUrl);
   const [apiKey, setApiKey] = useState<string>(() => {
     if (typeof window === "undefined") return "";
-    const boot = consumeBootstrapHashParams();
+    const boot = getBootstrapHashParams();
     if (boot.apiKey) return boot.apiKey;
-    return window.localStorage.getItem(STORAGE_API_KEY) ?? "";
+    return safeGetStorage(STORAGE_API_KEY) ?? "";
   });
 
   const [snapshot, setSnapshot] = useState<GatewayTelemetrySnapshot | null>(null);
@@ -149,8 +174,8 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
       setBaseUrl(cleanUrl);
       setApiKey(cleanKey);
       if (typeof window !== "undefined") {
-        window.localStorage.setItem(STORAGE_BASE_URL, cleanUrl);
-        window.localStorage.setItem(STORAGE_API_KEY, cleanKey);
+        safeSetStorage(STORAGE_BASE_URL, cleanUrl);
+        safeSetStorage(STORAGE_API_KEY, cleanKey);
       }
     },
     [],

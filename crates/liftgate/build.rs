@@ -18,14 +18,18 @@ fn main() {
     let has_web_sources = web_dir.join("package.json").is_file();
 
     if has_web_sources {
-        println!(
-            "cargo:rerun-if-changed={}",
-            web_dir.join("package.json").display()
-        );
-        println!(
-            "cargo:rerun-if-changed={}",
-            web_dir.join("index.html").display()
-        );
+        for watched in [
+            "package.json",
+            "bun.lock",
+            "index.html",
+            "vite.config.ts",
+            "tsconfig.json",
+        ] {
+            let p = web_dir.join(watched);
+            if p.is_file() {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
         println!("cargo:rerun-if-changed={}", web_dir.join("src").display());
     }
 
@@ -112,7 +116,10 @@ fn is_dist_missing_or_stale(web_dir: &Path, dist_dir: &Path) -> bool {
     let mut newest_src = None;
     for candidate in [
         web_dir.join("package.json"),
+        web_dir.join("bun.lock"),
         web_dir.join("index.html"),
+        web_dir.join("vite.config.ts"),
+        web_dir.join("tsconfig.json"),
         web_dir.join("src"),
     ] {
         update_latest_mtime(&candidate, &mut newest_src);
@@ -166,30 +173,120 @@ fn run_bun_command(bun: &Path, web_dir: &Path, args: &[&str]) -> bool {
 }
 
 fn resolve_bun_binary() -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["bun.exe", "bun.cmd", "bun"]
-    } else {
-        &["bun"]
-    };
-    if let Some(path_var) = env::var_os("PATH") {
-        for dir in env::split_paths(&path_var) {
-            for name in names {
-                let cand = dir.join(name);
+    if cfg!(windows) {
+        let path_dirs: Vec<PathBuf> = env::var_os("PATH")
+            .map(|v| {
+                env::split_paths(&v)
+                    .map(|d| {
+                        if let Some(raw) = d.to_str()
+                            && raw.contains('%')
+                        {
+                            return PathBuf::from(expand_percent_vars(raw));
+                        }
+                        d
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for dir in &path_dirs {
+            let direct = dir.join("bun.exe");
+            if direct.is_file() {
+                return Some(direct);
+            }
+            let npm_nested = dir
+                .join("node_modules")
+                .join("bun")
+                .join("bin")
+                .join("bun.exe");
+            if npm_nested.is_file() {
+                return Some(npm_nested);
+            }
+        }
+
+        let mut win_candidates = Vec::new();
+        if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+            win_candidates.push(PathBuf::from(home).join(".bun").join("bin").join("bun.exe"));
+        }
+        if let Some(appdata) = env::var_os("APPDATA") {
+            win_candidates.push(
+                PathBuf::from(appdata)
+                    .join("npm")
+                    .join("node_modules")
+                    .join("bun")
+                    .join("bin")
+                    .join("bun.exe"),
+            );
+        }
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            win_candidates.push(
+                PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("bun.exe"),
+            );
+        }
+        win_candidates.push(PathBuf::from(
+            r"C:\nvm4w\nodejs\node_modules\bun\bin\bun.exe",
+        ));
+        for cand in win_candidates {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+
+        for dir in &path_dirs {
+            for shim in ["bun.cmd", "bun.bat"] {
+                let cand = dir.join(shim);
                 if cand.is_file() {
                     return Some(cand);
                 }
             }
         }
+        return None;
     }
-    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"));
-    if let Some(h) = home {
-        let base = PathBuf::from(h).join(".bun").join("bin");
-        for name in names {
-            let cand = base.join(name);
+
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let cand = dir.join("bun");
             if cand.is_file() {
                 return Some(cand);
             }
         }
     }
-    None
+    let mut unix_candidates = Vec::new();
+    if let Some(h) = env::var_os("HOME") {
+        unix_candidates.push(PathBuf::from(h).join(".bun").join("bin").join("bun"));
+    }
+    unix_candidates.push(PathBuf::from("/opt/homebrew/bin/bun"));
+    unix_candidates.push(PathBuf::from("/usr/local/bin/bun"));
+    unix_candidates.into_iter().find(|c| c.is_file())
+}
+
+fn expand_percent_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some((before, after_first)) = rest.split_once('%') {
+        out.push_str(before);
+        if let Some((var_name, after_second)) = after_first.split_once('%') {
+            if !var_name.is_empty()
+                && !var_name.contains([' ', '\t', '/', '\\'])
+                && let Ok(val) = env::var(var_name)
+            {
+                out.push_str(&val);
+                rest = after_second;
+                continue;
+            }
+            out.push('%');
+            rest = after_first;
+        } else {
+            out.push('%');
+            out.push_str(after_first);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
 }

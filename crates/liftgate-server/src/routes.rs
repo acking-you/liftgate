@@ -2895,6 +2895,10 @@ async fn handle_telemetry_events<B: AcpBackend>(
     let cap = state.config.limits.channel_capacity().get();
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Bytes, Infallible>>(cap);
     let mut notify_rx = state.telemetry.subscribe();
+    let mut shutdown_rx = state.telemetry.subscribe_shutdown();
+    if *shutdown_rx.borrow() {
+        return sse_body_response(sse_rx);
+    }
 
     tokio::spawn(async move {
         let initial = build_telemetry_snapshot(&state);
@@ -2910,6 +2914,7 @@ async fn handle_telemetry_events<B: AcpBackend>(
             tokio::select! {
                 biased;
                 () = sse_tx.closed() => return,
+                () = wait_shutdown_signal(&mut shutdown_rx) => return,
                 recv_res = notify_rx.recv() => {
                     if matches!(recv_res, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                         return;
@@ -2930,6 +2935,10 @@ async fn handle_telemetry_events<B: AcpBackend>(
     });
 
     sse_body_response(sse_rx)
+}
+
+async fn wait_shutdown_signal(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|&stop| stop).await;
 }
 
 async fn handle_close_idle_session<B: AcpBackend>(
@@ -2964,6 +2973,7 @@ async fn handle_admin_shutdown<B: AcpBackend>(
     if !handle.verify_and_trigger(provided) {
         return GatewayError::Unauthorized.into_openai_response();
     }
+    state.telemetry.signal_shutdown();
     Json(json!({ "status": "shutting_down" })).into_response()
 }
 

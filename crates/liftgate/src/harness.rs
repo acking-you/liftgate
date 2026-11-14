@@ -7,8 +7,9 @@ use liftgate_server::platform::{
 };
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::task::JoinSet;
 
-use crate::cli::{ClaudeArgs, CodexArgs};
+use crate::cli::{ClaudeArgs, CodexArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes,
     resolve_fast_model,
@@ -41,14 +42,11 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .filter(|s| !s.is_empty())
         .unwrap_or(&target.default_model)
         .to_owned();
-    let auth_token = target
-        .api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .unwrap_or("local-agy")
-        .to_owned();
+    let auth_token = normalize_optional_api_key(target.api_key.as_deref())
+        .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let discovered = target.client.fetch_models().await.unwrap_or_default();
+
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
 
     let sync_params = HarnessSyncParams {
@@ -143,12 +141,9 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .filter(|s| !s.is_empty())
         .unwrap_or(&target.default_model)
         .to_owned();
-    let auth_token = target
-        .api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .unwrap_or("local-agy")
-        .to_owned();
+    let normalized_key = normalize_optional_api_key(target.api_key.as_deref());
+    let require_env_key = normalized_key.is_some();
+    let auth_token = normalized_key.unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let catalog_bytes = match target.client.fetch_codex_catalog_json(&primary_model).await {
         Ok(bytes) => bytes,
@@ -190,29 +185,31 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     if !args.no_bypass && !has_explicit_approval {
         cmd.arg("--dangerously-bypass-approvals-and-sandbox");
     }
-    let toml_primary = toml_basic_string(&primary_model);
-    let toml_catalog = toml_basic_string(&catalog_slash);
-    let toml_base_v1 = toml_basic_string(&format!("{}/v1", target.client.base_url()));
-    cmd.arg("-c").arg("model_provider=\"agy\"");
+    let toml_primary = toml_inline_string(&primary_model);
+    let toml_catalog = toml_inline_string(&catalog_slash);
+    let toml_base_v1 = toml_inline_string(&format!("{}/v1", target.client.base_url()));
+    cmd.arg("-c").arg("model_provider='agy'");
     if !has_explicit_model {
         cmd.arg("-c").arg(format!("model={toml_primary}"));
     }
     cmd.arg("-c")
         .arg(format!("model_catalog_json={toml_catalog}"))
         .arg("-c")
-        .arg("web_search=\"live\"")
+        .arg("web_search='live'")
         .arg("-c")
         .arg("model_context_window=1000000")
         .arg("-c")
         .arg("model_auto_compact_token_limit=850000")
         .arg("-c")
-        .arg("model_providers.agy.name=\"Liftgate\"")
+        .arg("model_providers.agy.name='Liftgate'")
         .arg("-c")
-        .arg(format!("model_providers.agy.base_url={toml_base_v1}"))
-        .arg("-c")
-        .arg("model_providers.agy.env_key=\"AGY_GATEWAY_API_KEY\"")
-        .arg("-c")
-        .arg("model_providers.agy.wire_api=\"responses\"");
+        .arg(format!("model_providers.agy.base_url={toml_base_v1}"));
+    if require_env_key {
+        cmd.arg("-c")
+            .arg("model_providers.agy.env_key='AGY_GATEWAY_API_KEY'");
+    }
+    cmd.arg("-c")
+        .arg("model_providers.agy.wire_api='responses'");
     cmd.args(&args.passthrough_args);
 
     let no_proxy = merge_loopback_no_proxy(
@@ -234,8 +231,12 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     Ok(exit_code)
 }
 
-fn toml_basic_string(val: &str) -> String {
-    serde_json::to_string(val).unwrap_or_else(|_| format!("{val:?}"))
+fn toml_inline_string(val: &str) -> String {
+    if !val.contains('\'') && !val.chars().any(char::is_control) {
+        format!("'{val}'")
+    } else {
+        serde_json::to_string(val).unwrap_or_else(|_| format!("{val:?}"))
+    }
 }
 
 fn build_base_child_command(resolved: &ResolvedCommand) -> Command {
@@ -264,16 +265,19 @@ async fn spawn_and_wait_interactive(
         source,
     })?;
 
-    let ctrl_c_guard = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
+    let mut sig_tasks = JoinSet::new();
+    sig_tasks.spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
 
-    let status = child.wait().await.map_err(|source| CliError::HarnessSpawn {
-        tool,
-        path: program_path.to_path_buf(),
-        source,
-    });
-    ctrl_c_guard.abort();
+    let status = child
+        .wait()
+        .await
+        .map_err(|source| CliError::HarnessSpawn {
+            tool,
+            path: program_path.to_path_buf(),
+            source,
+        })?;
 
-    Ok(status?.code().unwrap_or(1))
+    Ok(status.code().unwrap_or(1))
 }
 
 pub fn resolve_claude_command(explicit: Option<&Path>) -> Result<ResolvedCommand, CliError> {
@@ -544,4 +548,42 @@ fn resolve_windows_node_exe(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_inline_string_uses_single_quotes_for_plain_values() {
+        assert_eq!(
+            toml_inline_string("gemini-4-carbon-high"),
+            "'gemini-4-carbon-high'"
+        );
+        assert_eq!(
+            toml_inline_string("C:/Users/alice/.liftgate/ephemeral/cat.json"),
+            "'C:/Users/alice/.liftgate/ephemeral/cat.json'"
+        );
+    }
+
+    #[test]
+    fn toml_inline_string_escapes_embedded_single_quotes_as_json_basic_string() {
+        assert_eq!(
+            toml_inline_string("C:/Users/O'Connor/cat.json"),
+            "\"C:/Users/O'Connor/cat.json\""
+        );
+    }
+
+    #[test]
+    fn resolve_explicit_nonexistent_binary_returns_not_found() {
+        let missing = PathBuf::from("__nonexistent_liftgate_test_binary__.exe");
+        assert!(matches!(
+            resolve_claude_command(Some(&missing)),
+            Err(CliError::HarnessNotFound { tool: "claude", .. })
+        ));
+        assert!(matches!(
+            resolve_codex_command(Some(&missing)),
+            Err(CliError::HarnessNotFound { tool: "codex", .. })
+        ));
+    }
 }

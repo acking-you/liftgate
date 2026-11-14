@@ -58,7 +58,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ```bash
 agy acp --login                         # 首次使用时登录 Antigravity
-cargo install --path crates/liftgate    # 若本机装有 Bun 会自动编译并内嵌 Web 监控面板
+cargo install --path crates/liftgate --locked  # 若本机装有 Bun 会自动编译并内嵌 Web 监控面板
 
 liftgate start --open                   # 后台启动网关服务并打开监控面板（http://127.0.0.1:8787/）
 liftgate codex                          # 在当前目录直接启动 Codex CLI（退出后 0 副作用）

@@ -8,6 +8,19 @@ use liftgate_types::config::{
     DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS,
 };
 
+/// Sentinel placeholder token injected into client harnesses when the local gateway runs
+/// without API key authentication.
+pub const PLACEHOLDER_API_KEY: &str = "local-agy";
+
+/// Normalizes an optional API key, treating empty strings and [`PLACEHOLDER_API_KEY`] as
+/// unauthenticated (`None`).
+#[must_use]
+pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(PLACEHOLDER_API_KEY))
+        .map(str::to_owned)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "liftgate",
@@ -47,7 +60,7 @@ pub enum Commands {
     Logs(LogsArgs),
 
     /// Open (or print) the live Web observability dashboard URL.
-    #[command(visible_alias = "dashboard")]
+    #[command(visible_aliases = ["web", "dashboard"])]
     Ui(UiArgs),
 
     /// List live models discovered from `agy acp`.
@@ -156,9 +169,8 @@ impl Default for ServeArgs {
         let acp_cwd = std::env::var_os("AGY_ACP_CWD")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        let api_key = std::env::var("AGY_GATEWAY_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        let api_key =
+            normalize_optional_api_key(std::env::var("AGY_GATEWAY_API_KEY").ok().as_deref());
         let ui_dir = std::env::var_os("AGY_UI_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
@@ -329,7 +341,7 @@ pub struct ClaudeArgs {
     pub api_key: Option<String>,
 
     /// Primary model ID override for this session.
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     pub model: Option<String>,
 
     /// Fast/subagent model override (`ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`).
@@ -360,7 +372,7 @@ pub struct CodexArgs {
     pub api_key: Option<String>,
 
     /// Primary model ID override for this session.
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     pub model: Option<String>,
 
     /// Keep Codex CLI's normal approval/sandbox prompts instead of `--dangerously-bypass-approvals-and-sandbox`.
@@ -410,7 +422,7 @@ pub struct ConfigArgs {
     pub api_key: Option<String>,
 
     /// Primary model ID to configure.
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     pub model: Option<String>,
 
     /// Fast/subagent model override for Claude Code.
@@ -464,6 +476,7 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--state-dir",
             "--listen",
             "--api-key",
+            "-m",
             "--model",
             "--fast-model",
             "--claude-bin",
@@ -473,6 +486,7 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--state-dir",
             "--listen",
             "--api-key",
+            "-m",
             "--model",
             "--codex-bin",
         ]
@@ -582,7 +596,7 @@ mod tests {
         let cli = parse_strs(&[
             "liftgate",
             "claude",
-            "--model",
+            "-m",
             "gemini-3.8-pro-high",
             "-p",
             "summarize repo",
