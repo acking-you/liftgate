@@ -509,8 +509,9 @@ pub fn build_session_system_append(
         out.push_str(
             "- Whenever you want to invoke one or more XML-bridged tools below (including parallel calls \
              in a single turn), optionally write a brief one-sentence status note before the first XML \
-             block, then emit one XML block per tool call in this EXACT format (no XML attributes on \
-             the tag), and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
+             block, then emit one XML block per tool call in this EXACT format (no XML attributes, \
+             NEVER wrap the tag in backticks/code fences, and JSON-escape all `\\`, `\"`, and `\\n` inside strings), \
+             and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
              function calls after the final closing tag — NEVER guess, fabricate, or simulate tool \
              outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
         );
@@ -586,19 +587,50 @@ pub fn build_session_system_append(
     out
 }
 
+/// Maximum total UTF-8 text bytes emitted in a single `session/prompt` request.
+///
+/// Upstream `agy acp` truncates oversized prompt payloads from the tail near ~250 KB; bounding
+/// cold-replay and delta prompts to 180 KB guarantees recent user turns and `### Current Caller Input`
+/// remain intact at the end of the prompt.
+pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 180_000;
+
+const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 68_000;
+const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
+
+const ARCHIVE_OPEN_HEADER: &str =
+    "--- Prior Conversation Context (Read-Only Archive; Do NOT echo these headers) ---\n";
+const ARCHIVE_CLOSE_HEADER: &str = "--- End Prior Conversation Context ---\n\n### Current Caller Input (Respond ONLY for the current assistant step)\n";
+
+#[derive(Clone, Copy)]
+struct PartRenderLimits {
+    max_text_bytes: usize,
+    max_tool_call_bytes: usize,
+    max_tool_result_bytes: usize,
+    emit_images: bool,
+}
+
+impl PartRenderLimits {
+    const UNBOUNDED: Self = Self {
+        max_text_bytes: usize::MAX,
+        max_tool_call_bytes: usize::MAX,
+        max_tool_result_bytes: usize::MAX,
+        emit_images: true,
+    };
+}
+
 /// Converts a slice of `CanonicalMessage` turns into ACP `AcpPromptBlock`s.
 ///
 /// When `is_full_history_replay` is true and there are prior turns before the latest turn,
-/// earlier turns are formatted inside `<conversation_history>` so the model has full context.
+/// earlier turns are formatted inside a bounded read-only archive that preserves user instructions
+/// and recent context without exceeding upstream `agy acp`'s per-prompt payload ceiling.
 #[must_use]
 pub fn build_acp_prompt_blocks(
     messages: &[CanonicalMessage],
     tool_nonce: &str,
     is_full_history_replay: bool,
 ) -> Vec<AcpPromptBlock> {
-    let mut blocks = Vec::new();
     if messages.is_empty() {
-        return blocks;
+        return Vec::new();
     }
 
     let split_history_at = if is_full_history_replay && messages.len() > 1 {
@@ -614,11 +646,25 @@ pub fn build_acp_prompt_blocks(
         .split_at_checked(split_history_at)
         .unwrap_or((&[], messages));
 
+    if estimate_raw_prompt_bytes(history_slice, active_slice) <= MAX_ACP_PROMPT_TEXT_BYTES {
+        let uncompacted = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+        if total_text_block_bytes(&uncompacted) <= MAX_ACP_PROMPT_TEXT_BYTES {
+            return uncompacted;
+        }
+    }
+
+    render_bounded_prompt_blocks(history_slice, active_slice, tool_nonce)
+}
+
+fn render_uncompacted_prompt_blocks(
+    history_slice: &[CanonicalMessage],
+    active_slice: &[CanonicalMessage],
+    tool_nonce: &str,
+) -> Vec<AcpPromptBlock> {
+    let mut blocks = Vec::new();
     let mut text_acc = String::new();
     if !history_slice.is_empty() {
-        text_acc.push_str(
-            "--- Prior Conversation Context (Read-Only Archive; Do NOT echo these headers) ---\n",
-        );
+        text_acc.push_str(ARCHIVE_OPEN_HEADER);
         for msg in history_slice {
             let role_header = match msg.role {
                 CanonicalRole::User => "### Prior User Turn\n",
@@ -628,40 +674,510 @@ pub fn build_acp_prompt_blocks(
                 text_acc.push('\n');
             }
             text_acc.push_str(role_header);
-            render_parts_into(msg, tool_nonce, true, &mut text_acc, &mut blocks);
+            render_parts_into(
+                msg,
+                tool_nonce,
+                true,
+                PartRenderLimits::UNBOUNDED,
+                &mut text_acc,
+                &mut blocks,
+            );
             if !text_acc.ends_with('\n') {
                 text_acc.push('\n');
             }
         }
-        text_acc.push_str(
-            "--- End Prior Conversation Context ---\n\n### Current Caller Input (Respond ONLY for the current assistant step)\n",
-        );
+        text_acc.push_str(ARCHIVE_CLOSE_HEADER);
     }
 
     for (idx, msg) in active_slice.iter().enumerate() {
         if idx > 0 && !text_acc.is_empty() && !text_acc.ends_with('\n') {
             text_acc.push('\n');
         }
-        render_parts_into(msg, tool_nonce, false, &mut text_acc, &mut blocks);
+        render_parts_into(
+            msg,
+            tool_nonce,
+            false,
+            PartRenderLimits::UNBOUNDED,
+            &mut text_acc,
+            &mut blocks,
+        );
     }
 
     if !text_acc.is_empty() {
         blocks.push(AcpPromptBlock::Text { text: text_acc });
     }
-
     if blocks.is_empty() {
         blocks.push(AcpPromptBlock::Text {
             text: " ".to_owned(),
         });
     }
-
     blocks
+}
+
+fn render_bounded_prompt_blocks(
+    history_slice: &[CanonicalMessage],
+    active_slice: &[CanonicalMessage],
+    tool_nonce: &str,
+) -> Vec<AcpPromptBlock> {
+    let active_budget = if history_slice.is_empty() {
+        MAX_ACP_PROMPT_TEXT_BYTES
+    } else {
+        MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES
+    };
+    let active_blocks = render_bounded_active_slice(active_slice, tool_nonce, active_budget);
+    let active_bytes = total_text_block_bytes(&active_blocks);
+
+    if history_slice.is_empty() {
+        if active_blocks.is_empty() {
+            return vec![AcpPromptBlock::Text {
+                text: " ".to_owned(),
+            }];
+        }
+        return active_blocks;
+    }
+
+    let framing_bytes = ARCHIVE_OPEN_HEADER.len() + ARCHIVE_CLOSE_HEADER.len() + 64;
+    let history_budget = MAX_ACP_PROMPT_TEXT_BYTES
+        .saturating_sub(active_bytes)
+        .saturating_sub(framing_bytes);
+
+    let history_body = build_compacted_history_body(history_slice, tool_nonce, history_budget);
+
+    let mut archive_prefix = String::with_capacity(
+        ARCHIVE_OPEN_HEADER.len() + history_body.len() + ARCHIVE_CLOSE_HEADER.len(),
+    );
+    archive_prefix.push_str(ARCHIVE_OPEN_HEADER);
+    archive_prefix.push_str(&history_body);
+    if !archive_prefix.ends_with('\n') {
+        archive_prefix.push('\n');
+    }
+    archive_prefix.push_str(ARCHIVE_CLOSE_HEADER);
+
+    let mut combined = Vec::with_capacity(active_blocks.len() + 1);
+    let mut active_iter = active_blocks.into_iter();
+    match active_iter.next() {
+        Some(AcpPromptBlock::Text { text }) => {
+            archive_prefix.push_str(&text);
+            combined.push(AcpPromptBlock::Text {
+                text: archive_prefix,
+            });
+        }
+        Some(other) => {
+            combined.push(AcpPromptBlock::Text {
+                text: archive_prefix,
+            });
+            combined.push(other);
+        }
+        None => {
+            combined.push(AcpPromptBlock::Text {
+                text: archive_prefix,
+            });
+        }
+    }
+    combined.extend(active_iter);
+    combined
+}
+
+fn render_bounded_active_slice(
+    active_slice: &[CanonicalMessage],
+    tool_nonce: &str,
+    budget: usize,
+) -> Vec<AcpPromptBlock> {
+    let mut result_count = 0usize;
+    let mut text_count = 0usize;
+    let mut fixed_overhead = 0usize;
+
+    for msg in active_slice {
+        for part in &msg.parts {
+            match part {
+                CanonicalPart::ToolResult { call_id, .. } => {
+                    result_count += 1;
+                    fixed_overhead += call_id.len() + 80;
+                }
+                CanonicalPart::Text(_) => {
+                    text_count += 1;
+                    fixed_overhead += 16;
+                }
+                CanonicalPart::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    fixed_overhead += call_id.len() + name.len() + arguments.len() + 96;
+                }
+                CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
+            }
+        }
+    }
+
+    let variable_slots = (result_count + text_count).max(1);
+    let per_slot_budget = budget.saturating_sub(fixed_overhead) / variable_slots;
+    let limits = PartRenderLimits {
+        max_text_bytes: per_slot_budget.max(4_096),
+        max_tool_call_bytes: usize::MAX,
+        max_tool_result_bytes: per_slot_budget.max(2_048),
+        emit_images: true,
+    };
+
+    let mut blocks = Vec::new();
+    let mut text_acc = String::new();
+    for (idx, msg) in active_slice.iter().enumerate() {
+        if idx > 0 && !text_acc.is_empty() && !text_acc.ends_with('\n') {
+            text_acc.push('\n');
+        }
+        render_parts_into(msg, tool_nonce, false, limits, &mut text_acc, &mut blocks);
+    }
+    if !text_acc.is_empty() {
+        if text_acc.len() > budget {
+            text_acc = truncate_middle_utf8_bytes(&text_acc, budget, 13, 20);
+        }
+        blocks.push(AcpPromptBlock::Text { text: text_acc });
+    }
+    blocks
+}
+
+struct CompactedHistoryEntry {
+    priority: u8,
+    keep: bool,
+    text: String,
+}
+
+fn build_compacted_history_body(
+    history_slice: &[CanonicalMessage],
+    tool_nonce: &str,
+    budget: usize,
+) -> String {
+    if history_slice.is_empty() || budget == 0 {
+        return String::new();
+    }
+
+    let conversational_user_flags: Vec<bool> = history_slice
+        .iter()
+        .map(is_conversational_user_message)
+        .collect();
+    let last_user_idx = conversational_user_flags
+        .iter()
+        .rposition(|&flag| flag)
+        .unwrap_or(0);
+    let recent_tail_start = history_slice
+        .len()
+        .saturating_sub(RECENT_TAIL_HISTORY_MESSAGES);
+
+    let mut entries = Vec::with_capacity(history_slice.len());
+    for (idx, msg) in history_slice.iter().enumerate() {
+        let is_conv_user = conversational_user_flags.get(idx).copied().unwrap_or(false);
+        let next_is_conv_user = conversational_user_flags
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(false);
+        let is_assistant_summary = msg.role == CanonicalRole::Assistant
+            && msg
+                .parts
+                .iter()
+                .any(|p| matches!(p, CanonicalPart::Text(t) if !t.trim().is_empty()))
+            && (!msg
+                .parts
+                .iter()
+                .any(|p| matches!(p, CanonicalPart::ToolCall { .. }))
+                || next_is_conv_user);
+
+        let (priority, limits) = if idx == 0 {
+            (
+                3,
+                PartRenderLimits {
+                    max_text_bytes: 26_000,
+                    max_tool_call_bytes: 600,
+                    max_tool_result_bytes: 1_200,
+                    emit_images: false,
+                },
+            )
+        } else if is_conv_user {
+            let max_user_txt = if idx == last_user_idx { 24_000 } else { 14_000 };
+            (
+                3,
+                PartRenderLimits {
+                    max_text_bytes: max_user_txt,
+                    max_tool_call_bytes: 600,
+                    max_tool_result_bytes: 1_200,
+                    emit_images: false,
+                },
+            )
+        } else if idx >= recent_tail_start {
+            (
+                2,
+                PartRenderLimits {
+                    max_text_bytes: 4_000,
+                    max_tool_call_bytes: 2_000,
+                    max_tool_result_bytes: 3_200,
+                    emit_images: false,
+                },
+            )
+        } else if is_assistant_summary {
+            (
+                2,
+                PartRenderLimits {
+                    max_text_bytes: 3_200,
+                    max_tool_call_bytes: 400,
+                    max_tool_result_bytes: 400,
+                    emit_images: false,
+                },
+            )
+        } else if idx > last_user_idx {
+            (
+                1,
+                PartRenderLimits {
+                    max_text_bytes: 900,
+                    max_tool_call_bytes: 320,
+                    max_tool_result_bytes: 400,
+                    emit_images: false,
+                },
+            )
+        } else {
+            (
+                0,
+                PartRenderLimits {
+                    max_text_bytes: 600,
+                    max_tool_call_bytes: 220,
+                    max_tool_result_bytes: 280,
+                    emit_images: false,
+                },
+            )
+        };
+
+        let mut entry_text = String::new();
+        let role_header = match msg.role {
+            CanonicalRole::User => "### Prior User Turn\n",
+            CanonicalRole::Assistant => "### Prior Assistant Turn\n",
+        };
+        entry_text.push_str(role_header);
+        let mut ignored_blocks = Vec::new();
+        render_parts_into(
+            msg,
+            tool_nonce,
+            true,
+            limits,
+            &mut entry_text,
+            &mut ignored_blocks,
+        );
+        if !entry_text.ends_with('\n') {
+            entry_text.push('\n');
+        }
+
+        entries.push(CompactedHistoryEntry {
+            priority,
+            keep: true,
+            text: entry_text,
+        });
+    }
+
+    let mut current_bytes: usize = entries.iter().map(|e| e.text.len()).sum();
+    let omission_marker_reserve = 256usize;
+    let target_bytes = budget.saturating_sub(omission_marker_reserve);
+
+    // Drop lowest-priority older entries first (`0` -> `1` -> `2` outside immediate tail -> middle `3`)
+    for drop_prio in 0..=2u8 {
+        if current_bytes <= target_bytes {
+            break;
+        }
+        let protect_tail_from = history_slice.len().saturating_sub(6);
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            if current_bytes <= target_bytes {
+                break;
+            }
+            if !entry.keep || entry.priority != drop_prio {
+                continue;
+            }
+            if drop_prio == 2 && idx >= protect_tail_from {
+                continue;
+            }
+            entry.keep = false;
+            current_bytes = current_bytes.saturating_sub(entry.text.len());
+        }
+    }
+
+    // Extreme fallback: if dozens of large user pastes still exceed `target_bytes`, shrink older
+    // `priority == 3` entries between `0` and `last_user_idx` before ever dropping any.
+    if current_bytes > target_bytes {
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            if current_bytes <= target_bytes {
+                break;
+            }
+            if !entry.keep || idx == 0 || idx == last_user_idx {
+                continue;
+            }
+            if entry.text.len() > 2_400 {
+                let old_len = entry.text.len();
+                entry.text = truncate_middle_utf8_bytes(&entry.text, 2_400, 13, 20);
+                if !entry.text.ends_with('\n') {
+                    entry.text.push('\n');
+                }
+                current_bytes = current_bytes
+                    .saturating_sub(old_len)
+                    .saturating_add(entry.text.len());
+            }
+        }
+    }
+
+    let mut assembled = String::with_capacity(current_bytes.min(budget) + 128);
+    let mut omitted_run = 0usize;
+    for entry in &entries {
+        if !entry.keep {
+            omitted_run += 1;
+            continue;
+        }
+        if omitted_run > 0 {
+            if !assembled.is_empty() && !assembled.ends_with('\n') {
+                assembled.push('\n');
+            }
+            assembled.push_str(&format!(
+                "[... omitted {omitted_run} earlier archival turns to fit context window ...]\n"
+            ));
+            omitted_run = 0;
+        }
+        assembled.push_str(&entry.text);
+    }
+    if omitted_run > 0 {
+        assembled.push_str(&format!(
+            "[... omitted {omitted_run} earlier archival turns to fit context window ...]\n"
+        ));
+    }
+
+    if assembled.len() > budget {
+        // Favor the tail (70%) so `last_user_idx` and the newest turns stay completely intact.
+        truncate_middle_utf8_bytes(&assembled, budget, 3, 10)
+    } else {
+        assembled
+    }
+}
+
+fn is_conversational_user_message(msg: &CanonicalMessage) -> bool {
+    if msg.role != CanonicalRole::User {
+        return false;
+    }
+    for part in &msg.parts {
+        match part {
+            CanonicalPart::ImageBase64 { .. } => return true,
+            CanonicalPart::Text(txt) => {
+                let cleaned = strip_unstable_harness_noise(txt);
+                let trimmed = cleaned.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if (trimmed.starts_with("<developer_instructions>")
+                    && trimmed.ends_with("</developer_instructions>"))
+                    || (trimmed.starts_with("<environment_context>")
+                        && trimmed.ends_with("</environment_context>"))
+                    || (trimmed.starts_with("<system-reminder>")
+                        && trimmed.ends_with("</system-reminder>"))
+                {
+                    continue;
+                }
+                return true;
+            }
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::ToolCall { .. }
+            | CanonicalPart::ToolResult { .. } => {}
+        }
+    }
+    false
+}
+
+fn estimate_raw_prompt_bytes(
+    history_slice: &[CanonicalMessage],
+    active_slice: &[CanonicalMessage],
+) -> usize {
+    let mut total: usize = if history_slice.is_empty() { 0 } else { 256 };
+    for msg in history_slice.iter().chain(active_slice.iter()) {
+        total = total.saturating_add(32);
+        for part in &msg.parts {
+            let part_len = match part {
+                CanonicalPart::Text(t) => t.len(),
+                CanonicalPart::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => call_id.len() + name.len() + arguments.len() + 96,
+                CanonicalPart::ToolResult {
+                    call_id, output, ..
+                } => call_id.len() + output.len() + 80,
+                CanonicalPart::ImageBase64 { media_type, .. } => media_type.len() + 48,
+                CanonicalPart::Reasoning(_) => 0,
+            };
+            total = total.saturating_add(part_len);
+        }
+    }
+    total
+}
+
+fn total_text_block_bytes(blocks: &[AcpPromptBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|b| match b {
+            AcpPromptBlock::Text { text } => text.len(),
+            AcpPromptBlock::Image { .. } => 0,
+        })
+        .sum()
+}
+
+fn floor_utf8_boundary(s: &str, max_byte: usize) -> usize {
+    let mut idx = max_byte.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_utf8_boundary(s: &str, min_byte: usize) -> usize {
+    let mut idx = min_byte.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn truncate_middle_utf8_bytes(
+    input: &str,
+    max_bytes: usize,
+    head_num: usize,
+    denom: usize,
+) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    if max_bytes <= 80 {
+        let head_end = floor_utf8_boundary(input, max_bytes.saturating_sub(3));
+        let head = input.get(..head_end).unwrap_or("");
+        return format!("{head}...");
+    }
+
+    let marker_overhead = 56usize;
+    let usable = max_bytes.saturating_sub(marker_overhead);
+    let safe_denom = denom.max(1);
+    let head_budget = usable.saturating_mul(head_num.min(safe_denom)) / safe_denom;
+    let tail_budget = usable.saturating_sub(head_budget);
+
+    let head_end = floor_utf8_boundary(input, head_budget);
+    let tail_start =
+        ceil_utf8_boundary(input, input.len().saturating_sub(tail_budget)).max(head_end);
+
+    let head = input.get(..head_end).unwrap_or("").trim_end();
+    let tail = input.get(tail_start..).unwrap_or("").trim_start();
+    let omitted_bytes = tail_start.saturating_sub(head_end);
+
+    let mut out = String::with_capacity(head.len() + tail.len() + marker_overhead);
+    out.push_str(head);
+    out.push_str(&format!("\n...[omitted {omitted_bytes} bytes]...\n"));
+    out.push_str(tail);
+    out
 }
 
 fn render_parts_into(
     msg: &CanonicalMessage,
     tool_nonce: &str,
     is_archival: bool,
+    limits: PartRenderLimits,
     text_acc: &mut String,
     blocks: &mut Vec<AcpPromptBlock>,
 ) {
@@ -673,19 +1189,32 @@ fn render_parts_into(
                     if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                         text_acc.push('\n');
                     }
-                    text_acc.push_str(&cleaned);
+                    if cleaned.len() > limits.max_text_bytes {
+                        let compacted =
+                            truncate_middle_utf8_bytes(&cleaned, limits.max_text_bytes, 13, 20);
+                        text_acc.push_str(&compacted);
+                    } else {
+                        text_acc.push_str(&cleaned);
+                    }
                 }
             }
             CanonicalPart::ImageBase64 { media_type, data } => {
-                if !text_acc.is_empty() {
-                    blocks.push(AcpPromptBlock::Text {
-                        text: std::mem::take(text_acc),
+                if limits.emit_images {
+                    if !text_acc.is_empty() {
+                        blocks.push(AcpPromptBlock::Text {
+                            text: std::mem::take(text_acc),
+                        });
+                    }
+                    blocks.push(AcpPromptBlock::Image {
+                        data: data.clone(),
+                        mime_type: media_type.clone(),
                     });
+                } else {
+                    if !text_acc.is_empty() && !text_acc.ends_with('\n') {
+                        text_acc.push('\n');
+                    }
+                    text_acc.push_str(&format!("[Prior Image media_type={media_type}]\n"));
                 }
-                blocks.push(AcpPromptBlock::Image {
-                    data: data.clone(),
-                    mime_type: media_type.clone(),
-                });
             }
             CanonicalPart::Reasoning(_) => {}
             CanonicalPart::ToolCall {
@@ -701,9 +1230,14 @@ fn render_parts_into(
                     // Render historical tool invocations without live `<agy_tool_call_...>` XML tags
                     // so multi-turn cold replays never prime the model to continue generating fake
                     // tool results after its own closing `</agy_tool_call_...>` tag.
+                    let trimmed_args = arguments.trim();
+                    let arg_summary = if trimmed_args.len() > limits.max_tool_call_bytes {
+                        truncate_middle_utf8_bytes(trimmed_args, limits.max_tool_call_bytes, 13, 20)
+                    } else {
+                        trimmed_args.to_owned()
+                    };
                     text_acc.push_str(&format!(
-                        "[Completed Tool Invocation id={call_id} name={name}]: {}\n",
-                        arguments.trim()
+                        "[Completed Tool Invocation id={call_id} name={name}]: {arg_summary}\n"
                     ));
                 } else {
                     let field_key = if *is_custom { "input" } else { "arguments" };
@@ -729,10 +1263,15 @@ fn render_parts_into(
                     text_acc.push('\n');
                 }
                 let cleaned_output = strip_unstable_harness_noise(output);
+                let trimmed_output = cleaned_output.trim();
+                let rendered_output = if trimmed_output.len() > limits.max_tool_result_bytes {
+                    truncate_middle_utf8_bytes(trimmed_output, limits.max_tool_result_bytes, 13, 20)
+                } else {
+                    trimmed_output.to_owned()
+                };
                 text_acc.push_str(&format!(
-                    "[Client Tool Result id={call_id} status={}]:\n{}\n[End Client Tool Result]\n",
+                    "[Client Tool Result id={call_id} status={}]:\n{rendered_output}\n[End Client Tool Result]\n",
                     if *is_error { "error" } else { "ok" },
-                    cleaned_output.trim()
                 ));
             }
         }
@@ -852,5 +1391,109 @@ mod tests {
         assert!(!out.contains("additionalProperties"));
         assert!(out.contains("\"required\":[\"command\"]"));
         assert!(out.contains("\"command\""));
+    }
+
+    #[test]
+    fn cold_history_replay_bounds_megabyte_transcript_and_preserves_late_user_instructions() {
+        let mut messages = Vec::new();
+
+        // 1. Initial developer + AGENTS.md + Task 1 user prompt
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![
+                CanonicalPart::Text(
+                    "<developer_instructions>\nFollow workspace Rust rules.\n</developer_instructions>"
+                        .to_owned(),
+                ),
+                CanonicalPart::Text("Task 1: build the `liftgate` management CLI.".to_owned()),
+            ],
+        });
+
+        // 2. 120 bulky tool round-trips (~1.8 MB total) from Task 1
+        for step in 0..120 {
+            messages.push(CanonicalMessage {
+                role: CanonicalRole::Assistant,
+                parts: vec![CanonicalPart::ToolCall {
+                    call_id: format!("call_old_{step}"),
+                    name: "exec_command".to_owned(),
+                    arguments: format!("{{\"cmd\":\"Get-Content file_{step}.rs\"}}"),
+                    is_custom: false,
+                }],
+            });
+            messages.push(CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::ToolResult {
+                    call_id: format!("call_old_{step}"),
+                    output: format!(
+                        "// file_{step}.rs header\n{}\n// file_{step}.rs EOF",
+                        "x".repeat(15_000)
+                    ),
+                    is_error: false,
+                }],
+            });
+        }
+
+        // 3. Assistant completion summary for Task 1
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(
+                "Task 1 is complete: `liftgate` CLI built and all tests passed.".to_owned(),
+            )],
+        });
+
+        // 4. Late user message (reproducing L1170 "突然失忆" scenario after 1.8 MB of history)
+        let critical_user_msg =
+            "目前我在使用codex的过程中遇到了两个bad case：请重点修复工具调用解析与会话失忆问题！";
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(critical_user_msg.to_owned())],
+        });
+
+        // 5. 20 tool steps already executed under Task 2
+        for step in 0..20 {
+            messages.push(CanonicalMessage {
+                role: CanonicalRole::Assistant,
+                parts: vec![CanonicalPart::ToolCall {
+                    call_id: format!("call_new_{step}"),
+                    name: "exec_command".to_owned(),
+                    arguments: format!("{{\"cmd\":\"cargo test step_{step}\"}}"),
+                    is_custom: false,
+                }],
+            });
+            messages.push(CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::ToolResult {
+                    call_id: format!("call_new_{step}"),
+                    output: format!(
+                        "running 12 tests for step_{step} ... ok\n{}",
+                        "y".repeat(6_000)
+                    ),
+                    is_error: false,
+                }],
+            });
+        }
+
+        let blocks = build_acp_prompt_blocks(&messages, "f032d02ecd5b", true);
+        let joined: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                AcpPromptBlock::Text { text } => Some(text.as_str()),
+                AcpPromptBlock::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            joined.len() <= MAX_ACP_PROMPT_TEXT_BYTES,
+            "cold replay prompt len {} exceeded safe ceiling {}",
+            joined.len(),
+            MAX_ACP_PROMPT_TEXT_BYTES
+        );
+        assert!(joined.contains("<developer_instructions>\nFollow workspace Rust rules."));
+        assert!(joined.contains("Task 1: build the `liftgate` management CLI."));
+        assert!(joined.contains("Task 1 is complete: `liftgate` CLI built and all tests passed."));
+        assert!(joined.contains(critical_user_msg));
+        assert!(joined.contains("### Current Caller Input"));
+        assert!(joined.contains("[Client Tool Result id=call_new_19 status=ok]:"));
     }
 }

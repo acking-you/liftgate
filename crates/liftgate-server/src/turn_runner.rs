@@ -1322,11 +1322,17 @@ async fn emit_parsed_items_inner(
                 state.emitted_client_tool = true;
 
                 task_guard.record_client_tool(&name);
-                let is_declared_custom = req
-                    .client_tools
-                    .iter()
-                    .any(|t| t.name == name && matches!(t.kind, CanonicalToolKind::Custom { .. }));
-                let is_custom = is_declared_custom || is_raw_input;
+                let matched_spec = req.client_tools.iter().find(|t| t.name == name);
+                let is_custom = match matched_spec {
+                    Some(spec) => matches!(spec.kind, CanonicalToolKind::Custom { .. }),
+                    None => is_raw_input,
+                };
+                let arguments = normalize_emitted_tool_arguments(
+                    arguments,
+                    is_custom,
+                    is_raw_input,
+                    matched_spec,
+                );
                 let call_id = format!("call_{}", generate_short_nonce());
                 state.assistant_parts.push(CanonicalPart::ToolCall {
                     call_id: call_id.clone(),
@@ -1352,6 +1358,67 @@ async fn emit_parsed_items_inner(
         }
     }
     true
+}
+
+fn normalize_emitted_tool_arguments(
+    arguments: String,
+    is_custom: bool,
+    is_raw_input: bool,
+    matched_spec: Option<&liftgate_types::canonical::CanonicalToolSpec>,
+) -> String {
+    if is_custom {
+        if !is_raw_input
+            && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments)
+        {
+            for key in ["input", "patch", "diff"] {
+                if let Some(serde_json::Value::String(inner)) = map.get(key) {
+                    return inner.clone();
+                }
+            }
+        }
+        return arguments;
+    }
+
+    if !is_raw_input
+        && matches!(
+            serde_json::from_str::<serde_json::Value>(&arguments),
+            Ok(serde_json::Value::Object(_))
+        )
+    {
+        return arguments;
+    }
+
+    let fallback_key = matched_spec
+        .and_then(|spec| match &spec.kind {
+            CanonicalToolKind::Function { parameters_json } => {
+                single_required_string_param(parameters_json)
+            }
+            CanonicalToolKind::Custom { .. } => None,
+        })
+        .unwrap_or_else(|| "input".to_owned());
+
+    let mut map = serde_json::Map::with_capacity(1);
+    map.insert(fallback_key, serde_json::Value::String(arguments));
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn single_required_string_param(parameters_json: &str) -> Option<String> {
+    let schema: serde_json::Value = serde_json::from_str(parameters_json).ok()?;
+    let req_arr = schema.get("required")?.as_array()?;
+    if req_arr.len() != 1 {
+        return None;
+    }
+    let key = req_arr.first()?.as_str()?;
+    let prop_type = schema
+        .get("properties")
+        .and_then(|p| p.get(key))
+        .and_then(|prop| prop.get("type"))
+        .and_then(serde_json::Value::as_str);
+    if matches!(prop_type, Some("string") | None) {
+        Some(key.to_owned())
+    } else {
+        None
+    }
 }
 
 fn contains_runaway_marker(buf: &str) -> bool {

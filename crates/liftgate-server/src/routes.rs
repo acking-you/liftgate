@@ -2331,6 +2331,10 @@ fn stream_anthropic_messages(
                         }),
                     )
                     .await;
+                    let partial_json = match serde_json::from_str::<Value>(&arguments) {
+                        Ok(Value::Object(_)) => arguments,
+                        _ => json!({ "raw": arguments }).to_string(),
+                    };
                     let _ = send_sse_frame(
                         &sse_tx,
                         "content_block_delta",
@@ -2339,7 +2343,7 @@ fn stream_anthropic_messages(
                             "index": idx,
                             "delta": {
                                 "type": "input_json_delta",
-                                "partial_json": arguments
+                                "partial_json": partial_json
                             }
                         }),
                     )

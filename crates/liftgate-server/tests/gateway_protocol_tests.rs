@@ -2295,3 +2295,352 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
     let sse_bytes = sse_resp.into_body().collect().await.unwrap().to_bytes();
     assert!(sse_bytes.is_empty());
 }
+
+#[tokio::test]
+async fn codex_responses_repairs_malformed_tool_escapes_raw_newlines_and_backtick_wrappers() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
+        thoughts: Vec::new(),
+        chunks_template: vec![
+            "我现在更新 `routes.rs` 并检索会话记录。`<agy_tool_call_{NONCE}>\n\
+             {\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n*** Update File: src/routes.rs\\n@@\\n+#[derive(Clone, Debug)]\n+pub struct Guard {}\\n*** End Patch\"}\n\
+             </agy_tool_call_{NONCE}>`\n\
+             <agy_tool_call_{NONCE}>\n\
+             {\"name\": \"exec_command\", \"arguments\": {\"cmd\": \"if ($t -notmatch '^# AGENTS\\.md') { Write-Output \\\"ok\\\" }\", \"workdir\": \"D:\\\\rust_pro\\\\agy\"}}\n\
+             </agy_tool_call_{NONCE}>"
+                .to_owned(),
+        ],
+    }]));
+
+    let app = test_app(Arc::clone(&backend), 30);
+    let req = json!({
+        "model": "gpt-5.4",
+        "stream": false,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply patch"
+            },
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" },
+                        "workdir": { "type": "string" }
+                    },
+                    "required": ["cmd"]
+                }
+            }
+        ],
+        "input": [
+            { "type": "message", "role": "user", "content": "Update routes.rs and verify." }
+        ]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let output = body["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+
+    assert_eq!(output[0]["type"], "message");
+    let visible_text = output[0]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(visible_text, "我现在更新 `routes.rs` 并检索会话记录。");
+    assert!(!visible_text.contains("agy_tool_call_"));
+
+    assert_eq!(output[1]["type"], "custom_tool_call");
+    assert_eq!(output[1]["name"], "apply_patch");
+    assert!(
+        output[1]["input"]
+            .as_str()
+            .unwrap()
+            .contains("+#[derive(Clone, Debug)]\n+pub struct Guard {}")
+    );
+
+    assert_eq!(output[2]["type"], "function_call");
+    assert_eq!(output[2]["name"], "exec_command");
+    let parsed_args: Value = serde_json::from_str(output[2]["arguments"].as_str().unwrap())
+        .expect("function_call arguments must be valid RFC-8259 JSON");
+    assert!(
+        parsed_args["cmd"]
+            .as_str()
+            .unwrap()
+            .contains(r"'^# AGENTS\.md'")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_cold_replay_after_tainted_session_preserves_late_user_task_and_resumes_pool() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1: Tainted by internal ACP malformed-call retry after emitting `exec_command`
+        MockScript::ChunksThenHang {
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"Get-Content src/parser.rs\"}}</agy_tool_call_{NONCE}>\n".to_owned(),
+                "⚠ Your previous response contained an improperly formatted function call: Malformed function call: Function call is empty.\nRetries remaining: 3\n".to_owned(),
+            ],
+        },
+        // Turn 2: Cold replay on `sess_2` (with >1.6 MB history!) -> emits another `exec_command` cleanly
+        MockScript::Immediate {
+            thoughts: Vec::new(),
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"cargo test -p liftgate-types\"}}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        // Turn 3: Must reuse warm `sess_2` via prefix-hash match (delta only!)
+        MockScript::Immediate {
+            thoughts: Vec::new(),
+            chunks_template: vec!["两个 bad case 已全部修复并通过测试。".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+    let tools = json!([
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Execute shell command",
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        }
+    ]);
+
+    // Build a realistic >1.6 MB multi-task Codex `input` history
+    let mut input_items = vec![
+        json!({
+            "type": "message",
+            "role": "developer",
+            "content": "Follow repository Rust engineering rules strictly."
+        }),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": "Task 1: build the `liftgate` CLI binary."
+        }),
+    ];
+    for i in 0..100 {
+        input_items.push(json!({
+            "type": "function_call",
+            "call_id": format!("call_arch_{i}"),
+            "name": "exec_command",
+            "arguments": format!("{{\"cmd\":\"Get-Content mod_{i}.rs\"}}")
+        }));
+        input_items.push(json!({
+            "type": "function_call_output",
+            "call_id": format!("call_arch_{i}"),
+            "output": format!("// mod_{i}.rs\n{}", "a".repeat(16_500))
+        }));
+    }
+    input_items.push(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "Task 1 (`liftgate` CLI) is finished." }]
+    }));
+    let late_user_prompt =
+        "Task 2: 目前使用 codex 遇到了两个 bad case（工具调用未解析 + 突然失忆），请一并修复！";
+    input_items.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": late_user_prompt
+    }));
+
+    // Turn 1 (`sess_1`, tainted by malformed retry banner)
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "tools": tools,
+                        "input": input_items,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let body1: Value =
+        serde_json::from_slice(&resp1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let call1 = &body1["output"][0];
+    assert_eq!(call1["type"], "function_call");
+    let call1_id = call1["call_id"].as_str().unwrap().to_owned();
+
+    // Append Turn 1 tool call + output -> Turn 2 triggers cold replay on `sess_2`
+    input_items.push(json!({
+        "type": "function_call",
+        "call_id": call1_id,
+        "name": "exec_command",
+        "arguments": call1["arguments"]
+    }));
+    input_items.push(json!({
+        "type": "function_call_output",
+        "call_id": call1["call_id"],
+        "output": "fn parse_tool_call_body(raw_body: &str) -> Option<ParsedToolCall> { ... }"
+    }));
+
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "tools": tools,
+                        "input": input_items,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2: Value =
+        serde_json::from_slice(&resp2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let call2 = &body2["output"][0];
+    assert_eq!(call2["type"], "function_call");
+
+    // Append Turn 2 tool call + output -> Turn 3 must reuse warm `sess_2`!
+    input_items.push(json!({
+        "type": "function_call",
+        "call_id": call2["call_id"],
+        "name": "exec_command",
+        "arguments": call2["arguments"]
+    }));
+    input_items.push(json!({
+        "type": "function_call_output",
+        "call_id": call2["call_id"],
+        "output": "test result: ok. 42 passed; 0 failed"
+    }));
+
+    let resp3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "tools": tools,
+                        "input": input_items,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[0].session_id, "sess_1");
+    assert_eq!(prompts[1].session_id, "sess_2");
+    // Turn 3 reused `sess_2` seamlessly!
+    assert_eq!(prompts[2].session_id, "sess_2");
+
+    // Verify Turn 2's cold replay stayed strictly below the upstream tail-truncation limit AND
+    // preserved both the late user task and current caller input at the tail!
+    assert!(
+        prompts[1].text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES,
+        "cold replay len={} exceeded limit",
+        prompts[1].text_joined.len()
+    );
+    assert!(
+        prompts[1]
+            .text_joined
+            .contains("Task 1 (`liftgate` CLI) is finished.")
+    );
+    assert!(prompts[1].text_joined.contains(late_user_prompt));
+    assert!(prompts[1].text_joined.contains("### Current Caller Input"));
+    assert!(prompts[1].text_joined.contains("fn parse_tool_call_body"));
+    // And Turn 3 sent only the compact delta on warm `sess_2`!
+    assert!(prompts[2].text_joined.len() < 512);
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("test result: ok. 42 passed")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_streaming_coerces_raw_string_input_for_function_tool_to_valid_json_object() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
+        thoughts: Vec::new(),
+        chunks_template: vec![
+            "<agy_tool_call_{NONCE}>{\"name\":\"Bash\",\"input\":\"cargo test --workspace\"}</agy_tool_call_{NONCE}>"
+                .to_owned(),
+        ],
+    }]));
+
+    let app = test_app(Arc::clone(&backend), 30);
+    let req = json!({
+        "model": "claude-opus-4-6",
+        "stream": true,
+        "tools": [
+            {
+                "name": "Bash",
+                "description": "Run shell command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }
+            }
+        ],
+        "messages": [{ "role": "user", "content": "Run workspace tests" }]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw_sse = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(raw_sse.contains("\"type\":\"input_json_delta\""));
+    assert!(raw_sse.contains("{\\\"command\\\":\\\"cargo test --workspace\\\"}"));
+}
