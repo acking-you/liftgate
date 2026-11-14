@@ -697,7 +697,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
 
                 if !state.pending_web_fetches.is_empty() && !state.emitted_client_tool {
                     let queued_fetches: Vec<(String, String)> =
-                        state.pending_web_fetches.drain(..).collect();
+                        std::mem::take(&mut state.pending_web_fetches);
                     let mut continuation_xml = String::new();
 
                     for (fetch_call_id, raw_url) in queued_fetches {
