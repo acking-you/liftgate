@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  一键启动 Antigravity ACP Gateway + 实时监控前端 + 动态模型发现 + 本地环境变量注入 + Claude CLI (Gemini Carbon)
+  一键启动 Liftgate + 实时监控前端 + 动态模型发现 + 本地环境变量注入 + Claude CLI (Gemini Carbon)
 
 .EXAMPLES
   # 一键启动网关、前端、同步全部模型发现并直接进入交互式 Claude CLI (默认 gemini-4-carbon-high)
@@ -124,7 +124,7 @@ function Stop-TrackedProcess([string]$PidFile, [string]$Label) {
 
 if ($StopServices) {
     Stop-TrackedProcess -PidFile $WebPidFile -Label "Web Frontend"
-    Stop-TrackedProcess -PidFile $GatewayPidFile -Label "agy-acp-gateway"
+    Stop-TrackedProcess -PidFile $GatewayPidFile -Label "liftgate"
     return
 }
 
@@ -156,18 +156,18 @@ function Resolve-BunExecutable {
 }
 
 # ============================================================================
-# 1. Ensure agy-acp-gateway is running
+# 1. Ensure liftgate is running
 # ============================================================================
 if (Test-HttpOk "$GatewayBaseUrl/healthz") {
     Write-Host "[1/4] Gateway already running at $GatewayBaseUrl" -ForegroundColor Cyan
 } else {
-    $binName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "agy-acp-gateway.exe" } else { "agy-acp-gateway" }
+    $binName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "liftgate.exe" } else { "liftgate" }
     $gwBin = Join-Path $RootDir "target\release\$binName"
     if (-not (Test-Path $gwBin)) {
-        Write-Host "[1/4] Building release agy-acp-gateway ..." -ForegroundColor Cyan
+        Write-Host "[1/4] Building release liftgate ..." -ForegroundColor Cyan
         Push-Location $RootDir
         try {
-            & cargo build --release -p agy-acp-gateway
+            & cargo build --release -p liftgate
             if ($LASTEXITCODE -ne 0) {
                 throw "cargo build failed with exit code $LASTEXITCODE"
             }
@@ -176,7 +176,7 @@ if (Test-HttpOk "$GatewayBaseUrl/healthz") {
         }
     }
 
-    Write-Host "[1/4] Starting agy-acp-gateway on $GatewayBaseUrl (default model: $GatewayModel) ..." -ForegroundColor Cyan
+    Write-Host "[1/4] Starting liftgate on $GatewayBaseUrl (default model: $GatewayModel) ..." -ForegroundColor Cyan
     $gwArgs = @("--listen", "${ListenHost}:${ListenPort}", "--default-model", $GatewayModel, "--acp-mode", "auto")
     $startParams = @{
         FilePath               = $gwBin
@@ -197,7 +197,7 @@ if (Test-HttpOk "$GatewayBaseUrl/healthz") {
         Start-Sleep -Milliseconds 300
         if ($gwProc.HasExited) {
             $errTail = if (Test-Path $GatewayLogErr) { (Get-Content $GatewayLogErr -Tail 20) -join "`n" } else { "" }
-            throw "agy-acp-gateway exited unexpectedly (code $($gwProc.ExitCode)):`n$errTail"
+            throw "liftgate exited unexpectedly (code $($gwProc.ExitCode)):`n$errTail"
         }
         if (Test-HttpOk "$GatewayBaseUrl/healthz") {
             $ready = $true
@@ -426,7 +426,7 @@ model_context_window = 1000000
 model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
-name = "Antigravity ACP Gateway"
+name = "Liftgate"
 base_url = "$GatewayBaseUrl/v1"
 env_key = "AGY_GATEWAY_API_KEY"
 wire_api = "responses"
@@ -543,7 +543,7 @@ if ($BackgroundOnly) {
 $cliExitCode = 0
 try {
     if ($LaunchCodex) {
-        $providerSpec = "{name=`"Antigravity ACP Gateway`",base_url=`"$GatewayBaseUrl/v1`",env_key=`"AGY_GATEWAY_API_KEY`",wire_api=`"responses`"}"
+        $providerSpec = "{name=`"Liftgate`",base_url=`"$GatewayBaseUrl/v1`",env_key=`"AGY_GATEWAY_API_KEY`",wire_api=`"responses`"}"
         $hasExplicitCodexModel = $false
         foreach ($ca in $ClaudeArgs) {
             if ($ca -eq "-m" -or $ca -eq "--model" -or $ca.StartsWith("-m=") -or $ca.StartsWith("--model=")) {

@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Renamed the project to **Liftgate**: the binary is now `liftgate` (release archives `liftgate-<target>`) and the crates are `liftgate`, `liftgate-server` and `liftgate-types`. `AGY_*` environment variables, the Codex provider id `agy` and the `run-gateway` / `start-agy` scripts are unchanged.
+- Rewrote the READMEs (Chinese moved to `README.zh-CN.md`) around a new architecture diagram, and moved setup details into `docs/` (usage guide in English and Chinese, API reference, architecture).
+
 ## [0.1.0] - 2026-11-14
 
 ### Added

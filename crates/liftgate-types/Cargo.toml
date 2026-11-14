@@ -1,5 +1,5 @@
 [package]
-name = "agy-gateway-types"
+name = "liftgate-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

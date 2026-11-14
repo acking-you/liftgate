@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use agy_gateway_types::{
+use liftgate_types::{
     canonical::CanonicalMessage,
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,

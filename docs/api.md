@@ -1,0 +1,75 @@
+# API
+
+Liftgate answers the OpenAI Responses and Anthropic Messages APIs on one
+address (default `http://127.0.0.1:8787`). Every `/v1/...` route also answers
+without the `/v1` prefix.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /v1/responses` | OpenAI Responses, streamed (SSE) or not |
+| `GET /v1/responses/{id}` | a completed response, kept in memory (last 256 by default) |
+| `POST /v1/messages` | Anthropic Messages, streamed (SSE) or not |
+| `POST /v1/messages/count_tokens` | Anthropic token count (a local estimate) |
+| `GET /v1/models`, `GET /v1/models/{id}` | the models your Antigravity account can use |
+| `GET /v1/codex-models?default_model=<id>` | the same models as a Codex `model_catalog_json` |
+| `GET /healthz` | liveness |
+| `GET /api/telemetry/snapshot`, `GET /api/telemetry/events` | dashboard data (snapshot and SSE stream) |
+| `POST /api/telemetry/sessions/{id}/close` | close an idle pooled session |
+
+## Authentication
+
+Started without `--api-key`, Liftgate checks nothing; bind it to loopback (the
+default). With `--api-key <key>`, send `Authorization: Bearer <key>` or
+`x-api-key: <key>`; the telemetry routes also accept `?api_key=<key>`.
+
+## OpenAI Responses
+
+Base URL `http://127.0.0.1:8787/v1`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="local-agy")
+reply = client.responses.create(model="gemini-4-carbon-high", input="Hello")
+print(reply.output_text)
+```
+
+- Tools: `function`, `custom` and `namespace` tools, plus Codex `local_shell`
+  and `apply_patch`; the client runs them and sends the results back.
+- Built in: `web_search`, and server-side page fetching for the `open_page`
+  action.
+- Reasoning: the model's thoughts stream as reasoning summary events. When a
+  client asks for `reasoning.encrypted_content`, it gets a fixed placeholder;
+  the thoughts themselves are only in the summary.
+- `instructions` and `developer` / `system` items become
+  `<developer_instructions>` blocks in the prompt
+  ([why](architecture.md#translate)).
+
+## Anthropic Messages
+
+Base URL `http://127.0.0.1:8787` (the SDK adds `/v1/messages`).
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8787", api_key="local-agy")
+reply = client.messages.create(
+    model="gemini-4-carbon-high",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(reply.content[0].text)
+```
+
+- Extended thinking, parallel `tool_use` / `tool_result` and image input.
+- Built in: `web_search_20250305` and `web_fetch_20250910`; fetches refuse
+  private and loopback addresses.
+- Claude Code's background requests (Auto Mode classifiers, titles, recaps)
+  go to the fastest Flash model ([model routing](architecture.md#model-routing)).
+
+## Models
+
+Use any ID from `GET /v1/models`, such as `gemini-4-carbon-high` or
+`gemini-3.8-flash-low`. An unknown or generic name (for example a client's
+built-in default) maps to `--default-model`. The catalog reports a 1,000,000
+token context window for `gemini-*` models and 200,000 for the others.

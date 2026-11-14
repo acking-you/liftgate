@@ -463,7 +463,7 @@ pub fn build_session_system_append(
          - NEVER invoke your internal host workspace tools (`read_file`, `write_file`, `edit_file`, \
          `run_command`, `manage_task`, `ask_question`, `invoke_subagent`, `define_subagent`, \
          `manage_subagents`, `run_workflow`, `swarm`, `schedule`, `send_message`).\n\
-         - Ignore any internal ACP host directory such as `agy-acp-gateway-empty-cwd`; it is only an \
+         - Ignore any internal ACP host directory such as `liftgate-empty-cwd`; it is only an \
          inert gateway sandbox folder. External `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, \
          `Grep`, `Glob`, etc.) execute directly in the caller's actual workspace directory described \
          in `<caller_system_instructions>` and caller environment blocks.\n\

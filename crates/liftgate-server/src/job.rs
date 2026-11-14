@@ -26,7 +26,7 @@ pub fn configure_command_group(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-        // Isolate console CTRL_C_EVENT so `agy-acp-gateway` drains active HTTP streams first
+        // Isolate console CTRL_C_EVENT so `liftgate` drains active HTTP streams first
         // (matching `process_group(0)` on Unix) and avoid flashing console windows when headless.
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }

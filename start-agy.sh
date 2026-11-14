@@ -39,14 +39,14 @@ elif [[ "${1:-}" == "--codex" ]]; then
   shift
 fi
 
-# 1. Start agy-acp-gateway if not running
+# 1. Start liftgate if not running
 if ! curl -fsS "${GW_URL}/healthz" >/dev/null 2>&1; then
-  GW_BIN="${SCRIPT_DIR}/target/release/agy-acp-gateway"
+  GW_BIN="${SCRIPT_DIR}/target/release/liftgate"
   if [[ ! -x "${GW_BIN}" ]]; then
-    echo "[1/4] Building release agy-acp-gateway ..."
-    (cd "${SCRIPT_DIR}" && cargo build --release -p agy-acp-gateway)
+    echo "[1/4] Building release liftgate ..."
+    (cd "${SCRIPT_DIR}" && cargo build --release -p liftgate)
   fi
-  echo "[1/4] Starting agy-acp-gateway on ${GW_URL} ..."
+  echo "[1/4] Starting liftgate on ${GW_URL} ..."
   nohup "${GW_BIN}" --listen "${GW_HOST}:${GW_PORT}" --default-model "${MODEL}" --acp-mode auto \
     >"${RUNTIME_DIR}/gateway.out.log" 2>"${RUNTIME_DIR}/gateway.err.log" &
   echo $! >"${RUNTIME_DIR}/gateway.pid"
@@ -152,7 +152,7 @@ model_context_window = 1000000
 model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
-name = "Antigravity ACP Gateway"
+name = "Liftgate"
 base_url = "${GW_URL}/v1"
 env_key = "AGY_GATEWAY_API_KEY"
 wire_api = "responses"
@@ -200,7 +200,7 @@ if [[ "${LAUNCH_CODEX}" -eq 1 ]]; then
       -c 'web_search="live"' \
       -c 'model_context_window=1000000' \
       -c 'model_auto_compact_token_limit=850000' \
-      -c "model_providers.agy={name=\"Antigravity ACP Gateway\",base_url=\"${GW_URL}/v1\",env_key=\"AGY_GATEWAY_API_KEY\",wire_api=\"responses\"}" \
+      -c "model_providers.agy={name=\"Liftgate\",base_url=\"${GW_URL}/v1\",env_key=\"AGY_GATEWAY_API_KEY\",wire_api=\"responses\"}" \
       "$@"
   else
     exec codex \
@@ -210,7 +210,7 @@ if [[ "${LAUNCH_CODEX}" -eq 1 ]]; then
       -c 'web_search="live"' \
       -c 'model_context_window=1000000' \
       -c 'model_auto_compact_token_limit=850000' \
-      -c "model_providers.agy={name=\"Antigravity ACP Gateway\",base_url=\"${GW_URL}/v1\",env_key=\"AGY_GATEWAY_API_KEY\",wire_api=\"responses\"}" \
+      -c "model_providers.agy={name=\"Liftgate\",base_url=\"${GW_URL}/v1\",env_key=\"AGY_GATEWAY_API_KEY\",wire_api=\"responses\"}" \
       "$@"
   fi
 fi

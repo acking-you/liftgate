@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agy_gateway_types::{
-    anthropic::{AnthropicErrorBody, AnthropicErrorEnvelope},
-    error::ProtocolError,
-    openai::{OpenAiErrorBody, OpenAiErrorEnvelope},
-};
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
+};
+use liftgate_types::{
+    anthropic::{AnthropicErrorBody, AnthropicErrorEnvelope},
+    error::ProtocolError,
+    openai::{OpenAiErrorBody, OpenAiErrorEnvelope},
 };
 use thiserror::Error;
 use tokio_util::codec::LinesCodecError;

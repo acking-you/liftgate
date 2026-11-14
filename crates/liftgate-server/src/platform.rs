@@ -139,7 +139,7 @@ fn platform_default_candidates() -> Vec<PathBuf> {
 /// Prepares an isolated working directory for ACP sessions across Windows, Linux, and macOS.
 ///
 /// On multi-user Unix systems (Linux & macOS), `/tmp` is shared across UIDs; the default directory
-/// is therefore scoped by effective UID (`agy-acp-gateway-cwd-<uid>`) and created with mode `0o700`
+/// is therefore scoped by effective UID (`liftgate-cwd-<uid>`) and created with mode `0o700`
 /// to prevent cross-user permission collisions.
 pub fn prepare_isolated_session_cwd(
     explicit: Option<PathBuf>,
@@ -170,12 +170,12 @@ fn default_isolated_cwd_path() -> PathBuf {
     {
         // SAFETY: `geteuid` is thread-safe, infallible, and takes no pointers.
         let uid = unsafe { libc::geteuid() };
-        std::env::temp_dir().join(format!("agy-acp-gateway-cwd-{uid}"))
+        std::env::temp_dir().join(format!("liftgate-cwd-{uid}"))
     }
 
     #[cfg(not(unix))]
     {
-        std::env::temp_dir().join("agy-acp-gateway-empty-cwd")
+        std::env::temp_dir().join("liftgate-empty-cwd")
     }
 }
 
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn prepares_isolated_cwd_cleanly() {
-        let custom = std::env::temp_dir().join("agy-acp-gateway-platform-test");
+        let custom = std::env::temp_dir().join("liftgate-platform-test");
         let (_, canonical) = prepare_isolated_session_cwd(Some(custom.clone())).unwrap();
         assert!(canonical.is_dir());
         let _ = fs::remove_dir(&custom);

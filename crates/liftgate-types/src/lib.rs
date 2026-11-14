@@ -1,4 +1,4 @@
-//! Pure wire, configuration, and protocol translation types for `agy-acp-gateway`.
+//! Pure wire, configuration, and protocol translation types for `liftgate`.
 
 pub mod acp;
 pub mod anthropic;

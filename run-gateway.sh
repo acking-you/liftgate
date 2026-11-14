@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build `agy-acp-gateway` in release mode (plus embedded web UI if Bun is installed) and start the server.
+# Build `liftgate` in release mode (plus embedded web UI if Bun is installed) and start the server.
 #
 # Usage:
 #   ./run-gateway.sh                 # Build release & run in foreground (Ctrl+C to stop)
@@ -85,7 +85,7 @@ if [[ "${STOP}" -eq 1 ]]; then
     pid="$(cat "${PID_FILE}")"
     kill "${pid}" 2>/dev/null || true
     rm -f "${PID_FILE}"
-    echo "[STOP] Stopped agy-acp-gateway (PID ${pid})."
+    echo "[STOP] Stopped liftgate (PID ${pid})."
   else
     echo "[INFO] No background gateway PID file found at ${PID_FILE}"
   fi
@@ -105,11 +105,11 @@ if [[ "${SKIP_BUILD}" -eq 0 ]]; then
     echo "[1/3] Companion web bundle (web/dist) already built."
   fi
 
-  echo "[2/3] Building release binary (cargo build --release --locked -p agy-acp-gateway) ..."
-  (cd "${SCRIPT_DIR}" && cargo build --release --locked -p agy-acp-gateway)
+  echo "[2/3] Building release binary (cargo build --release --locked -p liftgate) ..."
+  (cd "${SCRIPT_DIR}" && cargo build --release --locked -p liftgate)
 fi
 
-GW_BIN="${SCRIPT_DIR}/target/release/agy-acp-gateway"
+GW_BIN="${SCRIPT_DIR}/target/release/liftgate"
 if [[ ! -x "${GW_BIN}" ]]; then
   echo "[ERROR] Release binary not found at ${GW_BIN}" >&2
   exit 1
@@ -138,7 +138,7 @@ echo "  Live Models & Catalog   : ${BASE_URL}/v1/models  |  ${BASE_URL}/v1/codex
 echo ""
 
 if [[ "${DAEMON}" -eq 1 ]]; then
-  echo "[3/3] Starting agy-acp-gateway in background ..."
+  echo "[3/3] Starting liftgate in background ..."
   nohup "${GW_BIN}" "${FINAL_ARGS[@]}" >"${LOG_OUT}" 2>"${LOG_ERR}" &
   gw_pid=$!
   echo "${gw_pid}" >"${PID_FILE}"
@@ -146,7 +146,7 @@ if [[ "${DAEMON}" -eq 1 ]]; then
   ready=0
   for _ in {1..40}; do
     if ! kill -0 "${gw_pid}" 2>/dev/null; then
-      echo "[ERROR] agy-acp-gateway exited unexpectedly:" >&2
+      echo "[ERROR] liftgate exited unexpectedly:" >&2
       tail -n 20 "${LOG_ERR}" >&2 || true
       exit 1
     fi
@@ -165,5 +165,5 @@ if [[ "${DAEMON}" -eq 1 ]]; then
   exit 0
 fi
 
-echo "[3/3] Starting agy-acp-gateway in foreground (press Ctrl+C to stop) ..."
+echo "[3/3] Starting liftgate in foreground (press Ctrl+C to stop) ..."
 exec "${GW_BIN}" "${FINAL_ARGS[@]}"

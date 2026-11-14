@@ -8,7 +8,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use agy_gateway_types::{
+use bytes::Bytes;
+use liftgate_types::{
     acp::{
         ACP_PROTOCOL_VERSION, AcpPromptBlock, AntigravityNewMeta, AvailableModel,
         ClientCapabilities, ClientInfo, FsCapabilities, IncomingRpcFrame, InitializeParams,
@@ -22,7 +23,6 @@ use agy_gateway_types::{
     config::{AcpModeId, GatewayLimits, ModelId, SessionId},
     telemetry::{AcpProcessTelemetry, StderrLogEntry},
 };
-use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use tokio::{
@@ -396,7 +396,7 @@ impl LiveAcpGeneration {
                         terminal: false,
                     },
                     client_info: ClientInfo {
-                        name: "agy-acp-gateway",
+                        name: "liftgate",
                         version: env!("CARGO_PKG_VERSION"),
                     },
                 },

@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Build `agy-acp-gateway` in release mode (plus embedded web UI if Bun is installed) and start the server.
+  Build `liftgate` in release mode (plus embedded web UI if Bun is installed) and start the server.
 
 .EXAMPLES
   # Build release and run gateway in the foreground (Ctrl+C to stop)
@@ -13,7 +13,7 @@
   # Stop background gateway started with -Daemon
   .\run-gateway.cmd -Stop
 
-  # Pass any agy-acp-gateway flags directly (e.g. custom port, model, or API key)
+  # Pass any liftgate flags directly (e.g. custom port, model, or API key)
   .\run-gateway.cmd --listen 127.0.0.1:8787 --default-model gemini-4-carbon-high --api-key local-agy
 #>
 $ErrorActionPreference = "Stop"
@@ -81,7 +81,7 @@ if ($Stop) {
             $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
             if ($null -ne $proc) {
                 Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-                Write-Host "[STOP] Stopped agy-acp-gateway (PID $procId)." -ForegroundColor Yellow
+                Write-Host "[STOP] Stopped liftgate (PID $procId)." -ForegroundColor Yellow
             }
         }
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
@@ -123,10 +123,10 @@ if (-not $SkipBuild) {
         Write-Host "[1/3] Companion web bundle (web/dist) already built." -ForegroundColor Cyan
     }
 
-    Write-Host "[2/3] Building release binary (cargo build --release --locked -p agy-acp-gateway) ..." -ForegroundColor Cyan
+    Write-Host "[2/3] Building release binary (cargo build --release --locked -p liftgate) ..." -ForegroundColor Cyan
     Push-Location $RootDir
     try {
-        & cargo build --release --locked -p agy-acp-gateway
+        & cargo build --release --locked -p liftgate
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build --release failed with exit code $LASTEXITCODE"
         }
@@ -135,7 +135,7 @@ if (-not $SkipBuild) {
     }
 }
 
-$binName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "agy-acp-gateway.exe" } else { "agy-acp-gateway" }
+$binName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "liftgate.exe" } else { "liftgate" }
 $gwBin = Join-Path $RootDir "target\release\$binName"
 if (-not (Test-Path $gwBin)) {
     throw "Release binary not found at $gwBin"
@@ -167,7 +167,7 @@ Write-Host "  Live Models & Catalog   : $baseUrl/v1/models  |  $baseUrl/v1/codex
 Write-Host ""
 
 if ($Daemon) {
-    Write-Host "[3/3] Starting agy-acp-gateway in background ..." -ForegroundColor Cyan
+    Write-Host "[3/3] Starting liftgate in background ..." -ForegroundColor Cyan
     $startParams = @{
         FilePath               = $gwBin
         ArgumentList           = $finalArgs
@@ -187,7 +187,7 @@ if ($Daemon) {
         Start-Sleep -Milliseconds 300
         if ($proc.HasExited) {
             $errTail = if (Test-Path $LogErr) { (Get-Content $LogErr -Tail 20) -join "`n" } else { "" }
-            throw "agy-acp-gateway exited unexpectedly (code $($proc.ExitCode)):`n$errTail"
+            throw "liftgate exited unexpectedly (code $($proc.ExitCode)):`n$errTail"
         }
         try {
             $resp = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 2
@@ -204,6 +204,6 @@ if ($Daemon) {
     return
 }
 
-Write-Host "[3/3] Starting agy-acp-gateway in foreground (press Ctrl+C to stop) ..." -ForegroundColor Cyan
+Write-Host "[3/3] Starting liftgate in foreground (press Ctrl+C to stop) ..." -ForegroundColor Cyan
 & $gwBin @finalArgs
 exit $LASTEXITCODE

@@ -1,5 +1,5 @@
 [package]
-name = "agy-gateway-server"
+name = "liftgate-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,10 @@ repository.workspace = true
 
 [features]
 default = []
-test-support = ["agy-gateway-types/test-support"]
+test-support = ["liftgate-types/test-support"]
 
 [dependencies]
-agy-gateway-types = { workspace = true }
+liftgate-types = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 dunce = { workspace = true }
@@ -36,7 +36,7 @@ windows-sys = { workspace = true, features = [
 libc = { workspace = true }
 
 [dev-dependencies]
-agy-gateway-types = { workspace = true, features = ["test-support"] }
+liftgate-types = { workspace = true, features = ["test-support"] }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }

@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use agy_gateway_server::{
+use clap::Parser;
+use liftgate_server::{
     acp_client::{LiveAcpClient, LiveAcpConfig},
     error::AcpError,
     job::install_panic_cleanup_hook,
@@ -16,7 +17,7 @@ use agy_gateway_server::{
     telemetry::TelemetryHub,
     turn_runner::GatewayRuntimeConfig,
 };
-use agy_gateway_types::{
+use liftgate_types::{
     config::{
         AcpModeId, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
         DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS,
@@ -24,14 +25,13 @@ use agy_gateway_types::{
     },
     error::ValidationError,
 };
-use clap::Parser;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "agy-acp-gateway",
+    name = "liftgate",
     version,
     about = "Local HTTP API gateway exposing OpenAI `/v1/responses` and Anthropic `/v1/messages` over `agy acp`"
 )]
@@ -170,7 +170,7 @@ async fn run(args: CliArgs) -> Result<(), StartupError> {
         session_cwd = %session_cwd.display(),
         default_model = %default_model,
         acp_mode = %acp_mode,
-        "starting agy-acp-gateway"
+        "starting liftgate"
     );
 
     let live_client = Arc::new(

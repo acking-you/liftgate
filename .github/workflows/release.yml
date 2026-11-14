@@ -1,4 +1,4 @@
-name: Build and release agy-acp-gateway
+name: Build and release liftgate
 
 on:
   push:
@@ -64,20 +64,20 @@ jobs:
           bun install --frozen-lockfile
           bun run build
 
-      - name: Build agy-acp-gateway CLI
+      - name: Build liftgate CLI
         uses: houseabsolute/actions-rust-cross@v1
         with:
           target: ${{ matrix.platform.target }}
           toolchain: stable
-          args: "--locked --release --bin agy-acp-gateway"
+          args: "--locked --release --bin liftgate"
           strip: true
 
       - name: Package artifact and publish tagged release
         uses: houseabsolute/actions-rust-release@v0
         with:
-          executable-name: agy-acp-gateway
+          executable-name: liftgate
           target: ${{ matrix.platform.target }}
-          archive-name: agy-acp-gateway-${{ matrix.platform.target }}
+          archive-name: liftgate-${{ matrix.platform.target }}
           changes-file: CHANGELOG.md
           extra-files: |
             CHANGELOG.md

@@ -5,7 +5,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use agy_gateway_server::{
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
+use liftgate_server::{
     acp_client::AcpBackend,
     error::AcpError,
     routes::{AppState, build_router},
@@ -13,7 +18,7 @@ use agy_gateway_server::{
     telemetry::TelemetryHub,
     turn_runner::GatewayRuntimeConfig,
 };
-use agy_gateway_types::{
+use liftgate_types::{
     acp::{
         AcpChunkContent, AcpPromptBlock, AvailableModel, ModelsCatalog, ModesCatalog,
         PromptTurnResult, SessionNewResult, SessionUpdatePayload,
@@ -21,11 +26,6 @@ use agy_gateway_types::{
     config::{AcpModeId, GatewayLimits, ModelId, SessionId},
     test_support::{mock_acp_usage, mock_available_models},
 };
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use http_body_util::BodyExt;
 use serde_json::{Value, json, value::RawValue};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -276,16 +276,16 @@ impl AcpBackend for MockAcpBackend {
         url: &str,
         allowed_domains: &[String],
         blocked_domains: &[String],
-    ) -> agy_gateway_server::web_fetch::WebFetchOutcome {
+    ) -> liftgate_server::web_fetch::WebFetchOutcome {
         if url.contains("127.0.0.1") || url.contains("localhost") {
-            return agy_gateway_server::web_fetch::fetch_url_sanitized(
+            return liftgate_server::web_fetch::fetch_url_sanitized(
                 url,
                 allowed_domains,
                 blocked_domains,
             )
             .await;
         }
-        agy_gateway_server::web_fetch::WebFetchOutcome::Success {
+        liftgate_server::web_fetch::WebFetchOutcome::Success {
             url: url.to_owned(),
             title: Some("Singapore 24-Hour Official Forecast".to_owned()),
             media_type: "text/plain".to_owned(),
@@ -787,7 +787,7 @@ async fn models_count_tokens_and_api_key_enforcement() {
     // `x-api-key` -> 200 `/v1/messages/count_tokens`
     let count_req = json!({
         "model": "claude-opus-4-6",
-        "messages": [{ "role": "user", "content": "Hello Antigravity ACP Gateway!" }]
+        "messages": [{ "role": "user", "content": "Hello Liftgate!" }]
     });
     let count_resp = app
         .oneshot(

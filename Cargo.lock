@@ -3,51 +3,6 @@
 version = 4
 
 [[package]]
-name = "agy-acp-gateway"
-version = "0.1.0"
-dependencies = [
- "agy-gateway-server",
- "agy-gateway-types",
- "clap",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agy-gateway-server"
-version = "0.1.0"
-dependencies = [
- "agy-gateway-types",
- "axum",
- "bytes",
- "dunce",
- "http-body-util",
- "libc",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower",
- "tracing",
- "uuid",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "agy-gateway-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -423,6 +378,51 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "liftgate"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "liftgate-server",
+ "liftgate-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "liftgate-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "dunce",
+ "http-body-util",
+ "libc",
+ "liftgate-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "liftgate-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
 
 [[package]]
 name = "matchers"

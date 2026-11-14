@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agy_gateway_types::{
+use liftgate_types::{
     acp::AcpUsage,
     canonical::{CanonicalMessage, CanonicalPart, CanonicalRole},
     telemetry::{GatewayMetricsSummary, TaskPhase, TaskProtocol, TaskSnapshot},

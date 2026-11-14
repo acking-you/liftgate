@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use agy_gateway_types::{
+use liftgate_types::{
     acp::{AcpPromptBlock, AcpUsage, PromptTurnResult, SessionUpdatePayload},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,

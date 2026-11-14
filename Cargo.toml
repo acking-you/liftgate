@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/agy-gateway-types",
-    "crates/agy-gateway-server",
-    "crates/agy-acp-gateway",
+    "crates/liftgate-types",
+    "crates/liftgate-server",
+    "crates/liftgate",
 ]
 
 [workspace.package]
@@ -14,8 +14,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/acking-you/antigravity-gateway"
 
 [workspace.dependencies]
-agy-gateway-types = { path = "crates/agy-gateway-types", default-features = false }
-agy-gateway-server = { path = "crates/agy-gateway-server", default-features = false }
+liftgate-types = { path = "crates/liftgate-types", default-features = false }
+liftgate-server = { path = "crates/liftgate-server", default-features = false }
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 bytes = { version = "1", default-features = false, features = ["std"] }

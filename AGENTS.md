@@ -16,16 +16,16 @@ Rules for changing this repository.
 ## Architecture
 
 - One-way workspace dependency graph (`resolver = "3"`, `edition = "2024"`, `rust-version = "1.85"`):
-  `agy-acp-gateway` (thin CLI binary) → `agy-gateway-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `agy-gateway-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
-- `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). When `web/dist` is built, `agy-acp-gateway` serves it directly at `/`.
-- Cross-platform child supervision (`crates/agy-gateway-server/src/job.rs`): Win32 Job Object (`KILL_ON_JOB_CLOSE`) on Windows; `process_group(0)` + `killpg` on Unix plus `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux, backed by a chained panic hook.
+  `liftgate` (thin CLI binary) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
+- `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). When `web/dist` is built, `liftgate` serves it directly at `/`.
+- Cross-platform child supervision (`crates/liftgate-server/src/job.rs`): Win32 Job Object (`KILL_ON_JOB_CLOSE`) on Windows; `process_group(0)` + `killpg` on Unix plus `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux, backed by a chained panic hook.
 
 ## Protocol & Session Invariants
 
 - OpenAI `/v1/responses` `instructions` and `developer`/`system` items normalize into `<developer_instructions>` blocks in `messages` (never into `_meta.antigravity.systemPrompt.append`), avoiding upstream `429` rejections on large harness prompts while keeping `SessionPool` prefix hashes deterministic across turns.
 - Volatile per-request harness noise (`x-anthropic-billing-header`, `cch=...`, `<total_tokens>`, `<budget:token_budget>`, `<current_time>`, `<timestamp>`) is stripped in `session_key::strip_unstable_harness_noise` before hashing and forwarding.
 - Auxiliary non-coding requests (Claude Auto Mode classifiers, startup recon, away-recaps, Codex title generators) route to the fastest `gemini-*-flash-low` model on ephemeral sessions without evicting or mutating cached primary sessions.
-- Server build/run scripts (`run-gateway.ps1`, `run-gateway.cmd`, `run-gateway.sh`) build `web/dist` (when Bun is present) and `agy-acp-gateway` (`--release --locked`) before starting the gateway. Harness wrapper scripts (`start-agy.ps1`, `start-agy.cmd`, `start-agy.sh`) scope `AGY_GATEWAY_API_KEY` and `-c model_catalog_json=...` to the launched child process and restore the caller shell on exit; never mutate `~/.codex/config.toml` or global `OPENAI_*` variables.
+- Server build/run scripts (`run-gateway.ps1`, `run-gateway.cmd`, `run-gateway.sh`) build `web/dist` (when Bun is present) and `liftgate` (`--release --locked`) before starting the gateway. Harness wrapper scripts (`start-agy.ps1`, `start-agy.cmd`, `start-agy.sh`) scope `AGY_GATEWAY_API_KEY` and `-c model_catalog_json=...` to the launched child process and restore the caller shell on exit; never mutate `~/.codex/config.toml` or global `OPENAI_*` variables.
 
 ## Verification
 

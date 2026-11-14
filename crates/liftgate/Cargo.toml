@@ -1,5 +1,5 @@
 [package]
-name = "agy-acp-gateway"
+name = "liftgate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "agy-acp-gateway"
+name = "liftgate"
 path = "src/main.rs"
 
 [dependencies]
-agy-gateway-server = { workspace = true }
-agy-gateway-types = { workspace = true }
+liftgate-server = { workspace = true }
+liftgate-types = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

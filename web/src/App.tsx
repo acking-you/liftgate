@@ -296,7 +296,7 @@ export function App(): React.JSX.Element {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-base font-semibold tracking-tight">
-                  Antigravity ACP Gateway
+                  Liftgate
                 </h1>
                 <Badge variant="secondary">
                   v{snapshot?.gateway_version ?? "0.1.0"}
@@ -375,7 +375,7 @@ export function App(): React.JSX.Element {
             <span>
               无法连接网关遥测接口（{lastError}）。请确认{" "}
               <code className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-xs">
-                agy-acp-gateway
+                liftgate
               </code>{" "}
               已启动，或在右上角「连接设置」检查地址与密钥。
             </span>
@@ -1028,7 +1028,7 @@ model_catalog_json = ".agy-runtime/codex-model-catalog.json"
 web_search = "live"
 
 [model_providers.agy]
-name = "Antigravity ACP Gateway"
+name = "Liftgate"
 base_url = "${effectiveGatewayOrigin}/v1"
 env_key = "AGY_GATEWAY_API_KEY"
 wire_api = "responses"`}

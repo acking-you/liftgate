@@ -5,7 +5,16 @@ use std::path::{Component, Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agy_gateway_types::{
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use liftgate_types::{
     acp::AcpUsage,
     anthropic::{
         ANTHROPIC_THOUGHT_SIGNATURE, AnthropicCountTokensResponse, AnthropicMessagesRequest,
@@ -22,15 +31,6 @@ use agy_gateway_types::{
     },
     session_key::INTERNAL_CODEX_LOCAL_SHELL_TOOL,
     telemetry::{GatewayTelemetrySnapshot, TaskProtocol},
-};
-use axum::{
-    Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, Request, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -238,7 +238,7 @@ async fn handle_get_model<B: AcpBackend>(
         return Json(build_model_card(exact.model_id.clone(), display, now)).into_response();
     }
 
-    let resolved = agy_gateway_types::model::resolve_model_id(
+    let resolved = liftgate_types::model::resolve_model_id(
         Some(&model_id),
         None,
         &available,
@@ -1497,7 +1497,7 @@ fn default_shell_wrap(cmd: &str) -> Vec<String> {
 }
 
 fn build_openai_web_sources(
-    links: &[agy_gateway_types::canonical::MarkdownLinkSpan],
+    links: &[liftgate_types::canonical::MarkdownLinkSpan],
 ) -> Vec<WebSearchSource> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();

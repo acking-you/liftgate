@@ -1,0 +1,7 @@
+The marks in this directory identify the clients the gateway works with in
+README.md and README.zh-CN.md. Path data is copied verbatim from Simple Icons
+15.22.0 (https://simpleicons.org, https://github.com/simple-icons/simple-icons),
+icons "openai", "claude" and "anthropic", released under CC0 1.0 Universal
+(https://creativecommons.org/publicdomain/zero/1.0/). Only the fill was changed
+to follow the reader's light or dark theme. Brand names and marks belong to
+their owners and are used only to identify each client.
