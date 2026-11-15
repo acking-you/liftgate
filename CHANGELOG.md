@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-11-15
+
+### Fixed
+- **Prevented multi-subcall `cached_read_tokens` inflation from prematurely triggering Codex / Claude Code auto-compaction**: when `agy acp` executes multiple internal `search_web` or retry sub-steps inside a single `session/prompt` RPC (multiplying a ~`100k` cached prefix into `~650k–720k` cumulative billable tokens), `turn_runner` now reconciles client-reported `usage` downward as well as upward against `UsageUpdate` single-window context occupancy (with a per-turn subcall-ceiling fallback when `UsageUpdate` is absent and full occupancy tracking across warm `SessionPool` commits), while preserving cumulative billable token totals in Liftgate telemetry.
+
 ## [0.1.5] - 2026-11-15
 
 ### Fixed

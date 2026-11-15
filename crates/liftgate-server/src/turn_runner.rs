@@ -489,6 +489,7 @@ struct TurnStreamState {
     halted_post_tool_runaway: bool,
     tainted_session: bool,
     peak_context_used: u64,
+    turn_peak_context_used: u64,
     latest_context_used: u64,
 }
 
@@ -507,6 +508,7 @@ impl TurnStreamState {
             halted_post_tool_runaway: false,
             tainted_session: false,
             peak_context_used: initial_context_used,
+            turn_peak_context_used: 0,
             latest_context_used: initial_context_used,
         }
     }
@@ -525,6 +527,7 @@ impl TurnStreamState {
             self.tainted_session = true;
         }
         self.peak_context_used = self.peak_context_used.max(used);
+        self.turn_peak_context_used = self.turn_peak_context_used.max(used);
         self.latest_context_used = used;
     }
 
@@ -574,6 +577,15 @@ async fn run_turn_pipeline<B: AcpBackend>(
         seed_chunks,
         final_blocks,
     } = prompt_plan;
+    let outbound_prompt_bytes: usize = seed_chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter())
+        .chain(final_blocks.iter())
+        .map(|b| match b {
+            AcpPromptBlock::Text { text } => text.len(),
+            AcpPromptBlock::Image { .. } => 8_192,
+        })
+        .sum();
     let mut current_prompt_blocks = final_blocks;
     let mut state = TurnStreamState::new(initial_context_used);
     let mut last_step_started_ms: u64;
@@ -1014,6 +1026,13 @@ async fn run_turn_pipeline<B: AcpBackend>(
         return;
     }
 
+    context_usage = reconcile_turn_context_usage(
+        context_usage,
+        &state,
+        initial_context_used,
+        outbound_prompt_bytes,
+    );
+
     if let Some(final_lease) = lease.take() {
         if retire_after_turn || req.auxiliary_task.is_some() || state.tainted_session {
             final_lease.finish_ephemeral();
@@ -1033,34 +1052,22 @@ async fn run_turn_pipeline<B: AcpBackend>(
             let dialogue_hash =
                 hash_dialogue_with_reply(final_lease.model_id(), &full_messages, &assistant_msg);
             full_messages.push(assistant_msg);
+            let committed_context_used = if state.turn_peak_context_used > 0 {
+                state.latest_context_used
+            } else {
+                context_usage.total_tokens
+            };
             final_lease.commit(
                 post_hash,
                 dialogue_hash,
                 req.client_tools,
-                state.latest_context_used,
+                committed_context_used,
                 Some(response_id),
                 full_messages,
             );
         }
     }
 
-    // UsageUpdate is occupancy, not billable work. Use its pre-compaction peak as a
-    // lower bound, so a small warm delta or a post-turn reset cannot hide a full window.
-    let reported_input = context_usage
-        .input_tokens
-        .saturating_add(context_usage.cached_read_tokens)
-        .saturating_add(context_usage.cached_write_tokens);
-    let required_input = state
-        .peak_context_used
-        .saturating_sub(context_usage.output_tokens);
-    context_usage.input_tokens = context_usage
-        .input_tokens
-        .saturating_add(required_input.saturating_sub(reported_input));
-    context_usage.total_tokens = context_usage
-        .input_tokens
-        .saturating_add(context_usage.cached_read_tokens)
-        .saturating_add(context_usage.cached_write_tokens)
-        .saturating_add(context_usage.output_tokens);
     task_guard.complete(final_stop_reason.clone(), cumulative_usage);
     let _ = events_tx
         .send(TurnEvent::Completed {
@@ -1068,6 +1075,88 @@ async fn run_turn_pipeline<B: AcpBackend>(
             stop_reason: final_stop_reason,
         })
         .await;
+}
+
+/// Reconciles `PromptTurnResult.usage` (which `agy acp` sums across all internal `search_web` /
+/// retry sub-calls inside a single `session/prompt` RPC) with true single-window context occupancy
+/// so Codex and Claude Code neither miss compaction on warm deltas nor prematurely auto-compact
+/// when `cached_read_tokens` is multiplied across 5–7 internal sub-steps.
+fn reconcile_turn_context_usage(
+    mut usage: AcpUsage,
+    state: &TurnStreamState,
+    initial_context_used: u64,
+    outbound_prompt_bytes: usize,
+) -> AcpUsage {
+    if state.turn_peak_context_used > 0 {
+        let authoritative_total = if state.tainted_session {
+            state.peak_context_used
+        } else {
+            state.turn_peak_context_used
+        };
+        usage.output_tokens = usage.output_tokens.min(authoritative_total);
+        usage.thought_tokens = usage.thought_tokens.min(usage.output_tokens);
+        let target_input = authoritative_total.saturating_sub(usage.output_tokens);
+        let reported_input = usage
+            .input_tokens
+            .saturating_add(usage.cached_read_tokens)
+            .saturating_add(usage.cached_write_tokens);
+        if reported_input < target_input {
+            usage.input_tokens = usage
+                .input_tokens
+                .saturating_add(target_input - reported_input);
+        } else if reported_input > target_input {
+            let rep_u128 = u128::from(reported_input);
+            let tgt_u128 = u128::from(target_input);
+            let new_cached_read =
+                u64::try_from((u128::from(usage.cached_read_tokens) * tgt_u128) / rep_u128)
+                    .unwrap_or(0);
+            let new_cached_write =
+                u64::try_from((u128::from(usage.cached_write_tokens) * tgt_u128) / rep_u128)
+                    .unwrap_or(0)
+                    .min(target_input.saturating_sub(new_cached_read));
+            usage.cached_read_tokens = new_cached_read;
+            usage.cached_write_tokens = new_cached_write;
+            usage.input_tokens = target_input
+                .saturating_sub(new_cached_read)
+                .saturating_sub(new_cached_write);
+        }
+        usage.total_tokens = target_input.saturating_add(usage.output_tokens);
+        return usage;
+    }
+
+    let single_call_ceiling = initial_context_used
+        .saturating_add(((outbound_prompt_bytes / 3) as u64).max(24_576))
+        .saturating_add(24_576);
+    let mut reported_input = usage
+        .input_tokens
+        .saturating_add(usage.cached_read_tokens)
+        .saturating_add(usage.cached_write_tokens);
+    if usage.cached_read_tokens > single_call_ceiling
+        && reported_input > single_call_ceiling.saturating_mul(2)
+        && let Some(denom) = std::num::NonZeroU64::new(single_call_ceiling)
+    {
+        let est_subcalls = (reported_input / denom).max(2);
+        if let Some(subcalls) = std::num::NonZeroU64::new(est_subcalls) {
+            usage.cached_read_tokens /= subcalls;
+            usage.cached_write_tokens /= subcalls;
+            usage.input_tokens /= subcalls;
+            reported_input = usage
+                .input_tokens
+                .saturating_add(usage.cached_read_tokens)
+                .saturating_add(usage.cached_write_tokens);
+        }
+    }
+
+    let required_input = state.peak_context_used.saturating_sub(usage.output_tokens);
+    usage.input_tokens = usage
+        .input_tokens
+        .saturating_add(required_input.saturating_sub(reported_input));
+    usage.total_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cached_read_tokens)
+        .saturating_add(usage.cached_write_tokens)
+        .saturating_add(usage.output_tokens);
+    usage
 }
 
 fn accumulate_usage(acc: &mut AcpUsage, step: AcpUsage) {
@@ -2232,5 +2321,38 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn reconciles_multi_subcall_cached_token_inflation_to_single_window_occupancy() {
+        let summed_six_subcalls = AcpUsage {
+            input_tokens: 58_432,
+            output_tokens: 7_413,
+            cached_read_tokens: 656_495,
+            cached_write_tokens: 0,
+            thought_tokens: 5_789,
+            total_tokens: 722_340,
+        };
+
+        // 1. With `UsageUpdate` (`115_000` actual context occupancy): exact reconciliation.
+        let mut state_with_upd = TurnStreamState::new(97_971);
+        state_with_upd.observe_usage_update(115_000, 1_048_576);
+        let rec =
+            reconcile_turn_context_usage(summed_six_subcalls, &state_with_upd, 97_971, 30_000);
+        assert_eq!(rec.total_tokens, 115_000);
+        assert_eq!(rec.output_tokens, 7_413);
+        assert_eq!(
+            rec.input_tokens + rec.cached_read_tokens + rec.cached_write_tokens,
+            107_587
+        );
+        assert!(rec.cached_read_tokens > 90_000 && rec.cached_read_tokens < 105_000);
+
+        // 2. Without `UsageUpdate` (`turn_peak_context_used == 0`): heuristic subcall divisor
+        //    still prevents the 722k billable sum from crossing Codex's 245k auto-compact limit.
+        let state_no_upd = TurnStreamState::new(97_971);
+        let rec_fallback =
+            reconcile_turn_context_usage(summed_six_subcalls, &state_no_upd, 97_971, 30_000);
+        assert!(rec_fallback.total_tokens < 200_000);
+        assert!(rec_fallback.total_tokens >= 97_971);
     }
 }
