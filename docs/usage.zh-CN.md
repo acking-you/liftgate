@@ -7,27 +7,31 @@
 ## 准备工作
 
 - **Antigravity CLI（`agy`）**：安装后执行一次 `agy acp --login` 完成登录。Liftgate 会在 `PATH` 和标准安装位置查找它，找不到时用 `--agy-bin <路径>` 指定。
-- **全局安装 `liftgate`**：从 GitHub Releases 下载单文件可执行程序放入 `PATH`，或使用 **Rust 1.85+** 从源码全局安装：
+- **全局安装 `lg` / `liftgate`**：从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包放入 `PATH`（或运行 `cargo binstall liftgate`），亦可使用 **Rust 1.85+** 从源码全局安装：
   ```bash
   cargo install --path crates/liftgate --locked
   ```
   编译 Release 时若本机装有 **Bun**，`build.rs` 会自动构建 `web/` 并将完整 React 监控面板直接内嵌进 `liftgate` 单二进制中（运行时无需外部 `web/dist` 目录）；未安装 Bun 时所有 API 照常可用，且 `/` 仍提供内置的轻量级实时遥测页面。
 
-## 全局服务管理（`liftgate` CLI）
+## 全局服务管理（`lg` / `liftgate` CLI）
 
-把 `liftgate` 安装到全局 `PATH` 后，可在任意目录下启停后台网关、查看状态与日志（运行状态与日志默认保存在 `~/.liftgate`，可通过 `--state-dir` 或 `LIFTGATE_HOME` 指定）：
+发行包与 `cargo install` 默认同时安装完整命令 `liftgate` 与短别名 `lg`（也可通过 `liftgate alias --name <名称>` 安装自定义短别名）。可在任意目录下使用全屏 TUI、启停后台网关与查看状态（状态与日志默认保存在 `~/.liftgate`，可通过 `--state-dir` 或 `LIFTGATE_HOME` 指定）：
 
 ```bash
-liftgate start                  # 后台启动网关与内嵌 Web 监控面板
-liftgate start --open           # 后台启动并自动在浏览器打开监控面板
-liftgate status                 # 查看健康状态、PID、会话池、Token 统计与模型数量（支持 --json）
-liftgate logs -n 100 -f         # 查看并实时跟随后台日志（加 --acp 一并查看 agy stderr）
-liftgate ui                     # 打开 Web 监控面板（加 --print 仅输出地址）
-liftgate models                 # 列出当前账号通过 agy acp 发现的全部实时模型
-liftgate doctor                 # 自检 agy、claude、codex、内嵌面板与登录模型就绪状态
-liftgate restart                # 重启后台网关（自动保留或按参数覆盖原配置）
-liftgate stop                   # 优雅停止后台网关并清理 ACP 子进程树
-liftgate serve                  # 前台运行网关（等同于不带子命令直接运行 liftgate）
+lg                              # 在交互式终端打开快捷控制中心
+lg top                          # 打开全屏实时 TUI 监控仪表盘（别名：tui、dash、monitor）
+lg up                           # 后台启动网关与内嵌 Web 监控面板（全称：start）
+lg up --open                    # 后台启动并自动在浏览器打开监控面板
+lg st                           # 查看健康状态、PID、会话池、Token 统计与进行中轮次（全称：status，支持 --json）
+lg l -n 100 -f                  # 查看并实时跟随后台日志（全称：logs，加 --acp 查看 agy stderr）
+lg web                          # 打开 Web 监控面板（全称：ui，加 --print 仅输出地址）
+lg m -i                         # 交互式搜索并热切换默认模型（全称：models --pick）
+lg doc                          # 自检 agy、claude、codex、代理、内嵌面板与登录模型就绪状态（全称：doctor）
+lg r                            # 重启后台网关（全称：restart）
+lg down                         # 优雅停止后台网关并清理 ACP 子进程树（全称：stop）
+lg alias --name lg              # 在 PATH 中安装或移除（--uninstall）短命令别名
+lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh、fish、powershell、elvish）
+liftgate serve                  # 前台运行网关
 ```
 
 ## 零副作用临时启动（`liftgate codex` / `liftgate claude`）

@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img alt="status: work in progress" src="https://img.shields.io/badge/status-WIP-626C7E"></a>
-  <a href="https://github.com/acking-you/antigravity-gateway/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/antigravity-gateway/actions/workflows/syntax-check.yml/badge.svg"></a>
+  <a href="https://github.com/acking-you/liftgate/releases"><img alt="release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF"></a>
+  <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-355ACF.svg"></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
 </p>
@@ -57,8 +57,10 @@ Any other harness that speaks either API connects the same way
 - **Failover and fast lanes** — on an upstream `429` a turn moves to a backup
   model at once; titles, recaps and Auto Mode classifiers go to the fastest
   Flash model without touching your main session ([model routing](docs/architecture.md#model-routing)).
-- **Live dashboard** — in-flight turns, the session pool, token usage, models
-  and `agy` logs at `http://127.0.0.1:8787/` ([dashboard](docs/usage.md#dashboard)).
+- **Web & terminal dashboards** — inspect live turns, evict pooled sessions,
+  switch models and tail `agy` logs either in the browser
+  (`http://127.0.0.1:8787/`) or right inside your terminal with `lg top`
+  ([dashboard](docs/usage.md#dashboard)).
 
 ## How it works
 
@@ -74,27 +76,29 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 ## Get started
 
-Sign in once with the Antigravity CLI (`agy`), install `liftgate` globally
-(prebuilt release binary or `cargo install`), and manage everything from one
-command:
+Sign in once with the Antigravity CLI (`agy`), grab a prebuilt archive from
+[GitHub Releases](https://github.com/acking-you/liftgate/releases) (or
+`cargo binstall liftgate` / `cargo install`), and drive everything with the
+short **`lg`** alias (identical to `liftgate`):
 
 ```bash
 agy acp --login                         # once, to sign in to Antigravity
-cargo install --path crates/liftgate --locked  # embeds Web UI automatically when Bun is installed
+cargo install --path crates/liftgate --locked  # installs both `lg` and `liftgate` (embeds Web UI when Bun is present)
 
-liftgate start --open                   # start background gateway + dashboard (http://127.0.0.1:8787/)
-liftgate codex                          # launch Codex CLI in current dir (0 side effects on exit)
-liftgate claude                         # or launch Claude Code in current dir (0 side effects on exit)
+lg                                      # open interactive command center in your terminal
+lg cx                                   # launch Codex CLI in current dir (0 side effects on exit)
+lg cc                                   # or launch Claude Code in current dir (0 side effects on exit)
 ```
 
-Manage the service, inspect logs, or write local/global client configs from anywhere:
+Monitor live traffic in the TUI, switch models interactively, or sync configs from anywhere:
 
 ```bash
-liftgate status          # health, PID, session pool, token usage & model count
-liftgate logs -f         # tail / follow background service logs
-liftgate ui              # open the embedded Web dashboard
-liftgate config          # write/merge .claude/ & .codex/ configs (--global for ~/, --uninstall to remove)
-liftgate stop            # gracefully stop the background gateway
+lg top                   # full-screen real-time terminal dashboard (turns, pool, models, logs)
+lg m -i                  # interactively filter & switch default Antigravity model
+lg up --open             # start background gateway + open embedded Web dashboard
+lg st                    # health, PID, session pool, token metrics & active turns
+lg cfg -g                # write/merge ~/.claude & ~/.codex configs (--uninstall to remove)
+lg down                  # gracefully stop the background gateway
 ```
 
 Running straight from a source checkout via `./run-gateway.{sh,cmd}` and

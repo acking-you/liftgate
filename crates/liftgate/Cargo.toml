@@ -1,20 +1,46 @@
 [package]
 name = "liftgate"
+description = "Antigravity ACP local API gateway, interactive TUI & web dashboard, and Claude Code / Codex CLI manager"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+default-run = "liftgate"
 
 [[bin]]
 name = "liftgate"
 path = "src/main.rs"
 
+[[bin]]
+name = "lg"
+path = "src/bin/lg.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.i686-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
 liftgate-server = { workspace = true }
 liftgate-types = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+comfy-table = { workspace = true }
+crossterm = { workspace = true }
 dunce = { workspace = true }
+owo-colors = { workspace = true }
+ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

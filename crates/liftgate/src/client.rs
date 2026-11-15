@@ -45,6 +45,12 @@ struct DiscoveredModelList {
     data: Vec<DiscoveredModel>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CloseSessionResponse {
+    #[serde(default)]
+    closed: bool,
+}
+
 /// Proxy-immune HTTP/1.1 client speaking directly over loopback TCP to a local `liftgate` instance.
 #[derive(Clone, Debug)]
 pub struct GatewayClient {
@@ -141,6 +147,23 @@ impl GatewayClient {
         serde_json::from_slice(&body).map_err(|source| CliError::GatewayBadJson { url, source })
     }
 
+    pub async fn close_idle_session(&self, session_id: &str) -> Result<bool, CliError> {
+        let encoded = percent_encode_query_component(session_id);
+        let path = format!("/api/telemetry/sessions/{encoded}/close");
+        let url = format!("{}{path}", self.base_url);
+        let (status, body) = self.authed_request("POST", &path, DEFAULT_TIMEOUT).await?;
+        if !(200..300).contains(&status) {
+            return Err(CliError::GatewayHttpStatus {
+                url,
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        let parsed: CloseSessionResponse = serde_json::from_slice(&body)
+            .map_err(|source| CliError::GatewayBadJson { url, source })?;
+        Ok(parsed.closed)
+    }
+
     pub async fn request_shutdown(&self, shutdown_token: &str) -> Result<(), CliError> {
         let path = "/api/admin/shutdown";
         let url = format!("{}{path}", self.base_url);
@@ -163,13 +186,23 @@ impl GatewayClient {
         path_and_query: &str,
         timeout_dur: Duration,
     ) -> Result<(u16, Vec<u8>), CliError> {
+        self.authed_request("GET", path_and_query, timeout_dur)
+            .await
+    }
+
+    async fn authed_request(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        timeout_dur: Duration,
+    ) -> Result<(u16, Vec<u8>), CliError> {
         if let Some(key) = &self.api_key {
             let auth_val = format!("Bearer {key}");
             let headers = [("Authorization", auth_val.as_str())];
-            self.raw_request("GET", path_and_query, &headers, timeout_dur)
+            self.raw_request(method, path_and_query, &headers, timeout_dur)
                 .await
         } else {
-            self.raw_request("GET", path_and_query, &[], timeout_dur)
+            self.raw_request(method, path_and_query, &[], timeout_dur)
                 .await
         }
     }

@@ -128,4 +128,22 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("`{feature}` requires an interactive terminal (TTY)")]
+    NotInteractiveTerminal { feature: &'static str },
+
+    #[error("interactive terminal UI error")]
+    TuiIo {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("invalid alias name `{name}` (must be a plain executable stem such as `lg`)")]
+    InvalidAliasName { name: String },
+
+    #[error(
+        "alias target `{}` already exists; pass `--force` to replace it or `--uninstall` to remove it",
+        path.display()
+    )]
+    AliasTargetExists { path: PathBuf },
 }

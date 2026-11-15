@@ -55,7 +55,7 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
-              crates/*|Cargo.toml|Cargo.lock|rustfmt.toml|clippy.toml|*/Cargo.toml)
+              crates/*|Cargo.toml|Cargo.lock|Cross.toml|rustfmt.toml|clippy.toml|*/Cargo.toml)
                 rust=true
                 ;;
               web/*)

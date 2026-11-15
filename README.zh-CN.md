@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img alt="status: work in progress" src="https://img.shields.io/badge/status-WIP-626C7E"></a>
-  <a href="https://github.com/acking-you/antigravity-gateway/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/antigravity-gateway/actions/workflows/syntax-check.yml/badge.svg"></a>
+  <a href="https://github.com/acking-you/liftgate/releases"><img alt="release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF"></a>
+  <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-355ACF.svg"></a>
   <a href="#许可证"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
 </p>
@@ -41,7 +41,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 - **会话预热复用**：按每次请求的历史匹配池中已预热的 ACP 会话，只发送本轮新增内容（[会话复用](docs/architecture.md#session-reuse)）。
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **容灾与快车道**：上游返回 `429` 时立即切换备用模型；标题、摘要与 Auto Mode 分类等辅助请求走最快的 Flash 模型，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
-- **实时监控面板**：在 `http://127.0.0.1:8787/` 查看进行中的任务、会话池、Token 用量、模型与 `agy` 日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
+- **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
 
 ## 工作原理
 
@@ -54,25 +54,26 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ## 快速开始
 
-使用 Antigravity CLI（`agy`）完成一次登录，全局安装单个 `liftgate` 二进制（预编译发行版或 `cargo install`），即可通过同一命令完成全部管理与启动：
+使用 Antigravity CLI（`agy`）完成一次登录，从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包（或通过 `cargo binstall liftgate` / `cargo install` 安装），即可直接使用短命令别名 **`lg`**（与 `liftgate` 完全等价）：
 
 ```bash
 agy acp --login                         # 首次使用时登录 Antigravity
-cargo install --path crates/liftgate --locked  # 若本机装有 Bun 会自动编译并内嵌 Web 监控面板
+cargo install --path crates/liftgate --locked  # 同时安装 `lg` 与 `liftgate`（装有 Bun 时自动内嵌 Web 面板）
 
-liftgate start --open                   # 后台启动网关服务并打开监控面板（http://127.0.0.1:8787/）
-liftgate codex                          # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
-liftgate claude                         # 或在当前目录直接启动 Claude Code（退出后 0 副作用）
+lg                                      # 在终端直接打开交互式控制中心（快捷键一键启动）
+lg cx                                   # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
+lg cc                                   # 或在当前目录直接启动 Claude Code（退出后 0 副作用）
 ```
 
-在任意目录下管理后台服务、查看日志，或生成/卸载项目级与全局客户端配置：
+在任意目录下打开终端 TUI 监控、交互式切换模型，或同步项目级与全局客户端配置：
 
 ```bash
-liftgate status          # 查看健康状态、PID、会话池、Token 用量与模型数
-liftgate logs -f         # 实时追踪后台网关日志
-liftgate ui              # 在浏览器打开内嵌 Web 监控面板
-liftgate config          # 生成/合并 .claude/ 与 .codex/ 配置（--global 写全局，--uninstall 卸载）
-liftgate stop            # 优雅停止后台网关服务
+lg top                   # 打开全屏实时终端仪表盘（实时请求、会话池管理、模型切换、日志）
+lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
+lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板
+lg st                    # 查看健康状态、PID、会话池、Token 统计与进行中轮次
+lg cfg -g                # 无损合并 ~/.claude 与 ~/.codex 全局配置（--uninstall 卸载）
+lg down                  # 优雅停止后台网关服务
 ```
 
 在源码仓库中继续使用 `./run-gateway.{sh,cmd}` 与 `./start-agy.{sh,cmd}` 同样完全兼容。完整子命令说明、参数列表与 SDK 接入方式见[使用指南](docs/usage.zh-CN.md)。

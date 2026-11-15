@@ -1,18 +1,23 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use liftgate_server::platform::{resolve_agy_binary, wait_for_shutdown_signal};
+use comfy_table::{Attribute, Cell, Color as TableColor};
+use liftgate_server::platform::{
+    canonicalize_clean, detect_effective_proxy_url, resolve_agy_binary, split_expanded_path_var,
+    wait_for_shutdown_signal,
+};
 use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId};
+use liftgate_types::telemetry::{TaskPhase, TaskProtocol};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::cli::{
-    DoctorArgs, LogsArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs,
-    normalize_optional_api_key,
+    AliasArgs, DoctorArgs, LogsArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs,
+    UiArgs, invoked_bin_name, normalize_optional_api_key,
 };
 use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
 use crate::config_sync::resolve_fast_model;
@@ -20,6 +25,7 @@ use crate::error::CliError;
 use crate::harness::{resolve_claude_command, resolve_codex_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{DaemonState, StatePaths, format_connect_url, now_unix_ms};
+use crate::ui::{self, Spinner, Tone};
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
 
@@ -67,15 +73,30 @@ pub async fn start_daemon_inner(
                     && existing.acp_mode == serve.acp_mode
                     && existing.api_key == requested_key;
                 if !quiet_banner {
-                    println!(
-                        "[OK] Liftgate gateway is already running (PID {}, API & Web UI: {}/)",
-                        existing.pid,
-                        existing.dashboard_base_url()
+                    let bin = invoked_bin_name();
+                    ui::headline(
+                        Tone::Ok,
+                        &format!(
+                            "Liftgate background service is already online (PID {})",
+                            existing.pid
+                        ),
+                    );
+                    ui::kv_accent("Gateway API", &format!("{}/", existing.connect_base_url()));
+                    ui::kv_accent(
+                        "Web Dashboard",
+                        &format!("{}/", existing.dashboard_base_url()),
+                    );
+                    ui::kv(
+                        "Default Model",
+                        &format!("{} (mode: {})", existing.default_model, existing.acp_mode),
                     );
                     if !config_matches {
-                        println!(
-                            "  [Note] Active daemon uses listen={} model={}; run `liftgate restart ...` or `liftgate start --force ...` to apply new settings.",
-                            existing.listen, existing.default_model
+                        ui::note(
+                            Tone::Warn,
+                            &format!(
+                                "Active daemon uses listen={} model={}; run `{bin} restart` or `{bin} up --force` to apply new flags.",
+                                existing.listen, existing.default_model
+                            ),
                         );
                     }
                 }
@@ -113,6 +134,11 @@ pub async fn start_daemon_inner(
     let exe_path = std::env::current_exe().map_err(|source| CliError::DaemonSpawn { source })?;
     let shutdown_token = Uuid::new_v4().to_string();
     let clean_api_key = normalize_optional_api_key(serve.api_key.as_deref());
+
+    let spinner = Spinner::start(format!(
+        "Starting Liftgate background gateway on {} (initializing agy acp)…",
+        format_connect_url(serve.listen)
+    ));
 
     let mut cmd = Command::new(&exe_path);
     cmd.arg("serve")
@@ -182,6 +208,7 @@ pub async fn start_daemon_inner(
     }
 
     if !ready {
+        spinner.finish_and_clear().await;
         let _ = terminate_pid_fallback(pid);
         let _ = force_kill_pid_if_needed(pid);
         return Err(CliError::DaemonHealthTimeout {
@@ -189,6 +216,7 @@ pub async fn start_daemon_inner(
             log_path: state_paths.log_file(),
         });
     }
+    spinner.finish_and_clear().await;
 
     let state = DaemonState {
         pid,
@@ -207,20 +235,29 @@ pub async fn start_daemon_inner(
     state_paths.write_daemon(&state)?;
 
     if !quiet_banner {
+        let bin = invoked_bin_name();
         let model_count = client.fetch_models().await.map_or(0, |m| m.len());
-        println!("[OK] Liftgate background service started (PID {pid})");
-        println!("  Gateway API  : {}/", state.connect_base_url());
-        println!("  Web Dashboard: {}/", state.dashboard_base_url());
-        println!(
-            "  Default Model: {} (mode: {}, live models: {model_count})",
-            state.default_model, state.acp_mode
+        ui::headline(
+            Tone::Ok,
+            &format!("Liftgate background service started (PID {pid})"),
         );
-        println!("  Service Logs : {}", state.log_file.display());
+        ui::kv_accent("Gateway API", &format!("{}/", state.connect_base_url()));
+        ui::kv_accent("Web Dashboard", &format!("{}/", state.dashboard_base_url()));
+        ui::kv(
+            "Default Model",
+            &format!(
+                "{}  (mode: {}, {model_count} live models)",
+                state.default_model, state.acp_mode
+            ),
+        );
+        ui::kv("Service Logs", &state.log_file.display().to_string());
         if model_count <= 1 {
-            println!(
-                "  [Hint] Only fallback model detected; run `agy acp --login` if you have not signed in yet."
+            ui::note(
+                Tone::Warn,
+                "Only fallback model detected; run `agy acp --login` if you have not signed in yet.",
             );
         }
+        ui::cmd_hint("Live terminal dashboard", &format!("{bin} top"));
     }
 
     Ok(state)
@@ -229,12 +266,17 @@ pub async fn start_daemon_inner(
 pub async fn stop_daemon(state_paths: &StatePaths, quiet: bool) -> Result<bool, CliError> {
     let Some(daemon) = state_paths.read_daemon()? else {
         if !quiet {
-            println!("[INFO] No managed background gateway is currently running.");
+            ui::headline(
+                Tone::Muted,
+                "No managed background gateway is currently running",
+            );
         }
         return Ok(false);
     };
 
     let pid = daemon.pid;
+    let spinner = (!quiet)
+        .then(|| Spinner::start(format!("Draining & stopping Liftgate daemon (PID {pid})…")));
     if is_pid_alive(pid) {
         let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
         let mut graceful_sent = false;
@@ -274,6 +316,9 @@ pub async fn stop_daemon(state_paths: &StatePaths, quiet: bool) -> Result<bool, 
                 }
             }
             if is_pid_alive(pid) {
+                if let Some(sp) = spinner {
+                    sp.finish_and_clear().await;
+                }
                 return Err(CliError::DaemonStopFailed {
                     pid,
                     source: io::Error::new(
@@ -285,9 +330,15 @@ pub async fn stop_daemon(state_paths: &StatePaths, quiet: bool) -> Result<bool, 
         }
     }
 
+    if let Some(sp) = spinner {
+        sp.finish_and_clear().await;
+    }
     state_paths.remove_daemon()?;
     if !quiet {
-        println!("[OK] Stopped Liftgate background service (PID {pid}).");
+        ui::headline(
+            Tone::Ok,
+            &format!("Stopped Liftgate background service (PID {pid})"),
+        );
     }
     Ok(true)
 }
@@ -407,10 +458,6 @@ pub async fn ensure_gateway_ready(
         if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
             serve.default_model = m.to_owned();
         }
-        eprintln!(
-            "[liftgate] Starting background gateway on {} ...",
-            format_connect_url(addr)
-        );
         let daemon = start_daemon_inner(state_paths, serve, false, true).await?;
         let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
         return Ok(ActiveGatewayTarget {
@@ -470,10 +517,6 @@ pub async fn ensure_gateway_ready(
     if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
         serve.default_model = m.to_owned();
     }
-    eprintln!(
-        "[liftgate] Starting background gateway on {} ...",
-        format_connect_url(serve.listen)
-    );
     let daemon = start_daemon_inner(state_paths, serve, false, true).await?;
     let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
     Ok(ActiveGatewayTarget {
@@ -539,54 +582,170 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         return Ok(());
     }
 
-    println!("Liftgate Service Status: {state_label}");
+    let (pill_tone, pill_text) = if healthy && managed_alive {
+        (Tone::Ok, "ONLINE · MANAGED")
+    } else if healthy {
+        (Tone::Info, "ONLINE · EXTERNAL")
+    } else {
+        (Tone::Err, "OFFLINE")
+    };
+    ui::banner(
+        "Liftgate Gateway",
+        Some((pill_tone, pill_text)),
+        Some(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+    );
+
     if let Some(d) = &daemon
         && managed_alive
     {
-        println!("  PID           : {}", d.pid);
+        ui::kv("Service PID", &d.pid.to_string());
     }
-    println!("  Gateway API   : {}/", client.base_url());
-    println!("  Web Dashboard : {dashboard_url}");
-    println!(
-        "  API Key Auth  : {}",
+    ui::kv_accent("Gateway API", &format!("{}/", client.base_url()));
+    ui::kv_accent("Web Dashboard", &dashboard_url);
+    ui::kv(
+        "Authentication",
         if api_key.is_some() {
-            "enabled"
+            "API key required (Bearer / x-api-key)"
         } else {
-            "disabled"
-        }
+            "open loopback (no API key required)"
+        },
     );
-    println!("  Log File      : {}", state_paths.log_file().display());
+    ui::kv("Service Log", &state_paths.log_file().display().to_string());
 
     if let Some(snap) = telemetry {
-        println!(
-            "  Uptime & ACP  : {}s · default={} · mode={} · agy_pid={:?}",
-            snap.acp_process.uptime_secs,
+        println!();
+        let mut table = ui::new_table(&["Subsystem", "Status", "Telemetry Summary"]);
+
+        let acp_tone = if snap.acp_process.connected {
+            Tone::Ok
+        } else {
+            Tone::Err
+        };
+        let agy_pid = snap
+            .acp_process
+            .pid
+            .map_or_else(|| "—".to_owned(), |p| p.to_string());
+        let acp_detail = format!(
+            "up {} · model={} · mode={} · agy_pid={agy_pid}",
+            ui::format_duration_secs(snap.acp_process.uptime_secs),
             snap.acp_process.default_model,
             snap.acp_process.acp_mode,
-            snap.acp_process.pid
         );
-        println!(
-            "  Session Pool  : {} active / {} idle (reused {}, created {})",
+        table.add_row(vec![
+            ui::accent_cell("ACP Engine"),
+            ui::status_cell(
+                if snap.acp_process.connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                },
+                acp_tone,
+            ),
+            Cell::new(acp_detail),
+        ]);
+
+        let pool_bar = ui::progress_bar(
+            snap.session_pool.idle_cached_sessions,
+            snap.session_pool.max_idle_sessions,
+            8,
+        );
+        let pool_detail = format!(
+            "{pool_bar}  {} active · {}/{} idle  (reused {}, created {}, evicted {})",
             snap.session_pool.active_leased_sessions,
             snap.session_pool.idle_cached_sessions,
+            snap.session_pool.max_idle_sessions,
             snap.session_pool.total_sessions_reused,
-            snap.session_pool.total_sessions_created
+            snap.session_pool.total_sessions_created,
+            snap.session_pool.total_sessions_closed_or_evicted,
         );
-        println!(
-            "  Requests      : {} total ({} completed, {} failed, {} active) · tokens in={} out={}",
+        table.add_row(vec![
+            ui::accent_cell("Session Pool"),
+            ui::status_cell("ready", Tone::Ok),
+            Cell::new(pool_detail),
+        ]);
+
+        let traffic_tone =
+            if snap.metrics.failed_requests > 0 && snap.metrics.completed_requests == 0 {
+                Tone::Warn
+            } else {
+                Tone::Ok
+            };
+        let traffic_detail = format!(
+            "{} total ({} ok, {} err, {} in-flight) · tokens in {} / out {} / think {}",
             snap.metrics.total_requests,
             snap.metrics.completed_requests,
             snap.metrics.failed_requests,
             snap.metrics.active_requests,
-            snap.metrics.total_input_tokens,
-            snap.metrics.total_output_tokens
+            ui::format_tokens(snap.metrics.total_input_tokens),
+            ui::format_tokens(snap.metrics.total_output_tokens),
+            ui::format_tokens(snap.metrics.total_thought_tokens),
         );
+        table.add_row(vec![
+            ui::accent_cell("API Traffic"),
+            ui::status_cell(
+                &format!("{} active", snap.metrics.active_requests),
+                traffic_tone,
+            ),
+            Cell::new(traffic_detail),
+        ]);
+
+        if let Some(list) = &models {
+            let model_tone = if list.len() > 1 { Tone::Ok } else { Tone::Warn };
+            table.add_row(vec![
+                ui::accent_cell("Model Catalog"),
+                ui::status_cell(&format!("{} live", list.len()), model_tone),
+                Cell::new(if list.len() > 1 {
+                    "Antigravity live catalog synchronized".to_owned()
+                } else {
+                    "Fallback catalog only (run `agy acp --login` to authenticate)".to_owned()
+                }),
+            ]);
+        }
+
+        println!("{table}");
+
+        if !snap.active_tasks.is_empty() {
+            ui::section("Active In-Flight Turns");
+            let mut turns = ui::new_table(&["Turn", "Surface", "Model", "Phase", "Elapsed"]);
+            for t in &snap.active_tasks {
+                let surface = match t.protocol {
+                    TaskProtocol::OpenaiResponses => "OpenAI",
+                    TaskProtocol::AnthropicMessages => "Anthropic",
+                };
+                let phase = match t.phase {
+                    TaskPhase::InitializingSession => "init",
+                    TaskPhase::Thinking => "thinking",
+                    TaskPhase::SearchingWeb => "web-search",
+                    TaskPhase::FetchingWeb => "web-fetch",
+                    TaskPhase::StreamingText => "streaming",
+                    TaskPhase::CallingClientTool => "tool-call",
+                    TaskPhase::Completed => "done",
+                    TaskPhase::Failed => "failed",
+                    TaskPhase::Cancelled => "cancelled",
+                };
+                let short_id: String = t.task_id.chars().take(12).collect();
+                turns.add_row(vec![
+                    ui::dim_cell(short_id),
+                    Cell::new(surface),
+                    ui::accent_cell(&t.resolved_model),
+                    ui::status_cell(phase, Tone::Info),
+                    ui::right_cell(ui::format_latency_ms(t.elapsed_ms)),
+                ]);
+            }
+            println!("{turns}");
+        }
+    } else if let Some(list) = models {
+        ui::kv("Live Models", &format!("{} discovered", list.len()));
     }
-    if let Some(list) = models {
-        println!("  Live Models   : {} discovered", list.len());
-    }
+
+    let bin = invoked_bin_name();
     if !healthy {
-        println!("  [Hint] Start the background gateway with: liftgate start");
+        println!();
+        ui::cmd_hint("Start background service", &format!("{bin} up"));
+        ui::cmd_hint("Open interactive command center", &bin);
+    } else {
+        println!();
+        ui::cmd_hint("Open real-time TUI monitor", &format!("{bin} top"));
     }
     Ok(())
 }
@@ -608,20 +767,25 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
                     source,
                 })?;
         }
-        println!("[OK] Cleared gateway log at {}", log_path.display());
+        ui::headline(
+            Tone::Ok,
+            &format!("Cleared gateway log at {}", log_path.display()),
+        );
         return Ok(());
     }
 
     if log_path.is_file() {
         let tail = tail_file_lines(&log_path, args.lines)?;
         if !tail.is_empty() {
-            print!("{tail}");
-            if !tail.ends_with('\n') {
-                println!();
+            for line in tail.lines() {
+                ui::print_log_line(line);
             }
         }
     } else if !args.follow && !args.acp {
-        println!("[INFO] No log file yet at {}", log_path.display());
+        ui::headline(
+            Tone::Muted,
+            &format!("No log file yet at {}", log_path.display()),
+        );
         return Ok(());
     }
 
@@ -635,9 +799,10 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
         if let Ok(snap) = client.fetch_telemetry().await
             && !snap.acp_process.recent_stderr.is_empty()
         {
-            println!("--- Recent `agy acp` stderr ---");
+            ui::section("Recent `agy acp` stderr");
             for item in &snap.acp_process.recent_stderr {
-                println!("[{}] {}", item.timestamp_unix_ms, item.line);
+                let ts = ui::format_utc_hms(item.timestamp_unix_ms);
+                ui::print_log_line(&format!("{ts}  {}", item.line));
             }
         }
     }
@@ -648,6 +813,7 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
 
     let mut offset = fs::metadata(&log_path).map_or(0, |m| m.len());
     let mut buf = vec![0u8; 8192];
+    let mut pending_line = String::new();
     let mut shutdown = std::pin::pin!(wait_for_shutdown_signal());
 
     loop {
@@ -660,6 +826,7 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
                 };
                 if meta.len() < offset {
                     offset = 0;
+                    pending_line.clear();
                 }
                 if meta.len() > offset
                     && let Ok(mut file) = File::open(&log_path)
@@ -671,7 +838,13 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
                             Ok(n) => {
                                 offset += n as u64;
                                 if let Some(chunk) = buf.get(..n) {
-                                    print!("{}", String::from_utf8_lossy(chunk));
+                                    pending_line.push_str(&String::from_utf8_lossy(chunk));
+                                    while let Some(nl_pos) = pending_line.find('\n') {
+                                        let rest = pending_line.split_off(nl_pos + 1);
+                                        let line = pending_line.trim_end_matches(&['\r', '\n'][..]);
+                                        ui::print_log_line(line);
+                                        pending_line = rest;
+                                    }
                                 }
                             }
                             Err(_) => break,
@@ -680,6 +853,9 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
                 }
             }
         }
+    }
+    if !pending_line.is_empty() {
+        ui::print_log_line(&pending_line);
     }
     Ok(())
 }
@@ -697,13 +873,20 @@ pub async fn run_ui(state_paths: &StatePaths, args: UiArgs) -> Result<(), CliErr
         println!("{url}");
         return Ok(());
     }
-    println!("Opening Liftgate Web Dashboard: {}", target.dashboard_url);
+    ui::headline(Tone::Ok, "Opening Liftgate Web Dashboard in browser");
+    ui::kv_accent("Dashboard URL", &target.dashboard_url);
     open_browser(&url)
 }
 
 pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<(), CliError> {
-    let target =
-        ensure_gateway_ready(state_paths, args.listen, args.api_key, None, !args.no_start).await?;
+    let target = ensure_gateway_ready(
+        state_paths,
+        args.listen,
+        args.api_key.clone(),
+        None,
+        !args.no_start,
+    )
+    .await?;
     let models: Vec<DiscoveredModel> = target.client.fetch_models().await?;
     let fast_model = resolve_fast_model(None, &target.default_model, &models);
 
@@ -725,64 +908,203 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
         return Ok(());
     }
 
-    println!(
-        "Available Antigravity Models ({} total · primary={} · fast={}):",
-        models.len(),
-        target.default_model,
-        fast_model
+    if args.pick {
+        let chosen =
+            crate::tui::run_model_picker(&models, &target.default_model, &fast_model).await?;
+        let Some(selected) = chosen else {
+            return Ok(());
+        };
+        let bin = invoked_bin_name();
+        if selected == target.default_model {
+            ui::headline(
+                Tone::Info,
+                &format!("Default model is already `{selected}`"),
+            );
+            return Ok(());
+        }
+        let managed_daemon = state_paths
+            .read_daemon()?
+            .filter(|d| is_pid_alive(d.pid) && args.listen.is_none_or(|l| l == d.listen));
+        if managed_daemon.is_some() {
+            ui::headline(
+                Tone::Action,
+                &format!("Switching managed gateway default model -> `{selected}`"),
+            );
+            run_restart(
+                state_paths,
+                RestartArgs {
+                    listen: args.listen,
+                    ui_listen: None,
+                    default_model: Some(selected),
+                    acp_mode: None,
+                    api_key: args.api_key,
+                    agy_bin: None,
+                    open: false,
+                },
+            )
+            .await?;
+        } else {
+            ui::headline(Tone::Info, &format!("Selected model `{selected}`"));
+            ui::cmd_hint(
+                "Launch Codex with this model",
+                &format!("{bin} cx -m {selected}"),
+            );
+            ui::cmd_hint(
+                "Launch Claude with this model",
+                &format!("{bin} cc -m {selected}"),
+            );
+        }
+        return Ok(());
+    }
+
+    let count_badge = format!("{} models", models.len());
+    let sub = format!("default={} · fast={fast_model}", target.default_model);
+    ui::banner(
+        "Antigravity Model Catalog",
+        Some((Tone::Ok, &count_badge)),
+        Some(&sub),
     );
+    println!();
+
+    let mut table = ui::new_table(&["Model ID", "Display Name", "Context", "Role"]);
     for m in &models {
         let ctx_k = if m.context_window > 0 {
             format!("{}k", m.context_window / 1_000)
         } else {
             "1000k".to_owned()
         };
-        let mut tags: Vec<&str> = Vec::new();
-        if m.id == target.default_model {
-            tags.push("default");
-        }
-        if m.id == fast_model {
-            tags.push("fast");
-        }
-        let tag_str = if tags.is_empty() {
-            String::new()
+        let is_default = m.id == target.default_model;
+        let is_fast = m.id == fast_model;
+        let id_cell = if is_default && ui::use_color() {
+            Cell::new(&m.id)
+                .fg(TableColor::Green)
+                .add_attribute(Attribute::Bold)
+        } else if is_fast && ui::use_color() {
+            Cell::new(&m.id).fg(TableColor::Cyan)
         } else {
-            format!(" [{}]", tags.join(", "))
+            Cell::new(&m.id)
         };
-        println!("  - {:<30} {:>6}  {}{tag_str}", m.id, ctx_k, m.display_name);
+        let role_cell = match (is_default, is_fast) {
+            (true, true) => ui::status_cell("default · fast", Tone::Ok),
+            (true, false) => ui::status_cell("default", Tone::Ok),
+            (false, true) => ui::status_cell("fast", Tone::Info),
+            (false, false) => ui::dim_cell("—"),
+        };
+        let display = if m.display_name.is_empty() {
+            m.id.as_str()
+        } else {
+            m.display_name.as_str()
+        };
+        table.add_row(vec![
+            id_cell,
+            Cell::new(display),
+            ui::right_cell(ctx_k),
+            role_cell,
+        ]);
     }
+    println!("{table}");
+    println!();
+    let bin = invoked_bin_name();
+    ui::cmd_hint(
+        "Interactively filter & switch default model",
+        &format!("{bin} m -i"),
+    );
     Ok(())
 }
 
 pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<(), CliError> {
-    println!("Liftgate Environment Doctor");
-    println!("  State Directory : {}", state_paths.root().display());
+    struct CheckRow {
+        name: &'static str,
+        status: &'static str,
+        tone: Tone,
+        detail: String,
+    }
+
+    let bin = invoked_bin_name();
+    let mut checks: Vec<CheckRow> = Vec::with_capacity(8);
+    let mut has_error = false;
+    let mut has_warn = false;
+
+    checks.push(CheckRow {
+        name: "State Directory",
+        status: "ready",
+        tone: Tone::Ok,
+        detail: state_paths.root().display().to_string(),
+    });
 
     match resolve_agy_binary(args.agy_bin) {
-        Some(bin) => println!("  [OK] agy CLI    : {}", bin.display()),
-        None => println!(
-            "  [!!] agy CLI    : NOT FOUND (install Antigravity CLI and run `agy acp --login`)"
-        ),
+        Some(agy) => checks.push(CheckRow {
+            name: "Antigravity CLI",
+            status: "found",
+            tone: Tone::Ok,
+            detail: agy.display().to_string(),
+        }),
+        None => {
+            has_error = true;
+            checks.push(CheckRow {
+                name: "Antigravity CLI",
+                status: "missing",
+                tone: Tone::Err,
+                detail: "NOT FOUND (install `agy` and run `agy acp --login`)".to_owned(),
+            });
+        }
     }
 
-    let (_, full_ui_embedded) = active_embedded_ui();
-    println!(
-        "  [OK] Web UI     : {}",
-        if full_ui_embedded {
-            "embedded production React dashboard"
+    let (ui_assets, full_ui_embedded) = active_embedded_ui();
+    checks.push(CheckRow {
+        name: "Embedded Web UI",
+        status: if full_ui_embedded {
+            "bundled"
         } else {
-            "embedded lightweight SSE telemetry dashboard"
-        }
-    );
+            "fallback"
+        },
+        tone: Tone::Ok,
+        detail: if full_ui_embedded {
+            format!("Production React dashboard ({} assets)", ui_assets.len())
+        } else {
+            "Lightweight SSE telemetry dashboard".to_owned()
+        },
+    });
 
     match resolve_claude_command(None) {
-        Ok(cmd) => println!("  [OK] claude CLI : {}", cmd.program.display()),
-        Err(_) => println!("  [--] claude CLI : not detected in PATH"),
+        Ok(cmd) => checks.push(CheckRow {
+            name: "Claude Code CLI",
+            status: "found",
+            tone: Tone::Ok,
+            detail: cmd.program.display().to_string(),
+        }),
+        Err(_) => checks.push(CheckRow {
+            name: "Claude Code CLI",
+            status: "optional",
+            tone: Tone::Muted,
+            detail: "not detected in PATH (`npm i -g @anthropic-ai/claude-code`)".to_owned(),
+        }),
     }
     match resolve_codex_command(None) {
-        Ok(cmd) => println!("  [OK] codex CLI  : {}", cmd.program.display()),
-        Err(_) => println!("  [--] codex CLI  : not detected in PATH"),
+        Ok(cmd) => checks.push(CheckRow {
+            name: "Codex CLI",
+            status: "found",
+            tone: Tone::Ok,
+            detail: cmd.program.display().to_string(),
+        }),
+        Err(_) => checks.push(CheckRow {
+            name: "Codex CLI",
+            status: "optional",
+            tone: Tone::Muted,
+            detail: "not detected in PATH (`npm i -g @openai/codex`)".to_owned(),
+        }),
     }
+
+    let proxy_detail = match detect_effective_proxy_url() {
+        Some(proxy) => format!("{proxy} (loopback 127.0.0.1 auto-bypassed via NO_PROXY)"),
+        None => "direct connection (no proxy configured)".to_owned(),
+    };
+    checks.push(CheckRow {
+        name: "Network Proxy",
+        status: "verified",
+        tone: Tone::Ok,
+        detail: proxy_detail,
+    });
 
     let daemon = state_paths.read_daemon()?;
     let listen = args
@@ -793,34 +1115,245 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
     let client = GatewayClient::new(listen, api_key);
 
     if client.check_health(Duration::from_millis(800)).await {
-        println!("  [OK] Gateway    : online at {}/", client.base_url());
+        checks.push(CheckRow {
+            name: "Gateway Service",
+            status: "online",
+            tone: Tone::Ok,
+            detail: format!("{}/", client.base_url()),
+        });
         match client.fetch_models().await {
             Ok(models) if models.len() > 1 => {
-                println!(
-                    "  [OK] Auth/Models: {} live Antigravity models ready",
-                    models.len()
-                );
+                checks.push(CheckRow {
+                    name: "ACP Auth/Models",
+                    status: "ready",
+                    tone: Tone::Ok,
+                    detail: format!("{} live Antigravity models available", models.len()),
+                });
             }
             Ok(_) => {
-                println!(
-                    "  [!!] Auth/Models: only fallback model returned; run `agy acp --login` to sign in"
-                );
+                has_warn = true;
+                checks.push(CheckRow {
+                    name: "ACP Auth/Models",
+                    status: "login needed",
+                    tone: Tone::Warn,
+                    detail: "only fallback model returned; run `agy acp --login`".to_owned(),
+                });
             }
             Err(err) => {
-                println!("  [!!] Auth/Models: {err}");
+                has_error = true;
+                checks.push(CheckRow {
+                    name: "ACP Auth/Models",
+                    status: "error",
+                    tone: Tone::Err,
+                    detail: err.to_string(),
+                });
             }
         }
     } else {
+        has_warn = true;
+        checks.push(CheckRow {
+            name: "Gateway Service",
+            status: "offline",
+            tone: Tone::Warn,
+            detail: format!(
+                "not listening at {}/ (start with `{bin} up`)",
+                client.base_url()
+            ),
+        });
+    }
+
+    if args.json {
+        let payload = json!({
+            "ok": !has_error,
+            "warnings": has_warn,
+            "checks": checks.iter().map(|c| json!({
+                "name": c.name,
+                "status": c.status,
+                "detail": c.detail,
+            })).collect::<Vec<_>>(),
+        });
         println!(
-            "  [--] Gateway    : offline at {}/ (start with `liftgate start`)",
-            client.base_url()
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
         );
+        return Ok(());
+    }
+
+    let summary_pill = if has_error {
+        (Tone::Err, "ACTION REQUIRED")
+    } else if has_warn {
+        (Tone::Warn, "READY WITH NOTES")
+    } else {
+        (Tone::Ok, "ALL SYSTEMS READY")
+    };
+    ui::banner(
+        "Liftgate Environment Doctor",
+        Some(summary_pill),
+        Some(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+    );
+    println!();
+
+    let mut table = ui::new_table(&["Component", "Status", "Details"]);
+    for row in &checks {
+        table.add_row(vec![
+            ui::accent_cell(row.name),
+            ui::status_cell(row.status, row.tone),
+            Cell::new(&row.detail),
+        ]);
+    }
+    println!("{table}");
+
+    if has_warn && !has_error {
+        println!();
+        ui::cmd_hint("Start background gateway", &format!("{bin} up"));
     }
 
     Ok(())
 }
 
-fn build_authenticated_dashboard_url(
+pub fn run_alias(args: AliasArgs) -> Result<(), CliError> {
+    let exe = std::env::current_exe().map_err(|source| CliError::StateIo {
+        path: PathBuf::from("current_exe"),
+        source,
+    })?;
+    let stem = validate_alias_stem(&args.name)?;
+    let dest_dir = match &args.dir {
+        Some(dir) => dir.clone(),
+        None => exe
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    let target_path = alias_binary_path(&dest_dir, &stem);
+    install_or_remove_alias(&exe, &target_path, &stem, args.force, args.uninstall)
+}
+
+fn validate_alias_stem(raw: &str) -> Result<String, CliError> {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_suffix(".exe")
+        .or_else(|| trimmed.strip_suffix(".EXE"))
+        .unwrap_or(trimmed);
+    let valid = !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(CliError::InvalidAliasName {
+            name: raw.to_owned(),
+        });
+    }
+    Ok(stripped.to_owned())
+}
+
+fn alias_binary_path(dir: &Path, stem: &str) -> PathBuf {
+    if cfg!(windows) {
+        dir.join(format!("{stem}.exe"))
+    } else {
+        dir.join(stem)
+    }
+}
+
+fn install_or_remove_alias(
+    source_exe: &Path,
+    target_path: &Path,
+    stem: &str,
+    force: bool,
+    uninstall: bool,
+) -> Result<(), CliError> {
+    let clean_source = canonicalize_clean(source_exe);
+    if uninstall {
+        if !target_path.exists() {
+            ui::headline(
+                Tone::Muted,
+                &format!("Alias `{stem}` is not present at {}", target_path.display()),
+            );
+            return Ok(());
+        }
+        fs::remove_file(target_path).map_err(|source| CliError::StateIo {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+        ui::headline(
+            Tone::Ok,
+            &format!("Removed CLI alias `{stem}` ({})", target_path.display()),
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = target_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|source| CliError::StateIo {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    if target_path.exists() {
+        let clean_target = canonicalize_clean(target_path);
+        if clean_target == clean_source {
+            ui::headline(Tone::Ok, &format!("CLI alias `{stem}` is already active"));
+            ui::kv_accent("Executable", &clean_target.display().to_string());
+            return Ok(());
+        }
+        if !force {
+            return Err(CliError::AliasTargetExists {
+                path: target_path.to_path_buf(),
+            });
+        }
+        fs::remove_file(target_path).map_err(|source| CliError::StateIo {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let strategy = link_or_copy_executable(&clean_source, target_path)?;
+    let resolved_target = canonicalize_clean(target_path);
+    ui::headline(Tone::Ok, &format!("Installed short CLI alias `{stem}`"));
+    ui::kv_accent("Alias Binary", &resolved_target.display().to_string());
+    ui::kv("Link Strategy", strategy);
+
+    if let Some(dir) = resolved_target.parent() {
+        let clean_dir = canonicalize_clean(dir);
+        let in_path = split_expanded_path_var()
+            .into_iter()
+            .any(|p| canonicalize_clean(&p) == clean_dir);
+        if !in_path {
+            ui::note(
+                Tone::Warn,
+                &format!(
+                    "Directory `{}` is not currently in your PATH; add it or pass `--dir <dir-on-PATH>`",
+                    clean_dir.display()
+                ),
+            );
+        }
+    }
+    ui::cmd_hint("Try your short alias", &format!("{stem} st"));
+    Ok(())
+}
+
+fn link_or_copy_executable(
+    source_exe: &Path,
+    target_path: &Path,
+) -> Result<&'static str, CliError> {
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(source_exe, target_path).is_ok() {
+            return Ok("symbolic link");
+        }
+    }
+    if fs::hard_link(source_exe, target_path).is_ok() {
+        return Ok("hard link (zero extra disk space)");
+    }
+    fs::copy(source_exe, target_path).map_err(|source| CliError::StateIo {
+        path: target_path.to_path_buf(),
+        source,
+    })?;
+    Ok("standalone binary copy")
+}
+
+pub(crate) fn build_authenticated_dashboard_url(
     dashboard_base_url: &str,
     gateway_base_url: &str,
     api_key: Option<&str>,
@@ -844,7 +1377,7 @@ fn build_authenticated_dashboard_url(
     }
 }
 
-fn open_browser(url: &str) -> Result<(), CliError> {
+pub(crate) fn open_browser(url: &str) -> Result<(), CliError> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
@@ -902,7 +1435,7 @@ fn open_browser(url: &str) -> Result<(), CliError> {
     }
 }
 
-fn tail_file_lines(path: &Path, max_lines: usize) -> Result<String, CliError> {
+pub(crate) fn tail_file_lines(path: &Path, max_lines: usize) -> Result<String, CliError> {
     if max_lines == 0 {
         return Ok(String::new());
     }
@@ -1028,8 +1561,8 @@ fn is_liftgate_process(pid: u32) -> bool {
                 return false;
             }
             let slice = buf.get(..size as usize).unwrap_or(&[]);
-            let path_str = String::from_utf16_lossy(slice).to_ascii_lowercase();
-            path_str.contains("liftgate")
+            let path_str = String::from_utf16_lossy(slice);
+            is_recognized_gateway_exe_path(&path_str)
         }
     }
 
@@ -1037,10 +1570,7 @@ fn is_liftgate_process(pid: u32) -> bool {
     {
         #[cfg(target_os = "linux")]
         if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-            return exe
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("liftgate");
+            return is_recognized_gateway_exe_path(&exe.to_string_lossy());
         }
         Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "comm="])
@@ -1048,11 +1578,24 @@ fn is_liftgate_process(pid: u32) -> bool {
             .output()
             .ok()
             .is_some_and(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .to_ascii_lowercase()
-                    .contains("liftgate")
+                is_recognized_gateway_exe_path(&String::from_utf8_lossy(&out.stdout))
             })
     }
+}
+
+fn is_recognized_gateway_exe_path(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_ascii_lowercase();
+    let stem = file_name.strip_suffix(".exe").unwrap_or(&file_name);
+    matches!(stem, "liftgate" | "lg") || stem.starts_with("liftgate-") || stem.starts_with("lg-")
 }
 
 fn terminate_pid_fallback(pid: u32) -> Result<(), CliError> {
@@ -1166,5 +1709,48 @@ mod tests {
             resolve_client_api_key(Some("local-agy"), None, listen),
             None
         );
+    }
+
+    #[test]
+    fn recognizes_both_liftgate_and_lg_process_image_names() {
+        assert!(is_recognized_gateway_exe_path(
+            r"C:\Users\dev\.cargo\bin\liftgate.exe"
+        ));
+        assert!(is_recognized_gateway_exe_path(
+            r"C:\Users\dev\.cargo\bin\lg.exe"
+        ));
+        assert!(is_recognized_gateway_exe_path("/usr/local/bin/liftgate"));
+        assert!(is_recognized_gateway_exe_path("/usr/local/bin/lg"));
+        assert!(!is_recognized_gateway_exe_path("/usr/bin/python3"));
+        assert!(!is_recognized_gateway_exe_path(r"C:\liftgate\other.exe"));
+    }
+
+    #[test]
+    fn alias_lifecycle_validates_installs_overwrites_and_uninstalls() {
+        assert!(validate_alias_stem("lg").is_ok());
+        assert_eq!(validate_alias_stem("lg.exe").unwrap(), "lg");
+        assert!(validate_alias_stem("../bad").is_err());
+        assert!(validate_alias_stem("bad/name").is_err());
+
+        let dir = std::env::temp_dir().join(format!("liftgate-alias-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake_src = alias_binary_path(&dir, "liftgate");
+        fs::write(&fake_src, b"fake-binary-bytes").unwrap();
+        let target = alias_binary_path(&dir, "lg");
+
+        install_or_remove_alias(&fake_src, &target, "lg", false, false).unwrap();
+        assert!(target.is_file());
+
+        let other_src = alias_binary_path(&dir, "other");
+        fs::write(&other_src, b"different-bytes").unwrap();
+        assert!(matches!(
+            install_or_remove_alias(&other_src, &target, "lg", false, false),
+            Err(CliError::AliasTargetExists { .. })
+        ));
+        install_or_remove_alias(&other_src, &target, "lg", true, false).unwrap();
+
+        install_or_remove_alias(&other_src, &target, "lg", false, true).unwrap();
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

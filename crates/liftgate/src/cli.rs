@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use liftgate_types::config::{
     DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
     DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS,
@@ -11,6 +12,30 @@ use liftgate_types::config::{
 /// Sentinel placeholder token injected into client harnesses when the local gateway runs
 /// without API key authentication.
 pub const PLACEHOLDER_API_KEY: &str = "local-agy";
+
+const AFTER_HELP_TEXT: &str = "\
+Quick Examples (both `lg` and `liftgate` work identically):
+  lg                      Open interactive command center (when run in a terminal)
+  lg cx                   Launch Codex CLI in current dir (0 side effects on exit)
+  lg cc                   Launch Claude Code in current dir (0 side effects on exit)
+  lg top                  Open real-time terminal observability dashboard (TUI)
+  lg up --open            Start background gateway and open Web UI
+  lg m -i                 Interactively pick & switch default Antigravity model
+  lg st                   Inspect gateway health, session pool & token metrics
+  lg cfg -g               Configure ~/.claude & ~/.codex for bare `claude`/`codex`";
+
+/// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
+#[must_use]
+pub fn invoked_bin_name() -> String {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|raw| Path::new(raw).file_stem())
+        .and_then(|stem| stem.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("lg")
+        .to_owned()
+}
 
 /// Normalizes an optional API key, treating empty strings and [`PLACEHOLDER_API_KEY`] as
 /// unauthenticated (`None`).
@@ -25,7 +50,9 @@ pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
 #[command(
     name = "liftgate",
     version,
-    about = "Antigravity ACP local API gateway, embedded web dashboard, and Claude Code / Codex CLI manager"
+    styles = crate::ui::clap_styles(),
+    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude Code / Codex CLI manager (short alias: `lg`)",
+    after_help = AFTER_HELP_TEXT
 )]
 pub struct Cli {
     /// Directory storing global daemon state, logs, and ephemeral files (`~/.liftgate` by default).
@@ -42,6 +69,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Launch the interactive real-time terminal observability dashboard (TUI).
+    #[command(visible_aliases = ["tui", "dash", "monitor"])]
+    Top(TopArgs),
+
     /// Start the gateway and embedded Web UI in the background (`~/.liftgate`).
     #[command(visible_alias = "up")]
     Start(StartArgs),
@@ -51,36 +82,68 @@ pub enum Commands {
     Stop,
 
     /// Restart the managed background gateway service, preserving or overriding settings.
+    #[command(visible_alias = "r")]
     Restart(RestartArgs),
 
     /// Show live gateway health, PID, session pool, token metrics, and discovered model count.
+    #[command(visible_alias = "st", alias = "s")]
     Status(StatusArgs),
 
     /// Tail or follow (`-f`) the background gateway service log.
+    #[command(visible_alias = "l")]
     Logs(LogsArgs),
 
     /// Open (or print) the live Web observability dashboard URL.
-    #[command(visible_aliases = ["web", "dashboard"])]
+    #[command(visible_aliases = ["web", "dashboard", "open"])]
     Ui(UiArgs),
 
-    /// List live models discovered from `agy acp`.
+    /// List or interactively switch (`-i`) live models discovered from `agy acp`.
+    #[command(visible_aliases = ["m", "ls"])]
     Models(ModelsArgs),
 
     /// Launch Claude Code in the current directory via Liftgate with zero project/global file side effects.
+    #[command(visible_alias = "cc")]
     Claude(ClaudeArgs),
 
     /// Launch Codex CLI in the current directory via Liftgate with zero project/global file side effects.
+    #[command(visible_alias = "cx", alias = "x")]
     Codex(CodexArgs),
 
     /// Generate, update, or uninstall project-local or global configuration files for Claude Code and/or Codex CLI.
-    #[command(visible_alias = "setup")]
+    #[command(visible_aliases = ["setup", "cfg"])]
     Config(ConfigArgs),
 
     /// Diagnose `agy`, `claude`, `codex`, embedded Web UI, and live gateway readiness.
+    #[command(visible_alias = "doc")]
     Doctor(DoctorArgs),
+
+    /// Install or remove a short CLI executable alias (`lg` by default) on your PATH.
+    Alias(AliasArgs),
+
+    /// Generate shell completion scripts for `lg` or `liftgate`.
+    Completions(CompletionsArgs),
 
     /// Run the HTTP gateway and Web UI in the foreground.
     Serve(ServeArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct TopArgs {
+    /// Target gateway socket address override.
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+
+    /// Optional API key when inspecting an authenticated gateway.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Telemetry polling interval in milliseconds (minimum 250ms).
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+
+    /// Auto-start the background gateway if it is currently offline.
+    #[arg(long)]
+    pub auto_start: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -208,7 +271,7 @@ pub struct StartArgs {
     pub open: bool,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct RestartArgs {
     /// Override bind socket address (`127.0.0.1:8787` by default).
     #[arg(long)]
@@ -306,6 +369,10 @@ pub struct ModelsArgs {
     #[arg(long)]
     pub api_key: Option<String>,
 
+    /// Interactively filter, pick, and switch the active default model.
+    #[arg(short = 'i', long)]
+    pub pick: bool,
+
     /// Emit JSON output.
     #[arg(long)]
     pub json: bool,
@@ -328,6 +395,40 @@ pub struct DoctorArgs {
     /// Optional API key for querying live gateway status.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct AliasArgs {
+    /// Short executable name to install (without `.exe`).
+    #[arg(short = 'n', long, default_value = "lg")]
+    pub name: String,
+
+    /// Destination directory on PATH (defaults to the directory containing the current binary).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+
+    /// Replace an existing executable at the destination path.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Remove the installed alias binary.
+    #[arg(long, visible_alias = "remove")]
+    pub uninstall: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CompletionsArgs {
+    /// Target shell (`bash`, `zsh`, `fish`, `powershell`, `elvish`).
+    #[arg(value_enum)]
+    pub shell: Shell,
+
+    /// Binary name to bind completions to (defaults to invoked command name, e.g. `lg` or `liftgate`).
+    #[arg(long)]
+    pub bin: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -361,6 +462,23 @@ pub struct ClaudeArgs {
     pub passthrough_args: Vec<String>,
 }
 
+impl ClaudeArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            fast_model: None,
+            no_bypass: false,
+            claude_bin: std::env::var_os("CLAUDE_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct CodexArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
@@ -386,6 +504,22 @@ pub struct CodexArgs {
     /// Arguments forwarded verbatim to `codex` (works with or without `--`).
     #[arg(last = true, value_name = "CODEX_ARGS")]
     pub passthrough_args: Vec<String>,
+}
+
+impl CodexArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            no_bypass: false,
+            codex_bin: std::env::var_os("CODEX_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -446,6 +580,25 @@ pub struct ConfigArgs {
     pub uninstall: bool,
 }
 
+impl ConfigArgs {
+    #[must_use]
+    pub fn default_local() -> Self {
+        Self {
+            target: ConfigTarget::All,
+            global: false,
+            dir: None,
+            listen: None,
+            api_key: None,
+            model: None,
+            fast_model: None,
+            no_bypass: false,
+            offline: false,
+            print: false,
+            uninstall: false,
+        }
+    }
+}
+
 /// Normalizes `liftgate claude ...` and `liftgate codex ...` argv sequences so callers can pass
 /// native `claude` / `codex` flags or prompts directly (e.g. `liftgate claude -p "hi"` or
 /// `liftgate codex exec "fix tests"`) without needing an explicit `--` separator.
@@ -458,8 +611,8 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
     let Some(sub_name) = args.get(sub_idx).and_then(|s| s.to_str()) else {
         return args;
     };
-    let is_claude = sub_name == "claude";
-    let is_codex = sub_name == "codex";
+    let is_claude = matches!(sub_name, "claude" | "cc");
+    let is_codex = matches!(sub_name, "codex" | "cx" | "x");
     if !is_claude && !is_codex {
         return args;
     }
@@ -616,6 +769,22 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let short_claude = parse_strs(&["lg", "cc", "-p", "quick check"]);
+        match short_claude.command {
+            Some(Commands::Claude(c)) => {
+                assert_eq!(c.passthrough_args, vec!["-p", "quick check"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let short_codex = parse_strs(&["lg", "cx", "exec", "cargo test"]);
+        match short_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert_eq!(c.passthrough_args, vec!["exec", "cargo test"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
@@ -638,5 +807,23 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn short_subcommand_aliases_and_new_commands_parse_cleanly() {
+        let top_cli = parse_strs(&["lg", "tui", "--auto-start"]);
+        assert!(matches!(top_cli.command, Some(Commands::Top(t)) if t.auto_start));
+
+        let pick_cli = parse_strs(&["lg", "m", "-i"]);
+        assert!(matches!(pick_cli.command, Some(Commands::Models(m)) if m.pick));
+
+        let alias_cli = parse_strs(&["liftgate", "alias", "--name", "lg", "--force"]);
+        assert!(matches!(alias_cli.command, Some(Commands::Alias(a)) if a.name == "lg" && a.force));
+
+        let comp_cli = parse_strs(&["lg", "completions", "powershell"]);
+        assert!(matches!(
+            comp_cli.command,
+            Some(Commands::Completions(c)) if c.shell == Shell::PowerShell
+        ));
     }
 }

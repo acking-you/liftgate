@@ -1,0 +1,5 @@
+[build.env]
+passthrough = [
+    "LIFTGATE_SKIP_WEB_BUILD",
+    "LIFTGATE_REQUIRE_EMBEDDED_WEB",
+]

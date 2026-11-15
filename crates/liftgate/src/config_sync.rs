@@ -10,12 +10,14 @@ use liftgate_types::{
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, normalize_optional_api_key,
+    ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, invoked_bin_name,
+    normalize_optional_api_key,
 };
 use crate::client::DiscoveredModel;
 use crate::daemon::{ensure_gateway_ready, resolve_client_api_key};
 use crate::error::CliError;
 use crate::state::{StatePaths, format_connect_url, user_home_dir, write_file_atomic};
+use crate::ui::{self, Tone};
 
 const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -544,28 +546,28 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
         if want_claude {
             let claude_path = resolve_claude_config_path(args.global, args.dir.as_deref())?;
             if uninstall_claude_config(&claude_path)? {
-                println!(
-                    "[OK] Removed Liftgate settings from {}",
-                    claude_path.display()
+                ui::headline(
+                    Tone::Ok,
+                    &format!("Removed Liftgate settings from {}", claude_path.display()),
                 );
             } else {
-                println!(
-                    "[INFO] No Liftgate settings found at {}",
-                    claude_path.display()
+                ui::headline(
+                    Tone::Muted,
+                    &format!("No Liftgate settings found at {}", claude_path.display()),
                 );
             }
         }
         if want_codex {
             let (codex_cfg, codex_cat) = resolve_codex_paths(args.global, args.dir.as_deref())?;
             if uninstall_codex_config(&codex_cfg, &codex_cat)? {
-                println!(
-                    "[OK] Removed Liftgate provider from {}",
-                    codex_cfg.display()
+                ui::headline(
+                    Tone::Ok,
+                    &format!("Removed Liftgate provider from {}", codex_cfg.display()),
                 );
             } else {
-                println!(
-                    "[INFO] No Liftgate provider found at {}",
-                    codex_cfg.display()
+                ui::headline(
+                    Tone::Muted,
+                    &format!("No Liftgate provider found at {}", codex_cfg.display()),
                 );
             }
         }
@@ -647,9 +649,11 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
             println!("# --- {} ---", claude_path.display());
             print!("{rendered}");
         } else {
-            println!(
-                "[OK] Wrote Claude Code configuration -> {} (model: {primary_model}, fast: {fast_model})",
-                claude_path.display()
+            ui::headline(Tone::Ok, "Updated Claude Code configuration");
+            ui::kv_accent("Settings File", &claude_path.display().to_string());
+            ui::kv(
+                "Model Routing",
+                &format!("primary={primary_model} · fast={fast_model}"),
             );
         }
     }
@@ -679,19 +683,25 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
             println!("# --- {} ---", codex_cfg.display());
             print!("{rendered}");
         } else {
-            println!(
-                "[OK] Wrote Codex CLI configuration -> {} (catalog: {})",
-                codex_cfg.display(),
-                codex_cat.display()
-            );
+            let bin = invoked_bin_name();
+            ui::headline(Tone::Ok, "Updated Codex CLI configuration");
+            ui::kv_accent("Config File", &codex_cfg.display().to_string());
+            ui::kv("Model Catalog", &codex_cat.display().to_string());
+            ui::kv("Default Model", &primary_model);
             if !args.global {
-                println!(
-                    "  [Tip] Codex CLI ignores untrusted project `.codex/config.toml` until trusted; pass `--global` to configure `~/.codex/config.toml` or run `liftgate codex` for zero-config launch."
+                ui::note(
+                    Tone::Info,
+                    &format!(
+                        "Codex CLI skips untrusted project `.codex/config.toml` until trusted; pass `--global` for `~/.codex/config.toml` or run `{bin} cx` for zero-config launch."
+                    ),
                 );
             }
             if require_env_key {
-                println!(
-                    "  [Note] Gateway API key auth is active; export `AGY_GATEWAY_API_KEY` when running bare `codex`, or run `liftgate codex` directly."
+                ui::note(
+                    Tone::Warn,
+                    &format!(
+                        "Gateway API key auth is active; export `AGY_GATEWAY_API_KEY` for bare `codex`, or run `{bin} cx` directly."
+                    ),
                 );
             }
         }

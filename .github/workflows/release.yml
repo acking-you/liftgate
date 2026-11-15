@@ -1,9 +1,10 @@
-name: Build and release liftgate
+name: Release
 
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
   workflow_dispatch:
 
 permissions:
@@ -13,34 +14,16 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  release:
-    name: Release ${{ matrix.platform.name }}
-    runs-on: ${{ matrix.platform.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: Linux x86_64 musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - name: Linux ARM64 musl
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-          - name: macOS x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
-          - name: macOS ARM64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          - name: Windows x86_64 MSVC
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-
+  prepare:
+    name: Prepare Web UI & Release Notes
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Verify release tag matches Cargo version
+      - name: Verify release tag matches Cargo workspace version
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
@@ -53,39 +36,278 @@ jobs:
               exit
             }
           ' Cargo.toml)"
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
+          if [ "${GITHUB_REF_NAME}" != "v${package_version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${package_version}"
+            exit 1
+          fi
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
-      - name: Build companion web dashboard dist
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Build embedded React Web UI dist
         working-directory: web
         run: |
           bun install --frozen-lockfile
           bun run build
+          test -f dist/index.html
 
-      - name: Build liftgate CLI
-        uses: houseabsolute/actions-rust-cross@v1
+      - name: Upload compiled Web UI bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          changelog_section="$(awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "${changelog_section// /}" ]; then
+            changelog_section="$(awk '
+              /^## \[/ && !found { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md)"
+          fi
+
+          cat > release_notes.md <<'EOF'
+Every archive ships **both** executables with the production Web Dashboard compiled in:
+- `lg` — short daily-driver CLI alias (interactive cockpit, `lg top` TUI, `lg cx`, `lg cc`, `lg m -i`)
+- `liftgate` — full canonical binary name
+
+### Quick Download Guide
+
+| Platform | Architecture | Recommended Archive |
+|---|---|---|
+| **macOS** | Apple Silicon (M1–M4) | `liftgate-aarch64-apple-darwin.tar.gz` |
+| **macOS** | Intel (x86_64) | `liftgate-x86_64-apple-darwin.tar.gz` |
+| **Windows** | x64 (MSVC) | `liftgate-x86_64-pc-windows-msvc.zip` |
+| **Windows** | ARM64 (Snapdragon / Surface) | `liftgate-aarch64-pc-windows-msvc.zip` |
+| **Windows** | x86 32-bit (MSVC) | `liftgate-i686-pc-windows-msvc.zip` |
+| **Linux (Static)** | x86_64 · zero glibc dep | `liftgate-x86_64-unknown-linux-musl.tar.gz` |
+| **Linux (Static)** | ARM64 · zero glibc dep | `liftgate-aarch64-unknown-linux-musl.tar.gz` |
+| **Linux (Static)** | ARMv7hf / i686 / RISC-V 64 | `liftgate-{armv7-unknown-linux-musleabihf,i686-unknown-linux-musl,riscv64gc-unknown-linux-musl}.tar.gz` |
+| **Linux (glibc)** | x86_64 / ARM64 / ARMv7hf / RISC-V 64 / ppc64le / s390x | `liftgate-*-unknown-linux-gnu*.tar.gz` |
+| **FreeBSD** | x86_64 | `liftgate-x86_64-unknown-freebsd.tar.gz` |
+
+> Verify integrity against `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`). Also installable via `cargo binstall liftgate`.
+EOF
+          printf '\n%s\n' "${changelog_section}" >> release_notes.md
+          cat release_notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release_notes.md
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.platform.name }})
+    needs: prepare
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # --- Linux Static (musl: zero glibc dependency, portable everywhere) ---
+          - name: Linux x86_64 (musl static)
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross_toolchain: true
+          - name: Linux ARM64 (musl static)
+            os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            cross_toolchain: true
+          - name: Linux ARMv7hf (musl static)
+            os: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            cross_toolchain: true
+          - name: Linux i686 (musl static)
+            os: ubuntu-24.04
+            target: i686-unknown-linux-musl
+            cross_toolchain: true
+          - name: Linux RISC-V 64 (musl static)
+            os: ubuntu-24.04
+            target: riscv64gc-unknown-linux-musl
+            cross_toolchain: true
+
+          # --- Linux GNU (glibc) ---
+          - name: Linux x86_64 (gnu)
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross_toolchain: false
+          - name: Linux ARM64 (gnu)
+            os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cross_toolchain: true
+          - name: Linux ARMv7hf (gnu)
+            os: ubuntu-24.04
+            target: armv7-unknown-linux-gnueabihf
+            cross_toolchain: true
+          - name: Linux RISC-V 64 (gnu)
+            os: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+            cross_toolchain: true
+          - name: Linux PowerPC 64 LE (gnu)
+            os: ubuntu-24.04
+            target: powerpc64le-unknown-linux-gnu
+            cross_toolchain: true
+          - name: Linux IBM Z s390x (gnu)
+            os: ubuntu-24.04
+            target: s390x-unknown-linux-gnu
+            cross_toolchain: true
+
+          # --- BSD ---
+          - name: FreeBSD x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-freebsd
+            cross_toolchain: true
+
+          # --- macOS (Apple Silicon + Intel) ---
+          - name: macOS ARM64 (Apple Silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            cross_toolchain: false
+          - name: macOS x86_64 (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cross_toolchain: false
+
+          # --- Windows (MSVC x64, ARM64, x86) ---
+          - name: Windows x86_64 (MSVC)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross_toolchain: false
+          - name: Windows ARM64 (MSVC)
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross_toolchain: false
+          - name: Windows i686 (MSVC)
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            cross_toolchain: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt Web UI bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Set up cross-compilation toolchain
+        if: matrix.platform.cross_toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          toolchain: stable
-          args: "--locked --release --bin liftgate"
-          strip: true
+          runner: none
 
-      - name: Package artifact and publish tagged release
-        uses: houseabsolute/actions-rust-release@v0
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          executable-name: liftgate
-          target: ${{ matrix.platform.target }}
-          archive-name: liftgate-${{ matrix.platform.target }}
-          changes-file: CHANGELOG.md
-          extra-files: |
-            CHANGELOG.md
-            LICENSE-MIT
-            LICENSE-APACHE
-            README.md
-            AGENTS.md
-            start-agy.ps1
-            start-agy.cmd
-            start-agy.sh
-            web/dist
+          key: release-${{ matrix.platform.target }}
+
+      - name: Build `liftgate` and `lg` release binaries
+        shell: bash
+        env:
+          LIFTGATE_SKIP_WEB_BUILD: "1"
+          LIFTGATE_REQUIRE_EMBEDDED_WEB: "1"
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.platform.target }}" \
+            -p liftgate --bin liftgate --bin lg
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.platform.target }}"
+          pkg="liftgate-${target}"
+          stage="dist/${pkg}"
+          mkdir -p "${stage}"
+
+          cp README.md README.zh-CN.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "${stage}/"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${target}/release/liftgate.exe" "${stage}/"
+            cp "target/${target}/release/lg.exe" "${stage}/"
+            cp start-agy.ps1 start-agy.cmd "${stage}/"
+            (cd dist && 7z a -tzip "${pkg}.zip" "${pkg}" >/dev/null)
+          else
+            cp "target/${target}/release/liftgate" "${stage}/"
+            cp "target/${target}/release/lg" "${stage}/"
+            chmod +x "${stage}/liftgate" "${stage}/lg"
+            cp start-agy.sh "${stage}/"
+            chmod +x "${stage}/start-agy.sh"
+            tar -czf "dist/${pkg}.tar.gz" -C dist "${pkg}"
+          fi
+          rm -rf "${stage}"
+          ls -lh dist/
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.platform.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release & Checksums
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Download all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            sha256sum liftgate-* | sort -k2 > SHA256SUMS
+            cat SHA256SUMS
+          )
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Liftgate ${{ github.ref_name }}
+          body_path: release_notes.md
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: release-assets/*

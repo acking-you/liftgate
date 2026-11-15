@@ -19,6 +19,8 @@ use tokio::task::JoinSet;
 
 use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
+use crate::state::format_connect_url;
+use crate::ui::print_serve_ready_banner;
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
 
@@ -153,6 +155,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();
     let api_key = normalize_optional_api_key(args.api_key.as_deref()).map(Arc::<str>::from);
+    let auth_enabled = api_key.is_some();
+    let default_model_str = default_model.as_str().to_owned();
+    let acp_mode_str = acp_mode.as_str().to_owned();
 
     let shutdown_token = std::env::var(ENV_SHUTDOWN_TOKEN)
         .ok()
@@ -207,6 +212,19 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         ui_disk_override = ui_dist_dir.is_some(),
         ui_embedded_bundle = full_bundle_embedded,
         "gateway listening and ready"
+    );
+
+    let listen_url = format_connect_url(args.listen);
+    let dash_url = args
+        .ui_listen
+        .map_or_else(|| listen_url.clone(), format_connect_url);
+    print_serve_ready_banner(
+        &listen_url,
+        &dash_url,
+        &default_model_str,
+        &acp_mode_str,
+        auth_enabled,
+        full_bundle_embedded,
     );
 
     if let Some(extra_listener) = ui_listener {

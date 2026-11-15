@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIFTGATE_SKIP_WEB_BUILD");
     println!("cargo:rerun-if-env-changed=LIFTGATE_REBUILD_WEB");
+    println!("cargo:rerun-if-env-changed=LIFTGATE_REQUIRE_EMBEDDED_WEB");
 
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo always sets CARGO_MANIFEST_DIR"),
@@ -37,6 +38,9 @@ fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let force_rebuild = env::var("LIFTGATE_REBUILD_WEB")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let require_embedded_web = env::var("LIFTGATE_REQUIRE_EMBEDDED_WEB")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let is_release = env::var("PROFILE").as_deref() == Ok("release");
@@ -75,6 +79,11 @@ fn main() {
         code.push_str("];\n");
         fs::write(&generated_rs, code).expect("writing embedded_ui.rs in OUT_DIR must succeed");
     } else {
+        assert!(
+            !require_embedded_web,
+            "LIFTGATE_REQUIRE_EMBEDDED_WEB=1 was set, but `{}` does not exist",
+            dist_dir.join("index.html").display()
+        );
         fs::write(
             &generated_rs,
             "pub const EMBEDDED_UI_ASSETS: &[(&str, &[u8])] = &[];\n",

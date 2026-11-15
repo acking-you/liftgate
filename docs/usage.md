@@ -11,8 +11,9 @@ client at it. Every address below assumes the default
 - **Antigravity CLI (`agy`)**, installed and signed in once with
   `agy acp --login`. Liftgate finds it on `PATH` and in the standard install
   locations; otherwise pass `--agy-bin <path>`.
-- **Liftgate (`liftgate`)**, installed globally from a GitHub Release archive or
-  built from source with **Rust 1.85+**:
+- **Liftgate (`lg` / `liftgate`)**, installed globally from a
+  [GitHub Release](https://github.com/acking-you/liftgate/releases) archive,
+  `cargo binstall liftgate`, or built from source with **Rust 1.85+**:
   ```bash
   cargo install --path crates/liftgate --locked
   ```
@@ -21,23 +22,29 @@ client at it. Every address below assumes the default
   external `web/dist` folder needed at runtime). Without Bun, every API still
   works and `/` serves a lightweight built-in SSE telemetry page.
 
-## Manage the gateway service (`liftgate` CLI)
+## Manage the gateway service (`lg` / `liftgate` CLI)
 
-Once `liftgate` is on your `PATH`, manage the background gateway and embedded
-Web UI from any directory (state and logs live in `~/.liftgate`, configurable
-via `--state-dir` or `LIFTGATE_HOME`):
+Every archive and `cargo install` ships both `liftgate` and its short alias
+`lg` (you can also install custom aliases via `liftgate alias --name <cmd>`).
+Manage the background gateway, live TUI, and embedded Web UI from any directory
+(state and logs live in `~/.liftgate`, configurable via `--state-dir` or
+`LIFTGATE_HOME`):
 
 ```bash
-liftgate start                  # start background gateway + embedded Web UI
-liftgate start --open           # start and open http://127.0.0.1:8787/ in your browser
-liftgate status                 # live health, PID, session pool, tokens & model count (--json supported)
-liftgate logs -n 100 -f         # tail and follow ~/.liftgate/gateway.log (--acp includes agy stderr)
-liftgate ui                     # open the dashboard (--print prints the URL)
-liftgate models                 # list live models discovered from agy acp
-liftgate doctor                 # check agy, claude, codex, embedded UI & auth readiness
-liftgate restart                # restart preserving (or overriding) settings
-liftgate stop                   # gracefully stop the background service and ACP process tree
-liftgate serve                  # run in the foreground (same as bare `liftgate`)
+lg                              # open interactive command center (on a TTY)
+lg top                          # full-screen live TUI dashboard (aliases: tui, dash, monitor)
+lg up                           # start background gateway + embedded Web UI (full: start)
+lg up --open                    # start and open http://127.0.0.1:8787/ in your browser
+lg st                           # live health, PID, session pool, tokens & active turns (full: status, --json)
+lg l -n 100 -f                  # tail & follow ~/.liftgate/gateway.log (full: logs, --acp includes agy stderr)
+lg web                          # open the browser dashboard (full: ui, --print prints URL)
+lg m -i                         # interactively filter & switch default model (full: models --pick)
+lg doc                          # check agy, claude, codex, proxy, embedded UI & auth readiness (full: doctor)
+lg r                            # restart preserving (or overriding) settings (full: restart)
+lg down                         # gracefully stop the background service and ACP process tree (full: stop)
+lg alias --name lg              # install or remove (`--uninstall`) short executable alias on PATH
+lg completions zsh              # generate shell completions (bash, zsh, fish, powershell, elvish)
+liftgate serve                  # run in the foreground
 ```
 
 ## Zero-side-effect launch (`liftgate codex` / `liftgate claude`)
