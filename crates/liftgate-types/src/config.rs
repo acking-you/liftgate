@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -138,6 +139,208 @@ impl From<AcpModeId> for String {
     }
 }
 
+/// Returns `true` when `raw` is a user-facing keyword disabling proxy injection.
+#[must_use]
+pub fn is_proxy_disable_keyword(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "off" | "none" | "direct" | "clear" | "unset" | "false" | "disable" | "disabled"
+    )
+}
+
+/// Validated outbound proxy URL (`http://`, `https://`, `socks5://`, or `socks5h://`)
+/// injected into `agy` subprocesses when explicitly configured.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProxyUrl(Arc<str>);
+
+impl ProxyUrl {
+    /// Parses and normalizes a proxy specification.
+    ///
+    /// Accepted forms:
+    /// - Port shorthand (`"7890"`) -> `"http://127.0.0.1:7890"`
+    /// - Host:port shorthand (`"127.0.0.1:7890"`, `"[::1]:1080"`) -> `"http://<host>:<port>"`
+    /// - Explicit URL (`http://`, `https://`, `socks5://`, `socks5h://`)
+    pub fn try_new(raw: impl AsRef<str>) -> Result<Self, ValidationError> {
+        let raw_ref = raw.as_ref();
+        let trimmed = raw_ref.trim();
+        if trimmed.is_empty() {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: raw_ref.to_owned(),
+                reason: "proxy address must not be empty",
+            });
+        }
+        if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: trimmed.to_owned(),
+                reason: "proxy address must not contain whitespace or control characters",
+            });
+        }
+
+        // 1. Pure port shorthand: e.g. `7890` -> `http://127.0.0.1:7890`.
+        if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            let port = trimmed
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
+                .ok_or_else(|| ValidationError::InvalidProxyUrl {
+                    value: trimmed.to_owned(),
+                    reason: "port number must be between 1 and 65535",
+                })?;
+            return Ok(Self(Arc::from(format!("http://127.0.0.1:{port}"))));
+        }
+
+        // 2. Host:port shorthand without scheme (`://`).
+        let normalized = if let Some((scheme_raw, rest_raw)) = trimmed.split_once("://") {
+            let scheme = scheme_raw.to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+                return Err(ValidationError::InvalidProxyUrl {
+                    value: trimmed.to_owned(),
+                    reason: "scheme must be http://, https://, socks5://, or socks5h://",
+                });
+            }
+            let rest = rest_raw.strip_suffix('/').unwrap_or(rest_raw);
+            if rest.contains('/') {
+                return Err(ValidationError::InvalidProxyUrl {
+                    value: trimmed.to_owned(),
+                    reason: "proxy URL must not contain a URL path",
+                });
+            }
+            validate_proxy_authority(rest, trimmed)?;
+            format!("{scheme}://{rest}")
+        } else {
+            let rest = trimmed.strip_suffix('/').unwrap_or(trimmed);
+            if rest.contains('/') {
+                return Err(ValidationError::InvalidProxyUrl {
+                    value: trimmed.to_owned(),
+                    reason: "missing URL scheme (expected e.g. http://127.0.0.1:7890)",
+                });
+            }
+            validate_proxy_authority(rest, trimmed)?;
+            format!("http://{rest}")
+        };
+
+        Ok(Self(Arc::from(normalized)))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Formats the proxy URL for logs, UI, and telemetry while masking any embedded `user:pass@` password.
+    #[must_use]
+    pub fn redacted_display(&self) -> Cow<'_, str> {
+        let raw = self.as_str();
+        let Some((scheme, after_scheme)) = raw.split_once("://") else {
+            return Cow::Borrowed(raw);
+        };
+        let Some((userinfo, host_part)) = after_scheme.rsplit_once('@') else {
+            return Cow::Borrowed(raw);
+        };
+        if let Some((user, _secret)) = userinfo.split_once(':') {
+            Cow::Owned(format!("{scheme}://{user}:***@{host_part}"))
+        } else {
+            Cow::Owned(format!("{scheme}://***@{host_part}"))
+        }
+    }
+}
+
+fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), ValidationError> {
+    let host_port = match authority.rsplit_once('@') {
+        Some((userinfo, hp)) => {
+            if userinfo.is_empty() {
+                return Err(ValidationError::InvalidProxyUrl {
+                    value: original.to_owned(),
+                    reason: "proxy credentials before '@' must not be empty",
+                });
+            }
+            hp
+        }
+        None => authority,
+    };
+
+    if host_port.is_empty() {
+        return Err(ValidationError::InvalidProxyUrl {
+            value: original.to_owned(),
+            reason: "proxy host must not be empty",
+        });
+    }
+
+    let (host, port_opt) = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let Some((ipv6_host, tail)) = after_bracket.split_once(']') else {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: original.to_owned(),
+                reason: "unclosed IPv6 bracket in proxy host",
+            });
+        };
+        if ipv6_host.is_empty() {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: original.to_owned(),
+                reason: "IPv6 proxy host must not be empty",
+            });
+        }
+        let port_str = if tail.is_empty() {
+            None
+        } else if let Some(p) = tail.strip_prefix(':') {
+            Some(p)
+        } else {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: original.to_owned(),
+                reason: "unexpected characters after IPv6 host bracket",
+            });
+        };
+        (ipv6_host, port_str)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        if h.contains(':') {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: original.to_owned(),
+                reason: "IPv6 proxy host must be enclosed in brackets (e.g. [::1]:7890)",
+            });
+        }
+        (h, Some(p))
+    } else {
+        (host_port, None)
+    };
+
+    if host.is_empty() {
+        return Err(ValidationError::InvalidProxyUrl {
+            value: original.to_owned(),
+            reason: "proxy host must not be empty",
+        });
+    }
+    if let Some(p_str) = port_opt {
+        let valid_port = p_str.parse::<u16>().ok().is_some_and(|p| p > 0);
+        if !valid_port {
+            return Err(ValidationError::InvalidProxyUrl {
+                value: original.to_owned(),
+                reason: "proxy port must be a valid integer between 1 and 65535",
+            });
+        }
+    }
+    Ok(())
+}
+
+impl fmt::Display for ProxyUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ProxyUrl {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<ProxyUrl> for String {
+    fn from(value: ProxyUrl) -> Self {
+        value.0.to_string()
+    }
+}
+
 /// Bounded resource limits for external HTTP bodies, ACP stdio lines, and queues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GatewayLimits {
@@ -246,5 +449,48 @@ impl Default for GatewayLimits {
             turn_timeout_secs: NonZeroU64::new(DEFAULT_TURN_TIMEOUT_SECS)
                 .expect("DEFAULT_TURN_TIMEOUT_SECS is a non-zero compile-time constant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_url_normalizes_ports_hosts_schemes_and_redacts_secrets() {
+        assert_eq!(
+            ProxyUrl::try_new("7890").unwrap().as_str(),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            ProxyUrl::try_new("127.0.0.1:7890").unwrap().as_str(),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            ProxyUrl::try_new("[::1]:1080").unwrap().as_str(),
+            "http://[::1]:1080"
+        );
+        assert_eq!(
+            ProxyUrl::try_new("SOCKS5H://127.0.0.1:1080/")
+                .unwrap()
+                .as_str(),
+            "socks5h://127.0.0.1:1080"
+        );
+        let authed = ProxyUrl::try_new("socks5://alice:s3cr3t@proxy.internal:1080").unwrap();
+        assert_eq!(
+            authed.redacted_display(),
+            "socks5://alice:***@proxy.internal:1080"
+        );
+        assert!(is_proxy_disable_keyword("off"));
+        assert!(is_proxy_disable_keyword("DIRECT"));
+        assert!(!is_proxy_disable_keyword("7890"));
+
+        assert!(ProxyUrl::try_new("").is_err());
+        assert!(ProxyUrl::try_new("0").is_err());
+        assert!(ProxyUrl::try_new("70000").is_err());
+        assert!(ProxyUrl::try_new("ftp://127.0.0.1:21").is_err());
+        assert!(ProxyUrl::try_new("http://").is_err());
+        assert!(ProxyUrl::try_new("http://127.0.0.1:7890/bad/path").is_err());
+        assert!(ProxyUrl::try_new("http://127.0.0.1:7890 bad").is_err());
     }
 }

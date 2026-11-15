@@ -23,6 +23,13 @@ export interface AcpProcessTelemetry {
   rpc_notifications_received: number;
   rpc_pending_in_flight: number;
   active_prompt_streams: number;
+  agy_proxy?: string | null;
+  auto_update_enabled?: boolean;
+  latest_known_version?: string | null;
+  last_update_check_unix_ms?: number | null;
+  last_auto_update_unix_ms?: number | null;
+  last_auto_updated_from?: string | null;
+  auto_update_note?: string | null;
   recent_stderr: StderrLogEntry[];
 }
 

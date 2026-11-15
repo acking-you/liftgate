@@ -16,14 +16,17 @@ pub const PLACEHOLDER_API_KEY: &str = "local-agy";
 const AFTER_HELP_TEXT: &str = "\
 Quick Examples (both `lg` and `liftgate` work identically):
   lg                      Open interactive command center (when run in a terminal)
+  lg agy                  Inspect `agy` version, login status, proxy & auto-update
+  lg agy install          Download & install Antigravity CLI (`agy`) automatically
+  lg agy login            Sign in to Antigravity interactively (with proxy applied)
+  lg proxy 7890           Force `http://127.0.0.1:7890` into `agy` (`lg proxy off` to clear)
   lg cx                   Launch Codex CLI in current dir (0 side effects on exit)
   lg cc                   Launch Claude Code in current dir (0 side effects on exit)
   lg top                  Open real-time terminal observability dashboard (TUI)
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
   lg st                   Inspect gateway health, session pool & token metrics
-  lg upgrade              Check GitHub Releases & self-upgrade `lg` + `liftgate`
-  lg cfg -g               Configure ~/.claude & ~/.codex for bare `claude`/`codex`";
+  lg upgrade              Check GitHub Releases & self-upgrade `lg` + `liftgate`";
 
 /// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
 #[must_use]
@@ -118,6 +121,13 @@ pub enum Commands {
     #[command(visible_alias = "doc")]
     Doctor(DoctorArgs),
 
+    /// Inspect, install, sign in, update, or run Antigravity CLI (`agy`) with Liftgate's proxy & auto-update policy.
+    Agy(AgyArgs),
+
+    /// View, set (`lg proxy 7890`), or clear (`lg proxy off`) the outbound proxy forced into `agy` (default: none).
+    #[command(visible_alias = "px")]
+    Proxy(ProxyArgs),
+
     /// Check GitHub Releases and automatically upgrade `lg` and `liftgate` with SHA-256 verification.
     #[command(visible_aliases = ["update", "self-update", "upg"])]
     Upgrade(UpgradeArgs),
@@ -189,6 +199,19 @@ pub struct ServeArgs {
     #[arg(long, env = "AGY_UI_DIR")]
     pub ui_dir: Option<PathBuf>,
 
+    /// Outbound proxy URL forced into `agy` (`http://...`, `socks5://...`, port `7890`, or `off`).
+    /// Defaults to `~/.liftgate/settings.json` (`none` / direct connection by default).
+    #[arg(long, env = "AGY_PROXY")]
+    pub agy_proxy: Option<String>,
+
+    /// Override background idle auto-updating of `agy` CLI (`true` or `false`; enabled by default).
+    #[arg(long, env = "AGY_AUTO_UPDATE")]
+    pub agy_auto_update: Option<bool>,
+
+    /// Disable background idle auto-updating of `agy` CLI for this server run.
+    #[arg(long, conflicts_with = "agy_auto_update")]
+    pub no_agy_auto_update: bool,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -242,6 +265,17 @@ impl Default for ServeArgs {
         let ui_dir = std::env::var_os("AGY_UI_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let agy_proxy = std::env::var("AGY_PROXY")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let agy_auto_update = std::env::var("AGY_AUTO_UPDATE").ok().and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        });
 
         Self {
             listen,
@@ -252,6 +286,9 @@ impl Default for ServeArgs {
             acp_cwd,
             api_key,
             ui_dir,
+            agy_proxy,
+            agy_auto_update,
+            no_agy_auto_update: false,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -301,6 +338,18 @@ pub struct RestartArgs {
     /// Override `agy` executable path.
     #[arg(long)]
     pub agy_bin: Option<PathBuf>,
+
+    /// Override outbound proxy forced into `agy` (or `off` to disable).
+    #[arg(long)]
+    pub agy_proxy: Option<String>,
+
+    /// Override background idle `agy` auto-update (`true` or `false`).
+    #[arg(long)]
+    pub agy_auto_update: Option<bool>,
+
+    /// Disable background idle `agy` auto-update.
+    #[arg(long, conflicts_with = "agy_auto_update")]
+    pub no_agy_auto_update: bool,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]
@@ -404,6 +453,208 @@ pub struct DoctorArgs {
     /// Emit structured JSON output.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct ProxyArgs {
+    /// Proxy URL (`http://127.0.0.1:7890`, `socks5://127.0.0.1:1080`), port shorthand (`7890`),
+    /// `system` (import OS/env proxy), or `off` / `clear` / `none` (disable proxy).
+    pub target: Option<String>,
+
+    /// Clear the configured proxy so `agy` connects directly (default behavior).
+    #[arg(long, visible_aliases = ["clear", "unset", "disable"])]
+    pub off: bool,
+
+    /// Detect and save the current system or shell proxy for `agy`.
+    #[arg(long)]
+    pub from_system: bool,
+
+    /// Probe connectivity to the official Antigravity release endpoint using the effective proxy.
+    #[arg(long)]
+    pub test: bool,
+
+    /// Do not automatically restart a running managed background gateway after updating proxy settings.
+    #[arg(long)]
+    pub no_restart: bool,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyArgs {
+    /// Optional explicit path to `agy` executable.
+    #[arg(long, global = true, env = "AGY_BIN")]
+    pub agy_bin: Option<PathBuf>,
+
+    /// Emit structured JSON output.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    #[command(subcommand)]
+    pub action: Option<AgyCommand>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum AgyCommand {
+    /// Inspect `agy` presence, version, latest release, login status, forced proxy & auto-update policy.
+    #[command(visible_aliases = ["st", "info", "check"])]
+    Status(AgyStatusArgs),
+
+    /// Download, SHA-512 verify, and install the official Antigravity CLI (`agy`) for this platform.
+    #[command(visible_aliases = ["get", "download"])]
+    Install(AgyInstallArgs),
+
+    /// Check (`-c`) or update the installed `agy` CLI to the latest official release.
+    #[command(visible_aliases = ["upgrade", "up", "upg"])]
+    Update(AgyUpdateArgs),
+
+    /// Sign in to Antigravity interactively (`agy acp --login`) with Liftgate's proxy configuration applied.
+    #[command(visible_aliases = ["auth", "signin"])]
+    Login(AgyLoginArgs),
+
+    /// View or toggle background idle auto-updating of `agy` CLI (`on` by default, `off` to disable).
+    #[command(name = "auto-update", visible_aliases = ["autoupdate", "auto"])]
+    AutoUpdate(AgyAutoUpdateArgs),
+
+    /// View, set, or clear the forced outbound proxy injected into `agy` (`none` by default).
+    #[command(visible_alias = "px")]
+    Proxy(ProxyArgs),
+
+    /// List account models directly via `agy models` with Liftgate's proxy configuration applied.
+    #[command(visible_aliases = ["m", "ls"])]
+    Models,
+
+    /// Forward `mcp` subcommands (`list`, `add`, `remove`, `enable`, `disable`) to `agy` with proxy applied.
+    Mcp(AgyForwardArgs),
+
+    /// Forward `plugin` subcommands (`list`, `install`, `uninstall`, `enable`, `disable`) to `agy` with proxy applied.
+    #[command(visible_alias = "plugins")]
+    Plugin(AgyForwardArgs),
+
+    /// Show Antigravity CLI release notes via `agy changelog` with proxy applied.
+    Changelog,
+
+    /// Run `agy` interactively or pass arbitrary flags/prompts with Liftgate's proxy configuration applied.
+    #[command(visible_alias = "exec")]
+    Run(AgyForwardArgs),
+
+    /// Forward any other subcommand directly to `agy` with Liftgate's proxy configuration applied.
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyStatusArgs {
+    /// Skip querying the remote Antigravity manifest for the latest available version.
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Skip probing `agy models` when the local gateway is offline.
+    #[arg(long)]
+    pub no_auth_check: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyInstallArgs {
+    /// Only check the latest official `agy` release for this platform without installing.
+    #[arg(short = 'c', long)]
+    pub check: bool,
+
+    /// Reinstall/overwrite even if `agy` is already on the latest version.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Custom installation directory (defaults to `%LOCALAPPDATA%\agy\bin` on Windows, `~/.local/bin` on Unix).
+    #[arg(short = 'd', long)]
+    pub dir: Option<PathBuf>,
+
+    /// One-off proxy override for downloading the `agy` manifest and binary.
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Skip running `agy install --skip-aliases` shell PATH setup after placing the binary.
+    #[arg(long)]
+    pub skip_path: bool,
+
+    /// Internal/mirror manifest base URL override for self-hosted mirrors and integration tests.
+    #[arg(long, hide = true, env = "LIFTGATE_AGY_MANIFEST_BASE_URL")]
+    pub manifest_base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyUpdateArgs {
+    /// Only check whether a newer official `agy` build is available without updating.
+    #[arg(short = 'c', long)]
+    pub check: bool,
+
+    /// Re-download and reinstall even if `agy` is already on the latest version.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// One-off proxy override for checking and downloading the update.
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Do not automatically restart a running managed background gateway after updating `agy`.
+    #[arg(long)]
+    pub no_restart: bool,
+
+    /// Internal/mirror manifest base URL override for self-hosted mirrors and integration tests.
+    #[arg(long, hide = true, env = "LIFTGATE_AGY_MANIFEST_BASE_URL")]
+    pub manifest_base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyLoginArgs {
+    /// Automatically download and install `agy` first if it is missing on this machine.
+    #[arg(long)]
+    pub install: bool,
+
+    /// One-off proxy override injected into `agy acp --login`.
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Do not restart a running managed background gateway after signing in.
+    #[arg(long)]
+    pub no_restart: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum AutoUpdateToggle {
+    /// Print current background idle auto-update setting and live daemon status.
+    #[default]
+    #[value(aliases = ["st", "show"])]
+    Status,
+    /// Enable background idle auto-updating of `agy` CLI (default).
+    #[value(aliases = ["true", "1", "enable", "enabled"])]
+    On,
+    /// Disable background idle auto-updating of `agy` CLI.
+    #[value(aliases = ["false", "0", "disable", "disabled"])]
+    Off,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyAutoUpdateArgs {
+    /// Desired state (`on`, `off`, or `status`). Omit to inspect current status.
+    #[arg(value_enum, default_value_t = AutoUpdateToggle::Status)]
+    pub mode: AutoUpdateToggle,
+
+    /// Do not automatically restart a running managed background gateway after changing the setting.
+    #[arg(long)]
+    pub no_restart: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AgyForwardArgs {
+    /// Arguments forwarded verbatim to `agy`.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "AGY_ARGS"
+    )]
+    pub args: Vec<OsString>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -743,6 +994,8 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--acp-cwd",
         "--api-key",
         "--ui-dir",
+        "--agy-proxy",
+        "--agy-auto-update",
         "--max-line-bytes",
         "--max-body-bytes",
         "--channel-capacity",
@@ -884,6 +1137,54 @@ mod tests {
         assert!(matches!(
             upd_alias.command,
             Some(Commands::Upgrade(u)) if u.version.as_deref() == Some("v0.1.0")
+        ));
+
+        let proxy_set = parse_strs(&["lg", "proxy", "7890"]);
+        assert!(matches!(
+            proxy_set.command,
+            Some(Commands::Proxy(p)) if p.target.as_deref() == Some("7890")
+        ));
+
+        let proxy_off = parse_strs(&["lg", "px", "off"]);
+        assert!(matches!(
+            proxy_off.command,
+            Some(Commands::Proxy(p)) if p.target.as_deref() == Some("off")
+        ));
+
+        let agy_bare = parse_strs(&["lg", "agy"]);
+        assert!(matches!(
+            agy_bare.command,
+            Some(Commands::Agy(a)) if a.action.is_none()
+        ));
+
+        let agy_install = parse_strs(&["lg", "agy", "install", "--force"]);
+        assert!(matches!(
+            agy_install.command,
+            Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::Install(i)), .. })) if i.force
+        ));
+
+        let agy_login = parse_strs(&["lg", "agy", "login", "--install"]);
+        assert!(matches!(
+            agy_login.command,
+            Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::Login(l)), .. })) if l.install
+        ));
+
+        let agy_auto_off = parse_strs(&["lg", "agy", "auto-update", "off"]);
+        assert!(matches!(
+            agy_auto_off.command,
+            Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::AutoUpdate(a)), .. })) if a.mode == AutoUpdateToggle::Off
+        ));
+
+        let agy_mcp = parse_strs(&["lg", "agy", "mcp", "list"]);
+        assert!(matches!(
+            agy_mcp.command,
+            Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::Mcp(f)), .. })) if f.args == vec![OsString::from("list")]
+        ));
+
+        let agy_ext = parse_strs(&["lg", "agy", "agents"]);
+        assert!(matches!(
+            agy_ext.command,
+            Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::External(v)), .. })) if v == vec![OsString::from("agents")]
         ));
     }
 }

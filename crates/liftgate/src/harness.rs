@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use liftgate_server::platform::{
-    canonicalize_clean, detect_effective_proxy_url, is_executable_file, merge_loopback_no_proxy,
-    split_expanded_path_var,
+    canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
 };
 use serde_json::Value;
 use tokio::process::Command;
@@ -114,9 +113,6 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
         .env("NO_PROXY", &no_proxy)
         .env("no_proxy", &no_proxy);
-    if let Some(proxy) = detect_effective_proxy_url() {
-        cmd.env("HTTP_PROXY", &proxy).env("HTTPS_PROXY", &proxy);
-    }
 
     let exit_code = spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await?;
     drop(ephemeral_settings);
@@ -222,9 +218,6 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .env("AGY_GATEWAY_API_KEY", &auth_token)
         .env("NO_PROXY", &no_proxy)
         .env("no_proxy", &no_proxy);
-    if let Some(proxy) = detect_effective_proxy_url() {
-        cmd.env("HTTP_PROXY", &proxy).env("HTTPS_PROXY", &proxy);
-    }
 
     let exit_code = spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await?;
     drop(ephemeral_catalog);

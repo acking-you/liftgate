@@ -223,7 +223,13 @@ pub fn print_cli_error(err: &CliError, bin_name: &str) {
 fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
     match err {
         CliError::AgyBinaryNotFound => Some(format!(
-            "Install Antigravity CLI, sign in with `agy acp --login`, then verify via `{bin} doctor`."
+            "Run `{bin} agy install` to download & install Antigravity CLI automatically, then `{bin} agy login` to sign in."
+        )),
+        CliError::NoSystemProxyDetected => Some(format!(
+            "Set an explicit proxy with `{bin} proxy 7890` (or `{bin} proxy socks5://127.0.0.1:1080`), or clear with `{bin} proxy off`."
+        )),
+        CliError::AgyInstallFailed { .. } => Some(format!(
+            "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
         )),
         CliError::GatewayUnreachable { .. } => Some(format!(
             "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
@@ -253,6 +259,10 @@ fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
 }
 
 /// Prints a concise foreground startup banner to `stderr` when attached to a terminal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup banner summarizes all active server settings in one call"
+)]
 pub fn print_serve_ready_banner(
     listen_url: &str,
     dashboard_url: &str,
@@ -260,6 +270,8 @@ pub fn print_serve_ready_banner(
     acp_mode: &str,
     auth_enabled: bool,
     full_ui_embedded: bool,
+    agy_proxy_display: Option<&str>,
+    agy_auto_update: bool,
 ) {
     if !stderr().is_terminal() {
         return;
@@ -280,6 +292,14 @@ pub fn print_serve_ready_banner(
         (
             "Default Model",
             format!("{default_model} (mode: {acp_mode})"),
+        ),
+        (
+            "AGY Policy",
+            format!(
+                "proxy={} · idle-auto-update={}",
+                agy_proxy_display.unwrap_or("none"),
+                if agy_auto_update { "on" } else { "off" }
+            ),
         ),
         (
             "Security & UI",

@@ -4,10 +4,7 @@ use std::time::Duration;
 
 use liftgate_server::{
     acp_client::{LiveAcpClient, LiveAcpConfig},
-    platform::{
-        canonicalize_clean, prepare_isolated_session_cwd, resolve_agy_binary,
-        wait_for_shutdown_signal,
-    },
+    platform::{canonicalize_clean, prepare_isolated_session_cwd, wait_for_shutdown_signal},
     routes::{AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router, serve_router},
     session_pool::SessionPool,
     telemetry::TelemetryHub,
@@ -19,7 +16,10 @@ use tokio::task::JoinSet;
 
 use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
-use crate::state::format_connect_url;
+use crate::state::{
+    StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
+    resolve_effective_agy_proxy,
+};
 use crate::ui::print_serve_ready_banner;
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -92,7 +92,7 @@ pub fn active_embedded_ui() -> (&'static [EmbeddedUiAsset], bool) {
     }
 }
 
-pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
+pub async fn run_serve(state_paths: &StatePaths, args: ServeArgs) -> Result<(), CliError> {
     let default_model = ModelId::try_new(&args.default_model)?;
     let acp_mode = AcpModeId::try_new(&args.acp_mode)?;
     let limits = GatewayLimits::try_new(
@@ -104,7 +104,12 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         args.turn_timeout_secs,
     )?;
 
-    let binary_path = resolve_agy_binary(args.agy_bin).ok_or(CliError::AgyBinaryNotFound)?;
+    let settings = state_paths.read_settings()?;
+    let agy_proxy = resolve_effective_agy_proxy(args.agy_proxy.as_deref(), &settings)?;
+    let auto_update_enabled =
+        resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
+    let binary_path =
+        resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)
         .map_err(|(path, source)| CliError::PrepareCwd { path, source })?;
 
@@ -137,6 +142,12 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         session_cwd = %session_cwd.display(),
         default_model = %default_model,
         acp_mode = %acp_mode,
+        agy_proxy = agy_proxy
+            .as_ref()
+            .map(liftgate_types::config::ProxyUrl::redacted_display)
+            .as_deref()
+            .unwrap_or("none"),
+        agy_auto_update = auto_update_enabled,
         "starting liftgate"
     );
 
@@ -146,6 +157,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
             extra_args: Vec::new(),
             session_cwd,
             limits,
+            agy_proxy: agy_proxy.clone(),
+            auto_update_enabled,
         })
         .await?,
     );
@@ -173,7 +186,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
 
     let app_state = AppState {
         backend: Arc::new(Arc::clone(&live_client)),
-        pool,
+        pool: Arc::clone(&pool),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
             default_model,
@@ -203,6 +216,24 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         let _ = stop_tx.send_replace(true);
     });
 
+    if auto_update_enabled {
+        let updater_paths = state_paths.clone();
+        let updater_client = Arc::clone(&live_client);
+        let updater_pool = Arc::clone(&pool);
+        let updater_telemetry = Arc::clone(&telemetry);
+        let updater_stop_rx = stop_rx.clone();
+        bg_tasks.spawn(async move {
+            crate::agy_manager::run_idle_agy_auto_updater(
+                updater_paths,
+                updater_client,
+                updater_pool,
+                updater_telemetry,
+                updater_stop_rx,
+            )
+            .await;
+        });
+    }
+
     tracing::info!(
         dashboard_url = %format!("http://{}/", args.listen),
         telemetry_url = %format!("http://{}/api/telemetry/snapshot", args.listen),
@@ -218,6 +249,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     let dash_url = args
         .ui_listen
         .map_or_else(|| listen_url.clone(), format_connect_url);
+    let proxy_banner = agy_proxy
+        .as_ref()
+        .map(liftgate_types::config::ProxyUrl::redacted_display);
     print_serve_ready_banner(
         &listen_url,
         &dash_url,
@@ -225,6 +259,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         &acp_mode_str,
         auth_enabled,
         full_bundle_embedded,
+        proxy_banner.as_deref(),
+        auto_update_enabled,
     );
 
     if let Some(extra_listener) = ui_listener {

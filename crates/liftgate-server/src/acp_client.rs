@@ -20,7 +20,7 @@ use liftgate_types::{
         SessionSetModelParams, SessionUpdateNotification, SessionUpdatePayload,
         SystemPromptAppendMeta,
     },
-    config::{AcpModeId, GatewayLimits, ModelId, SessionId},
+    config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl, SessionId},
     telemetry::{AcpProcessTelemetry, StderrLogEntry},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -41,6 +41,7 @@ use crate::{
     error::AcpError,
     job::{ProcessGroupGuard, configure_command_group},
     platform::configure_acp_child_env,
+    session_pool::SessionPool,
     telemetry::unix_timestamp_ms,
 };
 
@@ -134,6 +135,13 @@ pub trait AcpBackend: Send + Sync + 'static {
             rpc_pending_in_flight: 0,
             active_prompt_streams: 0,
             recent_stderr: Vec::new(),
+            agy_proxy: None,
+            auto_update_enabled: false,
+            latest_known_version: None,
+            last_update_check_unix_ms: None,
+            last_auto_update_unix_ms: None,
+            last_auto_updated_from: None,
+            auto_update_note: None,
         }
     }
 }
@@ -156,6 +164,57 @@ pub struct LiveAcpConfig {
     pub extra_args: Vec<String>,
     pub session_cwd: PathBuf,
     pub limits: GatewayLimits,
+    pub agy_proxy: Option<ProxyUrl>,
+    pub auto_update_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AutoUpdateTelemetryState {
+    latest_known_version: Option<String>,
+    last_update_check_unix_ms: Option<u64>,
+    last_auto_update_unix_ms: Option<u64>,
+    last_auto_updated_from: Option<String>,
+    auto_update_note: Option<String>,
+}
+
+/// Synchronous rollback guard for an in-place `agy` executable swap.
+///
+/// If dropped before [`Self::commit`], synchronously restores `backup_path` back to `target_path`.
+pub struct BinarySwapGuard {
+    target_path: PathBuf,
+    backup_path: Option<PathBuf>,
+    committed: bool,
+}
+
+impl BinarySwapGuard {
+    #[must_use]
+    pub fn new(target_path: PathBuf, backup_path: Option<PathBuf>) -> Self {
+        Self {
+            target_path,
+            backup_path,
+            committed: false,
+        }
+    }
+
+    /// Disarms rollback and cleans up the temporary backup file on a best-effort basis.
+    pub fn commit(mut self) {
+        self.committed = true;
+        if let Some(bak) = &self.backup_path {
+            let _ = std::fs::remove_file(bak);
+        }
+    }
+}
+
+impl Drop for BinarySwapGuard {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(bak) = &self.backup_path
+            && bak.exists()
+        {
+            let _ = std::fs::remove_file(&self.target_path);
+            let _ = std::fs::rename(bak, &self.target_path);
+        }
+    }
 }
 
 /// Self-healing supervised `agy acp --process-per-session --dangerously-skip-permissions` client over stdio.
@@ -166,6 +225,7 @@ pub struct LiveAcpClient {
     respawn_lock: tokio::sync::Mutex<()>,
     models_tx: watch::Sender<Arc<[AvailableModel]>>,
     models_rx: watch::Receiver<Arc<[AvailableModel]>>,
+    auto_update_state: Mutex<AutoUpdateTelemetryState>,
 }
 
 struct LiveAcpGeneration {
@@ -247,7 +307,7 @@ impl LiveAcpGeneration {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        configure_acp_child_env(&mut cmd);
+        configure_acp_child_env(&mut cmd, cfg.agy_proxy.as_ref());
         configure_command_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|source| AcpError::SpawnProcess {
@@ -492,6 +552,7 @@ impl LiveAcpClient {
             respawn_lock: tokio::sync::Mutex::new(()),
             models_tx,
             models_rx,
+            auto_update_state: Mutex::new(AutoUpdateTelemetryState::default()),
         };
 
         // Warm up model catalog so `GET /v1/models` immediately sees all account models; if `agy`
@@ -507,12 +568,171 @@ impl LiveAcpClient {
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "initial model catalog probe deferred (run `agy acp --login` if sign-in is required); gateway will auto-reconnect on next request"
+                    "initial model catalog probe deferred (run `lg agy login` if sign-in is required); gateway will auto-reconnect on next request"
                 );
             }
         }
 
         Ok(client)
+    }
+
+    #[must_use]
+    pub fn binary_path(&self) -> &Path {
+        &self.cfg.binary_path
+    }
+
+    #[must_use]
+    pub fn agy_proxy(&self) -> Option<&ProxyUrl> {
+        self.cfg.agy_proxy.as_ref()
+    }
+
+    /// Returns the `agentInfo.version` reported by the active `agy acp` handshake, if available.
+    #[must_use]
+    pub fn current_agent_version(&self) -> Option<String> {
+        let active = self.active_gen();
+        let guard = match active.inner.agent_meta.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.2.clone()
+    }
+
+    /// Returns `(rpc_pending_in_flight, active_prompt_streams)` on the active ACP generation.
+    #[must_use]
+    pub fn active_activity_counts(&self) -> (usize, usize) {
+        let active = self.active_gen();
+        let rpc_pending = match active.inner.pending.lock() {
+            Ok(g) => g.len(),
+            Err(p) => p.into_inner().len(),
+        };
+        let streams = match active.inner.session_streams.lock() {
+            Ok(g) => g.len(),
+            Err(p) => p.into_inner().len(),
+        };
+        (rpc_pending, streams)
+    }
+
+    pub fn record_auto_update_check(&self, latest_version: Option<String>, note: Option<String>) {
+        let mut guard = match self.auto_update_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.last_update_check_unix_ms = Some(unix_timestamp_ms());
+        if latest_version.is_some() {
+            guard.latest_known_version = latest_version;
+        }
+        guard.auto_update_note = note;
+    }
+
+    pub fn record_auto_update_applied(
+        &self,
+        previous_version: String,
+        new_version: String,
+        note: Option<String>,
+    ) {
+        let now = unix_timestamp_ms();
+        let mut guard = match self.auto_update_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.last_update_check_unix_ms = Some(now);
+        guard.last_auto_update_unix_ms = Some(now);
+        guard.last_auto_updated_from = Some(previous_version);
+        guard.latest_known_version = Some(new_version);
+        guard.auto_update_note = note;
+    }
+
+    /// Safely shuts down the active `agy acp` process tree while the gateway is completely idle,
+    /// runs `swap_binary` to replace the executable on disk (releasing Windows `.exe` locks),
+    /// and immediately spawns & handshakes a fresh `agy acp` generation with automatic rollback.
+    pub async fn hot_swap_binary_when_idle<CheckIdle, SwapFn>(
+        &self,
+        pool: &SessionPool,
+        is_still_idle: CheckIdle,
+        swap_binary: SwapFn,
+    ) -> Result<Option<String>, AcpError>
+    where
+        CheckIdle: Fn() -> bool,
+        SwapFn: FnOnce(&Path) -> std::io::Result<BinarySwapGuard>,
+    {
+        let _guard = self.respawn_lock.lock().await;
+        if !is_still_idle()
+            || self.active_activity_counts() != (0, 0)
+            || pool.idle_and_active_counts().0 > 0
+        {
+            return Ok(None);
+        }
+
+        let idle_entries = pool.take_all_idle_sessions();
+        for entry in &idle_entries {
+            let _ = self.close_session_inner(&entry.session_id).await;
+        }
+
+        if !is_still_idle()
+            || self.active_activity_counts() != (0, 0)
+            || pool.idle_and_active_counts().0 > 0
+        {
+            return Ok(None);
+        }
+
+        let previous = self.active_gen();
+        previous.shutdown().await;
+
+        let swap_guard = match swap_binary(&self.cfg.binary_path) {
+            Ok(g) => g,
+            Err(source) => {
+                let recovery_id = self.next_gen_id.fetch_add(1, Ordering::Relaxed);
+                if let Ok(recovered) =
+                    LiveAcpGeneration::spawn_and_handshake(recovery_id, &self.cfg).await
+                {
+                    let mut write_guard = match self.generation.write() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    *write_guard = Arc::new(recovered);
+                }
+                return Err(AcpError::SpawnProcess {
+                    path: self.cfg.binary_path.clone(),
+                    source,
+                });
+            }
+        };
+
+        let new_id = self.next_gen_id.fetch_add(1, Ordering::Relaxed);
+        match LiveAcpGeneration::spawn_and_handshake(new_id, &self.cfg).await {
+            Ok(fresh_raw) => {
+                swap_guard.commit();
+                let fresh = Arc::new(fresh_raw);
+                {
+                    let mut write_guard = match self.generation.write() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    *write_guard = Arc::clone(&fresh);
+                }
+                if let Ok(probe) = fresh.create_session_once("", &self.models_tx).await {
+                    let _ = self.close_session_inner(&probe.session_id).await;
+                }
+                Ok(Some(
+                    self.current_agent_version()
+                        .unwrap_or_else(|| "updated".to_owned()),
+                ))
+            }
+            Err(spawn_err) => {
+                drop(swap_guard);
+                let recovery_id = self.next_gen_id.fetch_add(1, Ordering::Relaxed);
+                if let Ok(recovered) =
+                    LiveAcpGeneration::spawn_and_handshake(recovery_id, &self.cfg).await
+                {
+                    let mut write_guard = match self.generation.write() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    *write_guard = Arc::new(recovered);
+                }
+                Err(spawn_err)
+            }
+        }
     }
 
     fn active_gen(&self) -> Arc<LiveAcpGeneration> {
@@ -724,6 +944,21 @@ impl AcpBackend for Arc<LiveAcpClient> {
             .collect()
     }
 
+    async fn fetch_web_url(
+        &self,
+        url: &str,
+        allowed_domains: &[String],
+        blocked_domains: &[String],
+    ) -> crate::web_fetch::WebFetchOutcome {
+        crate::web_fetch::fetch_url_sanitized_with_proxy(
+            url,
+            allowed_domains,
+            blocked_domains,
+            self.cfg.agy_proxy.as_ref(),
+        )
+        .await
+    }
+
     fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
         (**self).process_telemetry(default_model, acp_mode)
     }
@@ -752,6 +987,10 @@ impl LiveAcpClient {
             Ok(g) => g.iter().cloned().collect(),
             Err(p) => p.into_inner().iter().cloned().collect(),
         };
+        let auto_meta = match self.auto_update_state.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
 
         AcpProcessTelemetry {
             connected: !inner.stdin_tx.is_closed() && !active.cancel.is_cancelled(),
@@ -777,6 +1016,17 @@ impl LiveAcpClient {
             rpc_pending_in_flight,
             active_prompt_streams,
             recent_stderr,
+            agy_proxy: self
+                .cfg
+                .agy_proxy
+                .as_ref()
+                .map(|p| p.redacted_display().into_owned()),
+            auto_update_enabled: self.cfg.auto_update_enabled,
+            latest_known_version: auto_meta.latest_known_version,
+            last_update_check_unix_ms: auto_meta.last_update_check_unix_ms,
+            last_auto_update_unix_ms: auto_meta.last_auto_update_unix_ms,
+            last_auto_updated_from: auto_meta.last_auto_updated_from,
+            auto_update_note: auto_meta.auto_update_note,
         }
     }
 }

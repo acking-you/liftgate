@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::time::Duration;
 
+use liftgate_types::config::ProxyUrl;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -33,6 +34,16 @@ pub async fn fetch_url_sanitized(
     raw_url: &str,
     allowed_domains: &[String],
     blocked_domains: &[String],
+) -> WebFetchOutcome {
+    fetch_url_sanitized_with_proxy(raw_url, allowed_domains, blocked_domains, None).await
+}
+
+/// Like [`fetch_url_sanitized`], honoring Liftgate's explicit `agy_proxy` policy (`None` = direct).
+pub async fn fetch_url_sanitized_with_proxy(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    agy_proxy: Option<&ProxyUrl>,
 ) -> WebFetchOutcome {
     let trimmed = raw_url.trim();
     let parsed = match validate_fetch_url(trimmed, allowed_domains, blocked_domains) {
@@ -70,7 +81,7 @@ pub async fn fetch_url_sanitized(
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    configure_acp_child_env(&mut cmd);
+    configure_acp_child_env(&mut cmd, agy_proxy);
 
     #[cfg(windows)]
     {

@@ -2,6 +2,32 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use liftgate_types::config::ProxyUrl;
+
+const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_KEY",
+    "AGY_API_KEY",
+    "AGY_GATEWAY_API_KEY",
+];
+
+const OUTBOUND_PROXY_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
 /// Resolves the `agy` CLI executable across Windows, Linux, and macOS.
 ///
 /// Discovery priority:
@@ -246,24 +272,11 @@ pub fn canonicalize_clean(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Scrubs gateway-client variables from the `agy acp` subprocess environment, ensures
-/// loopback addresses bypass proxies, and on Windows propagates the active WinINet system
-/// proxy into `HTTP_PROXY`/`HTTPS_PROXY` when Go's `http.ProxyFromEnvironment` needs it.
-pub fn configure_acp_child_env(cmd: &mut tokio::process::Command) {
-    const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "OPENAI_BASE_URL",
-        "OPENAI_API_KEY",
-        "AGY_API_KEY",
-        "AGY_GATEWAY_API_KEY",
-    ];
+/// Scrubs gateway-client variables from an `agy` subprocess (`tokio::process::Command`),
+/// ensures loopback addresses bypass proxies, and enforces Liftgate's explicit proxy policy:
+/// - `Some(proxy)`: forcibly injects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+/// - `None` (default): clears outbound proxy variables so `agy` connects directly with no proxy.
+pub fn configure_acp_child_env(cmd: &mut tokio::process::Command, agy_proxy: Option<&ProxyUrl>) {
     for key in CLIENT_ENV_VARS_TO_STRIP {
         cmd.env_remove(key);
     }
@@ -277,24 +290,41 @@ pub fn configure_acp_child_env(cmd: &mut tokio::process::Command) {
     cmd.env("NO_PROXY", &merged_no_proxy);
     cmd.env("no_proxy", &merged_no_proxy);
 
-    #[cfg(windows)]
-    {
-        let has_proxy_env = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
-            .iter()
-            .any(|k| {
-                std::env::var_os(k)
-                    .and_then(|v| v.into_string().ok())
-                    .is_some_and(|s| !s.trim().is_empty())
-            });
-        if !has_proxy_env && let Some(proxy_url) = detect_windows_system_proxy() {
-            tracing::info!(
-                proxy = %proxy_url,
-                "propagating Windows system proxy to `agy acp` subprocess"
-            );
-            cmd.env("HTTP_PROXY", &proxy_url);
-            cmd.env("HTTPS_PROXY", &proxy_url);
-            cmd.env("http_proxy", &proxy_url);
-            cmd.env("https_proxy", &proxy_url);
+    if let Some(proxy) = agy_proxy {
+        let val = proxy.as_str();
+        for key in OUTBOUND_PROXY_ENV_KEYS {
+            cmd.env(key, val);
+        }
+    } else {
+        for key in OUTBOUND_PROXY_ENV_KEYS {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+/// Synchronous `std::process::Command` counterpart to [`configure_acp_child_env`].
+pub fn configure_acp_std_child_env(cmd: &mut std::process::Command, agy_proxy: Option<&ProxyUrl>) {
+    for key in CLIENT_ENV_VARS_TO_STRIP {
+        cmd.env_remove(key);
+    }
+
+    let merged_no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+    cmd.env("NO_PROXY", &merged_no_proxy);
+    cmd.env("no_proxy", &merged_no_proxy);
+
+    if let Some(proxy) = agy_proxy {
+        let val = proxy.as_str();
+        for key in OUTBOUND_PROXY_ENV_KEYS {
+            cmd.env(key, val);
+        }
+    } else {
+        for key in OUTBOUND_PROXY_ENV_KEYS {
+            cmd.env_remove(key);
         }
     }
 }
@@ -317,11 +347,18 @@ pub fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
     entries.join(",")
 }
 
-/// Detects the effective outbound HTTP(S) proxy URL from environment variables or, on Windows,
-/// the active WinINet `Internet Settings` registry configuration.
+/// Opt-in helper detecting an ambient shell or OS HTTP(S) proxy URL when the user explicitly
+/// runs `lg proxy system` (never applied automatically by default).
 #[must_use]
-pub fn detect_effective_proxy_url() -> Option<String> {
-    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+pub fn detect_system_proxy_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         if let Some(val) = std::env::var_os(key)
             .and_then(|v| v.into_string().ok())
             .map(|s| s.trim().to_owned())

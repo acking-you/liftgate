@@ -127,6 +127,8 @@ pub enum CockpitAction {
     PickModel,
     OpenWebUi,
     StartOrRestart,
+    AgyManage,
+    AgyLogin,
     SyncConfig,
     Doctor,
     Upgrade,
@@ -178,6 +180,18 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         action: CockpitAction::StartOrRestart,
     },
     CockpitItem {
+        hotkey: 'i',
+        label: "Antigravity CLI (agy)",
+        desc: "Inspect agy status, proxy & auto-update, or install agy if missing",
+        action: CockpitAction::AgyManage,
+    },
+    CockpitItem {
+        hotkey: 'l',
+        label: "Antigravity Sign-In",
+        desc: "Interactive Google sign-in via official `agy acp --login`",
+        action: CockpitAction::AgyLogin,
+    },
+    CockpitItem {
         hotkey: 'g',
         label: "Configure Client Files",
         desc: "Non-destructively sync .claude & .codex project configuration",
@@ -214,10 +228,15 @@ struct CockpitSummary {
     idle_sessions: usize,
     total_requests: u64,
     total_tokens: u64,
+    agy_installed: bool,
+    agy_version: Option<String>,
+    agy_proxy: Option<String>,
+    agy_auto_update: bool,
     cwd_display: String,
 }
 
 async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
+    let local_agy = crate::agy_manager::quick_local_agy_summary(state_paths, None).await;
     let daemon = state_paths.read_daemon().ok().flatten();
     let default_serve = ServeArgs::default();
     let listen = daemon.as_ref().map_or(default_serve.listen, |d| d.listen);
@@ -246,6 +265,23 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_owned());
 
+    let agy_version = snap
+        .as_ref()
+        .and_then(|s| s.acp_process.agent_version.clone())
+        .or(local_agy.version);
+    let agy_proxy = snap
+        .as_ref()
+        .and_then(|s| s.acp_process.agy_proxy.clone())
+        .or_else(|| {
+            local_agy
+                .proxy
+                .as_ref()
+                .map(|p| p.redacted_display().into_owned())
+        });
+    let agy_auto_update = snap.as_ref().map_or(local_agy.auto_update_enabled, |s| {
+        s.acp_process.auto_update_enabled
+    });
+
     CockpitSummary {
         healthy,
         managed: healthy && managed_alive,
@@ -269,6 +305,10 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
                 .total_input_tokens
                 .saturating_add(s.metrics.total_output_tokens)
         }),
+        agy_installed: local_agy.binary_path.is_some(),
+        agy_version,
+        agy_proxy,
+        agy_auto_update,
         cwd_display,
     }
 }
@@ -345,12 +385,12 @@ fn poll_cockpit_input(selected: &mut usize) -> Result<Option<Option<CockpitActio
 }
 
 fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mut ListState) {
-    let area = centered_rect(86, 23, frame.area());
+    let area = centered_rect(86, 26, frame.area());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Min(11),
+            Constraint::Length(7),
+            Constraint::Min(13),
             Constraint::Length(2),
         ])
         .split(area);
@@ -437,6 +477,48 @@ fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mu
         Span::styled(&summary.cwd_display, Style::default().fg(Color::Gray)),
     ]);
 
+    let agy_badge = if summary.agy_installed {
+        let v = summary.agy_version.as_deref().unwrap_or("installed");
+        Span::styled(
+            format!("v{v}"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "MISSING (press [i] to install)",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let agy_line = Line::from(vec![
+        Span::styled("AGY CLI: ", Style::default().fg(Color::DarkGray)),
+        agy_badge,
+        Span::styled("   Proxy: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            summary.agy_proxy.as_deref().unwrap_or("none"),
+            Style::default().fg(if summary.agy_proxy.is_some() {
+                Color::Cyan
+            } else {
+                Color::Gray
+            }),
+        ),
+        Span::styled(
+            "   Idle Auto-Update: ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if summary.agy_auto_update { "on" } else { "off" },
+            Style::default().fg(if summary.agy_auto_update {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        ),
+    ]);
+
     let header_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -461,8 +543,13 @@ fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mu
         ]));
 
     if let Some(&header_rect) = chunks.first() {
-        let header_para =
-            Paragraph::new(vec![Line::from(status_spans), meta_line, cwd_line]).block(header_block);
+        let header_para = Paragraph::new(vec![
+            Line::from(status_spans),
+            meta_line,
+            agy_line,
+            cwd_line,
+        ])
+        .block(header_block);
         frame.render_widget(header_para, header_rect);
     }
 
@@ -1079,12 +1166,9 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                 TuiCommand::SwitchDefaultModel(model_id) => {
                     let restart_args = RestartArgs {
                         listen: worker_listen,
-                        ui_listen: None,
                         default_model: Some(model_id.clone()),
-                        acp_mode: None,
                         api_key: worker_key.clone(),
-                        agy_bin: None,
-                        open: false,
+                        ..RestartArgs::default()
                     };
                     match restart_daemon_quiet(&worker_paths, restart_args).await {
                         Ok(()) => Ok(format!("Switched default model to {model_id}")),
@@ -1099,12 +1183,8 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                             &worker_paths,
                             RestartArgs {
                                 listen: worker_listen,
-                                ui_listen: None,
-                                default_model: None,
-                                acp_mode: None,
                                 api_key: worker_key.clone(),
-                                agy_bin: None,
-                                open: false,
+                                ..RestartArgs::default()
                             },
                         )
                         .await
@@ -1641,15 +1721,25 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 
     // 4. ACP JSON-RPC Transport
     if let Some(&c3) = cols.get(3) {
-        let (sent, recv, notifs, streams, sup) = snap.map_or((0, 0, 0, 0, "—"), |s| {
-            (
-                s.acp_process.rpc_requests_sent,
-                s.acp_process.rpc_responses_received,
-                s.acp_process.rpc_notifications_received,
-                s.acp_process.active_prompt_streams,
-                s.acp_process.supervision_strategy.as_ref(),
-            )
-        });
+        let (sent, recv, notifs, streams, agy_meta) = snap.map_or_else(
+            || (0, 0, 0, 0, "proxy=— · upd=—".to_owned()),
+            |s| {
+                let px = s.acp_process.agy_proxy.as_deref().unwrap_or("none");
+                let au = if s.acp_process.auto_update_enabled {
+                    "on"
+                } else {
+                    "off"
+                };
+                let ver = s.acp_process.agent_version.as_deref().unwrap_or("—");
+                (
+                    s.acp_process.rpc_requests_sent,
+                    s.acp_process.rpc_responses_received,
+                    s.acp_process.rpc_notifications_received,
+                    s.acp_process.active_prompt_streams,
+                    format!("v{ver} · px={px} · upd={au}"),
+                )
+            },
+        );
         let card = Paragraph::new(vec![
             Line::from(vec![Span::styled(
                 format!("RPC {sent}↑ / {recv}↓"),
@@ -1665,10 +1755,7 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
-            Line::from(Span::styled(
-                format!("Guard: {sup}"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(agy_meta, Style::default().fg(Color::DarkGray))),
         ])
         .block(kpi_block(" ACP Subprocess "));
         frame.render_widget(card, c3);

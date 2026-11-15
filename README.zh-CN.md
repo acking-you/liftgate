@@ -36,6 +36,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 ## 能做什么
 
 - **只走官方接口**：只通过 `agy acp`（CLI 为编辑器提供的 Agent Client Protocol）与 Antigravity 通信，登录、Token、配额与 TLS 都留在 `agy` 内部（[为什么是 ACP](docs/architecture.md#why-acp)）。
+- **内置 `agy` 一键安装、代理注入与空闲自动更新**：缺失 `agy` 时用 `lg agy install` 跨平台自动下载并做 SHA-512 校验，用 `lg agy login` 完成交互登录；默认**不设置任何代理**，需要时一条 `lg proxy <端口|URL>` 即可在 `agy` 启动时强制注入代理；网关运行期间默认在空闲时自动检测并无感热更新 `agy`（可通过 `lg agy auto-update` 随时开关）。
 - **两套标准 API**：OpenAI Responses 与 Anthropic Messages，支持流式输出、工具调用、思考过程、图片与 Token 计数（[API](docs/api.md)）。
 - **工具留在你的智能体里**：ACP 会话运行在空目录且不挂任何 MCP 服务，文件编辑与命令执行仍由 Codex 或 Claude Code 完成；联网搜索与防 SSRF 的网页抓取由网关处理（[纯推理会话](docs/architecture.md#inference-only-sessions)）。
 - **会话预热复用**：按每次请求的历史匹配池中已预热的 ACP 会话，只发送本轮新增内容（[会话复用](docs/architecture.md#session-reuse)）。
@@ -54,11 +55,14 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ## 快速开始
 
-使用 Antigravity CLI（`agy`）完成一次登录，从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包（或通过 `cargo binstall liftgate` / `cargo install` 安装），即可直接使用短命令别名 **`lg`**（与 `liftgate` 完全等价）：
+从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包（或通过 `cargo binstall liftgate` / `cargo install` 安装），即可直接用短命令 **`lg`**（与 `liftgate` 完全等价）一键完成 `agy` 安装、可选代理设置与登录：
 
 ```bash
-agy acp --login                         # 首次使用时登录 Antigravity
 cargo install --path crates/liftgate --locked  # 同时安装 `lg` 与 `liftgate`（装有 Bun 时自动内嵌 Web 面板）
+
+lg agy install                          # 若本机尚未安装 `agy`，跨平台下载官方包并做 SHA-512 校验安装
+lg proxy 7890                           # 可选：为 `agy` 强制指定代理（默认不设任何代理，`lg proxy off` 关闭）
+lg agy login                            # 通过官方 `agy acp --login` 交互式登录 Google Antigravity
 
 lg                                      # 在终端直接打开交互式控制中心（快捷键一键启动）
 lg cx                                   # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
@@ -68,6 +72,7 @@ lg cc                                   # 或在当前目录直接启动 Claude 
 在任意目录下打开终端 TUI 监控、交互式切换模型，或同步项目级与全局客户端配置：
 
 ```bash
+lg agy                   # 查看 `agy` 是否存在、版本、登录状态、强制代理与空闲自动更新策略
 lg top                   # 打开全屏实时终端仪表盘（实时请求、会话池管理、模型切换、日志）
 lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
 lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板

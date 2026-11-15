@@ -1,3 +1,5 @@
+#[path = "agy_manager.rs"]
+pub(crate) mod agy_manager;
 #[path = "cli.rs"]
 pub(crate) mod cli;
 #[path = "client.rs"]
@@ -30,11 +32,12 @@ use liftgate_server::job::install_panic_cleanup_hook;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{
-    ClaudeArgs, Cli, CodexArgs, Commands, ConfigArgs, DoctorArgs, ModelsArgs, RestartArgs,
-    ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs, invoked_bin_name, normalize_harness_args,
+    AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs, Cli, CodexArgs,
+    Commands, ConfigArgs, DoctorArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, TopArgs,
+    UiArgs, UpgradeArgs, invoked_bin_name, normalize_harness_args,
 };
 use crate::error::CliError;
-use crate::state::StatePaths;
+use crate::state::{StatePaths, resolve_effective_agy_bin};
 use crate::tui::CockpitAction;
 
 pub async fn entry() -> ExitCode {
@@ -99,6 +102,7 @@ async fn dispatch(
     bin_name: &str,
 ) -> Result<i32, CliError> {
     let state_paths = StatePaths::resolve(cli.state_dir)?;
+    agy_manager::sweep_stale_agy_backups(&state_paths);
 
     match cli.command {
         None if bare_interactive_invocation => {
@@ -108,7 +112,7 @@ async fn dispatch(
             dispatch_cockpit_action(&state_paths, action).await
         }
         None => {
-            serve::run_serve(cli.serve).await?;
+            serve::run_serve(&state_paths, cli.serve).await?;
             Ok(0)
         }
         Some(Commands::Top(args)) => {
@@ -116,7 +120,7 @@ async fn dispatch(
             Ok(0)
         }
         Some(Commands::Serve(args)) => {
-            serve::run_serve(args).await?;
+            serve::run_serve(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Start(args)) => {
@@ -159,6 +163,11 @@ async fn dispatch(
         }
         Some(Commands::Upgrade(args)) => {
             upgrade::run_upgrade(&state_paths, args).await?;
+            Ok(0)
+        }
+        Some(Commands::Agy(args)) => agy_manager::run_agy(&state_paths, args).await,
+        Some(Commands::Proxy(args)) => {
+            agy_manager::run_proxy(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Alias(args)) => {
@@ -243,6 +252,36 @@ async fn dispatch_cockpit_action(
                 .await?;
             }
             Ok(0)
+        }
+        CockpitAction::AgyManage => {
+            let settings = state_paths.read_settings()?;
+            if resolve_effective_agy_bin(None, &settings).is_none() {
+                let _ = agy_manager::run_agy_install(state_paths, AgyInstallArgs::default(), false)
+                    .await?;
+                Ok(0)
+            } else {
+                agy_manager::run_agy(
+                    state_paths,
+                    AgyArgs {
+                        agy_bin: None,
+                        json: false,
+                        action: Some(AgyCommand::Status(AgyStatusArgs::default())),
+                    },
+                )
+                .await
+            }
+        }
+        CockpitAction::AgyLogin => {
+            agy_manager::run_agy_login(
+                state_paths,
+                None,
+                AgyLoginArgs {
+                    install: true,
+                    proxy: None,
+                    no_restart: false,
+                },
+            )
+            .await
         }
         CockpitAction::SyncConfig => {
             config_sync::run_config(state_paths, ConfigArgs::default_local()).await?;

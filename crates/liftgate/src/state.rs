@@ -4,13 +4,18 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use liftgate_server::platform::canonicalize_clean;
+use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
+use liftgate_types::config::{ProxyUrl, is_proxy_disable_keyword};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::CliError;
 
 const MAX_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
+const fn default_true() -> bool {
+    true
+}
 
 /// Resolved filesystem locations for Liftgate's global management state (`~/.liftgate` by default).
 #[derive(Clone, Debug)]
@@ -36,6 +41,11 @@ impl StatePaths {
     #[must_use]
     pub fn daemon_file(&self) -> PathBuf {
         self.root.join("daemon.json")
+    }
+
+    #[must_use]
+    pub fn settings_file(&self) -> PathBuf {
+        self.root.join("settings.json")
     }
 
     #[must_use]
@@ -116,6 +126,108 @@ impl StatePaths {
             Err(source) => Err(CliError::StateIo { path, source }),
         }
     }
+
+    pub fn read_settings(&self) -> Result<LiftgateSettings, CliError> {
+        let path = self.settings_file();
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LiftgateSettings::default());
+            }
+            Err(source) => return Err(CliError::StateIo { path, source }),
+        };
+        let parsed = serde_json::from_slice(&bytes)
+            .map_err(|source| CliError::StateJson { path, source })?;
+        Ok(parsed)
+    }
+
+    pub fn write_settings(&self, settings: &LiftgateSettings) -> Result<(), CliError> {
+        self.ensure_root_dir()?;
+        let path = self.settings_file();
+        let mut json =
+            serde_json::to_vec_pretty(settings).map_err(|source| CliError::StateJson {
+                path: path.clone(),
+                source,
+            })?;
+        json.push(b'\n');
+        write_file_atomic(&path, &json, true)
+    }
+}
+
+/// Persistent user-level preferences stored at `~/.liftgate/settings.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiftgateSettings {
+    /// Forced outbound proxy URL injected into `agy` subprocesses (`None` = no proxy by default).
+    #[serde(default)]
+    pub agy_proxy: Option<ProxyUrl>,
+    /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
+    #[serde(default = "default_true")]
+    pub agy_auto_update: bool,
+    /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
+    #[serde(default)]
+    pub agy_bin: Option<PathBuf>,
+    /// Forward-compatible unknown keys preserved across versions.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for LiftgateSettings {
+    fn default() -> Self {
+        Self {
+            agy_proxy: None,
+            agy_auto_update: true,
+            agy_bin: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+/// Resolves the effective outbound `agy` proxy (`CLI/env override` -> `settings.json` -> `None`).
+pub fn resolve_effective_agy_proxy(
+    cli_override: Option<&str>,
+    settings: &LiftgateSettings,
+) -> Result<Option<ProxyUrl>, CliError> {
+    if let Some(raw) = cli_override.map(str::trim).filter(|s| !s.is_empty()) {
+        if is_proxy_disable_keyword(raw) {
+            return Ok(None);
+        }
+        return Ok(Some(ProxyUrl::try_new(raw)?));
+    }
+    Ok(settings.agy_proxy.clone())
+}
+
+/// Resolves the effective background idle `agy` auto-update toggle (`true` by default).
+#[must_use]
+pub const fn resolve_effective_agy_auto_update(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.agy_auto_update
+    }
+}
+
+/// Resolves the `agy` executable path, consulting saved `settings.agy_bin` when not yet on `PATH`.
+#[must_use]
+pub fn resolve_effective_agy_bin(
+    explicit: Option<PathBuf>,
+    settings: &LiftgateSettings,
+) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return resolve_agy_binary(explicit);
+    }
+    resolve_agy_binary(None).or_else(|| {
+        settings
+            .agy_bin
+            .as_ref()
+            .filter(|p| is_executable_file(p))
+            .map(|p| canonicalize_clean(p))
+    })
 }
 
 /// Persisted metadata describing a background `liftgate` daemon managed via `~/.liftgate/daemon.json`.
@@ -137,6 +249,10 @@ pub struct DaemonState {
     pub acp_cwd: Option<PathBuf>,
     #[serde(default)]
     pub ui_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub agy_proxy: Option<String>,
+    #[serde(default = "default_true")]
+    pub agy_auto_update: bool,
     #[serde(default)]
     pub shutdown_token: String,
     #[serde(default)]
@@ -385,6 +501,8 @@ mod tests {
             agy_bin: None,
             acp_cwd: None,
             ui_dir: None,
+            agy_proxy: None,
+            agy_auto_update: true,
             shutdown_token: "tok-123".to_owned(),
             started_at_unix_ms: 1000,
             log_file: paths.log_file(),
@@ -393,9 +511,26 @@ mod tests {
         let loaded = paths.read_daemon().unwrap().unwrap();
         assert_eq!(loaded.pid, 4242);
         assert_eq!(loaded.dashboard_base_url(), "http://127.0.0.1:5173");
+        assert!(loaded.agy_auto_update);
+        assert!(loaded.agy_proxy.is_none());
 
         paths.remove_daemon().unwrap();
         assert!(paths.read_daemon().unwrap().is_none());
+
+        let defaults = paths.read_settings().unwrap();
+        assert!(defaults.agy_proxy.is_none());
+        assert!(defaults.agy_auto_update);
+
+        let mut updated = defaults;
+        updated.agy_proxy = Some(ProxyUrl::try_new("7890").unwrap());
+        updated.agy_auto_update = false;
+        paths.write_settings(&updated).unwrap();
+        let reloaded = paths.read_settings().unwrap();
+        assert_eq!(
+            reloaded.agy_proxy.as_ref().map(ProxyUrl::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(!reloaded.agy_auto_update);
         let _ = fs::remove_dir_all(&temp_root);
     }
 }

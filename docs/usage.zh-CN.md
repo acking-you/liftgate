@@ -6,12 +6,12 @@
 
 ## 准备工作
 
-- **Antigravity CLI（`agy`）**：安装后执行一次 `agy acp --login` 完成登录。Liftgate 会在 `PATH` 和标准安装位置查找它，找不到时用 `--agy-bin <路径>` 指定。
 - **全局安装 `lg` / `liftgate`**：从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包放入 `PATH`（或运行 `cargo binstall liftgate`），亦可使用 **Rust 1.85+** 从源码全局安装：
   ```bash
   cargo install --path crates/liftgate --locked
   ```
   编译 Release 时若本机装有 **Bun**，`build.rs` 会自动构建 `web/` 并将完整 React 监控面板直接内嵌进 `liftgate` 单二进制中（运行时无需外部 `web/dist` 目录）；未安装 Bun 时所有 API 照常可用，且 `/` 仍提供内置的轻量级实时遥测页面。
+- **Antigravity CLI（`agy`）**：若本机尚未安装 `agy`，直接执行 `lg agy install` 即可自动下载官方包并完成 SHA-512 校验安装，再执行一次 `lg agy login` 完成登录（底层调用官方 `agy acp --login`）。Liftgate 会在 `PATH`、标准安装目录及 `~/.liftgate/settings.json` 中自动定位它，也可通过 `--agy-bin <路径>` 或 `AGY_BIN` 指定。
 
 ## 全局服务管理（`lg` / `liftgate` CLI）
 
@@ -19,6 +19,10 @@
 
 ```bash
 lg                              # 在交互式终端打开快捷控制中心
+lg agy                          # 查看 agy 是否存在、版本、登录状态、强制代理与空闲自动更新设置
+lg agy install                  # 跨平台下载官方 agy 并完成 SHA-512 校验与安装
+lg agy login                    # 调用官方 `agy acp --login` 交互式登录 Google 账号
+lg proxy 7890                   # 为 agy 强制设置代理（默认不设任何代理，`lg proxy off` 恢复直连）
 lg top                          # 打开全屏实时 TUI 监控仪表盘（别名：tui、dash、monitor）
 lg up                           # 后台启动网关与内嵌 Web 监控面板（全称：start）
 lg up --open                    # 后台启动并自动在浏览器打开监控面板
@@ -34,6 +38,40 @@ lg alias --name lg              # 在 PATH 中安装或移除（--uninstall）�
 lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh、fish、powershell、elvish）
 liftgate serve                  # 前台运行网关
 ```
+
+## Antigravity CLI 管理（`lg agy`）与代理配置（`lg proxy`）
+
+无需手动查找安装包、拼环境变量或单独维护更新，直接通过 `lg` 即可完成 `agy` 的全生命周期管理：
+
+```bash
+# 1. 查看 agy 是否已安装、当前版本、上游最新版本、Google 登录状态、代理与自动更新开关
+lg agy                                  # 支持 `--json`、`lg agy status --offline`
+
+# 2. 跨平台安装或手动立即更新 agy（支持 Windows、macOS、Linux glibc/musl、Android）
+lg agy install                          # 从官方 Antigravity 清单下载并做 SHA-512 强校验
+lg agy update                           # 立即更新到最新版（若后台网关正在运行会自动热重启）
+
+# 3. 便捷设置强制注入给 agy 的网络代理（默认：不设置任何代理，直连）
+lg proxy                                # 查看当前代理状态（短别名：`lg px`）
+lg proxy 7890                           # 端口简写 -> 自动规范化为 http://127.0.0.1:7890
+lg proxy socks5h://127.0.0.1:1080       # 支持 http://、https://、socks5://、socks5h:// 与 host:port
+lg proxy system                         # 显式读取并导入一次当前系统/环境变量代理
+lg proxy test                           # 测试通过当前代理策略访问官方 Antigravity 更新源
+lg proxy off                            # 关闭代理，恢复默认的无代理直连模式
+
+# 4. 配置网关运行期间的 agy 空闲自动更新（默认：开启）
+lg agy auto-update                      # 查看当前自动更新开关与最近一次自动更新记录
+lg agy auto-update off                  # 关闭后台空闲自动更新
+lg agy auto-update on                   # 开启后台空闲自动更新（默认）
+
+# 5. 通过 lg 直接执行官方 agy CLI 操作（自动套用已配置的强制代理）
+lg agy login                            # 执行 `agy acp --login`（加 `--install` 可在缺失时先自动安装）
+lg agy models                           # 执行 `agy models` 查看账号已解锁模型
+lg agy mcp -- --help                    # 透传任意官方子命令（`mcp`、`plugin`、`changelog`、`run` 等）
+```
+
+- **默认零代理直连**：Liftgate 默认**不设置任何代理**，并在拉起 `agy` 时清理父进程残留的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（也不会自动注入系统注册表代理）。只有当你通过 `lg proxy`（持久化于 `~/.liftgate/settings.json`）或 `--agy-proxy` / `AGY_PROXY` 显式配置后，Liftgate 才会在每次启动 `agy` 时强制注入代理环境变量，并自动将 `127.0.0.1,localhost,::1` 写入 `NO_PROXY`。
+- **空闲无感自动热更新**：网关运行时默认开启 `agy` 自动更新（`true`）。后台任务会定期检查官方 Antigravity 清单；发现新版本时**绝不打断进行中的请求**，而是等待网关完全空闲（0 活跃请求、0 活跃流且会话池静置），排空缓存空闲会话并优雅释放旧 `agy` 进程文件锁（含 Windows `.exe` 锁），完成 SHA-512 校验替换后立即拉起新进程——若新版本握手异常还会自动回滚旧二进制。
 
 ## 零副作用临时启动（`liftgate codex` / `liftgate claude`）
 
@@ -204,6 +242,8 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--listen` | `AGY_GATEWAY_LISTEN` | `127.0.0.1:8787` |
 | `--ui-listen` | `AGY_UI_LISTEN` | 无（直接由 `--listen` 同端口提供） |
 | `--agy-bin` | `AGY_BIN` | 从 `PATH` 或标准安装位置查找 |
+| `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
+| `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |
@@ -220,8 +260,8 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 
 ## 常见问题
 
-- **请求卡住或被转发到代理**：把 `127.0.0.1,localhost,::1` 加入 `NO_PROXY`。
-- **`could not locate agy executable`**：传入 `--agy-bin <路径>` 或设置 `AGY_BIN`。
+- **请求卡住或被转发到代理**：把 `127.0.0.1,localhost,::1` 加入 `NO_PROXY`；若 `agy` 访问 Google Antigravity 需要走代理，运行 `lg proxy 7890`（或 `lg proxy <URL>`）。
+- **`could not locate agy executable`**：直接运行 `lg agy install` 自动安装，或传入 `--agy-bin <路径>` / 设置 `AGY_BIN`。
 - **`401`**：客户端密钥与 `--api-key` 不一致。
 - **额度耗尽（`Individual quota reached` / `insufficient_quota`）**：当前 Antigravity 账号或模型的配额已用完（`agy` 返回重置倒计时时会一并展示），可用 `/model` 切换模型或等待配额重置。
 - **后台运行的日志**：执行 `liftgate logs -f` 查看 `~/.liftgate/gateway.log`（使用 `./run-gateway` 脚本时位于 `.agy-runtime/gateway.{out,err}.log`）。

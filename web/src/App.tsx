@@ -472,6 +472,20 @@ export function App(): React.JSX.Element {
                   <span className="text-muted-foreground">隔离会话目录 (CWD): </span>
                   <code className="font-mono text-foreground/90">{acp.session_cwd}</code>
                 </div>
+                <div className="truncate">
+                  <span className="text-muted-foreground">AGY 代理策略: </span>
+                  <code className="font-mono text-foreground/90">
+                    {acp.agy_proxy ? `强制代理 (${acp.agy_proxy})` : "直连 (默认无代理)"}
+                  </code>
+                </div>
+                <div className="truncate">
+                  <span className="text-muted-foreground">AGY 空闲自动更新: </span>
+                  <code className="font-mono text-foreground/90">
+                    {(acp.auto_update_enabled ?? true) ? "开启" : "关闭"}
+                    {acp.latest_known_version ? ` · 上游 v${acp.latest_known_version}` : ""}
+                    {acp.auto_update_note ? ` (${acp.auto_update_note})` : ""}
+                  </code>
+                </div>
               </div>
             )}
           </CardContent>

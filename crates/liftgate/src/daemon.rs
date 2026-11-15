@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use comfy_table::{Attribute, Cell, Color as TableColor};
 use liftgate_server::platform::{
-    canonicalize_clean, detect_effective_proxy_url, resolve_agy_binary, split_expanded_path_var,
-    wait_for_shutdown_signal,
+    canonicalize_clean, split_expanded_path_var, wait_for_shutdown_signal,
 };
-use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId};
+use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl};
 use liftgate_types::telemetry::{TaskPhase, TaskProtocol};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::agy_manager::{
+    AgyAuthStatus, probe_agy_auth, probe_agy_version, quick_local_agy_summary,
+};
 use crate::cli::{
     AliasArgs, DoctorArgs, LogsArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs,
     UiArgs, invoked_bin_name, normalize_optional_api_key,
@@ -24,7 +26,10 @@ use crate::config_sync::resolve_fast_model;
 use crate::error::CliError;
 use crate::harness::{resolve_claude_command, resolve_codex_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
-use crate::state::{DaemonState, StatePaths, format_connect_url, now_unix_ms};
+use crate::state::{
+    DaemonState, StatePaths, format_connect_url, now_unix_ms, resolve_effective_agy_auto_update,
+    resolve_effective_agy_bin, resolve_effective_agy_proxy,
+};
 use crate::ui::{self, Spinner, Tone};
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -66,6 +71,14 @@ pub async fn start_daemon_with_exe(
     force_restart: bool,
     quiet_banner: bool,
 ) -> Result<DaemonState, CliError> {
+    let settings = state_paths.read_settings()?;
+    let effective_proxy = resolve_effective_agy_proxy(serve.agy_proxy.as_deref(), &settings)?;
+    let effective_auto_update = resolve_effective_agy_auto_update(
+        serve.agy_auto_update,
+        serve.no_agy_auto_update,
+        &settings,
+    );
+
     if let Some(existing) = state_paths.read_daemon()? {
         let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
         if is_pid_alive(existing.pid)
@@ -81,7 +94,10 @@ pub async fn start_daemon_with_exe(
                     && existing.ui_listen == serve.ui_listen
                     && existing.default_model == serve.default_model
                     && existing.acp_mode == serve.acp_mode
-                    && existing.api_key == requested_key;
+                    && existing.api_key == requested_key
+                    && existing.agy_proxy.as_deref()
+                        == effective_proxy.as_ref().map(ProxyUrl::as_str)
+                    && existing.agy_auto_update == effective_auto_update;
                 if !quiet_banner {
                     let bin = invoked_bin_name();
                     ui::headline(
@@ -99,6 +115,24 @@ pub async fn start_daemon_with_exe(
                     ui::kv(
                         "Default Model",
                         &format!("{} (mode: {})", existing.default_model, existing.acp_mode),
+                    );
+                    let existing_proxy_label = existing
+                        .agy_proxy
+                        .as_deref()
+                        .and_then(|s| ProxyUrl::try_new(s).ok())
+                        .map(|p| p.redacted_display().into_owned())
+                        .or_else(|| existing.agy_proxy.clone())
+                        .unwrap_or_else(|| "none".to_owned());
+                    ui::kv(
+                        "AGY Policy",
+                        &format!(
+                            "proxy={existing_proxy_label} · idle-auto-update={}",
+                            if existing.agy_auto_update {
+                                "on"
+                            } else {
+                                "off"
+                            }
+                        ),
                     );
                     if !config_matches {
                         ui::note(
@@ -132,8 +166,8 @@ pub async fn start_daemon_with_exe(
         serve.max_stored_responses,
         serve.turn_timeout_secs,
     )?;
-    let resolved_agy =
-        resolve_agy_binary(serve.agy_bin.clone()).ok_or(CliError::AgyBinaryNotFound)?;
+    let resolved_agy = resolve_effective_agy_bin(serve.agy_bin.clone(), &settings)
+        .ok_or(CliError::AgyBinaryNotFound)?;
 
     let log_out = state_paths.prepare_log_file_for_spawn()?;
     let log_err = log_out.try_clone().map_err(|source| CliError::StateIo {
@@ -154,11 +188,21 @@ pub async fn start_daemon_with_exe(
     ));
 
     let mut cmd = Command::new(&exe_path);
-    cmd.arg("serve")
+    cmd.arg("--state-dir")
+        .arg(state_paths.root())
+        .arg("serve")
         .arg("--listen")
         .arg(serve.listen.to_string())
         .arg("--agy-bin")
         .arg(&resolved_agy)
+        .arg("--agy-proxy")
+        .arg(effective_proxy.as_ref().map_or("off", ProxyUrl::as_str))
+        .arg("--agy-auto-update")
+        .arg(if effective_auto_update {
+            "true"
+        } else {
+            "false"
+        })
         .arg("--default-model")
         .arg(&serve.default_model)
         .arg("--acp-mode")
@@ -241,6 +285,8 @@ pub async fn start_daemon_with_exe(
         agy_bin: Some(resolved_agy),
         acp_cwd: serve.acp_cwd,
         ui_dir: serve.ui_dir,
+        agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
+        agy_auto_update: effective_auto_update,
         shutdown_token,
         started_at_unix_ms: now_unix_ms(),
         log_file: state_paths.log_file(),
@@ -263,11 +309,25 @@ pub async fn start_daemon_with_exe(
                 state.default_model, state.acp_mode
             ),
         );
+        ui::kv(
+            "AGY Policy",
+            &format!(
+                "proxy={} · idle-auto-update={}",
+                effective_proxy
+                    .as_ref()
+                    .map(ProxyUrl::redacted_display)
+                    .as_deref()
+                    .unwrap_or("none"),
+                if effective_auto_update { "on" } else { "off" }
+            ),
+        );
         ui::kv("Service Logs", &state.log_file.display().to_string());
         if model_count <= 1 {
             ui::note(
                 Tone::Warn,
-                "Only fallback model detected; run `agy acp --login` if you have not signed in yet.",
+                &format!(
+                    "Only fallback model detected; run `{bin} agy login` if you have not signed in yet."
+                ),
             );
         }
         ui::cmd_hint("Live terminal dashboard", &format!("{bin} top"));
@@ -404,6 +464,15 @@ pub async fn run_restart(state_paths: &StatePaths, args: RestartArgs) -> Result<
     }
     if let Some(bin) = args.agy_bin {
         serve.agy_bin = Some(bin);
+    }
+    if let Some(px) = args.agy_proxy {
+        serve.agy_proxy = Some(px);
+    }
+    if let Some(au) = args.agy_auto_update {
+        serve.agy_auto_update = Some(au);
+    }
+    if args.no_agy_auto_update {
+        serve.no_agy_auto_update = true;
     }
 
     let daemon = start_daemon_inner(state_paths, serve, false, false).await?;
@@ -585,6 +654,25 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         || format!("{}/", client.base_url()),
         |d| format!("{}/", d.dashboard_base_url()),
     );
+    let local_agy = quick_local_agy_summary(state_paths, None).await;
+    let effective_version = telemetry
+        .as_ref()
+        .and_then(|t| t.acp_process.agent_version.clone())
+        .or_else(|| local_agy.version.clone());
+    let effective_proxy_display = telemetry
+        .as_ref()
+        .and_then(|t| t.acp_process.agy_proxy.clone())
+        .or_else(|| {
+            local_agy
+                .proxy
+                .as_ref()
+                .map(|p| p.redacted_display().into_owned())
+        });
+    let effective_auto_update = telemetry
+        .as_ref()
+        .map_or(local_agy.auto_update_enabled, |t| {
+            t.acp_process.auto_update_enabled
+        });
 
     if args.json {
         let payload = json!({
@@ -597,6 +685,15 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             "state_dir": state_paths.root(),
             "log_file": state_paths.log_file(),
             "models_count": models.as_ref().map(Vec::len),
+            "agy": {
+                "installed": local_agy.binary_path.is_some(),
+                "binary_path": local_agy.binary_path,
+                "version": effective_version,
+                "proxy": effective_proxy_display,
+                "auto_update_enabled": effective_auto_update,
+                "latest_known_version": telemetry.as_ref().and_then(|t| t.acp_process.latest_known_version.clone()),
+                "auto_update_note": telemetry.as_ref().and_then(|t| t.acp_process.auto_update_note.clone()),
+            },
             "telemetry": telemetry,
         });
         println!(
@@ -633,6 +730,42 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         } else {
             "open loopback (no API key required)"
         },
+    );
+    let bin = invoked_bin_name();
+    match (&local_agy.binary_path, &effective_version) {
+        (Some(path), Some(ver)) => {
+            ui::kv("Antigravity CLI", &format!("v{ver}  ({})", path.display()));
+        }
+        (Some(path), None) => {
+            ui::kv("Antigravity CLI", &path.display().to_string());
+        }
+        (None, _) => {
+            ui::kv(
+                "Antigravity CLI",
+                &format!("missing — run `{bin} agy install` to install"),
+            );
+        }
+    }
+    ui::kv(
+        "AGY Proxy",
+        &effective_proxy_display
+            .as_deref()
+            .map_or_else(|| "none (direct)".to_owned(), |p| format!("forced -> {p}")),
+    );
+    let auto_update_suffix = telemetry
+        .as_ref()
+        .and_then(|t| t.acp_process.auto_update_note.as_deref())
+        .map_or_else(String::new, |note| format!("  ({note})"));
+    ui::kv(
+        "AGY Auto-Update",
+        &format!(
+            "{}{auto_update_suffix}",
+            if effective_auto_update {
+                "enabled (idle hot-swap)"
+            } else {
+                "disabled"
+            }
+        ),
     );
     ui::kv("Service Log", &state_paths.log_file().display().to_string());
 
@@ -721,7 +854,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 Cell::new(if list.len() > 1 {
                     "Antigravity live catalog synchronized".to_owned()
                 } else {
-                    "Fallback catalog only (run `agy acp --login` to authenticate)".to_owned()
+                    format!("Fallback catalog only (run `{bin} agy login` to authenticate)")
                 }),
             ]);
         }
@@ -762,7 +895,11 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         ui::kv("Live Models", &format!("{} discovered", list.len()));
     }
 
-    let bin = invoked_bin_name();
+    if local_agy.binary_path.is_none() {
+        println!();
+        ui::cmd_hint("Install Antigravity CLI", &format!("{bin} agy install"));
+        return Ok(());
+    }
     if !healthy {
         println!();
         ui::cmd_hint("Start background service", &format!("{bin} up"));
@@ -958,12 +1095,9 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
                 state_paths,
                 RestartArgs {
                     listen: args.listen,
-                    ui_listen: None,
                     default_model: Some(selected),
-                    acp_mode: None,
                     api_key: args.api_key,
-                    agy_bin: None,
-                    open: false,
+                    ..RestartArgs::default()
                 },
             )
             .await?;
@@ -1045,9 +1179,15 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
     }
 
     let bin = invoked_bin_name();
-    let mut checks: Vec<CheckRow> = Vec::with_capacity(8);
+    let settings = state_paths.read_settings()?;
+    let env_proxy = std::env::var("AGY_PROXY").ok();
+    let effective_proxy = resolve_effective_agy_proxy(env_proxy.as_deref(), &settings)?;
+    let auto_update_enabled = settings.agy_auto_update;
+    let mut checks: Vec<CheckRow> = Vec::with_capacity(9);
     let mut has_error = false;
     let mut has_warn = false;
+    let mut agy_missing = false;
+    let mut login_needed = false;
 
     checks.push(CheckRow {
         name: "State Directory",
@@ -1056,23 +1196,73 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
         detail: state_paths.root().display().to_string(),
     });
 
-    match resolve_agy_binary(args.agy_bin) {
-        Some(agy) => checks.push(CheckRow {
-            name: "Antigravity CLI",
-            status: "found",
-            tone: Tone::Ok,
-            detail: agy.display().to_string(),
-        }),
+    let resolved_agy = resolve_effective_agy_bin(args.agy_bin, &settings);
+    match &resolved_agy {
+        Some(agy) => {
+            let ver = probe_agy_version(agy, effective_proxy.as_ref()).await;
+            let detail = match ver {
+                Some(v) => format!("v{v} ({})", agy.display()),
+                None => agy.display().to_string(),
+            };
+            checks.push(CheckRow {
+                name: "Antigravity CLI",
+                status: "found",
+                tone: Tone::Ok,
+                detail,
+            });
+        }
         None => {
             has_error = true;
+            agy_missing = true;
             checks.push(CheckRow {
                 name: "Antigravity CLI",
                 status: "missing",
                 tone: Tone::Err,
-                detail: "NOT FOUND (install `agy` and run `agy acp --login`)".to_owned(),
+                detail: format!(
+                    "NOT FOUND — run `{bin} agy install` to download & verify official agy CLI"
+                ),
             });
         }
     }
+
+    match &effective_proxy {
+        Some(proxy) => checks.push(CheckRow {
+            name: "AGY Proxy",
+            status: "forced",
+            tone: Tone::Info,
+            detail: format!(
+                "{} (forcibly injected into agy; 127.0.0.1 bypassed via NO_PROXY)",
+                proxy.redacted_display()
+            ),
+        }),
+        None => checks.push(CheckRow {
+            name: "AGY Proxy",
+            status: "direct",
+            tone: Tone::Ok,
+            detail: format!(
+                "none (default: no proxy injected; configure via `{bin} proxy <port|url>`)"
+            ),
+        }),
+    }
+
+    checks.push(CheckRow {
+        name: "AGY Auto-Update",
+        status: if auto_update_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        tone: if auto_update_enabled {
+            Tone::Ok
+        } else {
+            Tone::Muted
+        },
+        detail: if auto_update_enabled {
+            "checks official manifest & hot-swaps agy when gateway is idle".to_owned()
+        } else {
+            format!("disabled (enable via `{bin} agy auto-update on`)")
+        },
+    });
 
     let (ui_assets, full_ui_embedded) = active_embedded_ui();
     checks.push(CheckRow {
@@ -1119,17 +1309,6 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
         }),
     }
 
-    let proxy_detail = match detect_effective_proxy_url() {
-        Some(proxy) => format!("{proxy} (loopback 127.0.0.1 auto-bypassed via NO_PROXY)"),
-        None => "direct connection (no proxy configured)".to_owned(),
-    };
-    checks.push(CheckRow {
-        name: "Network Proxy",
-        status: "verified",
-        tone: Tone::Ok,
-        detail: proxy_detail,
-    });
-
     let daemon = state_paths.read_daemon()?;
     let listen = args
         .listen
@@ -1156,11 +1335,12 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
             }
             Ok(_) => {
                 has_warn = true;
+                login_needed = true;
                 checks.push(CheckRow {
                     name: "ACP Auth/Models",
                     status: "login needed",
                     tone: Tone::Warn,
-                    detail: "only fallback model returned; run `agy acp --login`".to_owned(),
+                    detail: format!("only fallback model returned; run `{bin} agy login`"),
                 });
             }
             Err(err) => {
@@ -1184,6 +1364,43 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
                 client.base_url()
             ),
         });
+        if let Some(agy) = &resolved_agy {
+            match probe_agy_auth(state_paths, agy, effective_proxy.as_ref()).await {
+                AgyAuthStatus::SignedIn {
+                    model_count,
+                    source,
+                } => {
+                    checks.push(CheckRow {
+                        name: "ACP Auth/Models",
+                        status: "ready",
+                        tone: Tone::Ok,
+                        detail: format!(
+                            "signed in ({model_count} live Antigravity models via {source})"
+                        ),
+                    });
+                }
+                AgyAuthStatus::NotSignedIn { detail } => {
+                    has_warn = true;
+                    login_needed = true;
+                    checks.push(CheckRow {
+                        name: "ACP Auth/Models",
+                        status: "login needed",
+                        tone: Tone::Warn,
+                        detail: format!("{detail} (run `{bin} agy login`)"),
+                    });
+                }
+                AgyAuthStatus::NetworkError { detail } => {
+                    has_warn = true;
+                    checks.push(CheckRow {
+                        name: "ACP Auth/Models",
+                        status: "check failed",
+                        tone: Tone::Warn,
+                        detail: format!("{detail} (verify `{bin} proxy` or run `{bin} agy login`)"),
+                    });
+                }
+                AgyAuthStatus::NotInstalled | AgyAuthStatus::Skipped => {}
+            }
+        }
     }
 
     if args.json {
@@ -1227,7 +1444,23 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
     }
     println!("{table}");
 
-    if has_warn && !has_error {
+    if agy_missing {
+        println!();
+        ui::cmd_hint(
+            "Download & install Antigravity CLI",
+            &format!("{bin} agy install"),
+        );
+        ui::cmd_hint(
+            "Configure proxy first (if needed)",
+            &format!("{bin} proxy 7890"),
+        );
+    } else if login_needed {
+        println!();
+        ui::cmd_hint(
+            "Sign in to Antigravity interactively",
+            &format!("{bin} agy login"),
+        );
+    } else if has_warn && !has_error {
         println!();
         ui::cmd_hint("Start background gateway", &format!("{bin} up"));
     }
@@ -1717,6 +1950,8 @@ mod tests {
             agy_bin: None,
             acp_cwd: None,
             ui_dir: None,
+            agy_proxy: None,
+            agy_auto_update: true,
             shutdown_token: "tok".to_owned(),
             started_at_unix_ms: 1,
             log_file: Path::new("gateway.log").to_path_buf(),

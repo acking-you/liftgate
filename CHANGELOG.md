@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Antigravity CLI (`agy`) lifecycle, login & passthrough commands (`lg agy`)**:
+  - `lg agy` (`lg agy status`, `--json`, `--offline`) inspects `agy` installation path, local vs. latest upstream version, Google account login status (via live gateway catalog or official `agy models` probe), active proxy policy, and idle auto-update status.
+  - `lg agy install` and `lg agy update` download official platform releases (`windows_amd64`, `windows_arm64`, `darwin_arm64`, `darwin_amd64`, `linux_amd64`, `linux_arm64`, `linux_*_musl`, `android_*`), enforce fail-closed SHA-512 verification against the official Antigravity manifest, extract `antigravity` / `agy` archives in safe Rust, smoke-test `--version`, and register user `PATH` via `agy install --skip-aliases`.
+  - `lg agy login` delegates interactive authentication to `agy acp --login` (`--install` auto-installs `agy` first if missing) and restarts any active managed background gateway afterward; `lg agy models`, `lg agy mcp`, `lg agy plugin`, `lg agy changelog`, `lg agy run`, and external subcommand passthrough run official `agy` commands with Liftgate's proxy policy applied.
+  - Added `[i] Antigravity CLI (agy)` and `[l] Antigravity Sign-In` quick actions and live `AGY CLI` / `Proxy` / `Idle Auto-Update` status indicators to the `lg` interactive cockpit, `lg status`, `lg doctor`, `lg top`, and the embedded React Web dashboard.
+- **Explicit forced `agy` proxy management (`lg proxy` / `lg px`)**:
+  - Defaults strictly to **no proxy** (`direct` mode, stripping ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` instead of implicitly inheriting OS registry proxies).
+  - Supports shorthand port (`lg proxy 7890` -> `http://127.0.0.1:7890`), `host:port`, `http://`, `https://`, `socks5://`, `socks5h://`, opt-in OS proxy import (`lg proxy system`), connectivity testing (`lg proxy test`), and instant disable (`lg proxy off`), persisting in `~/.liftgate/settings.json` and forcibly injecting the proxy into `agy` on startup (also overridable via `--agy-proxy` / `AGY_PROXY`).
+- **Configurable background idle auto-update for `agy` (`lg agy auto-update`)**:
+  - Enabled by default (`true`) and toggleable via `lg agy auto-update [on|off|status]` or `--agy-auto-update` / `--no-agy-auto-update` / `AGY_AUTO_UPDATE`.
+  - Periodically checks the official Antigravity manifest while the gateway is running, defers updates whenever HTTP turns or ACP streams are active, and hot-swaps `agy` during idle windows with SHA-512 verification, Windows `.exe` lock release, and automatic rollback if the new binary fails ACP handshake.
+
 ## [0.1.1] - 2026-11-15
 
 ### Added

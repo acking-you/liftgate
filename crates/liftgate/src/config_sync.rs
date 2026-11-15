@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use liftgate_server::platform::{
-    canonicalize_clean, detect_effective_proxy_url, merge_loopback_no_proxy,
-};
+use liftgate_server::platform::{canonicalize_clean, merge_loopback_no_proxy};
 use liftgate_types::{
     config::ModelId, model::select_fastest_gemini_model, openai::build_codex_model_catalog,
 };
@@ -131,7 +129,6 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
     );
-    let proxy_url = detect_effective_proxy_url();
 
     let env_entry = existing
         .entry("env".to_owned())
@@ -182,13 +179,8 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             Value::String("0".to_owned()),
         );
         env_map.insert("NO_PROXY".to_owned(), Value::String(no_proxy));
-        if let Some(proxy) = proxy_url {
-            env_map.insert("HTTP_PROXY".to_owned(), Value::String(proxy.clone()));
-            env_map.insert("HTTPS_PROXY".to_owned(), Value::String(proxy));
-        } else {
-            env_map.remove("HTTP_PROXY");
-            env_map.remove("HTTPS_PROXY");
-        }
+        env_map.remove("HTTP_PROXY");
+        env_map.remove("HTTPS_PROXY");
     }
 
     existing.insert(

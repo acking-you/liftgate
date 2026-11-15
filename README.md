@@ -43,6 +43,11 @@ Any other harness that speaks either API connects the same way
 - **Official interface only** — talks to Antigravity only through `agy acp`,
   the Agent Client Protocol the CLI ships for editors. Login, tokens, quota and
   TLS stay inside `agy` ([why ACP](docs/architecture.md#why-acp)).
+- **Built-in `agy` setup, proxy & idle auto-update** — install `agy` with
+  `lg agy install` (SHA-512 verified), sign in with `lg agy login`, optionally
+  force an outbound proxy into `agy` with `lg proxy <port|url>` (default:
+  direct, no proxy), and keep `agy` automatically updated while the gateway is
+  idle (`lg agy auto-update`).
 - **Two standard APIs** — OpenAI Responses and Anthropic Messages, streamed,
   with tool calls, thinking, images and token counting ([API](docs/api.md)).
 - **Your agent keeps the tools** — ACP sessions run in an empty directory with
@@ -76,14 +81,17 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 ## Get started
 
-Sign in once with the Antigravity CLI (`agy`), grab a prebuilt archive from
+Grab a prebuilt archive from
 [GitHub Releases](https://github.com/acking-you/liftgate/releases) (or
-`cargo binstall liftgate` / `cargo install`), and drive everything with the
-short **`lg`** alias (identical to `liftgate`):
+`cargo binstall liftgate` / `cargo install`), then let **`lg`** (identical to
+`liftgate`) install `agy` if needed and sign you in:
 
 ```bash
-agy acp --login                         # once, to sign in to Antigravity
 cargo install --path crates/liftgate --locked  # installs both `lg` and `liftgate` (embeds Web UI when Bun is present)
+
+lg agy install                          # download & SHA-512-verify official `agy` CLI (if not installed yet)
+lg proxy 7890                           # optional: force proxy into `agy` (`lg proxy off` restores default direct mode)
+lg agy login                            # sign in to Google Antigravity interactively via `agy acp --login`
 
 lg                                      # open interactive command center in your terminal
 lg cx                                   # launch Codex CLI in current dir (0 side effects on exit)
@@ -93,6 +101,7 @@ lg cc                                   # or launch Claude Code in current dir (
 Monitor live traffic in the TUI, switch models interactively, or sync configs from anywhere:
 
 ```bash
+lg agy                   # inspect `agy` version, login status, forced proxy & idle auto-update
 lg top                   # full-screen real-time terminal dashboard (turns, pool, models, logs)
 lg m -i                  # interactively filter & switch default Antigravity model
 lg up --open             # start background gateway + open embedded Web dashboard

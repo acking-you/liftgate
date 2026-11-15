@@ -8,9 +8,6 @@ client at it. Every address below assumes the default
 
 ## Before you start
 
-- **Antigravity CLI (`agy`)**, installed and signed in once with
-  `agy acp --login`. Liftgate finds it on `PATH` and in the standard install
-  locations; otherwise pass `--agy-bin <path>`.
 - **Liftgate (`lg` / `liftgate`)**, installed globally from a
   [GitHub Release](https://github.com/acking-you/liftgate/releases) archive,
   `cargo binstall liftgate`, or built from source with **Rust 1.85+**:
@@ -21,6 +18,11 @@ client at it. Every address below assumes the default
   the production React dashboard directly into the single `liftgate` binary (no
   external `web/dist` folder needed at runtime). Without Bun, every API still
   works and `/` serves a lightweight built-in SSE telemetry page.
+- **Antigravity CLI (`agy`)**: if `agy` is not on your machine yet, run
+  `lg agy install` to download and SHA-512-verify the official platform binary,
+  then run `lg agy login` once to sign in (`agy acp --login`). Liftgate finds
+  `agy` on `PATH`, in standard install locations, or in `~/.liftgate/settings.json`
+  (override with `--agy-bin <path>` or `AGY_BIN`).
 
 ## Manage the gateway service (`lg` / `liftgate` CLI)
 
@@ -32,6 +34,10 @@ Manage the background gateway, live TUI, and embedded Web UI from any directory
 
 ```bash
 lg                              # open interactive command center (on a TTY)
+lg agy                          # inspect agy binary, version, login status, proxy & auto-update
+lg agy install                  # download, SHA-512-verify & install official agy CLI
+lg agy login                    # interactive Google login via official `agy acp --login`
+lg proxy 7890                   # force outbound proxy into agy (`lg proxy off` restores direct default)
 lg top                          # full-screen live TUI dashboard (aliases: tui, dash, monitor)
 lg up                           # start background gateway + embedded Web UI (full: start)
 lg up --open                    # start and open http://127.0.0.1:8787/ in your browser
@@ -47,6 +53,52 @@ lg alias --name lg              # install or remove (`--uninstall`) short execut
 lg completions zsh              # generate shell completions (bash, zsh, fish, powershell, elvish)
 liftgate serve                  # run in the foreground
 ```
+
+## Antigravity CLI (`lg agy`) & Proxy Management (`lg proxy`)
+
+Liftgate manages the official `agy` CLI lifecycle, outbound proxy injection,
+and background idle updates directly from `lg`:
+
+```bash
+# 1. Inspect agy presence, version, upstream release, login state, proxy & auto-update
+lg agy                                  # or `lg agy --json`, `lg agy status --offline`
+
+# 2. Install or manually update agy across Windows, macOS, Linux (glibc/musl) & Android
+lg agy install                          # SHA-512 verified from official Antigravity manifest
+lg agy update                           # check & update agy now (restarts running daemon)
+
+# 3. Configure forced proxy for agy (DEFAULT: no proxy / direct connection)
+lg proxy                                # show current proxy policy (alias: `lg px`)
+lg proxy 7890                           # shorthand -> http://127.0.0.1:7890
+lg proxy socks5h://127.0.0.1:1080       # HTTP, HTTPS, SOCKS5 and SOCKS5H supported
+lg proxy system                         # import OS / environment proxy once
+lg proxy test                           # test connectivity to official Antigravity manifest
+lg proxy off                            # clear forced proxy (back to default direct mode)
+
+# 4. Toggle background idle auto-update of agy (DEFAULT: enabled)
+lg agy auto-update                      # show current policy & last auto-update telemetry
+lg agy auto-update off                  # disable background idle auto-update
+lg agy auto-update on                   # re-enable background idle auto-update
+
+# 5. Delegate official agy operations (with forced proxy applied automatically)
+lg agy login                            # runs `agy acp --login` (--install installs agy first if missing)
+lg agy models                           # runs `agy models`
+lg agy mcp -- --help                    # forwards to `agy mcp ...` (any subcommand works)
+```
+
+- **Default direct mode**: out of the box, Liftgate strips ambient
+  `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` variables and does **not** inject
+  any OS proxy into `agy`. Only when you configure a proxy via `lg proxy`
+  (persisted in `~/.liftgate/settings.json`) or `--agy-proxy` / `AGY_PROXY`
+  does Liftgate forcibly inject `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`
+  (with loopback `127.0.0.1,localhost,::1` kept in `NO_PROXY`).
+- **Safe idle auto-update**: while the gateway is running and
+  `agy_auto_update` is enabled (`true` by default), Liftgate periodically
+  checks the official Antigravity manifest. When a newer version is available,
+  it waits until **zero** HTTP turns or ACP streams are active, drains pooled
+  idle sessions, verifies the SHA-512 digest, hot-swaps the `agy` binary
+  (rolling back automatically if the new binary fails ACP handshake), and
+  resumes serving without dropping configuration.
 
 ## Zero-side-effect launch (`liftgate codex` / `liftgate claude`)
 
@@ -254,6 +306,8 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--listen` | `AGY_GATEWAY_LISTEN` | `127.0.0.1:8787` |
 | `--ui-listen` | `AGY_UI_LISTEN` | none (served on `--listen`) |
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
+| `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
+| `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |
@@ -271,9 +325,10 @@ Logs follow `RUST_LOG` (default `info`). `liftgate --help` prints the same list.
 ## Troubleshooting
 
 - **Requests hang or go to a proxy** — add `127.0.0.1,localhost,::1` to
-  `NO_PROXY`.
-- **`could not locate agy executable`** — pass `--agy-bin <path>` or set
-  `AGY_BIN`.
+  `NO_PROXY`. If `agy` itself needs an outbound proxy to reach Google
+  Antigravity, run `lg proxy 7890` (or `lg proxy <url>`).
+- **`could not locate agy executable`** — run `lg agy install`, or pass
+  `--agy-bin <path>` / set `AGY_BIN`.
 - **`401`** — the client's key does not match `--api-key`.
 - **Quota exhausted (`Individual quota reached` / `insufficient_quota`)** — your
   Antigravity account or model quota is exhausted (the error includes the reset

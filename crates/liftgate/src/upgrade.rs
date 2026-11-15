@@ -924,6 +924,25 @@ async fn fetch_bytes_bounded(
     proxy: Option<&str>,
     accept_github_json: bool,
 ) -> Result<Vec<u8>, CliError> {
+    fetch_bytes_with_policy(
+        url,
+        max_bytes,
+        max_duration,
+        proxy,
+        false,
+        accept_github_json,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_bytes_with_policy(
+    url: &str,
+    max_bytes: u64,
+    max_duration: Duration,
+    proxy: Option<&str>,
+    force_direct_when_no_proxy: bool,
+    accept_github_json: bool,
+) -> Result<Vec<u8>, CliError> {
     if let Some(loopback) = parse_loopback_http_url(url) {
         return fetch_loopback_http(&loopback, max_bytes, max_duration).await;
     }
@@ -938,6 +957,7 @@ async fn fetch_bytes_bounded(
         max_bytes,
         max_duration,
         proxy,
+        force_direct_when_no_proxy,
         accept_github_json,
     )
     .await;
@@ -960,6 +980,17 @@ async fn download_url_to_path(
     max_duration: Duration,
     proxy: Option<&str>,
 ) -> Result<(), CliError> {
+    download_url_with_policy(url, dest, max_bytes, max_duration, proxy, false).await
+}
+
+pub(crate) async fn download_url_with_policy(
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+    max_duration: Duration,
+    proxy: Option<&str>,
+    force_direct_when_no_proxy: bool,
+) -> Result<(), CliError> {
     if let Some(loopback) = parse_loopback_http_url(url) {
         let bytes = fetch_loopback_http(&loopback, max_bytes, max_duration).await?;
         fs::write(dest, &bytes).map_err(|source| CliError::StateIo {
@@ -968,7 +999,16 @@ async fn download_url_to_path(
         })?;
         return Ok(());
     }
-    download_https_via_system_tool(url, dest, max_bytes, max_duration, proxy, false).await
+    download_https_via_system_tool(
+        url,
+        dest,
+        max_bytes,
+        max_duration,
+        proxy,
+        force_direct_when_no_proxy,
+        false,
+    )
+    .await
 }
 
 async fn download_https_via_system_tool(
@@ -977,6 +1017,7 @@ async fn download_https_via_system_tool(
     max_bytes: u64,
     max_duration: Duration,
     proxy: Option<&str>,
+    force_direct_when_no_proxy: bool,
     accept_github_json: bool,
 ) -> Result<(), CliError> {
     if !url.starts_with("https://") {
@@ -1016,6 +1057,8 @@ async fn download_https_via_system_tool(
 
     if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.arg("--proxy").arg(p);
+    } else if force_direct_when_no_proxy {
+        cmd.arg("--noproxy").arg("*");
     }
     suppress_windows_console(&mut cmd);
 
@@ -1076,7 +1119,8 @@ async fn download_https_via_system_tool(
             Ok(())
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            download_https_fallback(url, dest, max_duration, proxy).await
+            download_https_fallback(url, dest, max_duration, proxy, force_direct_when_no_proxy)
+                .await
         }
         Err(err) => Err(CliError::UpgradeNetwork {
             url: url.to_owned(),
@@ -1090,6 +1134,7 @@ async fn download_https_fallback(
     dest: &Path,
     max_duration: Duration,
     proxy: Option<&str>,
+    force_direct_when_no_proxy: bool,
 ) -> Result<(), CliError> {
     #[cfg(windows)]
     {
@@ -1109,6 +1154,18 @@ async fn download_https_fallback(
             cmd.env("LG_UPG_PROXY", p);
         } else {
             cmd.env_remove("LG_UPG_PROXY");
+            if force_direct_when_no_proxy {
+                for k in [
+                    "HTTP_PROXY",
+                    "http_proxy",
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "ALL_PROXY",
+                    "all_proxy",
+                ] {
+                    cmd.env_remove(k);
+                }
+            }
         }
         suppress_windows_console(&mut cmd);
         let out = timeout(max_duration, cmd.output())
@@ -1138,6 +1195,9 @@ async fn download_https_fallback(
             ("fetch", vec!["-q", "-o"]),
         ] {
             let mut cmd = Command::new(tool);
+            if force_direct_when_no_proxy && proxy.is_none() && tool == "wget" {
+                cmd.arg("--no-proxy");
+            }
             cmd.args(&args)
                 .arg(dest)
                 .arg(url)
@@ -1146,6 +1206,17 @@ async fn download_https_fallback(
                 .stderr(Stdio::piped());
             if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
                 cmd.env("https_proxy", p).env("HTTPS_PROXY", p);
+            } else if force_direct_when_no_proxy {
+                for k in [
+                    "HTTP_PROXY",
+                    "http_proxy",
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "ALL_PROXY",
+                    "all_proxy",
+                ] {
+                    cmd.env_remove(k);
+                }
             }
             match cmd.spawn() {
                 Ok(child) => {

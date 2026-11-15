@@ -13,10 +13,30 @@ pub enum CliError {
         source: ValidationError,
     },
 
-    #[error(
-        "could not locate `agy` executable; install Antigravity CLI, run `agy acp --login`, or pass `--agy-bin <path>` / `AGY_BIN`"
-    )]
+    #[error("Antigravity CLI (`agy`) is not installed or not found in PATH")]
     AgyBinaryNotFound,
+
+    #[error(
+        "official Antigravity CLI does not currently publish prebuilt binaries for `{os}/{arch}` (supported: 64-bit Windows, macOS, Linux, and Android)"
+    )]
+    AgyPlatformUnsupported { os: String, arch: String },
+
+    #[error(
+        "SHA-512 verification failed for Antigravity CLI payload `{asset}` (expected `{expected}`, got `{actual}`)"
+    )]
+    AgyChecksumMismatch {
+        asset: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("failed to install or update Antigravity CLI (`agy`): {detail}")]
+    AgyInstallFailed { detail: String },
+
+    #[error(
+        "no system or environment proxy was detected; pass an explicit address such as `lg proxy 7890` or `lg proxy http://127.0.0.1:7890`"
+    )]
+    NoSystemProxyDetected,
 
     #[error("failed to prepare isolated ACP session directory `{}`", path.display())]
     PrepareCwd {

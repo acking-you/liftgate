@@ -23,6 +23,9 @@ pub enum ValidationError {
 
     #[error("invalid data URL for base64 image input")]
     InvalidImageDataUrl,
+
+    #[error("invalid proxy URL `{value}`: {reason}")]
+    InvalidProxyUrl { value: String, reason: &'static str },
 }
 
 /// Protocol normalization and payload decoding errors.

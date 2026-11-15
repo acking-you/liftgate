@@ -34,6 +34,20 @@ pub struct AcpProcessTelemetry {
     pub rpc_pending_in_flight: usize,
     pub active_prompt_streams: usize,
     pub recent_stderr: Vec<StderrLogEntry>,
+    #[serde(default)]
+    pub agy_proxy: Option<String>,
+    #[serde(default)]
+    pub auto_update_enabled: bool,
+    #[serde(default)]
+    pub latest_known_version: Option<String>,
+    #[serde(default)]
+    pub last_update_check_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_auto_update_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_auto_updated_from: Option<String>,
+    #[serde(default)]
+    pub auto_update_note: Option<String>,
 }
 
 /// Current lifecycle state of a tracked ACP session worker (`--process-per-session`).

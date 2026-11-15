@@ -50,6 +50,7 @@ struct PoolInner {
     total_sessions_created: u64,
     total_sessions_reused: u64,
     total_sessions_closed_or_evicted: u64,
+    last_activity_unix_ms: u64,
 }
 
 impl SessionPool {
@@ -64,6 +65,7 @@ impl SessionPool {
                 total_sessions_created: 0,
                 total_sessions_reused: 0,
                 total_sessions_closed_or_evicted: 0,
+                last_activity_unix_ms: unix_timestamp_ms(),
             }),
         }
     }
@@ -80,6 +82,7 @@ impl SessionPool {
             .iter()
             .rposition(|e| e.last_response_id.as_deref() == Some(response_id))?;
         guard.total_sessions_reused += 1;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
         guard.idle_sessions.remove(pos)
     }
 
@@ -95,7 +98,39 @@ impl SessionPool {
             .iter()
             .rposition(|e| &e.post_turn_hash == hash)?;
         guard.total_sessions_reused += 1;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
         guard.idle_sessions.remove(pos)
+    }
+
+    /// Returns `(active_leased_sessions, idle_cached_sessions)` without cloning session entries.
+    #[must_use]
+    pub fn idle_and_active_counts(&self) -> (usize, usize) {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (guard.active_leases.len(), guard.idle_sessions.len())
+    }
+
+    /// Returns the Unix millisecond timestamp of the most recent turn lease checkout or checkin.
+    #[must_use]
+    pub fn last_activity_unix_ms(&self) -> u64 {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.last_activity_unix_ms
+    }
+
+    /// Atomically drains all idle cached sessions (used before an idle `agy` binary hot-swap).
+    pub fn take_all_idle_sessions(&self) -> Vec<IdleSessionEntry> {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let count = guard.idle_sessions.len() as u64;
+        guard.total_sessions_closed_or_evicted += count;
+        guard.idle_sessions.drain(..).collect()
     }
 
     /// Manually closes and evicts an idle session from the pool (used by operator dashboard).
@@ -208,6 +243,7 @@ impl SessionPool {
         if is_new {
             guard.total_sessions_created += 1;
         }
+        guard.last_activity_unix_ms = meta.last_active_unix_ms;
         guard.active_leases.insert(sid.as_str().to_owned(), meta);
     }
 
@@ -228,6 +264,7 @@ impl SessionPool {
         };
         let _ = guard.active_leases.remove(sid.as_str());
         guard.total_sessions_closed_or_evicted += 1;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
     }
 
     fn checkin<B: AcpBackend>(&self, entry: IdleSessionEntry, backend: &B) {
@@ -236,6 +273,7 @@ impl SessionPool {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            guard.last_activity_unix_ms = entry.last_active_unix_ms;
             let _ = guard.active_leases.remove(entry.session_id.as_str());
             let evicted = if guard.idle_sessions.len() >= self.limits.max_idle_sessions().get() {
                 guard.total_sessions_closed_or_evicted += 1;
