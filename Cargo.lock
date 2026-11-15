@@ -756,7 +756,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "liftgate"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "clap",
  "clap_complete",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-server"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "axum",
  "bytes",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-types"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
