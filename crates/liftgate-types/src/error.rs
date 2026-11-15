@@ -32,11 +32,11 @@ pub enum ValidationError {
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error(
-        "prompt is too long for the ACP single-turn limit ({bytes} bytes); compact the conversation or reduce the current input"
+        "Your input exceeds the context window of this model ({bytes} bytes). Please adjust your input and try again."
     )]
     PromptTooLarge { bytes: usize },
     #[error(
-        "prompt directives exceed the ACP single-turn limit ({bytes} bytes); reduce client tool definitions before retrying"
+        "Your input exceeds the context window of this model ({bytes} directive bytes). Please disable unused client tools or compact the conversation and try again."
     )]
     PromptDirectivesTooLarge { bytes: usize },
 
@@ -57,4 +57,20 @@ pub enum ProtocolError {
         #[from]
         source: ValidationError,
     },
+}
+
+impl ProtocolError {
+    /// Returns the offending byte size when this error represents a prompt/context size overflow.
+    #[must_use]
+    pub const fn context_overflow_bytes(&self) -> Option<usize> {
+        match self {
+            Self::PromptTooLarge { bytes } | Self::PromptDirectivesTooLarge { bytes } => {
+                Some(*bytes)
+            }
+            Self::EmptyInput
+            | Self::UnsupportedImageUrl
+            | Self::Json { .. }
+            | Self::Validation { .. } => None,
+        }
+    }
 }

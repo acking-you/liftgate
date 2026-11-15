@@ -1401,7 +1401,7 @@ fn stream_openai_responses(
             resp.status = Cow::Borrowed("failed");
             resp.error = Some(ResponseInlineError {
                 code: code.to_owned(),
-                message: gw_err.client_message(),
+                message: gw_err.openai_client_message(),
             });
             resp.output = finalized_items;
             let _ = send_sse_frame(
@@ -2398,7 +2398,7 @@ fn stream_anthropic_messages(
                             "type": "error",
                             "error": {
                                 "type": error_type,
-                                "message": gw_err.client_message()
+                                "message": gw_err.anthropic_client_message()
                             }
                         }),
                     )

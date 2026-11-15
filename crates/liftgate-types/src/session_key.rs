@@ -354,9 +354,8 @@ pub fn materialize_system_prompt_into_messages(
     };
     if client_tools.is_empty() && is_compaction_instructions_prompt(&wrapped) {
         if let Some(last_user) = messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == CanonicalRole::User)
+            .last_mut()
+            .filter(|m| m.role == CanonicalRole::User)
         {
             last_user.parts.push(CanonicalPart::Text(wrapped));
         } else {
@@ -891,13 +890,12 @@ pub fn build_session_system_append_with_spill(
         if let Some(spilled) = client_tools.get(inline_count..)
             && !spilled.is_empty()
         {
+            let spilled_refs: Vec<&CanonicalToolSpec> = spilled.iter().collect();
             let mut spill_xml = String::with_capacity(4096);
             spill_xml.push_str(
                 "<client_tools_update>\nAdditional active `<client_tools>` for this session:\n",
             );
-            for tool in spilled {
-                render_compact_client_tool(tool, &mut spill_xml);
-            }
+            render_bounded_tools_list(&spilled_refs, MAX_TOOL_DIRECTIVE_BYTES, &mut spill_xml);
             spill_xml.push_str("</client_tools_update>\n");
             return (header, Some(spill_xml));
         }
@@ -933,6 +931,134 @@ fn render_compact_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
             }
         }
     }
+}
+
+fn render_slim_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
+    out.push_str("- name: ");
+    out.push_str(&tool.name);
+    out.push('\n');
+    if let Some(desc) = &tool.description {
+        let short_desc = truncate_utf8_chars(&compact_tool_description(desc), 120);
+        if !short_desc.is_empty() {
+            out.push_str("  description: ");
+            out.push_str(&short_desc);
+            out.push('\n');
+        }
+    }
+    match &tool.kind {
+        CanonicalToolKind::Function { parameters_json } => {
+            out.push_str("  invocation: xml_json_arguments\n  args_schema: ");
+            out.push_str(&strip_schema_descriptions(parameters_json));
+            out.push('\n');
+        }
+        CanonicalToolKind::Custom { format_json } => {
+            out.push_str("  invocation: xml_freeform_input\n");
+            if let Some(fmt) = format_json {
+                out.push_str("  format: ");
+                out.push_str(&truncate_utf8_chars(fmt.trim(), 160));
+                out.push('\n');
+            }
+        }
+    }
+}
+
+fn render_minimal_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
+    out.push_str("- name: ");
+    out.push_str(&tool.name);
+    match &tool.kind {
+        CanonicalToolKind::Function { parameters_json } => {
+            out.push_str(" (json_args");
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(parameters_json)
+                && let Some(serde_json::Value::Object(props)) = map.get("properties")
+                && !props.is_empty()
+            {
+                let keys: Vec<&str> = props.keys().take(24).map(String::as_str).collect();
+                out.push_str(": ");
+                out.push_str(&keys.join(", "));
+            }
+            out.push_str(")\n");
+        }
+        CanonicalToolKind::Custom { .. } => {
+            out.push_str(" (freeform_input)\n");
+        }
+    }
+}
+
+fn strip_schema_descriptions(raw_schema: &str) -> String {
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw_schema) else {
+        return truncate_utf8_chars(raw_schema.trim(), 240);
+    };
+    strip_schema_metadata_value(&mut val);
+    serde_json::to_string(&val).unwrap_or_else(|_| truncate_utf8_chars(raw_schema.trim(), 240))
+}
+
+fn strip_schema_metadata_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            let _ = map.remove("$schema");
+            let _ = map.remove("additionalProperties");
+            let _ = map.remove("description");
+            let _ = map.remove("title");
+            let _ = map.remove("examples");
+            let _ = map.remove("default");
+            for child in map.values_mut() {
+                strip_schema_metadata_value(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_schema_metadata_value(item);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn render_bounded_tools_list(
+    tools: &[&CanonicalToolSpec],
+    max_body_bytes: usize,
+    out: &mut String,
+) {
+    let mut standard = String::new();
+    for tool in tools {
+        render_compact_client_tool(tool, &mut standard);
+    }
+    if standard.len() <= max_body_bytes {
+        out.push_str(&standard);
+        return;
+    }
+
+    let mut slim = String::new();
+    for tool in tools {
+        render_slim_client_tool(tool, &mut slim);
+    }
+    if slim.len() <= max_body_bytes {
+        out.push_str(&slim);
+        return;
+    }
+
+    let mut minimal = String::new();
+    let mut entry_buf = String::new();
+    let mut omitted = 0usize;
+    for tool in tools {
+        entry_buf.clear();
+        render_minimal_client_tool(tool, &mut entry_buf);
+        if minimal.len() + entry_buf.len() + 96 <= max_body_bytes {
+            minimal.push_str(&entry_buf);
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        minimal.push_str(&format!(
+            "  ... [{omitted} additional client tools omitted to stay within single-turn directive budget]\n"
+        ));
+    }
+    out.push_str(&minimal);
 }
 
 /// Builds an incremental `<client_tools_update>` block when a warm session's active tool list
@@ -977,14 +1103,14 @@ pub fn build_client_tools_delta_xml(
 
     if !removed_names.is_empty() {
         out.push_str("Removed client tools (no longer available): ");
-        out.push_str(&removed_names.join(", "));
+        let joined = removed_names.join(", ");
+        out.push_str(&truncate_utf8_chars(&joined, 4_000));
         out.push('\n');
     }
     if !added_or_changed.is_empty() {
         out.push_str("Added/updated client tools:\n");
-        for tool in added_or_changed {
-            render_compact_client_tool(tool, &mut out);
-        }
+        let remaining_budget = MAX_TOOL_DIRECTIVE_BYTES.saturating_sub(out.len());
+        render_bounded_tools_list(&added_or_changed, remaining_budget.max(4_096), &mut out);
     }
     out.push_str("</client_tools_update>\n");
     Some(out)
@@ -1008,9 +1134,14 @@ pub fn build_compaction_directive_xml(
     }
     let mut out = String::with_capacity(512);
     if let Some(sys) = cleaned_sys {
+        let bounded_sys = if sys.len() > 24_000 {
+            truncate_head_tail_lines(&sys, 24_000, "compaction instructions")
+        } else {
+            sys
+        };
         out.push_str("<caller_compaction_instructions>\n");
-        out.push_str(&sys);
-        if !sys.ends_with('\n') {
+        out.push_str(&bounded_sys);
+        if !bounded_sys.ends_with('\n') {
             out.push('\n');
         }
         out.push_str("</caller_compaction_instructions>\n");
@@ -1027,20 +1158,24 @@ pub fn build_compaction_directive_xml(
 /// Maximum total UTF-8 text bytes emitted in a single `session/prompt` request.
 ///
 /// Upstream `agy acp` truncates single-turn text payloads at `191,578` bytes (`<truncated N bytes>`).
-/// Keeping each ACP turn at or below `160,000` bytes provides >31 KB of safety headroom, while
-/// `build_acp_prompt_plan` streams larger histories across lossless hydration chunks.
-pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 160_000;
+/// Keeping each ACP turn at or below `176,000` bytes provides >15.5 KB of safety headroom while
+/// automatically preserving generous head and tail sections when large tool outputs or logs arrive.
+pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 176_000;
 
-/// Maximum number of fast Flash seed chunks before the final target-model turn (`5 * 148 KB + 160 KB ≈ 900 KB`).
+/// Progressive schema-compaction ceiling for spilled or incremental `<client_tools_update>` blocks.
+const MAX_TOOL_DIRECTIVE_BYTES: usize = 48_000;
+
+/// Maximum number of fast Flash seed chunks before the final target-model turn (`5 * 156 KB + 176 KB ≈ 956 KB`).
 pub const MAX_HYDRATION_SEED_CHUNKS: usize = 5;
 
 /// Maximum text capacity before framing; fragmented blocks can reach the turn cap sooner.
 pub const MAX_LOSSLESS_HYDRATION_BYTES: usize =
     (MAX_HYDRATION_SEED_CHUNKS + 1) * SEED_CHUNK_TARGET_TEXT_BYTES;
 
-const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 148_000;
+const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 156_000;
 
-const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 68_000;
+const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 76_000;
+const MAX_HISTORY_RESERVE_BYTES: usize = 48_000;
 const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
 
 const _: () = {
@@ -1049,12 +1184,20 @@ const _: () = {
         "systemPrompt.append cap must stay well below a single ACP prompt turn budget"
     );
     assert!(
+        MAX_TOOL_DIRECTIVE_BYTES * 2 < MAX_ACP_PROMPT_TEXT_BYTES,
+        "client_tools_update budget must leave the majority of a turn for conversation and tool outputs"
+    );
+    assert!(
         MAX_ACP_PROMPT_TEXT_BYTES > SEED_CHUNK_TARGET_TEXT_BYTES + 1_024,
         "hydration seed chunks plus footer framing must stay below the single-turn ACP ceiling"
     );
     assert!(
         SEED_CHUNK_TARGET_TEXT_BYTES > MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES,
         "seed chunk budget must exceed the active-slice share of a bounded cold replay"
+    );
+    assert!(
+        MAX_ACP_PROMPT_TEXT_BYTES > MAX_HISTORY_RESERVE_BYTES * 3,
+        "history reserve on cold replays must never starve the active turn below two-thirds of the turn budget"
     );
 };
 
@@ -1134,8 +1277,10 @@ pub fn build_acp_prompt_blocks(
     ))
 }
 
-/// Builds a single-turn bounded prompt by default. Experimental long-context mode may
-/// seed larger transcripts in multiple Flash turns; upstream compaction still applies.
+/// Builds a single-turn bounded prompt by default, automatically middle-truncating oversized
+/// tool results or pasted logs (preserving clean line-aligned head and tail sections) so agentic
+/// loops never stall on large command/file outputs. Experimental long-context mode may seed
+/// larger transcripts across multiple Flash turns; upstream compaction still applies.
 pub fn build_acp_prompt_plan(
     messages: &[CanonicalMessage],
     tool_nonce: &str,
@@ -1144,8 +1289,10 @@ pub fn build_acp_prompt_plan(
     long_context: bool,
 ) -> Result<AcpPromptPlan, ProtocolError> {
     // Reserve framing and slash-escaping bytes as well as the complete tool/directive update.
-    let directive_bytes = leading_directive_xml.map_or(0, str::len).saturating_add(64);
-    if directive_bytes >= MAX_ACP_PROMPT_TEXT_BYTES {
+    let directive_bytes = leading_directive_xml
+        .map_or(0, str::len)
+        .saturating_add(128);
+    if directive_bytes.saturating_add(2_048) > MAX_ACP_PROMPT_TEXT_BYTES {
         return Err(ProtocolError::PromptDirectivesTooLarge {
             bytes: directive_bytes,
         });
@@ -1176,32 +1323,26 @@ pub fn build_acp_prompt_plan(
 
     if !long_context {
         let budget = MAX_ACP_PROMPT_TEXT_BYTES.saturating_sub(directive_bytes);
-        let mut active = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
-        let active_bytes = total_text_block_bytes(&active);
-        if active_bytes > budget {
-            if let Some(slimmed_blocks) =
-                slim_developer_instructions_in_slice(active_slice, tool_nonce, budget)
-            {
-                active = slimmed_blocks;
-            } else {
-                return Err(ProtocolError::PromptTooLarge {
-                    bytes: active_bytes,
-                });
-            }
-        }
         let mut blocks = if history_slice.is_empty() {
-            active
+            render_smart_bounded_active_slice(active_slice, tool_nonce, budget)
         } else {
             let uncompacted =
                 render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
-            if total_text_block_bytes(&uncompacted) > budget {
-                render_history_around_active(history_slice, active, tool_nonce, budget)
-            } else {
+            if total_text_block_bytes(&uncompacted) <= budget {
                 uncompacted
+            } else {
+                let hist_reserve = estimate_raw_prompt_bytes(history_slice, &[])
+                    .min(budget / 3)
+                    .min(MAX_HISTORY_RESERVE_BYTES);
+                let active_budget = budget.saturating_sub(hist_reserve);
+                let active =
+                    render_smart_bounded_active_slice(active_slice, tool_nonce, active_budget);
+                render_history_around_active(history_slice, active, tool_nonce, budget)
             }
         };
         prepend_directive_to_blocks(&mut blocks, leading_directive_xml);
-        let blocks = sanitize_slash_command_blocks(blocks);
+        let mut blocks = sanitize_slash_command_blocks(blocks);
+        clamp_blocks_to_budget(&mut blocks, MAX_ACP_PROMPT_TEXT_BYTES);
         let bytes = total_text_block_bytes(&blocks);
         if bytes > MAX_ACP_PROMPT_TEXT_BYTES {
             return Err(ProtocolError::PromptTooLarge { bytes });
@@ -1211,6 +1352,7 @@ pub fn build_acp_prompt_plan(
             final_blocks: blocks,
         });
     }
+
     let raw_est =
         estimate_raw_prompt_bytes(history_slice, active_slice).saturating_add(directive_bytes);
 
@@ -1230,7 +1372,57 @@ pub fn build_acp_prompt_plan(
         }
     }
 
-    Err(ProtocolError::PromptTooLarge { bytes: raw_est })
+    // Ultra-large payload exceeding lossless hydration capacity: smartly middle-truncate the
+    // active turn to one seed-chunk budget and compact historical turns into the seed budget.
+    let active_hydration_budget = SEED_CHUNK_TARGET_TEXT_BYTES.saturating_sub(directive_bytes);
+    let mut active_blocks = render_smart_bounded_active_slice(
+        active_slice,
+        tool_nonce,
+        active_hydration_budget.max(8_192),
+    );
+    if history_slice.is_empty() {
+        prepend_directive_to_blocks(&mut active_blocks, leading_directive_xml);
+        return split_blocks_into_hydration_plan(active_blocks);
+    }
+
+    let history_budget = MAX_HYDRATION_SEED_CHUNKS * (SEED_CHUNK_TARGET_TEXT_BYTES - 8_000);
+    let history_body = build_compacted_history_body(history_slice, tool_nonce, history_budget);
+    let mut archive_text = String::with_capacity(
+        directive_bytes
+            + ARCHIVE_OPEN_HEADER.len()
+            + history_body.len()
+            + ARCHIVE_CLOSE_HEADER.len(),
+    );
+    if let Some(dir) = leading_directive_xml.filter(|s| !s.trim().is_empty()) {
+        archive_text.push_str(dir);
+        if !archive_text.ends_with('\n') {
+            archive_text.push('\n');
+        }
+    }
+    archive_text.push_str(ARCHIVE_OPEN_HEADER);
+    archive_text.push_str(&history_body);
+    if !archive_text.ends_with('\n') {
+        archive_text.push('\n');
+    }
+    archive_text.push_str(ARCHIVE_CLOSE_HEADER);
+
+    let mut combined = Vec::with_capacity(active_blocks.len() + 1);
+    let mut active_iter = active_blocks.into_iter();
+    match active_iter.next() {
+        Some(AcpPromptBlock::Text { text }) => {
+            archive_text.push_str(&text);
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+        }
+        Some(other) => {
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+            combined.push(other);
+        }
+        None => {
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+        }
+    }
+    combined.extend(active_iter);
+    split_blocks_into_hydration_plan(combined)
 }
 
 fn prepend_directive_to_blocks(blocks: &mut Vec<AcpPromptBlock>, directive: Option<&str>) {
@@ -1463,9 +1655,14 @@ fn render_bounded_prompt_blocks(
     let active_budget = if history_slice.is_empty() {
         max_bytes
     } else {
-        MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES.min(max_bytes / 2)
+        let hist_reserve = estimate_raw_prompt_bytes(history_slice, &[])
+            .min(max_bytes / 3)
+            .min(MAX_HISTORY_RESERVE_BYTES);
+        max_bytes
+            .saturating_sub(hist_reserve)
+            .max(MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES.min(max_bytes / 2))
     };
-    let active_blocks = render_bounded_active_slice(active_slice, tool_nonce, active_budget);
+    let active_blocks = render_smart_bounded_active_slice(active_slice, tool_nonce, active_budget);
     render_history_around_active(history_slice, active_blocks, tool_nonce, max_bytes)
 }
 
@@ -1528,112 +1725,235 @@ fn render_history_around_active(
     combined
 }
 
-/// Slims ONLY `<developer_instructions>` blocks when an active turn exceeds the single-turn ACP
-/// byte ceiling (for example, when a harness like OpenCode or Claude Code injects massive monorepo
-/// `AGENTS.md` / skill rules into `system`), keeping 100% of the caller's actual conversational
-/// prompt, tool calls, tool outputs, and images completely lossless.
-fn slim_developer_instructions_in_slice(
+/// Computes an exact `O(N log N)` water-filling per-item byte cap: items whose length already
+/// fits below the fair share keep 100% of their content untouched, redistributing all unused
+/// budget slack exclusively to the oversized items that caused the overflow.
+fn compute_waterfill_cap(lengths: &[usize], total_budget: usize) -> usize {
+    if lengths.is_empty() {
+        return total_budget;
+    }
+    let mut sorted = lengths.to_vec();
+    sorted.sort_unstable();
+    let mut rem_budget = total_budget;
+    let mut rem_count = sorted.len();
+    for len in sorted {
+        let share = rem_budget / rem_count.max(1);
+        if len <= share {
+            rem_budget = rem_budget.saturating_sub(len);
+            rem_count = rem_count.saturating_sub(1);
+        } else {
+            return share;
+        }
+    }
+    usize::MAX
+}
+
+fn clamp_blocks_to_budget(blocks: &mut [AcpPromptBlock], max_bytes: usize) {
+    let total = total_text_block_bytes(blocks);
+    if total <= max_bytes {
+        return;
+    }
+    let excess = total.saturating_sub(max_bytes);
+    let mut largest_idx: Option<(usize, usize)> = None;
+    for (idx, block) in blocks.iter().enumerate() {
+        if let AcpPromptBlock::Text { text } = block
+            && largest_idx.is_none_or(|(_, best_len)| text.len() > best_len)
+        {
+            largest_idx = Some((idx, text.len()));
+        }
+    }
+    if let Some((idx, cur_len)) = largest_idx
+        && let Some(AcpPromptBlock::Text { text }) = blocks.get_mut(idx)
+    {
+        let target = cur_len.saturating_sub(excess.saturating_add(32));
+        *text = truncate_head_tail_lines(text, target, "prompt content");
+    }
+}
+
+/// Renders `active_slice` losslessly whenever it fits within `budget`, and otherwise applies a
+/// prioritized, water-filling head+tail compaction pipeline:
+/// 1. Strip `<examples>` / `<commentary>` boilerplate inside `<developer_instructions>`.
+/// 2. Water-fill middle-truncate oversized `ToolResult` outputs while keeping small tool outputs,
+///    caller prompts, and `<developer_instructions>` 100% lossless.
+/// 3. Slim oversized `<developer_instructions>` blocks while preserving caller prompts intact.
+/// 4. Universal water-fill middle-truncation across all oversized variable parts (pasted logs,
+///    attachments, or giant tool payloads) so single-turn overflow never bricks the agent loop.
+fn render_smart_bounded_active_slice(
     active_slice: &[CanonicalMessage],
     tool_nonce: &str,
     budget: usize,
-) -> Option<Vec<AcpPromptBlock>> {
-    let dev_part_count: usize = active_slice
-        .iter()
-        .flat_map(|m| &m.parts)
-        .filter(|p| matches!(p, CanonicalPart::Text(t) if is_developer_instructions_wrapper(t)))
-        .count();
-    if dev_part_count == 0 {
-        return None;
+) -> Vec<AcpPromptBlock> {
+    let uncompacted = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
+    if total_text_block_bytes(&uncompacted) <= budget {
+        return uncompacted;
     }
 
-    // Pass 1: strip verbose `<examples>`, `<example>`, and `<commentary>` blocks inside
-    // `<developer_instructions>` only.
-    let mut slimmed: Vec<CanonicalMessage> = active_slice.to_vec();
-    for msg in &mut slimmed {
+    // Stage 1: Strip `<examples>`, `<example>`, and `<commentary>` inside `<developer_instructions>`.
+    let mut work: Vec<CanonicalMessage> = active_slice.to_vec();
+    let mut dev_part_count = 0usize;
+    for msg in &mut work {
         for part in &mut msg.parts {
             if let CanonicalPart::Text(text) = part
                 && is_developer_instructions_wrapper(text)
             {
+                dev_part_count += 1;
                 let s1 = strip_tag_blocks(text, "<examples>", "</examples>");
                 let s2 = strip_tag_blocks(&s1, "<example>", "</example>");
                 *text = strip_tag_blocks(&s2, "<commentary>", "</commentary>");
             }
         }
     }
-
-    let pass1_blocks = render_uncompacted_prompt_blocks(&[], &slimmed, tool_nonce);
-    if total_text_block_bytes(&pass1_blocks) <= budget {
-        return Some(pass1_blocks);
+    let stage1_blocks = render_uncompacted_prompt_blocks(&[], &work, tool_nonce);
+    if total_text_block_bytes(&stage1_blocks) <= budget {
+        return stage1_blocks;
     }
 
-    // Pass 2: measure exact byte footprint of all non-`<developer_instructions>` parts; if the
-    // caller's own prompt/tool inputs alone exceed `budget`, refuse to truncate them (`None`).
-    let mut non_dev_probe = slimmed.clone();
-    for msg in &mut non_dev_probe {
-        msg.parts.retain(
-            |p| !matches!(p, CanonicalPart::Text(t) if is_developer_instructions_wrapper(t)),
-        );
-    }
-    let non_dev_bytes = total_text_block_bytes(&render_uncompacted_prompt_blocks(
-        &[],
-        &non_dev_probe,
-        tool_nonce,
-    ));
-    if non_dev_bytes.saturating_add(512) >= budget {
-        return None;
-    }
-
-    let available_dev_bytes = budget.saturating_sub(non_dev_bytes.saturating_add(256));
-    let per_dev_budget = available_dev_bytes / dev_part_count;
-    if per_dev_budget < 512 {
-        return None;
-    }
-
-    for msg in &mut slimmed {
+    // Stage 2: Water-fill middle-truncate ONLY oversized `ToolResult` outputs if non-result parts fit.
+    let mut result_lens = Vec::new();
+    let mut empty_results_probe = work.clone();
+    for msg in &mut empty_results_probe {
         for part in &mut msg.parts {
-            if let CanonicalPart::Text(text) = part
-                && is_developer_instructions_wrapper(text)
-            {
-                let inner = text
-                    .trim()
-                    .strip_prefix("<developer_instructions>")
-                    .and_then(|s| s.strip_suffix("</developer_instructions>"))
-                    .unwrap_or(text.as_str())
-                    .trim();
-                let body_budget = per_dev_budget.saturating_sub(64);
-                let bounded = if inner.len() > body_budget {
-                    truncate_middle_utf8_bytes(inner, body_budget, 13, 20)
-                } else {
-                    inner.to_owned()
-                };
-                *text = format!("<developer_instructions>\n{bounded}\n</developer_instructions>");
+            if let CanonicalPart::ToolResult { output, .. } = part {
+                let cleaned = strip_billing_noise(output);
+                result_lens.push(cleaned.trim().len());
+                output.clear();
+            }
+        }
+    }
+    if !result_lens.is_empty() {
+        let non_result_bytes = total_text_block_bytes(&render_uncompacted_prompt_blocks(
+            &[],
+            &empty_results_probe,
+            tool_nonce,
+        ));
+        let safety_pad = result_lens.len().saturating_mul(16).saturating_add(128);
+        let available_for_results =
+            budget.saturating_sub(non_result_bytes.saturating_add(safety_pad));
+        let min_viable_results = result_lens.len().saturating_mul(1_024).min(16_384);
+        if available_for_results >= min_viable_results {
+            let cap = compute_waterfill_cap(&result_lens, available_for_results);
+            let mut stage2_msgs = work.clone();
+            for msg in &mut stage2_msgs {
+                for part in &mut msg.parts {
+                    if let CanonicalPart::ToolResult { output, .. } = part {
+                        let cleaned = strip_billing_noise(output);
+                        let trimmed = cleaned.trim();
+                        if trimmed.len() > cap {
+                            *output = truncate_head_tail_lines(trimmed, cap, "tool output");
+                        }
+                    }
+                }
+            }
+            let stage2_blocks = render_uncompacted_prompt_blocks(&[], &stage2_msgs, tool_nonce);
+            if total_text_block_bytes(&stage2_blocks) <= budget {
+                return stage2_blocks;
+            }
+            work = stage2_msgs;
+        }
+    }
+
+    // Stage 3: Slim `<developer_instructions>` while preserving caller prompts and remaining parts intact.
+    if let Some(dev_count) = std::num::NonZeroUsize::new(dev_part_count) {
+        let mut non_dev_probe = work.clone();
+        for msg in &mut non_dev_probe {
+            msg.parts.retain(
+                |p| !matches!(p, CanonicalPart::Text(t) if is_developer_instructions_wrapper(t)),
+            );
+        }
+        let non_dev_bytes = total_text_block_bytes(&render_uncompacted_prompt_blocks(
+            &[],
+            &non_dev_probe,
+            tool_nonce,
+        ));
+        if non_dev_bytes.saturating_add(512) < budget {
+            let available_dev = budget.saturating_sub(non_dev_bytes.saturating_add(256));
+            let per_dev = available_dev / dev_count;
+            if per_dev >= 512 {
+                let mut stage3_msgs = work.clone();
+                for msg in &mut stage3_msgs {
+                    for part in &mut msg.parts {
+                        if let CanonicalPart::Text(text) = part
+                            && is_developer_instructions_wrapper(text)
+                        {
+                            let inner = text
+                                .trim()
+                                .strip_prefix("<developer_instructions>")
+                                .and_then(|s| s.strip_suffix("</developer_instructions>"))
+                                .unwrap_or(text.as_str())
+                                .trim();
+                            let body_budget = per_dev.saturating_sub(64);
+                            let bounded = if inner.len() > body_budget {
+                                truncate_head_tail_lines(
+                                    inner,
+                                    body_budget,
+                                    "developer instructions",
+                                )
+                            } else {
+                                inner.to_owned()
+                            };
+                            *text = format!(
+                                "<developer_instructions>\n{bounded}\n</developer_instructions>"
+                            );
+                        }
+                    }
+                }
+                let stage3_blocks = render_uncompacted_prompt_blocks(&[], &stage3_msgs, tool_nonce);
+                if total_text_block_bytes(&stage3_blocks) <= budget {
+                    return stage3_blocks;
+                }
+                work = stage3_msgs;
+            }
+        } else {
+            // Non-dev parts ALSO overflow `budget`: cap `<developer_instructions>` to at most 20%
+            // of `budget` first so Stage 4 preserves up to 80% for caller prompt / tool payloads.
+            let dev_share = (budget / 5).max(2_048) / dev_count;
+            for msg in &mut work {
+                for part in &mut msg.parts {
+                    if let CanonicalPart::Text(text) = part
+                        && is_developer_instructions_wrapper(text)
+                        && text.len() > dev_share
+                    {
+                        let inner = text
+                            .trim()
+                            .strip_prefix("<developer_instructions>")
+                            .and_then(|s| s.strip_suffix("</developer_instructions>"))
+                            .unwrap_or(text.as_str())
+                            .trim();
+                        let bounded = truncate_head_tail_lines(
+                            inner,
+                            dev_share.saturating_sub(64),
+                            "developer instructions",
+                        );
+                        *text = format!(
+                            "<developer_instructions>\n{bounded}\n</developer_instructions>"
+                        );
+                    }
+                }
             }
         }
     }
 
-    let pass2_blocks = render_uncompacted_prompt_blocks(&[], &slimmed, tool_nonce);
-    (total_text_block_bytes(&pass2_blocks) <= budget).then_some(pass2_blocks)
-}
-
-fn render_bounded_active_slice(
-    active_slice: &[CanonicalMessage],
-    tool_nonce: &str,
-    budget: usize,
-) -> Vec<AcpPromptBlock> {
-    let mut result_count = 0usize;
-    let mut text_count = 0usize;
-    let mut fixed_overhead = 0usize;
-
-    for msg in active_slice {
+    // Stage 4: Universal water-filling across all variable text/tool-result/tool-call payloads.
+    let mut variable_lens = Vec::new();
+    let mut fixed_overhead = 128usize;
+    for msg in &work {
+        fixed_overhead = fixed_overhead.saturating_add(16);
         for part in &msg.parts {
             match part {
-                CanonicalPart::ToolResult { call_id, .. } => {
-                    result_count += 1;
-                    fixed_overhead += call_id.len() + 80;
+                CanonicalPart::Text(t) => {
+                    let cleaned = strip_billing_noise(t);
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        variable_lens.push(trimmed.len());
+                        fixed_overhead = fixed_overhead.saturating_add(16);
+                    }
                 }
-                CanonicalPart::Text(_) => {
-                    text_count += 1;
-                    fixed_overhead += 16;
+                CanonicalPart::ToolResult {
+                    call_id, output, ..
+                } => {
+                    let cleaned = strip_billing_noise(output);
+                    variable_lens.push(cleaned.trim().len());
+                    fixed_overhead = fixed_overhead.saturating_add(call_id.len() + 80);
                 }
                 CanonicalPart::ToolCall {
                     call_id,
@@ -1641,36 +1961,78 @@ fn render_bounded_active_slice(
                     arguments,
                     ..
                 } => {
-                    fixed_overhead += call_id.len() + name.len() + arguments.len() + 96;
+                    variable_lens.push(arguments.len());
+                    fixed_overhead = fixed_overhead
+                        .saturating_add(call_id.len() + name.len() + tool_nonce.len() * 2 + 96);
                 }
                 CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
             }
         }
     }
 
-    let variable_slots = (result_count + text_count).max(1);
-    let per_slot_budget = budget.saturating_sub(fixed_overhead) / variable_slots;
-    let limits = PartRenderLimits {
-        max_text_bytes: per_slot_budget.max(4_096),
-        max_tool_call_bytes: usize::MAX,
-        max_tool_result_bytes: per_slot_budget.max(2_048),
-        emit_images: true,
-    };
+    let available_var = budget.saturating_sub(fixed_overhead);
+    let universal_cap = compute_waterfill_cap(&variable_lens, available_var).max(512);
+    for msg in &mut work {
+        for part in &mut msg.parts {
+            match part {
+                CanonicalPart::Text(text) => {
+                    let cleaned = strip_billing_noise(text);
+                    let trimmed = cleaned.trim();
+                    if trimmed.len() > universal_cap {
+                        if is_developer_instructions_wrapper(trimmed) {
+                            let inner = trimmed
+                                .strip_prefix("<developer_instructions>")
+                                .and_then(|s| s.strip_suffix("</developer_instructions>"))
+                                .unwrap_or(trimmed)
+                                .trim();
+                            let bounded = truncate_head_tail_lines(
+                                inner,
+                                universal_cap.saturating_sub(64),
+                                "developer instructions",
+                            );
+                            *text = format!(
+                                "<developer_instructions>\n{bounded}\n</developer_instructions>"
+                            );
+                        } else {
+                            *text = truncate_head_tail_lines(trimmed, universal_cap, "input text");
+                        }
+                    }
+                }
+                CanonicalPart::ToolResult { output, .. } => {
+                    let cleaned = strip_billing_noise(output);
+                    let trimmed = cleaned.trim();
+                    if trimmed.len() > universal_cap {
+                        *output = truncate_head_tail_lines(trimmed, universal_cap, "tool output");
+                    }
+                }
+                CanonicalPart::ToolCall {
+                    arguments,
+                    is_custom,
+                    ..
+                } => {
+                    if arguments.len() > universal_cap {
+                        let preview = truncate_head_tail_lines(
+                            arguments,
+                            universal_cap.saturating_sub(96),
+                            "tool call arguments",
+                        );
+                        if *is_custom {
+                            *arguments = preview;
+                        } else {
+                            *arguments = serde_json::json!({
+                                "_truncated_arguments_preview": preview
+                            })
+                            .to_string();
+                        }
+                    }
+                }
+                CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
+            }
+        }
+    }
 
-    let mut blocks = Vec::new();
-    let mut text_acc = String::new();
-    for (idx, msg) in active_slice.iter().enumerate() {
-        if idx > 0 && !text_acc.is_empty() && !text_acc.ends_with('\n') {
-            text_acc.push('\n');
-        }
-        render_parts_into(msg, tool_nonce, false, limits, &mut text_acc, &mut blocks);
-    }
-    if !text_acc.is_empty() {
-        if text_acc.len() > budget {
-            text_acc = truncate_middle_utf8_bytes(&text_acc, budget, 13, 20);
-        }
-        blocks.push(AcpPromptBlock::Text { text: text_acc });
-    }
+    let mut blocks = render_uncompacted_prompt_blocks(&[], &work, tool_nonce);
+    clamp_blocks_to_budget(&mut blocks, budget);
     blocks
 }
 
@@ -1972,6 +2334,94 @@ fn ceil_utf8_boundary(s: &str, min_byte: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+fn count_logical_lines(s: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else {
+        s.bytes().filter(|&b| b == b'\n').count() + usize::from(!s.ends_with('\n'))
+    }
+}
+
+/// Truncates an oversized UTF-8 payload in the middle while preserving a generous head (~55%)
+/// and tail (~45%) snapped cleanly to line boundaries, inserting a structured diagnostic marker
+/// with exact byte and 1-based line ranges so coding agents understand that the middle was
+/// omitted and can inspect a targeted range if needed.
+#[must_use]
+pub fn truncate_head_tail_lines(input: &str, max_bytes: usize, kind_label: &str) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    if max_bytes <= 380 {
+        return truncate_middle_utf8_bytes(input, max_bytes, 11, 20);
+    }
+
+    let total_bytes = input.len();
+    let marker_reserve = 360usize;
+    let usable = max_bytes.saturating_sub(marker_reserve);
+    let head_budget = usable.saturating_mul(11) / 20;
+    let tail_budget = usable.saturating_sub(head_budget);
+
+    let raw_head_end = floor_utf8_boundary(input, head_budget);
+    let min_head_snap = (head_budget * 4) / 5;
+    let head_end = input
+        .get(min_head_snap..raw_head_end)
+        .and_then(|win| win.rfind('\n').map(|pos| min_head_snap + pos))
+        .unwrap_or(raw_head_end);
+
+    let raw_tail_start =
+        ceil_utf8_boundary(input, total_bytes.saturating_sub(tail_budget)).max(head_end);
+    let max_tail_snap = total_bytes
+        .saturating_sub((tail_budget * 4) / 5)
+        .max(raw_tail_start);
+    let tail_start = input
+        .get(raw_tail_start..max_tail_snap)
+        .and_then(|win| win.find('\n').map(|pos| raw_tail_start + pos + 1))
+        .unwrap_or(raw_tail_start)
+        .max(head_end);
+
+    let head = input
+        .get(..head_end)
+        .unwrap_or("")
+        .trim_end_matches(['\r', '\n']);
+    let tail = input
+        .get(tail_start..)
+        .unwrap_or("")
+        .trim_start_matches(['\r', '\n']);
+    let omitted_end = total_bytes.saturating_sub(tail.len()).max(head.len());
+    let omitted_slice = input.get(head.len()..omitted_end).unwrap_or("");
+    let omitted_bytes = omitted_slice.len();
+
+    let notice = if omitted_slice.contains('\n') {
+        let total_lines = count_logical_lines(input);
+        let head_lines = if head.is_empty() {
+            0
+        } else {
+            head.bytes().filter(|&b| b == b'\n').count() + 1
+        };
+        let tail_lines = count_logical_lines(tail);
+        let first_omitted = head_lines + 1;
+        let last_omitted = total_lines.saturating_sub(tail_lines).max(first_omitted);
+        let omitted_lines = last_omitted.saturating_sub(first_omitted) + 1;
+        format!(
+            "\n... [Gateway truncated {kind_label}: {total_bytes} bytes ({total_lines} lines) total; omitted middle {omitted_bytes} bytes ({omitted_lines} lines, lines {first_omitted}..={last_omitted}) to fit single-turn limit. Beginning and end are preserved intact; query that specific line range or filter output if the middle section is needed.] ...\n"
+        )
+    } else {
+        format!(
+            "\n... [Gateway truncated {kind_label}: {total_bytes} bytes total; omitted middle {omitted_bytes} bytes to fit single-turn limit. Beginning and end are preserved intact.] ...\n"
+        )
+    };
+
+    let mut out = String::with_capacity(head.len() + notice.len() + tail.len());
+    out.push_str(head);
+    out.push_str(&notice);
+    out.push_str(tail);
+    if out.len() > max_bytes {
+        truncate_middle_utf8_bytes(&out, max_bytes, 11, 20)
+    } else {
+        out
+    }
 }
 
 fn truncate_middle_utf8_bytes(
@@ -2601,9 +3051,24 @@ mod tests {
         );
         let oversized = [CanonicalMessage {
             role: CanonicalRole::User,
-            parts: vec![CanonicalPart::Text("x".repeat(890_000))],
+            parts: vec![CanonicalPart::Text(format!(
+                "MEGA_HEAD_MARKER\n{}\nMEGA_TAIL_MARKER",
+                "x".repeat(980_000)
+            ))],
         }];
-        assert!(build_acp_prompt_plan(&oversized, "nonce", false, None, true).is_err());
+        let bounded_mega = build_acp_prompt_plan(&oversized, "nonce", false, None, true)
+            .expect("oversized long-context turn should auto-truncate middle instead of failing");
+        let mega_text: String = bounded_mega
+            .final_blocks
+            .iter()
+            .filter_map(|b| match b {
+                AcpPromptBlock::Text { text } => Some(text.as_str()),
+                AcpPromptBlock::Image { .. } => None,
+            })
+            .collect();
+        assert!(mega_text.contains("MEGA_HEAD_MARKER"));
+        assert!(mega_text.contains("MEGA_TAIL_MARKER"));
+        assert!(mega_text.contains("[Gateway truncated input text:"));
         assert!(
             !plan.seed_chunks.is_empty() && plan.seed_chunks.len() <= MAX_HYDRATION_SEED_CHUNKS,
             "expected 1..={} seed chunks, got {}",
@@ -2638,6 +3103,7 @@ mod tests {
         }
         assert!(!combined.contains("...[omitted"));
         assert!(!combined.contains("[... omitted"));
+        assert!(!combined.contains("[Gateway truncated"));
         assert!(combined.contains("EARLY_NEEDLE_ALPHA_001"));
         assert!(combined.contains("MID_NEEDLE_BETA_002"));
         assert!(combined.contains("MID_NEEDLE_GAMMA_003"));
@@ -2700,12 +3166,12 @@ mod tests {
         assert!(spill_xml.contains("mcp__opencode_server__tool_59"));
         assert!(append.contains("mcp__opencode_server__tool_00"));
 
-        // Giant 135 KB `<developer_instructions>` + 35 KB user prompt (> 160 KB total) must slim
+        // Giant 150 KB `<developer_instructions>` + 35 KB user prompt (> 176 KB total) must slim
         // ONLY `<developer_instructions>` while preserving 100% of the user prompt losslessly.
         let user_prompt = format!("USER_START_MARKER\n{}\nUSER_END_MARKER", "u".repeat(35_000));
         let giant_dev = format!(
             "<developer_instructions>\nHEAD_RULE\n{}\nTAIL_RULE\n</developer_instructions>",
-            "r".repeat(135_000)
+            "r".repeat(150_000)
         );
         let plan = build_acp_prompt_plan(
             &[
@@ -2736,16 +3202,145 @@ mod tests {
         assert!(rendered.contains("HEAD_RULE"));
         assert!(rendered.contains("TAIL_RULE"));
 
-        // Conversely, an oversized raw user prompt (> 160 KB) MUST still fail with `PromptTooLarge`.
+        // An oversized raw user log paste (> 176 KB) must also auto-truncate its middle cleanly
+        // (preserving beginning + end) rather than throwing a hard `PromptTooLarge` error.
         let oversized_user = CanonicalMessage {
             role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(format!(
+                "PASTE_HEAD_LINE\n{}\nPASTE_TAIL_LINE",
+                "log_entry_1234567890\n".repeat(12_000)
+            ))],
+        };
+        let bounded_user_plan =
+            build_acp_prompt_plan(&[oversized_user], "abcd12", true, None, false)
+                .expect("oversized user paste must middle-truncate instead of failing");
+        let bounded_user_text = match bounded_user_plan.final_blocks.first() {
+            Some(AcpPromptBlock::Text { text }) => text,
+            _ => panic!("expected text block"),
+        };
+        assert!(bounded_user_text.len() <= MAX_ACP_PROMPT_TEXT_BYTES);
+        assert!(bounded_user_text.contains("PASTE_HEAD_LINE"));
+        assert!(bounded_user_text.contains("PASTE_TAIL_LINE"));
+        assert!(bounded_user_text.contains("[Gateway truncated input text:"));
+    }
+
+    #[test]
+    fn waterfill_head_tail_truncates_195kb_tool_output_preserving_small_siblings_and_session_hash()
+    {
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        let mut giant_cmd_output = String::with_capacity(200_000);
+        giant_cmd_output.push_str("CMD_START: cargo test --workspace\n");
+        for line_no in 2..=3_200 {
+            giant_cmd_output.push_str(&format!(
+                "line_{line_no:04}: compiler diagnostic output详情 payload_segment_abcdefghijklmnopqrstuvwxyz\n"
+            ));
+        }
+        giant_cmd_output.push_str("CMD_END: test result: FAILED. 142 passed; 2 failed;\n");
+        assert!(
+            giant_cmd_output.len() > 195_000,
+            "expected >195 KB tool result, got {}",
+            giant_cmd_output.len()
+        );
+
+        let small_sibling_a = "SMALL_TOOL_A_EXACT_CONTENT_100_PERCENT_INTACT";
+        let small_sibling_b = "SMALL_TOOL_B_EXACT_CONTENT_100_PERCENT_INTACT";
+
+        let turn_delta = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![
+                CanonicalPart::ToolResult {
+                    call_id: "call_small_a".to_owned(),
+                    output: small_sibling_a.to_owned(),
+                    is_error: false,
+                },
+                CanonicalPart::ToolResult {
+                    call_id: "call_giant".to_owned(),
+                    output: giant_cmd_output.clone(),
+                    is_error: true,
+                },
+                CanonicalPart::ToolResult {
+                    call_id: "call_small_b".to_owned(),
+                    output: small_sibling_b.to_owned(),
+                    is_error: false,
+                },
+            ],
+        };
+
+        let plan = build_acp_prompt_plan(
+            std::slice::from_ref(&turn_delta),
+            "abcd12",
+            false,
+            None,
+            false,
+        )
+        .expect("195 KB tool output must truncate middle cleanly without erroring");
+
+        assert!(plan.seed_chunks.is_empty());
+        let rendered = match plan.final_blocks.first() {
+            Some(AcpPromptBlock::Text { text }) => text,
+            _ => panic!("expected single text block"),
+        };
+        assert!(
+            rendered.len() <= MAX_ACP_PROMPT_TEXT_BYTES,
+            "rendered len {} exceeded {}",
+            rendered.len(),
+            MAX_ACP_PROMPT_TEXT_BYTES
+        );
+        // Water-filling must preserve >95% of the 176 KB budget instead of dividing 176 KB / 3!
+        assert!(
+            rendered.len() > 168_000,
+            "water-filling should utilize nearly full 176 KB budget, got {}",
+            rendered.len()
+        );
+        assert!(rendered.contains(small_sibling_a));
+        assert!(rendered.contains(small_sibling_b));
+        assert!(rendered.contains("CMD_START: cargo test --workspace"));
+        assert!(rendered.contains("CMD_END: test result: FAILED. 142 passed; 2 failed;"));
+        assert!(rendered.contains("[Gateway truncated tool output:"));
+        assert!(rendered.contains("lines "));
+
+        // Verify next-turn warm `SessionPool` prefix hash still hits 100% when client resends
+        // the original untruncated 195 KB `ToolResult` in `messages`!
+        let u1 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Run workspace tests".to_owned())],
+        };
+        let a1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::ToolCall {
+                call_id: "call_giant".to_owned(),
+                name: "Bash".to_owned(),
+                arguments: "{\"command\":\"cargo test\"}".to_owned(),
+                is_custom: false,
+            }],
+        };
+        let a2 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
             parts: vec![CanonicalPart::Text(
-                "u".repeat(MAX_ACP_PROMPT_TEXT_BYTES + 1_024),
+                "I see 2 failures at the end of the truncated test output.".to_owned(),
             )],
         };
-        assert!(matches!(
-            build_acp_prompt_plan(&[oversized_user], "abcd12", true, None, false),
-            Err(ProtocolError::PromptTooLarge { .. })
-        ));
+        let committed_hash = hash_conversation_with_reply(
+            Some("You are a coding agent."),
+            &[],
+            web_cfg,
+            &model,
+            &[u1.clone(), a1.clone(), turn_delta.clone()],
+            &a2,
+        );
+        let u3 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Fix those 2 failures.".to_owned())],
+        };
+        let next_routing = compute_routing_plan(
+            Some("You are a coding agent."),
+            &[],
+            web_cfg,
+            &model,
+            &[u1, a1, turn_delta, a2, u3],
+        );
+        assert_eq!(next_routing.prefix_lookup, Some((committed_hash, 4)));
     }
 }

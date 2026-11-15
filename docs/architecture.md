@@ -57,12 +57,21 @@ tools changed, or `session/set_model` if effort/model changed). Local `/compact`
 summarization turns match the warm coding session via a dialogue hash and retire
 it cleanly afterward.
 
-The default mode sends one ACP prompt per client step, with a `160,000`-byte
+The default mode sends one ACP prompt per client step, with a `176,000`-byte
 text budget below the observed upstream single-turn truncation boundary. It
-does not insert Flash seed turns. A cold replay can trim older history with
-explicit archive markers while preserving the current input; if that current
-input cannot fit, the gateway returns `400` instead of silently cutting it.
-Warm sessions continue receiving only the incremental input.
+does not insert Flash seed turns. Oversized tool outputs or single-turn inputs
+are automatically middle-truncated across line boundaries using water-filling
+Head+Tail preservation (~55% head, ~45% tail, with an explicit omitted-lines
+marker) while leaving smaller sibling tool results untouched and keeping the
+canonical `SessionPool` prefix hash intact for subsequent warm turns. Cold
+replays trim older history with explicit archive markers when needed.
+
+When a genuine context-window overflow occurs (such as upstream context-length
+rejection or compaction during `--long-context` hydration), Liftgate returns the
+standard reactive-compaction wire format expected by each client (`code:
+"context_length_exceeded"` / `param: "input"` on OpenAI `/v1/responses` and
+`prompt is too long: N tokens > M maximum` on Anthropic `/v1/messages`, across
+both HTTP `400` and SSE failure frames).
 
 Model metadata and generated client settings use conservative context and
 auto-compact limits: Gemini `280k / 245k`, Claude `200k / 170k`, and GPT-OSS

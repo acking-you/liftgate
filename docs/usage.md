@@ -142,10 +142,16 @@ gateway models share a canonical Claude name, the smaller threshold wins.
 That can compact sooner than the table. See the official
 [Claude context settings](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction).
 
-Every ACP prompt has a 160,000-byte text budget. Cold replays may shorten old
-history with explicit markers. Current input that cannot fit is rejected with
-`400`; split a large input, reduce a tool result, or start from a concise handoff.
-Client `/compact` reuses a matching warm session before retiring it.
+Every ACP prompt has a `176,000`-byte text budget. When an active turn or tool
+result exceeds that single-turn budget, Liftgate automatically middle-truncates
+only the oversized block(s) on clean line boundaries (preserving ~55% of the
+beginning and ~45% of the end with an explicit omitted-lines marker) while
+keeping smaller sibling tool results untouched and preserving warm `SessionPool`
+reuse on subsequent turns. Cold replays shorten older history with explicit
+archive markers when needed, and genuine context-window overflows emit standard
+auto-compactable errors (`context_length_exceeded` for Codex and `prompt is too
+long: N tokens > M maximum` for Claude Code). Client `/compact` reuses a
+matching warm session before retiring it.
 
 Long-context hydration is experimental and must be enabled explicitly:
 

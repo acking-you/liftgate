@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-11-15
+
+### Fixed
+- **Automatic Head+Tail middle-truncation for oversized tool outputs & single-turn inputs**: replaced the hard `prompt is too long for the ACP single-turn limit` `400` rejection with a `176,000`-byte water-filling Head+Tail line-boundary truncator (`truncate_head_tail_lines` + `render_smart_bounded_active_slice`). Large command/file outputs (`~195 KB+`) now keep ~55% opening lines and ~45% closing lines intact with an explicit `[Gateway truncated ...: omitted M bytes across lines X..=Y ...]` notice, leave small sibling tool results 100% untouched, and preserve warm `SessionPool` prefix-hash hits on subsequent turns without interrupting agentic loops.
+- **Standard reactive auto-compaction error wire contracts for OpenAI Codex & Claude Code**: mapped context-window overflows (`HydrationCompacted`, upstream ACP context-length errors, and directive overflows) across both HTTP JSON and SSE (`response.failed` / `event: error`) to OpenAI's `code: "context_length_exceeded"`, `param: "input"`, `"Your input exceeds the context window of this model. Please adjust your input and try again."` and Anthropic's `type: "invalid_request_error"`, `"prompt is too long: {used} tokens > {max} maximum"`, enabling automatic client-side reactive compaction.
+- **Bounded tool-schema delta & `web_fetch` continuation payloads**: added progressive 3-tier schema slimming for large `<client_tools_update>` directives (`<= 48 KB`), bounded `/compact` directives, and Head+Tail clamping on oversized server-side `web_fetch` continuations.
+
 ## [0.1.4] - 2026-11-15
 
 ### Fixed

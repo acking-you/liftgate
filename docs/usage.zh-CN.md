@@ -101,7 +101,7 @@ liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
 
 这是网关的运行窗口，并非模型宣传的原生容量，目的是为实测约 300k–320k tokens 的上游压缩行为留出余量。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
 
-每次 ACP 请求有 160,000 字节的文本预算。冷启动回放可能带标记缩减旧历史；当前输入本身放不下时返回 `400`，不会静默裁掉它。此时应拆分输入、缩短工具结果，或用简洁交接摘要启动新会话。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
+每次 ACP 请求有 `176,000` 字节的单轮文本预算。当某次工具调用输出或单轮输入超出预算时，Liftgate 会按水位线分配算法仅对超长块做按行对齐的首尾保留中间截断（保留约 55% 开头与 45% 结尾，并插入明确省略行号范围的提示标记），保持同轮其它小工具输出完整无损，且不影响后续轮次的 `SessionPool` 热会话前缀命中。冷启动回放会在必要时带标记缩减旧历史；真正发生上下文窗口溢出时，网关会返回客户端标准可自动触发压缩的错误格式（Codex 为 `context_length_exceeded`，Claude Code 为 `prompt is too long: N tokens > M maximum`）。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
 
 超长上下文是需要显式开启的实验功能：
 

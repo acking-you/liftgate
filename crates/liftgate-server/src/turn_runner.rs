@@ -12,10 +12,11 @@ use liftgate_types::{
     model::{resolve_model_id, select_fastest_gemini_model},
     parser::{IncrementalToolParser, ParsedStreamItem, ParsedToolCall},
     session_key::{
-        AcpPromptPlan, INTERNAL_GATEWAY_WEB_FETCH_TOOL, WebToolBridgeConfig, build_acp_prompt_plan,
-        build_client_tools_delta_xml, build_compaction_directive_xml,
-        build_session_system_append_with_spill, compute_routing_plan, hash_conversation_with_reply,
-        hash_dialogue_with_reply,
+        AcpPromptPlan, INTERNAL_GATEWAY_WEB_FETCH_TOOL, MAX_ACP_PROMPT_TEXT_BYTES,
+        WebToolBridgeConfig, build_acp_prompt_plan, build_client_tools_delta_xml,
+        build_compaction_directive_xml, build_session_system_append_with_spill,
+        compute_routing_plan, hash_conversation_with_reply, hash_dialogue_with_reply,
+        truncate_head_tail_lines,
     },
     telemetry::TaskProtocol,
 };
@@ -832,20 +833,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
             if let Some(old_lease) = lease.take() {
                 old_lease.finish_ephemeral();
             }
-            let err = match sig {
-                UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
-                    model: active_model.as_str().to_owned(),
-                    detail,
-                },
-                UpstreamBannerSignal::RateLimited => AcpError::UpstreamRateLimited {
-                    model: active_model.as_str().to_owned(),
-                    detail,
-                },
-                UpstreamBannerSignal::FatalAgentError => {
-                    AcpError::UpstreamAgentTerminated { detail }
-                }
-            };
-            tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream quota/rate-limit/fatal banner");
+            let err = signal_to_acp_error(sig, &active_model, detail);
+            tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream quota/context/rate-limit/fatal banner");
             task_guard.fail(err.to_string());
             let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
             return;
@@ -954,6 +943,13 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     continuation_xml.push_str(
                         "\nNow synthesize a complete, accurate response grounded in the fetched page content above.",
                     );
+                    if continuation_xml.len() > MAX_ACP_PROMPT_TEXT_BYTES {
+                        continuation_xml = truncate_head_tail_lines(
+                            &continuation_xml,
+                            MAX_ACP_PROMPT_TEXT_BYTES,
+                            "web_fetch content",
+                        );
+                    }
                     state.post_tool_spill_buf.clear();
                     state.halted_post_tool_runaway = false;
                     current_prompt_blocks = vec![AcpPromptBlock::Text {
@@ -1417,13 +1413,18 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
         | AcpError::UpstreamAgentTerminated { .. }
         | AcpError::EmptyUpstreamResponse { .. }
         | AcpError::Cancelled
-        | AcpError::HydrationCompacted => err,
+        | AcpError::HydrationCompacted
+        | AcpError::ContextLengthExceeded { .. } => err,
     }
 }
 
 fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: String) -> AcpError {
     match sig {
         UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
+            model: model.as_str().to_owned(),
+            detail,
+        },
+        UpstreamBannerSignal::ContextLengthExceeded => AcpError::ContextLengthExceeded {
             model: model.as_str().to_owned(),
             detail,
         },
@@ -1796,6 +1797,7 @@ async fn send_cancel_safe(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpstreamBannerSignal {
     QuotaExhausted,
+    ContextLengthExceeded,
     RateLimited,
     FatalAgentError,
 }
@@ -1835,6 +1837,20 @@ pub fn classify_upstream_error_text(text: &str) -> Option<UpstreamBannerSignal> 
         || trimmed.contains("配额")
     {
         return Some(UpstreamBannerSignal::QuotaExhausted);
+    }
+
+    // 2. Upstream model context-window overflow (must surface as a standard auto-compactable
+    //    `context_length_exceeded` / `prompt is too long` error so Codex & Claude Code compact).
+    if lower.contains("context_length_exceeded")
+        || lower.contains("prompt is too long")
+        || lower.contains("maximum context length")
+        || lower.contains("exceeds the context window")
+        || lower.contains("context window exceeded")
+        || lower.contains("too many input tokens")
+        || lower.contains("token count exceeds")
+        || (lower.contains("input token") && lower.contains("exceed"))
+    {
+        return Some(UpstreamBannerSignal::ContextLengthExceeded);
     }
 
     // 2. Server-side capacity / rate-limit congestion (eligible for immediate model failover).
@@ -1978,6 +1994,12 @@ impl AcpBannerFilter {
                     tracing::warn!(
                         banner = %dropped,
                         "detected upstream Antigravity quota exhaustion banner"
+                    );
+                }
+                UpstreamBannerSignal::ContextLengthExceeded => {
+                    tracing::warn!(
+                        banner = %dropped,
+                        "detected upstream ACP context-length exceeded banner"
                     );
                 }
                 UpstreamBannerSignal::RateLimited | UpstreamBannerSignal::FatalAgentError => {

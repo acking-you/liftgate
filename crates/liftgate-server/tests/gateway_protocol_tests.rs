@@ -47,6 +47,10 @@ enum MockScript {
         query: String,
         answer: String,
     },
+    RpcError {
+        code: i64,
+        message: String,
+    },
     HangForever,
 }
 
@@ -330,6 +334,11 @@ impl AcpBackend for MockAcpBackend {
                     error: None,
                 })
             }
+            MockScript::RpcError { code, message } => Err(AcpError::Rpc {
+                method: "session/prompt",
+                code,
+                message,
+            }),
             MockScript::HangForever => {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 Ok(PromptTurnResult::default())
@@ -409,18 +418,22 @@ fn test_app(backend: Arc<MockAcpBackend>, timeout_secs: u64) -> axum::Router {
 
 #[tokio::test]
 async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retry() {
-    for long_context in [false, true] {
+    let multiline_200k: String = (1..=4_000)
+        .map(|i| format!("LINE {i:04}: {}\n", "x".repeat(40)))
+        .collect();
+    assert!(multiline_200k.len() > 200_000);
+
+    // 1. Default mode (`long_context == false`): automatically middle-truncates oversized single-turn
+    //    inputs (preserving head + tail + structured marker) instead of failing with HTTP 400.
+    {
         let backend = Arc::new(MockAcpBackend::new(vec![]));
-        *backend.hydration_updates.lock().unwrap() =
-            vec![(320_000, 1_048_576), (20_000, 1_048_576)];
-        let app = test_app_with_context(Arc::clone(&backend), 30, None, long_context);
+        let app = test_app_with_context(Arc::clone(&backend), 30, None, false);
         for endpoint in ["/v1/responses", "/v1/messages"] {
-            let input = "a".repeat(200_000);
             let payload = if endpoint == "/v1/responses" {
-                json!({"model":"gemini-4-carbon-high", "input":input})
+                json!({"model":"gemini-4-carbon-high", "input": &multiline_200k})
             } else {
-                json!({"model":"gemini-4-carbon-high", "max_tokens":100,
-                    "messages":[{"role":"user", "content":input}]})
+                json!({"model":"gemini-4-carbon-high", "max_tokens": 100,
+                    "messages":[{"role":"user", "content": &multiline_200k}]})
             };
             let resp = app
                 .clone()
@@ -434,18 +447,314 @@ async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retr
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-            let body: Value =
-                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
-                    .unwrap();
-            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(resp.status(), StatusCode::OK);
         }
-        // Safe mode rejects before inference. Experimental mode stops after the first seed.
-        assert_eq!(
-            backend.recorded_prompts.lock().unwrap().len(),
-            if long_context { 2 } else { 0 }
-        );
+        let recorded = backend.recorded_prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        for prompt in recorded.iter() {
+            assert!(
+                prompt.text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES
+            );
+            assert!(prompt.text_joined.contains("LINE 0001:"));
+            assert!(prompt.text_joined.contains("LINE 4000:"));
+            assert!(prompt.text_joined.contains("[Gateway truncated "));
+        }
     }
+
+    // 2. Experimental `long_context == true`: stops immediately after the first seed chunk if
+    //    upstream compacts during hydration, returning standard auto-compactable wire errors for
+    //    both OpenAI Codex (`context_length_exceeded`) and Claude Code (`prompt is too long: ...`).
+    {
+        let backend = Arc::new(MockAcpBackend::new(vec![]));
+        *backend.hydration_updates.lock().unwrap() =
+            vec![(320_000, 1_048_576), (20_000, 1_048_576)];
+        let app = test_app_with_context(Arc::clone(&backend), 30, None, true);
+
+        let oai_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model":"gemini-4-carbon-high", "input": &multiline_200k})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oai_resp.status(), StatusCode::BAD_REQUEST);
+        let oai_body: Value =
+            serde_json::from_slice(&oai_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(oai_body["error"]["type"], "invalid_request_error");
+        assert_eq!(oai_body["error"]["code"], "context_length_exceeded");
+        assert_eq!(oai_body["error"]["param"], "input");
+        assert!(
+            oai_body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Your input exceeds the context window of this model.")
+        );
+
+        let anth_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gemini-4-carbon-high",
+                            "max_tokens": 100,
+                            "messages": [{"role": "user", "content": &multiline_200k}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anth_resp.status(), StatusCode::BAD_REQUEST);
+        let anth_body: Value =
+            serde_json::from_slice(&anth_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(anth_body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            anth_body["error"]["message"],
+            "prompt is too long: 280001 tokens > 280000 maximum"
+        );
+
+        assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn oversized_tool_result_auto_truncates_head_and_tail_and_preserves_warm_session_reuse() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"cargo test\"}}</agy_tool_call_{NONCE}>\n<agy_tool_call_{NONCE}>{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"git status -s\"}}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Analyzed truncated cargo test output.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Warm follow-up succeeded.".to_owned()],
+        },
+    ]));
+    let app = test_app(Arc::clone(&backend), 30);
+
+    let tools = json!([{
+        "type": "function",
+        "name": "exec_command",
+        "description": "Run shell command",
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+    }]);
+
+    // Turn 1: Assistant requests two tool calls.
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "tools": tools,
+                        "input": [{"role": "user", "content": "Run tests and check git status"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let out_items = b1["output"].as_array().unwrap();
+    assert_eq!(out_items.len(), 2);
+    let call_id_1 = out_items[0]["call_id"].as_str().unwrap().to_owned();
+    let call_id_2 = out_items[1]["call_id"].as_str().unwrap().to_owned();
+
+    // Turn 2: Client returns a ~196 KB `cargo test` output + a tiny `git status` sibling output.
+    let huge_tool_output: String = (1..=4_000)
+        .map(|i| format!("CARGO_LINE_{i:04}: {}\n", "z".repeat(32)))
+        .collect();
+    assert!(huge_tool_output.len() > 195_000);
+
+    let mut turn2_input = vec![
+        json!({"role": "user", "content": "Run tests and check git status"}),
+        out_items[0].clone(),
+        out_items[1].clone(),
+        json!({"type": "function_call_output", "call_id": call_id_1, "output": &huge_tool_output}),
+        json!({"type": "function_call_output", "call_id": call_id_2, "output": "SMALL_GIT_STATUS_CLEAN"}),
+    ];
+
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "tools": tools,
+                        "input": turn2_input
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let b2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        b2["output"][0]["content"][0]["text"],
+        "Analyzed truncated cargo test output."
+    );
+
+    // Turn 3: Client resends the original un-truncated 196 KB tool output in prior history + follow-up.
+    turn2_input.push(b2["output"][0].clone());
+    turn2_input.push(json!({"role": "user", "content": "What should we fix next?"}));
+    let r3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "tools": tools,
+                        "input": turn2_input
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+
+    let recorded = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0].session_id, "sess_1");
+    assert_eq!(recorded[1].session_id, "sess_1");
+    assert_eq!(recorded[2].session_id, "sess_1");
+
+    // Turn 2 outbound prompt stayed within budget, kept small sibling lossless, and preserved head + tail.
+    assert!(
+        recorded[1].text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES
+    );
+    assert!(recorded[1].text_joined.contains("SMALL_GIT_STATUS_CLEAN"));
+    assert!(recorded[1].text_joined.contains("CARGO_LINE_0001:"));
+    assert!(recorded[1].text_joined.contains("CARGO_LINE_4000:"));
+    assert!(
+        recorded[1]
+            .text_joined
+            .contains("[Gateway truncated tool output:")
+    );
+
+    // Turn 3 matched warm `sess_1` prefix hash and forwarded only the new user delta!
+    assert_eq!(recorded[2].text_joined, "What should we fix next?");
+}
+
+#[tokio::test]
+async fn sse_context_overflow_emits_standard_codex_and_claude_code_compact_errors() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::RpcError {
+            code: -32603,
+            message: "Context window exceeded: maximum context length reached".to_owned(),
+        },
+        MockScript::RpcError {
+            code: -32603,
+            message: "Context window exceeded: maximum context length reached".to_owned(),
+        },
+    ]));
+    let app = test_app(Arc::clone(&backend), 30);
+
+    let oai_sse_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oai_sse_resp.status(), StatusCode::OK);
+    let oai_sse_text = String::from_utf8(
+        oai_sse_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(oai_sse_text.contains("event: response.failed"));
+    assert!(oai_sse_text.contains("\"code\":\"context_length_exceeded\""));
+    assert!(oai_sse_text.contains("Your input exceeds the context window of this model."));
+
+    let anth_sse_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6-thinking",
+                        "max_tokens": 100,
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anth_sse_resp.status(), StatusCode::OK);
+    let anth_sse_text = String::from_utf8(
+        anth_sse_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(anth_sse_text.contains("event: error"));
+    assert!(anth_sse_text.contains("\"type\":\"invalid_request_error\""));
+    assert!(anth_sse_text.contains("prompt is too long: 200001 tokens > 200000 maximum"));
 }
 
 #[tokio::test]
