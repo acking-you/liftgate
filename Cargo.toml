@@ -12,7 +12,6 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/acking-you/liftgate"
-homepage = "https://github.com/acking-you/liftgate"
 
 [workspace.dependencies]
 liftgate-types = { path = "crates/liftgate-types", default-features = false }

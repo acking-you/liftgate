@@ -674,10 +674,9 @@ fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
     let (is_arguments_key, after_val_key) =
         if let Some(rest) = after_comma.strip_prefix("\"input\"") {
             (false, rest.trim_start().strip_prefix(':')?.trim_start())
-        } else if let Some(rest) = after_comma.strip_prefix("\"arguments\"") {
-            (true, rest.trim_start().strip_prefix(':')?.trim_start())
         } else {
-            return None;
+            let rest = after_comma.strip_prefix("\"arguments\"")?;
+            (true, rest.trim_start().strip_prefix(':')?.trim_start())
         };
 
     let without_trailing_comma = after_val_key
