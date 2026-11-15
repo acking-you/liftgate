@@ -43,6 +43,6 @@ pub const fn mock_acp_usage(input: u64, output: u64, thought: u64) -> AcpUsage {
         cached_read_tokens: 128,
         cached_write_tokens: 0,
         thought_tokens: thought,
-        total_tokens: input + output + thought,
+        total_tokens: input + output + 128,
     }
 }

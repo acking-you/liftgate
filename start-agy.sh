@@ -307,17 +307,32 @@ sync_claude_settings() {
         fastModel = flash[0];
       }
     }
+    const modelSettings = {};
+    const compactLimits = new Map();
+    const addCompactWindow = (id, limit) => {
+      const previous = modelSettings[id]?.autoCompactWindow;
+      modelSettings[id] = { autoCompactWindow: previous ? Math.min(previous, limit) : limit };
+    };
     const options = data.map((m) => {
       const id = String(m.id);
       const lower = id.toLowerCase();
-      const behavesAs = lower.includes("flash-low")
+      const behavesAs = lower.startsWith("gpt-oss")
         ? "claude-haiku-4-5-20251001"
+        : lower.startsWith("gemini-")
+          ? (lower.includes("flash-low") ? "claude-haiku-5-5"
+            : (lower.includes("sonnet") || lower.endsWith("-medium")) ? "claude-sonnet-5-5" : "claude-opus-5-5")
         : (lower.includes("sonnet") || lower.endsWith("-medium"))
           ? "claude-sonnet-4-6"
           : "claude-opus-4-6";
       const ctx = m.context_window && Number(m.context_window) > 0
         ? `${Math.round(Number(m.context_window) / 1000)}k ctx`
-        : "1000k ctx";
+        : "unknown ctx";
+      // An older gateway may advertise an inflated window without a safe limit.
+      const limit = Number.isSafeInteger(m.auto_compact_token_limit) && m.auto_compact_token_limit >= 100000
+        ? Math.min(m.auto_compact_token_limit, 1000000) : 110000;
+      compactLimits.set(id, limit);
+      addCompactWindow(id, limit);
+      addCompactWindow(behavesAs, limit);
       return {
         model: id,
         label: m.display_name || id,
@@ -334,7 +349,6 @@ sync_claude_settings() {
       ANTHROPIC_DEFAULT_SONNET_MODEL: process.env.MODEL,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: fastModel,
       ANTHROPIC_SMALL_FAST_MODEL: fastModel,
-      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       CLAUDE_CODE_AUTO_MODE_SERVER: "0",
       NO_PROXY: "127.0.0.1,localhost,::1",
@@ -359,6 +373,11 @@ sync_claude_settings() {
       "claude-sonnet-4-6": process.env.MODEL,
       "claude-haiku-4-5-20251001": fastModel,
     };
+    for (const [alias, target] of Object.entries(cfg.modelOverrides)) {
+      addCompactWindow(alias, compactLimits.get(target) || 110000);
+    }
+    cfg.autoCompactWindow = 110000;
+    cfg.modelSettings = modelSettings;
     cfg.modelPicker = { replaceBuiltInOptions: true, options };
     const json = JSON.stringify(cfg, null, 2);
     fs.writeFileSync(process.env.SETTINGS_PATH, json, "utf8");
@@ -386,17 +405,35 @@ if os.environ.get("EXPLICIT_FAST_MODEL") != "1":
         fast_model = flash[0]
 
 options = []
+model_settings = {}
+compact_limits = {}
+def add_compact_window(mid, limit):
+    previous = model_settings.get(mid, {}).get("autoCompactWindow", limit)
+    model_settings[mid] = {"autoCompactWindow": min(previous, limit)}
+
 for m in data:
     mid = str(m.get("id", ""))
     lower = mid.lower()
-    if "flash-low" in lower:
+    if lower.startswith("gpt-oss"):
         behaves_as = "claude-haiku-4-5-20251001"
+    elif lower.startswith("gemini-"):
+        if "flash-low" in lower:
+            behaves_as = "claude-haiku-5-5"
+        elif "sonnet" in lower or lower.endswith("-medium"):
+            behaves_as = "claude-sonnet-5-5"
+        else:
+            behaves_as = "claude-opus-5-5"
     elif "sonnet" in lower or lower.endswith("-medium"):
         behaves_as = "claude-sonnet-4-6"
     else:
         behaves_as = "claude-opus-4-6"
     cw = m.get("context_window")
-    ctx = f"{round(int(cw) / 1000)}k ctx" if cw and int(cw) > 0 else "1000k ctx"
+    ctx = f"{round(int(cw) / 1000)}k ctx" if cw and int(cw) > 0 else "unknown ctx"
+    limit = m.get("auto_compact_token_limit")
+    limit = min(limit, 1000000) if isinstance(limit, int) and limit >= 100000 else 110000
+    compact_limits[mid] = limit
+    add_compact_window(mid, limit)
+    add_compact_window(behaves_as, limit)
     options.append({
         "model": mid,
         "label": m.get("display_name") or mid,
@@ -413,7 +450,6 @@ env_obj = {
     "ANTHROPIC_DEFAULT_SONNET_MODEL": os.environ["MODEL"],
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": fast_model,
     "ANTHROPIC_SMALL_FAST_MODEL": fast_model,
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
     "NO_PROXY": "127.0.0.1,localhost,::1",
@@ -437,6 +473,10 @@ cfg["modelOverrides"] = {
     "claude-sonnet-4-6": os.environ["MODEL"],
     "claude-haiku-4-5-20251001": fast_model,
 }
+for alias, target in cfg["modelOverrides"].items():
+    add_compact_window(alias, compact_limits.get(target, 110000))
+cfg["autoCompactWindow"] = 110000
+cfg["modelSettings"] = model_settings
 cfg["modelPicker"] = {"replaceBuiltInOptions": True, "options": options}
 payload = json.dumps(cfg, ensure_ascii=False, indent=2)
 for p in (os.environ["SETTINGS_PATH"], os.environ["LOCAL_SETTINGS_PATH"]):
@@ -501,8 +541,6 @@ model = "${MODEL}"
 model_provider = "agy"
 model_catalog_json = "${CODEX_CATALOG_PATH}"
 ${CODEX_BYPASS_LINES}web_search = "live"
-model_context_window = 1000000
-model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
 name = "Liftgate"
@@ -525,7 +563,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="${MODEL}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${MODEL}"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="${FAST_MODEL}"
 export ANTHROPIC_SMALL_FAST_MODEL="${FAST_MODEL}"
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
+unset CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
 export CLAUDE_CODE_AUTO_MODE_SERVER="0"
 export AGY_GATEWAY_API_KEY="${API_KEY}"
@@ -546,7 +584,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="${MODEL}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${MODEL}"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="${FAST_MODEL}"
 export ANTHROPIC_SMALL_FAST_MODEL="${FAST_MODEL}"
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
+unset CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
 export CLAUDE_CODE_AUTO_MODE_SERVER="0"
 export AGY_GATEWAY_API_KEY="${API_KEY}"
@@ -599,8 +637,6 @@ if [[ "${LAUNCH_CODEX}" -eq 1 ]]; then
   CODEX_LAUNCH_ARGS+=(
     "-c" "model_catalog_json='${CODEX_CATALOG_PATH}'"
     "-c" "web_search='live'"
-    "-c" "model_context_window=1000000"
-    "-c" "model_auto_compact_token_limit=850000"
     "-c" "model_providers.agy.name='Liftgate'"
     "-c" "model_providers.agy.base_url='${GW_URL}/v1'"
     "-c" "model_providers.agy.env_key='AGY_GATEWAY_API_KEY'"

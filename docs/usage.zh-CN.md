@@ -89,6 +89,32 @@ liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
 - 注入的环境变量与临时配置目录（位于 `~/.liftgate/ephemeral/`）仅对子进程生效，进程退出时立即自动删除。
 - 默认开启全自动免确认模式（Codex 传 `--dangerously-bypass-approvals-and-sandbox`，Claude Code 传 `--dangerously-skip-permissions`）；加 `--no-bypass`（或显式传入权限/沙箱参数）即可保留常规权限确认。
 
+## 上下文窗口与超长上下文选项
+
+推荐通过 `lg cx` 或 `lg cc` 读取运行中网关的上下文策略。默认复用热 ACP 会话，由客户端提前压缩，不插入 Flash 预灌回合：
+
+| 模型系列 | 声明窗口 | 自动压缩阈值 |
+| --- | --- | --- |
+| Gemini | 280,000 | 245,000 |
+| Claude | 200,000 | 170,000 |
+| GPT-OSS | 128,000 | 110,000 |
+
+这是网关的运行窗口，并非模型宣传的原生容量，目的是为实测约 300k–320k tokens 的上游压缩行为留出余量。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
+
+每次 ACP 请求有 160,000 字节的文本预算。冷启动回放可能带标记缩减旧历史；当前输入本身放不下时返回 `400`，不会静默裁掉它。此时应拆分输入、缩短工具结果，或用简洁交接摘要启动新会话。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
+
+超长上下文是需要显式开启的实验功能：
+
+```bash
+lg start --long-context          # 网关尚未运行时开启
+lg restart --long-context        # 已运行的托管网关切换到实验模式
+lg restart --long-context=false  # 恢复稳妥默认模式
+```
+
+也可在启动网关前设置 `AGY_LONG_CONTEXT=true`，或在 `~/.liftgate/settings.json` 添加 `"long_context": true`，用于 `lg stop` 后的下一次 `lg start`。裸 `lg restart` 会保留当前守护进程的模式；已有服务应明确执行 `lg restart --long-context` 或 `lg restart --long-context=false` 切换。随后重新打开客户端；使用持久配置文件时，再执行 `lg config` 更新文件。
+
+实验模式为 Gemini 声明 `1M / 850k`，通过有数量和大小上限的 Flash 回合预灌较长历史，会增加调用并产生合成确认消息。它**不能绕过上游自动压缩，也不保证保留 1M 对话**。超过分片容量，或在预灌过程中检测到上游压缩时，返回不可重试的 `400`，避免掉段或重复重放。Claude 与 GPT-OSS 在此模式下仍保持较小窗口。
+
 ## 快捷生成本地或全局配置文件（`liftgate config`）
 
 如果你希望直接输入裸命令 `claude` 或 `codex` 使用网关，可用 `liftgate config`（别名 `liftgate setup`）一键生成或无损合并本地/全局配置文件：
@@ -151,7 +177,7 @@ liftgate config --uninstall         # 精准清理 Liftgate 写入的配置项�
 
 ## Codex CLI
 
-**1. 导出模型目录**（可选，推荐），让 Codex 的 `/model` 菜单列出全部 Antigravity 模型及其上下文窗口：
+推荐使用 `lg cx` 自动配置。手动接入时，**1. 导出模型目录**，让 Codex 的 `/model` 获取正确的逐模型窗口与压缩策略：
 
 ```bash
 mkdir -p ~/.codex
@@ -171,8 +197,6 @@ model_provider = "agy"
 # 第一步导出的绝对路径；Windows 请用正斜杠，如 "C:/Users/你的用户名/.codex/agy-models.json"
 model_catalog_json = "/Users/你的用户名/.codex/agy-models.json"
 web_search = "live"
-model_context_window = 1000000
-model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
 name = "Liftgate"
@@ -184,16 +208,18 @@ wire_api = "responses"
 
 **3. 运行 `codex`。** 如果终端开启了 HTTP 代理，先让本地回环地址绕过代理：`export NO_PROXY="127.0.0.1,localhost,::1"`。
 
+迁移已有配置时，删除旧的统一 `model_context_window` / `model_auto_compact_token_limit` 覆盖值，或重新执行 `lg config codex --global` 更新托管配置项。新版模型目录的 `max_context_window` 也会在当前 Codex 版本中限制旧全局覆盖；旧客户端可能不支持此上限，仍建议清理残留覆盖。导出的模型目录应与网关当前模式保持一致。
+
 ## Claude Code
 
-只对当前终端生效：
+推荐使用 `lg cc` 获取逐模型设置。下列手工示例对所有模型采用保守的 110k 自动压缩窗口，仅作用于当前终端：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local-agy"
 export ANTHROPIC_MODEL="gemini-4-carbon-high"
 export ANTHROPIC_SMALL_FAST_MODEL="gemini-3.8-flash-low"
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="110000"
 export NO_PROXY="127.0.0.1,localhost,::1"
 claude
 ```
@@ -203,7 +229,7 @@ $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 $env:ANTHROPIC_AUTH_TOKEN = "local-agy"
 $env:ANTHROPIC_MODEL = "gemini-4-carbon-high"
 $env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-3.8-flash-low"
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "1000000"
+$env:CLAUDE_CODE_AUTO_COMPACT_WINDOW = "110000"
 $env:NO_PROXY = "127.0.0.1,localhost,::1"
 claude
 ```
@@ -218,7 +244,7 @@ claude
     "ANTHROPIC_AUTH_TOKEN": "local-agy",
     "ANTHROPIC_MODEL": "gemini-4-carbon-high",
     "ANTHROPIC_SMALL_FAST_MODEL": "gemini-3.8-flash-low",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
     "NO_PROXY": "127.0.0.1,localhost,::1"
   }
 }
@@ -244,6 +270,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--agy-bin` | `AGY_BIN` | 从 `PATH` 或标准安装位置查找 |
 | `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
+| `--long-context[=true\|false]` | `AGY_LONG_CONTEXT` | `false`（或读取 `~/.liftgate/settings.json` 中的 `long_context`） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |

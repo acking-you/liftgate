@@ -97,6 +97,7 @@ impl Drop for ActiveTurnStream {
 /// Shared gateway runtime configuration.
 #[derive(Clone, Debug)]
 pub struct GatewayRuntimeConfig {
+    pub long_context: bool,
     pub default_model: ModelId,
     pub acp_mode: AcpModeId,
     pub api_key: Option<Arc<str>>,
@@ -192,7 +193,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     guard.tool_nonce(),
                     false,
                     tools_delta.as_deref(),
-                );
+                    cfg.long_context,
+                )?;
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -250,7 +252,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     guard.tool_nonce(),
                     false,
                     tools_delta.as_deref(),
-                );
+                    cfg.long_context,
+                )?;
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -303,7 +306,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     guard.tool_nonce(),
                     false,
                     directive.as_deref(),
-                );
+                    cfg.long_context,
+                )?;
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -362,7 +366,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             Arc::clone(&backend),
         );
 
-        let plan = build_acp_prompt_plan(&req.messages, guard.tool_nonce(), true, None);
+        let plan = build_acp_prompt_plan(
+            &req.messages,
+            guard.tool_nonce(),
+            true,
+            None,
+            cfg.long_context,
+        )?;
         let initial_rpc_model = if plan.seed_chunks.is_empty() {
             &resolved_model
         } else {
@@ -555,6 +565,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     let max_fetch_uses = req.web_fetch_max_uses.unwrap_or(5).clamp(1, 10) as usize;
     let mut completed_web_fetches: usize = 0;
     let mut cumulative_usage = AcpUsage::default();
+    let mut context_usage: AcpUsage;
     let mut final_stop_reason = "end_turn".to_owned();
     let AcpPromptPlan {
         seed_chunks,
@@ -587,6 +598,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 &cancel,
             )
             .await
+            .map(|usage| accumulate_usage(&mut cumulative_usage, usage))
             {
                 if matches!(err, AcpError::Cancelled) {
                     return;
@@ -865,6 +877,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 }
 
                 accumulate_usage(&mut cumulative_usage, turn_res.usage);
+                context_usage = turn_res.usage;
                 if !turn_res.stop_reason.is_empty() {
                     final_stop_reason = turn_res.stop_reason;
                 }
@@ -1033,10 +1046,27 @@ async fn run_turn_pipeline<B: AcpBackend>(
         }
     }
 
+    // UsageUpdate is occupancy, not billable work. Use its pre-compaction peak as a
+    // lower bound, so a small warm delta or a post-turn reset cannot hide a full window.
+    let reported_input = context_usage
+        .input_tokens
+        .saturating_add(context_usage.cached_read_tokens)
+        .saturating_add(context_usage.cached_write_tokens);
+    let required_input = state
+        .peak_context_used
+        .saturating_sub(context_usage.output_tokens);
+    context_usage.input_tokens = context_usage
+        .input_tokens
+        .saturating_add(required_input.saturating_sub(reported_input));
+    context_usage.total_tokens = context_usage
+        .input_tokens
+        .saturating_add(context_usage.cached_read_tokens)
+        .saturating_add(context_usage.cached_write_tokens)
+        .saturating_add(context_usage.output_tokens);
     task_guard.complete(final_stop_reason.clone(), cumulative_usage);
     let _ = events_tx
         .send(TurnEvent::Completed {
-            usage: cumulative_usage,
+            usage: context_usage,
             stop_reason: final_stop_reason,
         })
         .await;
@@ -1069,7 +1099,7 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     timeout_secs: u64,
     channel_cap: usize,
     cancel: &CancellationToken,
-) -> Result<(), AcpError> {
+) -> Result<AcpUsage, AcpError> {
     let (seed_tx, mut seed_rx) = mpsc::channel::<SessionUpdatePayload>(channel_cap);
     let mut banner_filter = AcpBannerFilter::new();
     let mut sink = String::new();
@@ -1138,7 +1168,8 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     }
 
     match outcome {
-        Some(Ok(_)) => Ok(()),
+        Some(Ok(_)) if state.tainted_session => Err(AcpError::HydrationCompacted),
+        Some(Ok(result)) => Ok(result.usage),
         Some(Err(err)) => Err(err),
         None => Err(AcpError::TransportClosed),
     }
@@ -1383,7 +1414,8 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
         | AcpError::UpstreamQuotaExhausted { .. }
         | AcpError::UpstreamAgentTerminated { .. }
         | AcpError::EmptyUpstreamResponse { .. }
-        | AcpError::Cancelled => err,
+        | AcpError::Cancelled
+        | AcpError::HydrationCompacted => err,
     }
 }
 

@@ -23,9 +23,24 @@ pub struct DiscoveredModel {
     pub display_name: String,
     #[serde(default)]
     pub context_window: u64,
+    #[serde(default)]
+    pub auto_compact_token_limit: u64,
 }
 
 impl DiscoveredModel {
+    /// Uses the live gateway's complete context policy, or a conservative fallback for old servers.
+    #[must_use]
+    pub fn context_limits(&self, long_context: bool) -> (u64, u64) {
+        if self.auto_compact_token_limit >= 100_000
+            && self.auto_compact_token_limit <= self.context_window
+            && self.context_window <= 1_000_000
+        {
+            (self.context_window, self.auto_compact_token_limit)
+        } else {
+            liftgate_types::model::context_limits(&self.id, long_context)
+        }
+    }
+
     #[must_use]
     pub fn to_available_model(&self) -> AvailableModel {
         AvailableModel {

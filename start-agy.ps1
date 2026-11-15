@@ -177,6 +177,7 @@ $EnvKeys = @(
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_AUTO_MODE_SERVER",
     "OPENAI_BASE_URL",
@@ -569,6 +570,7 @@ $TrackedSessionEnvKeys = @(
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_AUTO_MODE_SERVER",
     "AGY_API_KEY",
@@ -759,7 +761,16 @@ try {
     }
 
     $pickerOptions = [System.Collections.Generic.List[object]]::new()
+    $modelSettings = [ordered]@{}
+    $compactLimits = @{}
     $midDot = [char]0x00B7
+
+    function Add-ModelCompactWindow([string]$ModelId, [long]$Limit) {
+        if ($modelSettings.Contains($ModelId)) {
+            $Limit = [math]::Min($Limit, [long]$modelSettings[$ModelId].autoCompactWindow)
+        }
+        $modelSettings[$ModelId] = [ordered]@{ autoCompactWindow = $Limit }
+    }
 
     foreach ($m in $modelsResp.data) {
         $id = [string]$m.id
@@ -767,16 +778,28 @@ try {
         $ctxK = if ($null -ne $m.context_window -and [long]$m.context_window -gt 0) {
             "$([math]::Round([double]$m.context_window / 1000))k ctx"
         } else {
-            "1000k ctx"
+            "unknown ctx"
         }
         $lower = $id.ToLowerInvariant()
-        $behavesAs = if ($lower.Contains("flash-low")) {
+        $behavesAs = if ($lower.StartsWith("gpt-oss")) {
             "claude-haiku-4-5-20251001"
+        } elseif ($lower.StartsWith("gemini-")) {
+            if ($lower.Contains("flash-low")) { "claude-haiku-5-5" }
+            elseif ($lower.Contains("sonnet") -or $lower.EndsWith("-medium")) { "claude-sonnet-5-5" }
+            else { "claude-opus-5-5" }
         } elseif ($lower.Contains("sonnet") -or $lower.EndsWith("-medium")) {
             "claude-sonnet-4-6"
         } else {
             "claude-opus-4-6"
         }
+        # Older gateways do not expose an auto-compact limit. Stay conservative
+        # rather than inferring a safe threshold from a possibly inflated window.
+        $limit = if ($null -ne $m.auto_compact_token_limit -and [long]$m.auto_compact_token_limit -ge 100000) {
+            [math]::Min([long]$m.auto_compact_token_limit, 1000000)
+        } else { 110000 }
+        $compactLimits[$id] = $limit
+        Add-ModelCompactWindow $id $limit
+        Add-ModelCompactWindow $behavesAs $limit
 
         $pickerOptions.Add([ordered]@{
             model       = $id
@@ -815,7 +838,6 @@ try {
         ANTHROPIC_DEFAULT_SONNET_MODEL            = $GatewayModel
         ANTHROPIC_DEFAULT_HAIKU_MODEL             = $FastModel
         ANTHROPIC_SMALL_FAST_MODEL                = $FastModel
-        CLAUDE_CODE_MAX_CONTEXT_TOKENS            = "1000000"
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC  = "1"
         CLAUDE_CODE_AUTO_MODE_SERVER              = "0"
         NO_PROXY                                  = "127.0.0.1,localhost,::1"
@@ -844,6 +866,12 @@ try {
         "claude-sonnet-4-6"         = $GatewayModel
         "claude-haiku-4-5-20251001" = $FastModel
     }
+    foreach ($entry in $settingsObj["modelOverrides"].GetEnumerator()) {
+        $limit = if ($compactLimits.ContainsKey([string]$entry.Value)) { $compactLimits[[string]$entry.Value] } else { 110000 }
+        Add-ModelCompactWindow ([string]$entry.Key) $limit
+    }
+    $settingsObj["autoCompactWindow"] = 110000
+    $settingsObj["modelSettings"] = $modelSettings
     $settingsObj["modelPicker"] = [ordered]@{
         replaceBuiltInOptions = $true
         options               = $pickerOptions
@@ -876,8 +904,6 @@ model = "$GatewayModel"
 model_provider = "agy"
 model_catalog_json = "$codexCatalogSlash"
 ${codexBypassLines}web_search = "live"
-model_context_window = 1000000
-model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
 name = "Liftgate"
@@ -894,9 +920,13 @@ wire_api = "responses"
     # ============================================================================
     Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:\AGY_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:\CLAUDE_CODE_MAX_CONTEXT_TOKENS -ErrorAction SilentlyContinue
+    Remove-Item Env:\CLAUDE_CODE_AUTO_COMPACT_WINDOW -ErrorAction SilentlyContinue
     if ($InstallEnv -and $IsWin) {
         Remove-ItemProperty -Path "HKCU:\Environment" -Name "ANTHROPIC_API_KEY" -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path "HKCU:\Environment" -Name "AGY_API_KEY" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKCU:\Environment" -Name "CLAUDE_CODE_MAX_CONTEXT_TOKENS" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKCU:\Environment" -Name "CLAUDE_CODE_AUTO_COMPACT_WINDOW" -ErrorAction SilentlyContinue
         $curOpenAiKey = (Get-ItemProperty -Path "HKCU:\Environment" -ErrorAction SilentlyContinue).OPENAI_API_KEY
         if ($curOpenAiKey -eq $ApiKey) {
             Remove-ItemProperty -Path "HKCU:\Environment" -Name "OPENAI_API_KEY" -ErrorAction SilentlyContinue
@@ -914,7 +944,6 @@ wire_api = "responses"
         ANTHROPIC_DEFAULT_SONNET_MODEL            = $GatewayModel
         ANTHROPIC_DEFAULT_HAIKU_MODEL             = $FastModel
         ANTHROPIC_SMALL_FAST_MODEL                = $FastModel
-        CLAUDE_CODE_MAX_CONTEXT_TOKENS            = "1000000"
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC  = "1"
         CLAUDE_CODE_AUTO_MODE_SERVER              = "0"
         AGY_GATEWAY_API_KEY                       = $ApiKey
@@ -934,7 +963,9 @@ wire_api = "responses"
 
     $shExportLines = @(
         "unset ANTHROPIC_API_KEY",
-        "unset AGY_API_KEY"
+        "unset AGY_API_KEY",
+        "unset CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "unset CLAUDE_CODE_AUTO_COMPACT_WINDOW"
     ) + @(foreach ($entry in $fullEnvMap.GetEnumerator()) {
         "export $($entry.Key)=`"$($entry.Value)`""
     })
@@ -1005,10 +1036,6 @@ wire_api = "responses"
         $codexLaunchArgs.Add("model_catalog_json='$codexCatalogSlash'")
         $codexLaunchArgs.Add("-c")
         $codexLaunchArgs.Add("web_search='live'")
-        $codexLaunchArgs.Add("-c")
-        $codexLaunchArgs.Add("model_context_window=1000000")
-        $codexLaunchArgs.Add("-c")
-        $codexLaunchArgs.Add("model_auto_compact_token_limit=850000")
         $codexLaunchArgs.Add("-c")
         $codexLaunchArgs.Add("model_providers.agy.name='Liftgate'")
         $codexLaunchArgs.Add("-c")

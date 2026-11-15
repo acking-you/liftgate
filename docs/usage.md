@@ -123,6 +123,53 @@ liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
   for Codex, `--dangerously-skip-permissions` for Claude Code); pass
   `--no-bypass` (or explicit permission/sandbox flags) to keep standard prompts.
 
+## Context windows and long context
+
+Use `lg cx` or `lg cc` to load the running gateway's context policy. The default
+mode uses warm ACP sessions and client-side compaction without Flash seed turns:
+
+| Model family | Declared window | Auto-compact threshold |
+| --- | --- | --- |
+| Gemini | 280,000 | 245,000 |
+| Claude | 200,000 | 170,000 |
+| GPT-OSS | 128,000 | 110,000 |
+
+These are gateway limits, not the models' advertised native capacities. They
+leave room before the upstream compaction observed around 300k–320k tokens.
+Codex reads the policy per model from its catalog. Claude Code uses
+`modelSettings.autoCompactWindow` (requires v2.1.288 or later); when several
+gateway models share a canonical Claude name, the smaller threshold wins.
+That can compact sooner than the table. See the official
+[Claude context settings](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction).
+
+Every ACP prompt has a 160,000-byte text budget. Cold replays may shorten old
+history with explicit markers. Current input that cannot fit is rejected with
+`400`; split a large input, reduce a tool result, or start from a concise handoff.
+Client `/compact` reuses a matching warm session before retiring it.
+
+Long-context hydration is experimental and must be enabled explicitly:
+
+```bash
+lg start --long-context          # when the gateway is stopped
+lg restart --long-context        # enable on a running managed gateway
+lg restart --long-context=false  # return to conservative defaults
+```
+
+Alternatively set `AGY_LONG_CONTEXT=true` before starting the gateway, or add
+`"long_context": true` to `~/.liftgate/settings.json` for future starts after
+`lg stop` and `lg start`. A plain `lg restart` preserves the running daemon's
+mode; use the explicit `lg restart --long-context` or
+`lg restart --long-context=false` commands to change it. Relaunch the client; regenerate
+persisted client files with `lg config` if you use those instead of `lg cx` / `lg cc`.
+
+This mode advertises `1M / 850k` for Gemini and sends larger histories through
+bounded Flash seed turns, with extra calls and synthetic acknowledgements.
+It **cannot bypass upstream automatic compaction or guarantee a 1M retained
+conversation**. Exceeding the chunk capacity, or detecting upstream compaction
+during hydration, returns a non-retryable `400` rather than dropping segments or
+continually replaying the same history. Claude and GPT-OSS retain their smaller
+windows in this mode.
+
 ## Configure local or global client files (`liftgate config`)
 
 If you prefer running bare `claude` or `codex` directly, let `liftgate config`
@@ -204,8 +251,8 @@ to the process it launches; when that exits, your shell is as it was.
 
 ## Codex CLI
 
-**1. Export the model catalog** (optional, recommended) so `/model` in Codex
-lists every Antigravity model with its context window:
+Prefer `lg cx` for automatic configuration. For manual setup, **1. export the
+model catalog** so `/model` has the correct per-model window and compaction policy:
 
 ```bash
 mkdir -p ~/.codex
@@ -225,8 +272,6 @@ model_provider = "agy"
 # Absolute path from step 1; on Windows use forward slashes, e.g. "C:/Users/you/.codex/agy-models.json"
 model_catalog_json = "/Users/you/.codex/agy-models.json"
 web_search = "live"
-model_context_window = 1000000
-model_auto_compact_token_limit = 850000
 
 [model_providers.agy]
 name = "Liftgate"
@@ -239,16 +284,24 @@ wire_api = "responses"
 **3. Run `codex`.** Behind an HTTP proxy, keep loopback off it first:
 `export NO_PROXY="127.0.0.1,localhost,::1"`.
 
+Remove old blanket `model_context_window` / `model_auto_compact_token_limit`
+overrides when migrating an existing setup, or rerun `lg config codex --global`
+to update the managed keys. The new catalog's `max_context_window` also caps
+old global overrides in current Codex versions; older clients may not honor
+that cap, so clearing stale overrides is still recommended. Keep the exported
+catalog synchronized with the gateway's current mode.
+
 ## Claude Code
 
-Set the variables for one shell:
+Prefer `lg cc` for model-specific settings. This manual example uses a
+conservative 110k auto-compact window for every model. Set the variables for one shell:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local-agy"
 export ANTHROPIC_MODEL="gemini-4-carbon-high"
 export ANTHROPIC_SMALL_FAST_MODEL="gemini-3.8-flash-low"
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="110000"
 export NO_PROXY="127.0.0.1,localhost,::1"
 claude
 ```
@@ -258,7 +311,7 @@ $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 $env:ANTHROPIC_AUTH_TOKEN = "local-agy"
 $env:ANTHROPIC_MODEL = "gemini-4-carbon-high"
 $env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-3.8-flash-low"
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "1000000"
+$env:CLAUDE_CODE_AUTO_COMPACT_WINDOW = "110000"
 $env:NO_PROXY = "127.0.0.1,localhost,::1"
 claude
 ```
@@ -274,7 +327,7 @@ Or keep them in `~/.claude/settings.json` (or a project's
     "ANTHROPIC_AUTH_TOKEN": "local-agy",
     "ANTHROPIC_MODEL": "gemini-4-carbon-high",
     "ANTHROPIC_SMALL_FAST_MODEL": "gemini-3.8-flash-low",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
     "NO_PROXY": "127.0.0.1,localhost,::1"
   }
 }
@@ -308,6 +361,7 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
 | `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
+| `--long-context[=true\|false]` | `AGY_LONG_CONTEXT` | `false` (or `long_context` in `~/.liftgate/settings.json`) |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |

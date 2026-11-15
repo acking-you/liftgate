@@ -54,6 +54,7 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         primary_model: primary_model.clone(),
         fast_model: fast_model.clone(),
         no_bypass: args.no_bypass,
+        long_context: false,
         discovered_models: discovered,
     };
     let settings_map = build_claude_settings_map(&sync_params);
@@ -108,7 +109,8 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &primary_model)
         .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &fast_model)
         .env("ANTHROPIC_SMALL_FAST_MODEL", &fast_model)
-        .env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1000000")
+        .env_remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
         .env("NO_PROXY", &no_proxy)
@@ -145,7 +147,7 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         Ok(bytes) => bytes,
         Err(_) => {
             let discovered = target.client.fetch_models().await.unwrap_or_default();
-            build_offline_codex_catalog_bytes(&discovered, &primary_model)?
+            build_offline_codex_catalog_bytes(&discovered, &primary_model, false)?
         }
     };
 
@@ -192,10 +194,6 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .arg(format!("model_catalog_json={toml_catalog}"))
         .arg("-c")
         .arg("web_search='live'")
-        .arg("-c")
-        .arg("model_context_window=1000000")
-        .arg("-c")
-        .arg("model_auto_compact_token_limit=850000")
         .arg("-c")
         .arg("model_providers.agy.name='Liftgate'")
         .arg("-c")

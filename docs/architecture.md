@@ -55,11 +55,32 @@ warm ACP sessions (`--max-idle-sessions`, default 64). On a hit it sends only
 the new turn or tool results (plus an incremental `<client_tools_update>` if
 tools changed, or `session/set_model` if effort/model changed). Local `/compact`
 summarization turns match the warm coding session via a dialogue hash and retire
-it cleanly afterward. On a cold replay exceeding `160 KB` (`agy acp`'s
-`191,578`-byte single-turn limit), Liftgate hydrates up to `~900 KB` losslessly
-across fast Flash seed turns before switching the session to the target model,
-and retires any session where `UsageUpdate` indicates post-turn backend
-compaction.
+it cleanly afterward.
+
+The default mode sends one ACP prompt per client step, with a `160,000`-byte
+text budget below the observed upstream single-turn truncation boundary. It
+does not insert Flash seed turns. A cold replay can trim older history with
+explicit archive markers while preserving the current input; if that current
+input cannot fit, the gateway returns `400` instead of silently cutting it.
+Warm sessions continue receiving only the incremental input.
+
+Model metadata and generated client settings use conservative context and
+auto-compact limits: Gemini `280k / 245k`, Claude `200k / 170k`, and GPT-OSS
+`128k / 110k`. Codex uses per-model catalog entries, and Claude Code uses
+per-model `autoCompactWindow` settings. Canonical Claude aliases shared by
+several gateway models take the smallest limit. These settings aim to trigger
+client compaction before the upstream compaction observed around `300k–320k`;
+they do not change that upstream policy.
+
+Only explicit `--long-context` enables Flash hydration and Gemini's experimental
+`1M / 850k` metadata. Histories are split across bounded Flash seed turns in the
+same ACP session before switching to the requested model. This introduces
+synthetic acknowledgements and extra calls, and cannot preserve more history
+than upstream compaction permits. Inputs beyond the bounded chunk capacity
+return `400`. If `UsageUpdate` detects compaction during hydration, the request
+fails with a non-retryable `400` and the session is retired, preventing a replay
+loop. Post-turn compaction during ordinary inference retires the session after
+delivering the current response. See [context configuration](usage.md#context-windows-and-long-context).
 
 ### Streaming
 

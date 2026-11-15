@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use liftgate_server::platform::{canonicalize_clean, merge_loopback_no_proxy};
 use liftgate_types::{
-    config::ModelId, model::select_fastest_gemini_model, openai::build_codex_model_catalog,
+    config::ModelId,
+    model::{context_limits, select_fastest_gemini_model},
+    openai::build_codex_model_catalog,
 };
 use serde_json::{Map, Value, json};
 
@@ -27,6 +29,7 @@ const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_AUTO_MODE_SERVER",
     "NO_PROXY",
@@ -52,6 +55,7 @@ pub struct HarnessSyncParams {
     pub primary_model: String,
     pub fast_model: String,
     pub no_bypass: bool,
+    pub long_context: bool,
     pub discovered_models: Vec<DiscoveredModel>,
 }
 
@@ -90,6 +94,7 @@ pub fn build_claude_settings_map(params: &HarnessSyncParams) -> Map<String, Valu
 /// Non-destructively merges Liftgate's Claude Code configuration into `existing`, preserving any
 /// unrelated user settings (`hooks`, `mcpServers`, `enabledPlugins`, custom `env` entries).
 pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &HarnessSyncParams) {
+    strip_managed_claude_context(existing);
     existing.insert(
         "model".to_owned(),
         Value::String(params.primary_model.clone()),
@@ -166,10 +171,9 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             "ANTHROPIC_SMALL_FAST_MODEL".to_owned(),
             Value::String(params.fast_model.clone()),
         );
-        env_map.insert(
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_owned(),
-            Value::String("1000000".to_owned()),
-        );
+        // A process-wide override defeats per-model compaction on switches and subagents.
+        env_map.remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+        env_map.remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
         env_map.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_owned(),
             Value::String("1".to_owned()),
@@ -200,7 +204,8 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         vec![DiscoveredModel {
             id: params.primary_model.clone(),
             display_name: params.primary_model.clone(),
-            context_window: 1_000_000,
+            context_window: 0,
+            auto_compact_token_limit: 0,
         }]
     } else {
         params.discovered_models.clone()
@@ -210,18 +215,22 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         .iter()
         .map(|m| {
             let lower = m.id.to_ascii_lowercase();
-            let behaves_as = if lower.contains("flash-low") {
+            let behaves_as = if lower.starts_with("gpt-oss") {
                 "claude-haiku-4-5-20251001"
+            } else if lower.starts_with("gemini-") {
+                if lower.contains("flash-low") {
+                    "claude-haiku-5-5"
+                } else if lower.ends_with("-medium") {
+                    "claude-sonnet-5-5"
+                } else {
+                    "claude-opus-5-5"
+                }
             } else if lower.contains("sonnet") || lower.ends_with("-medium") {
                 "claude-sonnet-4-6"
             } else {
                 "claude-opus-4-6"
             };
-            let ctx_k = if m.context_window > 0 {
-                format!("{}k ctx", m.context_window / 1_000)
-            } else {
-                "1000k ctx".to_owned()
-            };
+            let ctx_k = format!("{}k ctx", m.context_limits(params.long_context).0 / 1_000);
             let label = if m.display_name.is_empty() {
                 m.id.clone()
             } else {
@@ -243,10 +252,121 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             "options": options,
         }),
     );
+    merge_claude_context_settings(existing, params);
+}
+
+/// Claude resolves modelSettings through canonical model names. Cover both exact gateway IDs
+/// and every canonical alias, taking the smallest window when several IDs share a capability map.
+fn merge_claude_context_settings(existing: &mut Map<String, Value>, params: &HarnessSyncParams) {
+    let mut windows = std::collections::BTreeMap::<String, u64>::new();
+    let resolve = |id: &str| {
+        params
+            .discovered_models
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(
+                || context_limits(id, params.long_context).1,
+                |m| m.context_limits(params.long_context).1,
+            )
+    };
+    let mut add = |id: &str, limit: u64| {
+        windows
+            .entry(id.to_owned())
+            .and_modify(|old| *old = (*old).min(limit))
+            .or_insert(limit);
+    };
+    for id in [&params.primary_model, &params.fast_model] {
+        add(id, resolve(id));
+    }
+    if let Some(Value::Array(options)) = existing.get("modelPicker").and_then(|v| v.get("options"))
+    {
+        for option in options {
+            if let Some(id) = option.get("model").and_then(Value::as_str) {
+                let limit = resolve(id);
+                add(id, limit);
+                if let Some(canonical) = option.get("behavesAs").and_then(Value::as_str) {
+                    add(canonical, limit);
+                }
+            }
+        }
+    }
+    if let Some(Value::Object(overrides)) = existing.get("modelOverrides") {
+        for (canonical, id) in overrides {
+            if let Some(id) = id.as_str() {
+                add(canonical, resolve(id));
+            }
+        }
+    }
+    // Applies to unlisted models; known models override it in the same settings scope.
+    existing.insert("autoCompactWindow".to_owned(), json!(110_000));
+    let settings = existing.entry("modelSettings").or_insert_with(|| json!({}));
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    if let Value::Object(settings) = settings {
+        for (id, limit) in windows {
+            let model = settings.entry(id).or_insert_with(|| json!({}));
+            if !model.is_object() {
+                *model = json!({});
+            }
+            if let Value::Object(model) = model {
+                model.insert("autoCompactWindow".to_owned(), json!(limit));
+            }
+        }
+    }
+}
+
+/// Remove only the context fields associated with our saved picker and routing map.
+fn strip_managed_claude_context(existing: &mut Map<String, Value>) {
+    let mut ids = Vec::new();
+    if let Some(Value::Array(options)) = existing.get("modelPicker").and_then(|v| v.get("options"))
+    {
+        for option in options {
+            if !option
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("Antigravity ACP"))
+            {
+                continue;
+            }
+            for key in ["model", "behavesAs"] {
+                if let Some(id) = option.get(key).and_then(Value::as_str) {
+                    ids.push(id.to_owned());
+                }
+            }
+        }
+    }
+    if !ids.is_empty()
+        && let Some(Value::Object(overrides)) = existing.get("modelOverrides")
+    {
+        for (canonical, id) in overrides {
+            ids.push(canonical.clone());
+            if let Some(id) = id.as_str() {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    if let Some(Value::Object(settings)) = existing.get_mut("modelSettings") {
+        for id in ids {
+            if let Some(Value::Object(model)) = settings.get_mut(&id) {
+                model.remove("autoCompactWindow");
+                if model.is_empty() {
+                    settings.remove(&id);
+                }
+            }
+        }
+        if settings.is_empty() {
+            existing.remove("modelSettings");
+        }
+    }
+    if existing.get("autoCompactWindow").and_then(Value::as_u64) == Some(110_000) {
+        existing.remove("autoCompactWindow");
+    }
 }
 
 /// Removes Liftgate-managed keys from a Claude Code settings JSON map.
 pub fn strip_claude_settings(existing: &mut Map<String, Value>) {
+    strip_managed_claude_context(existing);
     existing.remove("modelOverrides");
     existing.remove("modelPicker");
     existing.remove("skipDangerousModePermissionPrompt");
@@ -333,12 +453,23 @@ pub fn uninstall_claude_config(target_path: &Path) -> Result<bool, CliError> {
 pub fn build_offline_codex_catalog_bytes(
     discovered: &[DiscoveredModel],
     primary_model: &str,
+    long_context: bool,
 ) -> Result<Vec<u8>, CliError> {
     let available: Vec<_> = discovered
         .iter()
         .map(DiscoveredModel::to_available_model)
         .collect();
-    let catalog = build_codex_model_catalog(&available, primary_model);
+    let mut catalog = build_codex_model_catalog(&available, primary_model, long_context);
+    for entry in &mut catalog.models {
+        if let Some(model) = discovered.iter().find(|m| m.id == entry.slug) {
+            let (window, compact) = model.context_limits(long_context);
+            entry.context_window = i64::try_from(window).unwrap_or(i64::MAX);
+            entry.max_context_window = entry.context_window;
+            entry.auto_compact_token_limit = i64::try_from(compact).unwrap_or(i64::MAX);
+            entry.description =
+                format!("{}k ctx · Antigravity ACP ({})", window / 1_000, entry.slug);
+        }
+    }
     let mut bytes = serde_json::to_vec_pretty(&catalog).map_err(|source| CliError::StateJson {
         path: PathBuf::from("codex-models.json"),
         source,
@@ -402,8 +533,6 @@ pub fn merge_codex_config_toml(
         out.push_str("sandbox_mode = \"danger-full-access\"\n");
     }
     out.push_str("web_search = \"live\"\n");
-    out.push_str("model_context_window = 1000000\n");
-    out.push_str("model_auto_compact_token_limit = 850000\n");
 
     let stripped_tables = remove_toml_section(tables_part, "model_providers.agy");
     let trimmed_tables = stripped_tables.trim();
@@ -586,6 +715,15 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
 
     let daemon = state_paths.read_daemon()?;
     let default_serve = ServeArgs::default();
+    let long_context = if live_target.is_some() {
+        // Live discovery below carries the running gateway's policy. Never let saved preferences
+        // turn a missing/old live policy into an experimental one.
+        false
+    } else {
+        default_serve
+            .long_context
+            .unwrap_or(state_paths.read_settings()?.long_context)
+    };
     let resolved_listen = args
         .listen
         .or_else(|| daemon.as_ref().map(|d| d.listen))
@@ -634,6 +772,7 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
             primary_model: primary_model.clone(),
             fast_model: fast_model.clone(),
             no_bypass: args.no_bypass,
+            long_context,
             discovered_models: discovered_models.clone(),
         };
         let rendered = write_or_update_claude_config(&claude_path, &sync_params, args.print)?;
@@ -655,10 +794,14 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
         let catalog_bytes = if let Some(t) = &live_target {
             match t.client.fetch_codex_catalog_json(&primary_model).await {
                 Ok(bytes) => bytes,
-                Err(_) => build_offline_codex_catalog_bytes(&discovered_models, &primary_model)?,
+                Err(_) => build_offline_codex_catalog_bytes(
+                    &discovered_models,
+                    &primary_model,
+                    long_context,
+                )?,
             }
         } else {
-            build_offline_codex_catalog_bytes(&discovered_models, &primary_model)?
+            build_offline_codex_catalog_bytes(&discovered_models, &primary_model, long_context)?
         };
 
         let rendered = write_or_update_codex_config(&CodexSyncRequest {
@@ -819,8 +962,14 @@ mod tests {
     fn claude_settings_merge_and_uninstall_preserve_unrelated_user_keys() {
         let mut existing: Map<String, Value> = serde_json::from_value(json!({
             "alwaysThinkingEnabled": true,
+            "modelSettings": {
+                "gemini-4-carbon-high": { "effortLevel": "high" },
+                "unrelated-model": { "autoCompactWindow": 450000, "effortLevel": "low" }
+            },
             "env": {
-                "CUSTOM_USER_VAR": "keep-me"
+                "CUSTOM_USER_VAR": "keep-me",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000"
             }
         }))
         .unwrap();
@@ -831,10 +980,12 @@ mod tests {
             primary_model: "gemini-4-carbon-high".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: false,
+            long_context: false,
             discovered_models: vec![DiscoveredModel {
                 id: "gemini-4-carbon-high".to_owned(),
                 display_name: "Gemini 4 Carbon (High)".to_owned(),
-                context_window: 1_000_000,
+                context_window: 280_000,
+                auto_compact_token_limit: 245_000,
             }],
         };
 
@@ -847,6 +998,23 @@ mod tests {
         );
         assert_eq!(existing["model"], "gemini-4-carbon-high");
         assert_eq!(existing["skipDangerousModePermissionPrompt"], true);
+        assert!(
+            existing["env"]
+                .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .is_none()
+        );
+        assert!(
+            existing["env"]
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .is_none()
+        );
+        assert_eq!(
+            existing["modelSettings"]["gemini-4-carbon-high"]["autoCompactWindow"],
+            245000
+        );
+        let merged_once = existing.clone();
+        merged_claude_settings_into(&mut existing, &params);
+        assert_eq!(existing, merged_once);
 
         let mut standard_perms = params.clone();
         standard_perms.no_bypass = true;
@@ -859,11 +1027,84 @@ mod tests {
         assert_eq!(existing["env"]["CUSTOM_USER_VAR"], "keep-me");
         assert!(existing["env"].get("ANTHROPIC_BASE_URL").is_none());
         assert!(existing.get("modelOverrides").is_none());
+        assert_eq!(
+            existing["modelSettings"]["gemini-4-carbon-high"]["effortLevel"],
+            "high"
+        );
+        assert!(
+            existing["modelSettings"]["gemini-4-carbon-high"]
+                .get("autoCompactWindow")
+                .is_none()
+        );
+        assert_eq!(
+            existing["modelSettings"]["unrelated-model"]["autoCompactWindow"],
+            450000
+        );
+        assert!(existing.get("autoCompactWindow").is_none());
+    }
+
+    #[test]
+    fn context_policy_tracks_live_models_and_limits_shared_claude_aliases() {
+        let models: Vec<DiscoveredModel> = serde_json::from_value(json!([
+            {"id": "gemini-4-carbon-high", "context_window": 1000000, "auto_compact_token_limit": 850000},
+            {"id": "gemini-3.8-flash-low", "context_window": 1000000, "auto_compact_token_limit": 850000},
+            {"id": "gpt-oss-120b", "context_window": 128000, "auto_compact_token_limit": 110000},
+            {"id": "claude-opus-5-5", "context_window": 200000, "auto_compact_token_limit": 170000}
+        ])).unwrap();
+        let params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-3.8-flash-low".to_owned(),
+            no_bypass: true,
+            long_context: false,
+            discovered_models: models,
+        };
+        let settings = build_claude_settings_map(&params);
+        assert_eq!(settings["autoCompactWindow"], 110000);
+        assert_eq!(
+            settings["modelSettings"]["gemini-4-carbon-high"]["autoCompactWindow"],
+            850000
+        );
+        // The shared canonical ID must honor the smaller real Claude deployment.
+        assert_eq!(
+            settings["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"],
+            170000
+        );
+        assert_eq!(
+            settings["modelSettings"]["claude-haiku-4-5-20251001"]["autoCompactWindow"],
+            110000
+        );
+        assert_eq!(
+            settings["modelSettings"]["gpt-oss-120b"]["autoCompactWindow"],
+            110000
+        );
+        let catalog: Value = serde_json::from_slice(
+            &build_offline_codex_catalog_bytes(
+                &params.discovered_models,
+                &params.primary_model,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog_models = catalog["models"].as_array().unwrap();
+        let gemini = catalog_models
+            .iter()
+            .find(|m| m["slug"] == params.primary_model)
+            .unwrap();
+        assert_eq!(gemini["context_window"], 1000000);
+        assert_eq!(gemini["auto_compact_token_limit"], 850000);
+        let legacy: DiscoveredModel = serde_json::from_value(json!({
+            "id": "gemini-4-carbon-high", "context_window": 1000000
+        }))
+        .unwrap();
+        assert_eq!(legacy.context_limits(false), (280000, 245000));
     }
 
     #[test]
     fn codex_toml_merge_is_idempotent_keeps_root_before_tables_and_uninstalls_cleanly() {
-        let original = "# User header\ncustom_flag = true\n\n[projects.\"D:\\\\repo\"]\ntrust_level = \"trusted\"\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
+        let original = "# User header\ncustom_flag = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n\n[projects.\"D:\\\\repo\"]\ntrust_level = \"trusted\"\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
         let catalog = Path::new(r"C:\Users\alice\.codex\agy-models.json");
 
         let merged_once = merge_codex_config_toml(
@@ -893,6 +1134,8 @@ mod tests {
         assert!(merged_twice.contains("C:/Users/alice/.codex/agy-models.json"));
         assert!(merged_twice.contains("[mcp_servers.demo]"));
         assert!(merged_twice.contains("custom_flag = true"));
+        assert!(!merged_twice.contains("model_context_window"));
+        assert!(!merged_twice.contains("model_auto_compact_token_limit"));
 
         let stripped = strip_codex_config_toml(&merged_twice);
         assert!(!stripped.contains("[model_providers.agy]"));

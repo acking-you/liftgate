@@ -72,6 +72,7 @@ pub async fn start_daemon_with_exe(
     quiet_banner: bool,
 ) -> Result<DaemonState, CliError> {
     let settings = state_paths.read_settings()?;
+    let long_context = serve.long_context.unwrap_or(settings.long_context);
     let effective_proxy = resolve_effective_agy_proxy(serve.agy_proxy.as_deref(), &settings)?;
     let effective_auto_update = resolve_effective_agy_auto_update(
         serve.agy_auto_update,
@@ -97,7 +98,8 @@ pub async fn start_daemon_with_exe(
                     && existing.api_key == requested_key
                     && existing.agy_proxy.as_deref()
                         == effective_proxy.as_ref().map(ProxyUrl::as_str)
-                    && existing.agy_auto_update == effective_auto_update;
+                    && existing.agy_auto_update == effective_auto_update
+                    && existing.long_context == long_context;
                 if !quiet_banner {
                     let bin = invoked_bin_name();
                     ui::headline(
@@ -203,6 +205,7 @@ pub async fn start_daemon_with_exe(
         } else {
             "false"
         })
+        .arg(format!("--long-context={long_context}"))
         .arg("--default-model")
         .arg(&serve.default_model)
         .arg("--acp-mode")
@@ -287,6 +290,7 @@ pub async fn start_daemon_with_exe(
         ui_dir: serve.ui_dir,
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
         agy_auto_update: effective_auto_update,
+        long_context,
         shutdown_token,
         started_at_unix_ms: now_unix_ms(),
         log_file: state_paths.log_file(),
@@ -431,6 +435,7 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         } else {
             old.acp_mode.clone()
         },
+        long_context: Some(old.long_context),
         api_key: old.api_key.clone(),
         agy_bin: old.agy_bin.clone(),
         acp_cwd: old.acp_cwd.clone(),
@@ -470,6 +475,9 @@ pub async fn run_restart(state_paths: &StatePaths, args: RestartArgs) -> Result<
     }
     if let Some(au) = args.agy_auto_update {
         serve.agy_auto_update = Some(au);
+    }
+    if let Some(long_context) = args.long_context {
+        serve.long_context = Some(long_context);
     }
     if args.no_agy_auto_update {
         serve.no_agy_auto_update = true;
@@ -1952,6 +1960,7 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
+            long_context: false,
             shutdown_token: "tok".to_owned(),
             started_at_unix_ms: 1,
             log_file: Path::new("gateway.log").to_path_buf(),

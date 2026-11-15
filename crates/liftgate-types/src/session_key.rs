@@ -5,6 +5,7 @@ use crate::canonical::{
     CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
 };
 use crate::config::ModelId;
+use crate::error::ProtocolError;
 
 pub type ConversationHash = [u8; 32];
 
@@ -889,8 +890,9 @@ pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 160_000;
 /// Maximum number of fast Flash seed chunks before the final target-model turn (`5 * 148 KB + 160 KB ≈ 900 KB`).
 pub const MAX_HYDRATION_SEED_CHUNKS: usize = 5;
 
-/// Maximum total lossless hydration bytes (~300k–430k tokens) before 4-tier archival compaction engages.
-pub const MAX_LOSSLESS_HYDRATION_BYTES: usize = 900_000;
+/// Maximum text capacity before framing; fragmented blocks can reach the turn cap sooner.
+pub const MAX_LOSSLESS_HYDRATION_BYTES: usize =
+    (MAX_HYDRATION_SEED_CHUNKS + 1) * SEED_CHUNK_TARGET_TEXT_BYTES;
 
 const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 148_000;
 
@@ -906,7 +908,7 @@ const ARCHIVE_CLOSE_HEADER: &str = "--- End Prior Conversation Context ---\n\n##
 /// When `seed_chunks` is empty, `final_blocks` fits in a single `session/prompt` turn.
 /// When `seed_chunks` is non-empty, `turn_runner` seeds each chunk (`<= 148 KB`) on the fastest
 /// Flash model in the same ACP session before switching to the requested model for `final_blocks`,
-/// bypassing both upstream's `191,578`-byte single-turn truncation and ~300k post-turn compaction.
+/// avoiding single-turn truncation. This cannot disable upstream post-turn compaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpPromptPlan {
     pub seed_chunks: Vec<Vec<AcpPromptBlock>>,
@@ -969,28 +971,35 @@ pub fn build_acp_prompt_blocks(
         history_slice,
         active_slice,
         tool_nonce,
+        MAX_ACP_PROMPT_TEXT_BYTES,
     ))
 }
 
-/// Builds a lossless multi-chunk ACP prompt plan (`seed_chunks` + `final_blocks`) capable of
-/// carrying up to ~900 KB (~300k–430k tokens) with zero truncation, falling back to 4-tier
-/// priority compaction across `seed_chunks` only for multi-megabyte transcripts.
-#[must_use]
+/// Builds a single-turn bounded prompt by default. Experimental long-context mode may
+/// seed larger transcripts in multiple Flash turns; upstream compaction still applies.
 pub fn build_acp_prompt_plan(
     messages: &[CanonicalMessage],
     tool_nonce: &str,
     is_full_history_replay: bool,
     leading_directive_xml: Option<&str>,
-) -> AcpPromptPlan {
+    long_context: bool,
+) -> Result<AcpPromptPlan, ProtocolError> {
+    // Reserve framing and slash-escaping bytes as well as the complete tool/directive update.
+    let directive_bytes = leading_directive_xml.map_or(0, str::len).saturating_add(64);
+    if directive_bytes >= MAX_ACP_PROMPT_TEXT_BYTES {
+        return Err(ProtocolError::PromptDirectivesTooLarge {
+            bytes: directive_bytes,
+        });
+    }
     if messages.is_empty() {
         let text = leading_directive_xml
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(" ")
             .to_owned();
-        return AcpPromptPlan {
+        return Ok(AcpPromptPlan {
             seed_chunks: Vec::new(),
             final_blocks: sanitize_slash_command_blocks(vec![AcpPromptBlock::Text { text }]),
-        };
+        });
     }
 
     let split_history_at = if is_full_history_replay && messages.len() > 1 {
@@ -1006,7 +1015,29 @@ pub fn build_acp_prompt_plan(
         .split_at_checked(split_history_at)
         .unwrap_or((&[], messages));
 
-    let directive_bytes = leading_directive_xml.map_or(0, str::len);
+    if !long_context {
+        let budget = MAX_ACP_PROMPT_TEXT_BYTES.saturating_sub(directive_bytes);
+        let active = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
+        if total_text_block_bytes(&active) > budget {
+            return Err(ProtocolError::PromptTooLarge {
+                bytes: total_text_block_bytes(&active),
+            });
+        }
+        let mut blocks = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+        if total_text_block_bytes(&blocks) > budget {
+            blocks = render_history_around_active(history_slice, active, tool_nonce, budget);
+        }
+        prepend_directive_to_blocks(&mut blocks, leading_directive_xml);
+        let blocks = sanitize_slash_command_blocks(blocks);
+        let bytes = total_text_block_bytes(&blocks);
+        if bytes > MAX_ACP_PROMPT_TEXT_BYTES {
+            return Err(ProtocolError::PromptTooLarge { bytes });
+        }
+        return Ok(AcpPromptPlan {
+            seed_chunks: Vec::new(),
+            final_blocks: blocks,
+        });
+    }
     let raw_est =
         estimate_raw_prompt_bytes(history_slice, active_slice).saturating_add(directive_bytes);
 
@@ -1016,63 +1047,17 @@ pub fn build_acp_prompt_plan(
         prepend_directive_to_blocks(&mut uncompacted, leading_directive_xml);
         let total_bytes = total_text_block_bytes(&uncompacted);
         if total_bytes <= MAX_ACP_PROMPT_TEXT_BYTES {
-            return AcpPromptPlan {
+            return Ok(AcpPromptPlan {
                 seed_chunks: Vec::new(),
                 final_blocks: sanitize_slash_command_blocks(uncompacted),
-            };
+            });
         }
         if total_bytes <= MAX_LOSSLESS_HYDRATION_BYTES {
             return split_blocks_into_hydration_plan(uncompacted);
         }
     }
 
-    // Ultra-large multi-megabyte transcript (>900 KB): bound active turn to 148 KB and give
-    // 4-tier archival compaction up to `MAX_HYDRATION_SEED_CHUNKS * 144 KB` (720 KB) of room!
-    let mut active_blocks =
-        render_bounded_active_slice(active_slice, tool_nonce, SEED_CHUNK_TARGET_TEXT_BYTES);
-    if history_slice.is_empty() {
-        prepend_directive_to_blocks(&mut active_blocks, leading_directive_xml);
-        return split_blocks_into_hydration_plan(active_blocks);
-    }
-
-    let history_budget = MAX_HYDRATION_SEED_CHUNKS * 144_000;
-    let history_body = build_compacted_history_body(history_slice, tool_nonce, history_budget);
-    let mut archive_text = String::with_capacity(
-        directive_bytes
-            + ARCHIVE_OPEN_HEADER.len()
-            + history_body.len()
-            + ARCHIVE_CLOSE_HEADER.len(),
-    );
-    if let Some(dir) = leading_directive_xml.filter(|s| !s.trim().is_empty()) {
-        archive_text.push_str(dir);
-        if !archive_text.ends_with('\n') {
-            archive_text.push('\n');
-        }
-    }
-    archive_text.push_str(ARCHIVE_OPEN_HEADER);
-    archive_text.push_str(&history_body);
-    if !archive_text.ends_with('\n') {
-        archive_text.push('\n');
-    }
-    archive_text.push_str(ARCHIVE_CLOSE_HEADER);
-
-    let mut combined = Vec::with_capacity(active_blocks.len() + 1);
-    let mut active_iter = active_blocks.into_iter();
-    match active_iter.next() {
-        Some(AcpPromptBlock::Text { text }) => {
-            archive_text.push_str(&text);
-            combined.push(AcpPromptBlock::Text { text: archive_text });
-        }
-        Some(other) => {
-            combined.push(AcpPromptBlock::Text { text: archive_text });
-            combined.push(other);
-        }
-        None => {
-            combined.push(AcpPromptBlock::Text { text: archive_text });
-        }
-    }
-    combined.extend(active_iter);
-    split_blocks_into_hydration_plan(combined)
+    Err(ProtocolError::PromptTooLarge { bytes: raw_est })
 }
 
 fn prepend_directive_to_blocks(blocks: &mut Vec<AcpPromptBlock>, directive: Option<&str>) {
@@ -1102,7 +1087,10 @@ fn prepend_directive_to_blocks(blocks: &mut Vec<AcpPromptBlock>, directive: Opti
 
 /// Splits a sequence of `AcpPromptBlock`s into `<= MAX_HYDRATION_SEED_CHUNKS` seed turns
 /// (`<= SEED_CHUNK_TARGET_TEXT_BYTES` each) plus a `final_blocks` turn (`<= MAX_ACP_PROMPT_TEXT_BYTES`).
-fn split_blocks_into_hydration_plan(blocks: Vec<AcpPromptBlock>) -> AcpPromptPlan {
+fn split_blocks_into_hydration_plan(
+    blocks: Vec<AcpPromptBlock>,
+) -> Result<AcpPromptPlan, ProtocolError> {
+    let original_bytes = total_text_block_bytes(&blocks);
     let mut flat_segments: Vec<AcpPromptBlock> = Vec::new();
     for block in blocks {
         match block {
@@ -1154,12 +1142,12 @@ fn split_blocks_into_hydration_plan(blocks: Vec<AcpPromptBlock>) -> AcpPromptPla
     }
 
     if raw_turns.is_empty() {
-        return AcpPromptPlan {
+        return Ok(AcpPromptPlan {
             seed_chunks: Vec::new(),
             final_blocks: vec![AcpPromptBlock::Text {
                 text: " ".to_owned(),
             }],
-        };
+        });
     }
 
     let mut final_blocks = raw_turns.pop().unwrap_or_default();
@@ -1178,19 +1166,10 @@ fn split_blocks_into_hydration_plan(blocks: Vec<AcpPromptBlock>) -> AcpPromptPla
         });
     }
 
-    // Cap `seed_chunks` to `MAX_HYDRATION_SEED_CHUNKS`, keeping the first chunk (developer/system
-    // instructions + earliest user task) and the most recent chunks if ever exceeded.
     if raw_turns.len() > MAX_HYDRATION_SEED_CHUNKS {
-        let keep_tail = MAX_HYDRATION_SEED_CHUNKS.saturating_sub(1);
-        let tail_start = raw_turns.len().saturating_sub(keep_tail);
-        let mut bounded = Vec::with_capacity(MAX_HYDRATION_SEED_CHUNKS);
-        if let Some(first) = raw_turns.first().cloned() {
-            bounded.push(first);
-        }
-        if let Some(tail_slice) = raw_turns.get(tail_start..) {
-            bounded.extend(tail_slice.iter().cloned());
-        }
-        raw_turns = bounded;
+        return Err(ProtocolError::PromptTooLarge {
+            bytes: original_bytes,
+        });
     }
 
     let total_seeds = raw_turns.len();
@@ -1210,10 +1189,10 @@ fn split_blocks_into_hydration_plan(blocks: Vec<AcpPromptBlock>) -> AcpPromptPla
         })
         .collect();
 
-    AcpPromptPlan {
+    Ok(AcpPromptPlan {
         seed_chunks,
         final_blocks: sanitize_slash_command_blocks(final_blocks),
-    }
+    })
 }
 
 fn find_clean_line_split(text: &str, max_bytes: usize) -> usize {
@@ -1306,13 +1285,23 @@ fn render_bounded_prompt_blocks(
     history_slice: &[CanonicalMessage],
     active_slice: &[CanonicalMessage],
     tool_nonce: &str,
+    max_bytes: usize,
 ) -> Vec<AcpPromptBlock> {
     let active_budget = if history_slice.is_empty() {
-        MAX_ACP_PROMPT_TEXT_BYTES
+        max_bytes
     } else {
-        MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES
+        MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES.min(max_bytes / 2)
     };
     let active_blocks = render_bounded_active_slice(active_slice, tool_nonce, active_budget);
+    render_history_around_active(history_slice, active_blocks, tool_nonce, max_bytes)
+}
+
+fn render_history_around_active(
+    history_slice: &[CanonicalMessage],
+    active_blocks: Vec<AcpPromptBlock>,
+    tool_nonce: &str,
+    max_bytes: usize,
+) -> Vec<AcpPromptBlock> {
     let active_bytes = total_text_block_bytes(&active_blocks);
 
     if history_slice.is_empty() {
@@ -1325,7 +1314,7 @@ fn render_bounded_prompt_blocks(
     }
 
     let framing_bytes = ARCHIVE_OPEN_HEADER.len() + ARCHIVE_CLOSE_HEADER.len() + 64;
-    let history_budget = MAX_ACP_PROMPT_TEXT_BYTES
+    let history_budget = max_bytes
         .saturating_sub(active_bytes)
         .saturating_sub(framing_bytes);
 
@@ -2319,7 +2308,42 @@ mod tests {
             )],
         });
 
-        let plan = build_acp_prompt_plan(&messages, "abcd1234ef56", true, None);
+        let plan = build_acp_prompt_plan(&messages, "abcd1234ef56", true, None, true).unwrap();
+        let safe = build_acp_prompt_plan(
+            &messages,
+            "abcd1234ef56",
+            true,
+            Some("<client_tools_update>new tool</client_tools_update>"),
+            false,
+        )
+        .unwrap();
+        assert!(safe.seed_chunks.is_empty());
+        assert!(total_text_block_bytes(&safe.final_blocks) <= MAX_ACP_PROMPT_TEXT_BYTES);
+        let safe_text = safe
+            .final_blocks
+            .iter()
+            .filter_map(|b| match b {
+                AcpPromptBlock::Text { text } => Some(text.as_str()),
+                AcpPromptBlock::Image { .. } => None,
+            })
+            .collect::<String>();
+        assert!(safe_text.starts_with("<client_tools_update>"));
+        assert!(safe_text.contains("FINAL_NEEDLE_OMEGA_005"));
+        assert!(
+            build_acp_prompt_plan(
+                &messages,
+                "nonce",
+                true,
+                Some(&"x".repeat(MAX_ACP_PROMPT_TEXT_BYTES)),
+                false
+            )
+            .is_err()
+        );
+        let oversized = [CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("x".repeat(890_000))],
+        }];
+        assert!(build_acp_prompt_plan(&oversized, "nonce", false, None, true).is_err());
         assert!(
             !plan.seed_chunks.is_empty() && plan.seed_chunks.len() <= MAX_HYDRATION_SEED_CHUNKS,
             "expected 1..={} seed chunks, got {}",
@@ -2369,7 +2393,9 @@ mod tests {
             "abcd1234ef56",
             false,
             None,
-        );
+            false,
+        )
+        .unwrap();
         assert!(direct_slash.seed_chunks.is_empty());
         match direct_slash.final_blocks.first() {
             Some(AcpPromptBlock::Text { text }) => {

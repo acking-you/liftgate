@@ -189,6 +189,7 @@ pub async fn run_serve(state_paths: &StatePaths, args: ServeArgs) -> Result<(), 
         pool: Arc::clone(&pool),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
+            long_context: args.long_context.unwrap_or(settings.long_context),
             default_model,
             acp_mode,
             api_key,

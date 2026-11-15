@@ -1003,21 +1003,22 @@ pub struct ResponsesUsage {
 
 impl From<AcpUsage> for ResponsesUsage {
     fn from(u: AcpUsage) -> Self {
-        let total = if u.total_tokens > 0 {
-            u.total_tokens
-        } else {
-            u.input_tokens.saturating_add(u.output_tokens)
-        };
+        // Antigravity reports cache tokens separately from uncached input, while
+        // OpenAI includes them in input_tokens. Its output already includes thinking.
+        let input_tokens = u
+            .input_tokens
+            .saturating_add(u.cached_read_tokens)
+            .saturating_add(u.cached_write_tokens);
         Self {
-            input_tokens: u.input_tokens,
+            input_tokens,
             input_tokens_details: InputTokensDetails {
                 cached_tokens: u.cached_read_tokens,
             },
-            output_tokens: u.output_tokens.saturating_add(u.thought_tokens),
+            output_tokens: u.output_tokens,
             output_tokens_details: OutputTokensDetails {
-                reasoning_tokens: u.thought_tokens,
+                reasoning_tokens: u.thought_tokens.min(u.output_tokens),
             },
-            total_tokens: total,
+            total_tokens: input_tokens.saturating_add(u.output_tokens),
         }
     }
 }
@@ -1053,6 +1054,7 @@ pub struct ModelCard {
     pub created_at: &'static str,
     pub owned_by: &'static str,
     pub context_window: u64,
+    pub auto_compact_token_limit: u64,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
 }
@@ -1082,6 +1084,7 @@ pub struct CodexModelCatalogEntry {
     pub truncation_policy: CodexTruncationPolicy,
     pub supports_parallel_tool_calls: bool,
     pub context_window: i64,
+    pub max_context_window: i64,
     pub auto_compact_token_limit: i64,
     pub effective_context_window_percent: i64,
     pub experimental_supported_tools: Vec<String>,
@@ -1127,6 +1130,7 @@ You are a coding agent running in the Codex CLI, a terminal-based coding assista
 pub fn build_codex_model_catalog(
     available: &[AvailableModel],
     default_model: &str,
+    long_context: bool,
 ) -> CodexModelCatalogResponse {
     let mut ordered: Vec<(u8, usize, &str, String)> = available
         .iter()
@@ -1174,13 +1178,9 @@ pub fn build_codex_model_catalog(
         .enumerate()
         .map(|(rank, (_, _, slug, display_name))| {
             let lower = slug.to_ascii_lowercase();
-            let (context_window, auto_compact) = if lower.starts_with("gemini-") {
-                (1_000_000_i64, 850_000_i64)
-            } else if lower.starts_with("gpt-oss") {
-                (128_000_i64, 110_000_i64)
-            } else {
-                (200_000_i64, 170_000_i64)
-            };
+            let (window, compact) = crate::model::context_limits(slug, long_context);
+            let context_window = i64::try_from(window).unwrap_or(i64::MAX);
+            let auto_compact = i64::try_from(compact).unwrap_or(i64::MAX);
             let default_effort = if lower.ends_with("-xhigh") {
                 "xhigh"
             } else if lower.ends_with("-medium") {
@@ -1213,6 +1213,7 @@ pub fn build_codex_model_catalog(
                 },
                 supports_parallel_tool_calls: true,
                 context_window,
+                max_context_window: context_window,
                 auto_compact_token_limit: auto_compact,
                 effective_context_window_percent: 95,
                 experimental_supported_tools: vec![
@@ -1312,8 +1313,23 @@ mod tests {
                 if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUg=="
         ));
 
-        let catalog = build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high");
+        let catalog =
+            build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high", false);
         let first = catalog.models.first().expect("non-empty catalog");
+        assert_eq!(
+            (first.context_window, first.auto_compact_token_limit),
+            (280_000, 245_000)
+        );
+        let experimental =
+            build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high", true);
+        let first_long = experimental.models.first().unwrap();
+        assert_eq!(
+            (
+                first_long.context_window,
+                first_long.auto_compact_token_limit
+            ),
+            (1_000_000, 850_000)
+        );
         for tool in [
             "request_user_input_async",
             "send_user_message_async",

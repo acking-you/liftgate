@@ -212,6 +212,10 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
 
+    /// Opt into experimental Flash hydration; upstream compaction still applies.
+    #[arg(long, env = "AGY_LONG_CONTEXT", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub long_context: Option<bool>,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -289,6 +293,9 @@ impl Default for ServeArgs {
             agy_proxy,
             agy_auto_update,
             no_agy_auto_update: false,
+            long_context: std::env::var("AGY_LONG_CONTEXT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -350,6 +357,10 @@ pub struct RestartArgs {
     /// Disable background idle `agy` auto-update.
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
+
+    /// Opt into experimental Flash hydration; upstream compaction still applies.
+    #[arg(long, env = "AGY_LONG_CONTEXT", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub long_context: Option<bool>,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]
@@ -1043,6 +1054,14 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.serve.listen.port(), 9123);
         assert_eq!(cli.serve.default_model, "gemini-3.8-pro-high");
+        let start = parse_strs(&["lg", "start", "--long-context"]);
+        assert!(
+            matches!(start.command, Some(Commands::Start(s)) if s.serve.long_context == Some(true))
+        );
+        let restart = parse_strs(&["lg", "restart", "--long-context=false"]);
+        assert!(
+            matches!(restart.command, Some(Commands::Restart(s)) if s.long_context == Some(false))
+        );
     }
 
     #[test]

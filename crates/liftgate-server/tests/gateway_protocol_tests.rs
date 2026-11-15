@@ -64,6 +64,7 @@ struct MockAcpBackend {
     recorded_models: Mutex<Vec<String>>,
     recorded_prompts: Mutex<Vec<RecordedPrompt>>,
     scripts: Mutex<VecDeque<MockScript>>,
+    hydration_updates: Mutex<Vec<(u64, u64)>>,
 }
 
 impl MockAcpBackend {
@@ -76,6 +77,7 @@ impl MockAcpBackend {
             recorded_models: Mutex::new(Vec::new()),
             recorded_prompts: Mutex::new(Vec::new()),
             scripts: Mutex::new(VecDeque::from(scripts)),
+            hydration_updates: Mutex::new(Vec::new()),
         }
     }
 
@@ -168,6 +170,12 @@ impl AcpBackend for MockAcpBackend {
         });
 
         if is_hydration_seed {
+            let updates = self.hydration_updates.lock().unwrap().clone();
+            for (used, size) in updates {
+                let _ = updates_tx
+                    .send(SessionUpdatePayload::UsageUpdate { used, size })
+                    .await;
+            }
             let _ = updates_tx
                 .send(SessionUpdatePayload::AgentMessageChunk {
                     content: AcpChunkContent {
@@ -365,6 +373,15 @@ fn test_app_with_key(
     timeout_secs: u64,
     api_key: Option<&str>,
 ) -> axum::Router {
+    test_app_with_context(backend, timeout_secs, api_key, false)
+}
+
+fn test_app_with_context(
+    backend: Arc<MockAcpBackend>,
+    timeout_secs: u64,
+    api_key: Option<&str>,
+    long_context: bool,
+) -> axum::Router {
     let limits =
         GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, timeout_secs)
             .unwrap();
@@ -374,6 +391,7 @@ fn test_app_with_key(
         pool: Arc::new(SessionPool::new(limits)),
         telemetry: Arc::new(TelemetryHub::new()),
         config: GatewayRuntimeConfig {
+            long_context,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: api_key.map(Arc::<str>::from),
@@ -387,6 +405,110 @@ fn test_app_with_key(
 
 fn test_app(backend: Arc<MockAcpBackend>, timeout_secs: u64) -> axum::Router {
     test_app_with_key(backend, timeout_secs, None)
+}
+
+#[tokio::test]
+async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retry() {
+    for long_context in [false, true] {
+        let backend = Arc::new(MockAcpBackend::new(vec![]));
+        *backend.hydration_updates.lock().unwrap() =
+            vec![(320_000, 1_048_576), (20_000, 1_048_576)];
+        let app = test_app_with_context(Arc::clone(&backend), 30, None, long_context);
+        for endpoint in ["/v1/responses", "/v1/messages"] {
+            let input = "a".repeat(200_000);
+            let payload = if endpoint == "/v1/responses" {
+                json!({"model":"gemini-4-carbon-high", "input":input})
+            } else {
+                json!({"model":"gemini-4-carbon-high", "max_tokens":100,
+                    "messages":[{"role":"user", "content":input}]})
+            };
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+        }
+        // Safe mode rejects before inference. Experimental mode stops after the first seed.
+        assert_eq!(
+            backend.recorded_prompts.lock().unwrap().len(),
+            if long_context { 2 } else { 0 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn clients_receive_context_occupancy_without_double_counting_thought_or_cache() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(246_000, 1_048_576)],
+            chunks_template: vec!["First.".to_owned()],
+        },
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(248_000, 1_048_576)],
+            chunks_template: vec!["Second.".to_owned()],
+        },
+    ]));
+    let app = test_app(Arc::clone(&backend), 30);
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"input":"One."}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["usage"]["input_tokens"], 245_975);
+    assert_eq!(body["usage"]["output_tokens"], 25);
+    assert_eq!(body["usage"]["total_tokens"], 246_000);
+    let second = app.oneshot(Request::builder().method("POST").uri("/v1/messages")
+        .header("content-type","application/json").body(Body::from(json!({"model":"gemini-4-carbon-high", "max_tokens":100,"stream":true,
+            "messages":[{"role":"user","content":"One."},{"role":"assistant","content":"First."},{"role":"user","content":"Two."}]}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let sse = String::from_utf8(
+        second
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let delta = sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .find(|v| v["type"] == "message_delta")
+        .unwrap();
+    let usage = &delta["usage"];
+    assert_eq!(
+        usage["input_tokens"].as_u64().unwrap()
+            + usage["cache_read_input_tokens"].as_u64().unwrap()
+            + usage["cache_creation_input_tokens"].as_u64().unwrap(),
+        247_975
+    );
+    assert_eq!(usage["output_tokens"], 25);
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts[0].session_id, prompts[1].session_id);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2327,6 +2449,7 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
         pool: Arc::new(SessionPool::new(limits)),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
+            long_context: false,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: None,
@@ -2779,7 +2902,7 @@ async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_res
         ],
     }]));
 
-    let app = test_app(Arc::clone(&backend), 120);
+    let app = test_app_with_context(Arc::clone(&backend), 120, None, true);
     let req = json!({
         "model": "gemini-4-carbon-high",
         "stream": false,
@@ -2825,9 +2948,9 @@ async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_res
         body["output"][1]["content"][0]["text"],
         "All needles verified: EARLY_NEEDLE_01, MID_NEEDLE_02, LATE_NEEDLE_03."
     );
-    // Reported input_tokens must reflect ONLY the final turn's window occupancy (100),
+    // OpenAI input includes uncached (100) and cached (128) tokens from the final turn,
     // NOT the sum of intermediate Flash hydration turns (which would trigger premature /compact)!
-    assert_eq!(body["usage"]["input_tokens"], 100);
+    assert_eq!(body["usage"]["input_tokens"], 228);
 
     // Session started on `gemini-3.8-flash-low` for seed turns, then switched to `gemini-4-carbon-high`!
     let models = backend.recorded_models.lock().unwrap().clone();

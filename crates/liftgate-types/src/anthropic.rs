@@ -618,7 +618,7 @@ impl From<AcpUsage> for AnthropicUsage {
             input_tokens: u.input_tokens,
             cache_creation_input_tokens: u.cached_write_tokens,
             cache_read_input_tokens: u.cached_read_tokens,
-            output_tokens: u.output_tokens.saturating_add(u.thought_tokens),
+            output_tokens: u.output_tokens,
             server_tool_use: None,
         }
     }

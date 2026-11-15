@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-15
+
+### Changed
+- Default to one ACP prompt per client step with no Flash hydration or synthetic acknowledgement turns. Oversized cold histories retain bounded, marked archival context; oversized current input or tool updates return an explicit error instead of silently truncating the current request.
+- Advertise transport-aware windows and compaction thresholds: Gemini 280k/245k, Claude 200k/170k, GPT-OSS 128k/110k. Codex catalogs now include a maximum window cap, and launchers no longer force every model to 1M. Claude uses per-model auto-compaction settings with conservative handling of shared canonical aliases.
+- Make multi-turn Flash hydration and Gemini's advertised 1M/850k window experimental and opt-in via `--long-context[=true|false]`, `AGY_LONG_CONTEXT`, or `settings.json`'s `long_context`. Preserve the selected mode through managed restarts. This does **not** bypass upstream automatic compaction; the v0.1.2 description overstated that capability.
+
+### Fixed
+- Return non-retryable context errors when experimental hydration triggers upstream compaction or exceeds the seed-turn capacity, preventing repeated replay and silent loss of middle segments.
+- Include cache reads/writes in OpenAI input usage and stop double-counting reasoning output. Report final context occupancy separately from cumulative internal call consumption, retaining pre-compaction occupancy so clients do not miss their compaction threshold.
+- Keep warm `/compact` reuse, tool/model synchronization, multimodal forwarding, and direct requested-model quota/capacity errors intact.
+
 ## [0.1.2] - 2026-11-15
 
 ### Added

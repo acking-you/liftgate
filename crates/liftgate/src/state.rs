@@ -163,6 +163,9 @@ pub struct LiftgateSettings {
     /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
+    /// Experimental multi-turn hydration; disabled unless explicitly selected.
+    #[serde(default)]
+    pub long_context: bool,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -176,6 +179,7 @@ impl Default for LiftgateSettings {
         Self {
             agy_proxy: None,
             agy_auto_update: true,
+            long_context: false,
             agy_bin: None,
             extra: serde_json::Map::new(),
         }
@@ -253,6 +257,9 @@ pub struct DaemonState {
     pub agy_proxy: Option<String>,
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
+    /// Experimental multi-turn hydration; disabled unless explicitly selected.
+    #[serde(default)]
+    pub long_context: bool,
     #[serde(default)]
     pub shutdown_token: String,
     #[serde(default)]
@@ -503,6 +510,7 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
+            long_context: false,
             shutdown_token: "tok-123".to_owned(),
             started_at_unix_ms: 1000,
             log_file: paths.log_file(),

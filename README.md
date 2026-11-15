@@ -56,12 +56,15 @@ Any other harness that speaks either API connects the same way
   ([inference-only sessions](docs/architecture.md#inference-only-sessions)).
 - **Warm sessions** — each request's history is matched to a pooled ACP
   session and only the new turn is sent ([session reuse](docs/architecture.md#session-reuse)).
+- **Conservative context defaults** — Codex and Claude Code compact within
+  model-specific windows; Flash history hydration is an explicit experimental
+  option, not a bypass of upstream compaction ([context policy](docs/usage.md#context-windows-and-long-context)).
 - **Live model catalog** — `/v1/models` and a Codex catalog list every model
   your account can use, so `/model` pickers show Antigravity models
   ([Codex setup](docs/usage.md#codex-cli)).
 - **No silent downgrade & Flash fast lanes** — upstream `429` rate limits surface
   immediately on the exact model you asked for without silent fallback, while
-  titles, recaps, Auto Mode classifiers and multi-chunk context hydration use the fastest
+  titles, recaps and Auto Mode classifiers use the fastest
   Flash model without touching your main session ([model routing](docs/architecture.md#model-routing)).
 - **Web & terminal dashboards** — inspect live turns, evict pooled sessions,
   switch models and tail `agy` logs either in the browser

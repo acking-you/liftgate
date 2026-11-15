@@ -180,13 +180,14 @@ async fn handle_event_logging_noop() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-fn build_model_card(id: String, display_name: String, created: u64) -> ModelCard {
-    let lower = id.to_ascii_lowercase();
-    let context_window = if lower.starts_with("gemini-") {
-        1_000_000
-    } else {
-        200_000
-    };
+fn build_model_card(
+    id: String,
+    display_name: String,
+    created: u64,
+    long_context: bool,
+) -> ModelCard {
+    let (context_window, auto_compact_token_limit) =
+        liftgate_types::model::context_limits(&id, long_context);
     ModelCard {
         id,
         object: "model",
@@ -196,6 +197,7 @@ fn build_model_card(id: String, display_name: String, created: u64) -> ModelCard
         created_at: "2026-01-01T00:00:00Z",
         owned_by: "antigravity",
         context_window,
+        auto_compact_token_limit,
         max_input_tokens: context_window,
         max_output_tokens: 65_536,
     }
@@ -218,13 +220,18 @@ async fn handle_list_models<B: AcpBackend>(
             } else {
                 m.name
             };
-            build_model_card(m.model_id, display, now)
+            build_model_card(m.model_id, display, now, state.config.long_context)
         })
         .collect();
 
     if data.is_empty() {
         let fallback_id = state.config.default_model.as_str().to_owned();
-        data.push(build_model_card(fallback_id.clone(), fallback_id, now));
+        data.push(build_model_card(
+            fallback_id.clone(),
+            fallback_id,
+            now,
+            state.config.long_context,
+        ));
     }
 
     let first_id = data.first().map(|m| m.id.clone());
@@ -259,7 +266,8 @@ async fn handle_codex_model_catalog<B: AcpBackend>(
     let available = state.backend.refresh_models_if_empty().await;
     let preferred_default =
         query_param(&uri, "default_model").unwrap_or_else(|| state.config.default_model.as_str());
-    let catalog = build_codex_model_catalog(&available, preferred_default);
+    let catalog =
+        build_codex_model_catalog(&available, preferred_default, state.config.long_context);
     Json(catalog).into_response()
 }
 
@@ -282,7 +290,13 @@ async fn handle_get_model<B: AcpBackend>(
         } else {
             exact.name.clone()
         };
-        return Json(build_model_card(exact.model_id.clone(), display, now)).into_response();
+        return Json(build_model_card(
+            exact.model_id.clone(),
+            display,
+            now,
+            state.config.long_context,
+        ))
+        .into_response();
     }
 
     let resolved = liftgate_types::model::resolve_model_id(
@@ -297,7 +311,14 @@ async fn handle_get_model<B: AcpBackend>(
         .filter(|m| !m.name.is_empty())
         .map_or_else(|| resolved.as_str().to_owned(), |m| m.name.clone());
 
-    Json(build_model_card(model_id, display, now)).into_response()
+    let mut card = build_model_card(
+        resolved.as_str().to_owned(),
+        display,
+        now,
+        state.config.long_context,
+    );
+    card.id = model_id;
+    Json(card).into_response()
 }
 
 async fn handle_get_response<B: AcpBackend>(

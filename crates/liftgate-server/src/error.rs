@@ -17,6 +17,10 @@ use tokio_util::codec::LinesCodecError;
 /// Errors originating from ACP subprocess supervision or JSON-RPC transport.
 #[derive(Debug, Error)]
 pub enum AcpError {
+    #[error(
+        "prompt is too long: upstream compacted during experimental context hydration; compact the client conversation and disable long-context before retrying"
+    )]
+    HydrationCompacted,
     #[error("failed to spawn ACP subprocess `{}`", path.display())]
     SpawnProcess {
         path: PathBuf,
@@ -156,6 +160,7 @@ impl GatewayError {
 
     const fn acp_status(source: &AcpError) -> StatusCode {
         match source {
+            AcpError::HydrationCompacted => StatusCode::BAD_REQUEST,
             AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. } => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -176,6 +181,7 @@ impl GatewayError {
 
     const fn acp_anthropic_status(source: &AcpError) -> StatusCode {
         match source {
+            AcpError::HydrationCompacted => StatusCode::BAD_REQUEST,
             AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             AcpError::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
@@ -221,6 +227,7 @@ impl GatewayError {
 
     const fn acp_kind(source: &AcpError) -> (&'static str, &'static str) {
         match source {
+            AcpError::HydrationCompacted => ("invalid_request_error", "context_length_exceeded"),
             AcpError::TurnTimeout { .. } => ("api_error", "upstream_timeout"),
             AcpError::UpstreamRateLimited { .. } => ("rate_limit_error", "rate_limit_exceeded"),
             AcpError::UpstreamQuotaExhausted { .. } => ("insufficient_quota", "insufficient_quota"),
@@ -240,6 +247,7 @@ impl GatewayError {
 
     const fn acp_anthropic_error_type(source: &AcpError) -> &'static str {
         match source {
+            AcpError::HydrationCompacted => "invalid_request_error",
             AcpError::UpstreamRateLimited { .. } => "rate_limit_error",
             AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
                 "invalid_request_error"

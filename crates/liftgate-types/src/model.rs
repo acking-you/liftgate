@@ -2,6 +2,24 @@ use crate::acp::AvailableModel;
 use crate::canonical::ReasoningEffort;
 use crate::config::ModelId;
 
+/// Advertised context window and client compaction threshold for the ACP transport.
+/// The experimental Gemini window does not disable upstream automatic compaction.
+#[must_use]
+pub fn context_limits(model_id: &str, long_context: bool) -> (u64, u64) {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.starts_with("gemini-") {
+        if long_context {
+            (1_000_000, 850_000)
+        } else {
+            (280_000, 245_000)
+        }
+    } else if lower.starts_with("gpt-oss") {
+        (128_000, 110_000)
+    } else {
+        (200_000, 170_000)
+    }
+}
+
 /// Resolves an arbitrary caller model string (from Codex, Claude Code, or direct ACP model id)
 /// and optional reasoning effort into a concrete ACP `ModelId`.
 #[must_use]

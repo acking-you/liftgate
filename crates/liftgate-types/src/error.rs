@@ -31,6 +31,15 @@ pub enum ValidationError {
 /// Protocol normalization and payload decoding errors.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    #[error(
+        "prompt is too long for the ACP single-turn limit ({bytes} bytes); compact the conversation or reduce the current input"
+    )]
+    PromptTooLarge { bytes: usize },
+    #[error(
+        "prompt directives exceed the ACP single-turn limit ({bytes} bytes); reduce client tool definitions before retrying"
+    )]
+    PromptDirectivesTooLarge { bytes: usize },
+
     #[error("request contains no prompt input messages")]
     EmptyInput,
 
