@@ -533,6 +533,20 @@ impl TurnStreamState {
         }
     }
 
+    fn has_open_streamed_tool(&self) -> bool {
+        self.active_streaming_tool
+            .as_ref()
+            .is_some_and(|active| active.emitted_start)
+    }
+
+    fn take_open_streamed_tool_name(&mut self) -> Option<String> {
+        if self.has_open_streamed_tool() {
+            self.active_streaming_tool.take().map(|active| active.name)
+        } else {
+            None
+        }
+    }
+
     fn observe_usage_update(&mut self, used: u64, size: u64) {
         if used == 0 {
             return;
@@ -684,7 +698,11 @@ async fn run_turn_pipeline<B: AcpBackend>(
 
         let (acp_tx, mut acp_rx) = mpsc::channel::<SessionUpdatePayload>(channel_cap);
         let mut parser = IncrementalToolParser::new(&active_tool_nonce, has_xml_tools);
-        let mut banner_filter = AcpBannerFilter::new();
+        let mut banner_filter = if has_xml_tools {
+            AcpBannerFilter::with_tool_nonce(&active_tool_nonce)
+        } else {
+            AcpBannerFilter::new()
+        };
         let mut filter_out = String::new();
 
         let prompt_backend = Arc::clone(&backend);
@@ -725,14 +743,19 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         if state.truncated_tool_abort.is_some() {
                             break;
                         }
-                        if (banner_filter.take_malformed_retry()
-                            || banner_filter.take_transient_retry())
-                            && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
+                        if banner_filter.take_malformed_retry()
+                            || banner_filter.take_transient_retry()
                         {
-                            tracing::info!(
-                                "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
-                            );
-                            state.halted_post_tool_runaway = true;
+                            if let Some(open_name) = state.take_open_streamed_tool_name() {
+                                state.truncated_tool_abort = Some(open_name);
+                                break;
+                            }
+                            if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                                tracing::info!(
+                                    "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
+                                );
+                                state.halted_post_tool_runaway = true;
+                            }
                         }
                         if let Some((sig, detail)) = banner_filter.take_signal() {
                             let no_output_yet = state.text_accumulator.is_empty()
@@ -740,14 +763,23 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                 && !state.emitted_client_tool
                                 && state.seen_search_ids.is_empty()
                                 && completed_web_fetches == 0;
-                            if no_output_yet
+                            if state.has_open_streamed_tool()
+                                || no_output_yet
                                 || (sig == UpstreamBannerSignal::QuotaExhausted
                                     && !state.emitted_client_tool)
                             {
+                                state.active_streaming_tool = None;
                                 upstream_abort = Some((sig, detail));
                                 break;
                             }
                             state.halted_post_tool_runaway = true;
+                        }
+                        if state.halted_post_tool_runaway
+                            && let Some(open_name) = state.take_open_streamed_tool_name()
+                        {
+                            state.halted_post_tool_runaway = false;
+                            state.truncated_tool_abort = Some(open_name);
+                            break;
                         }
                         if state.halted_post_tool_runaway {
                             state.tainted_session = true;
@@ -819,13 +851,17 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if state.truncated_tool_abort.is_some() {
                     break;
                 }
-                if (banner_filter.take_malformed_retry() || banner_filter.take_transient_retry())
-                    && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
-                {
-                    tracing::info!(
-                        "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
-                    );
-                    state.halted_post_tool_runaway = true;
+                if banner_filter.take_malformed_retry() || banner_filter.take_transient_retry() {
+                    if let Some(open_name) = state.take_open_streamed_tool_name() {
+                        state.truncated_tool_abort = Some(open_name);
+                        break;
+                    }
+                    if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                        tracing::info!(
+                            "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
+                        );
+                        state.halted_post_tool_runaway = true;
+                    }
                 }
                 if let Some((sig, detail)) = banner_filter.take_signal() {
                     let no_output_yet = state.text_accumulator.is_empty()
@@ -833,14 +869,23 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         && !state.emitted_client_tool
                         && state.seen_search_ids.is_empty()
                         && completed_web_fetches == 0;
-                    if no_output_yet
+                    if state.has_open_streamed_tool()
+                        || no_output_yet
                         || (sig == UpstreamBannerSignal::QuotaExhausted
                             && !state.emitted_client_tool)
                     {
+                        state.active_streaming_tool = None;
                         upstream_abort = Some((sig, detail));
                         break;
                     }
                     state.halted_post_tool_runaway = true;
+                }
+                if state.halted_post_tool_runaway
+                    && let Some(open_name) = state.take_open_streamed_tool_name()
+                {
+                    state.halted_post_tool_runaway = false;
+                    state.truncated_tool_abort = Some(open_name);
+                    break;
                 }
                 if state.halted_post_tool_runaway {
                     state.tainted_session = true;
@@ -859,11 +904,13 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     && state.seen_search_ids.is_empty()
                     && completed_web_fetches == 0
                     && filter_out.trim().is_empty();
-                if no_output_yet
+                if state.has_open_streamed_tool()
+                    || no_output_yet
                     || (sig == UpstreamBannerSignal::QuotaExhausted
                         && !state.emitted_client_tool
                         && filter_out.trim().is_empty())
                 {
+                    state.active_streaming_tool = None;
                     upstream_abort = Some((sig, detail));
                 }
             }
@@ -1384,6 +1431,14 @@ async fn forward_acp_update(
     match upd {
         SessionUpdatePayload::AgentThoughtChunk { content } => {
             if !content.text.is_empty() {
+                if let Some(open_name) = state.take_open_streamed_tool_name() {
+                    tracing::warn!(
+                        tool = %open_name,
+                        "aborting active streamed XML tool call interrupted by ACP reasoning sub-step before closing tag"
+                    );
+                    state.truncated_tool_abort = Some(open_name);
+                    return true;
+                }
                 if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
                     tracing::info!(
                         "short-circuiting post-tool internal ACP reasoning sub-step because XML tool call was already captured"
@@ -1412,6 +1467,16 @@ async fn forward_acp_update(
             args,
             raw_input,
         } => {
+            if let Some(open_name) = state.take_open_streamed_tool_name() {
+                tracing::warn!(
+                    tool = %open_name,
+                    acp_tool = %name,
+                    acp_kind = %kind,
+                    "aborting active streamed XML tool call interrupted by native ACP tool call before closing tag"
+                );
+                state.truncated_tool_abort = Some(open_name);
+                return true;
+            }
             if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
                 tracing::info!(
                     acp_tool = %name,
@@ -2164,6 +2229,11 @@ pub struct AcpBannerFilter {
     has_emitted_non_ws: bool,
     saw_malformed_function_call_retry: bool,
     saw_transient_retry_banner: bool,
+    in_tool_payload: bool,
+    at_post_tool_boundary: bool,
+    tool_open_tag: Option<String>,
+    tool_close_tag: Option<String>,
+    tag_ring_buf: String,
     hold_buf: String,
     midline_probe_buf: String,
     dropped_line_buf: String,
@@ -2178,12 +2248,12 @@ const ACP_BANNER_LINE_PREFIXES: [&str; 4] = [
     "Retries remaining:",
 ];
 
-const MIDLINE_ACP_BANNER_PREFIXES: [&str; 5] = [
+const POST_TOOL_MIDLINE_BANNER_PREFIXES: [&str; 5] = [
     "⚠ Your previous response",
-    "⚠ API error",
+    "⚠ API error (",
     "⚠ Individual quota",
     "⚠ Agent execution terminated",
-    "⚠ Quota",
+    "⚠ Quota ",
 ];
 
 const LEADING_STRAY_WRAPPER_LINES: [&str; 9] = [
@@ -2207,12 +2277,28 @@ impl AcpBannerFilter {
             has_emitted_non_ws: false,
             saw_malformed_function_call_retry: false,
             saw_transient_retry_banner: false,
+            in_tool_payload: false,
+            at_post_tool_boundary: false,
+            tool_open_tag: None,
+            tool_close_tag: None,
+            tag_ring_buf: String::new(),
             hold_buf: String::new(),
             midline_probe_buf: String::new(),
             dropped_line_buf: String::new(),
             signal: None,
             suppressed_banners: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_tool_nonce(nonce: &str) -> Self {
+        let mut filter = Self::new();
+        let trimmed = nonce.trim();
+        if !trimmed.is_empty() {
+            filter.tool_open_tag = Some(format!("<agy_tool_call_{trimmed}>"));
+            filter.tool_close_tag = Some(format!("</agy_tool_call_{trimmed}>"));
+        }
+        filter
     }
 
     pub fn take_signal(&mut self) -> Option<(UpstreamBannerSignal, String)> {
@@ -2308,14 +2394,77 @@ impl AcpBannerFilter {
         );
     }
 
+    fn emit_char(&mut self, ch: char, out: &mut String) {
+        if !ch.is_whitespace() {
+            self.has_emitted_non_ws = true;
+        }
+        out.push(ch);
+        self.at_line_start = ch == '\n';
+        if ch == '\n' {
+            self.at_post_tool_boundary = false;
+        }
+
+        let max_tag_len = self
+            .tool_close_tag
+            .as_ref()
+            .map_or(0, String::len)
+            .max(self.tool_open_tag.as_ref().map_or(0, String::len));
+        if max_tag_len == 0 {
+            return;
+        }
+
+        self.tag_ring_buf.push(ch);
+        if self.tag_ring_buf.len() > max_tag_len {
+            let min_drop = self.tag_ring_buf.len() - max_tag_len;
+            let mut drop_idx = min_drop;
+            while drop_idx < self.tag_ring_buf.len()
+                && !self.tag_ring_buf.is_char_boundary(drop_idx)
+            {
+                drop_idx += 1;
+            }
+            self.tag_ring_buf.drain(..drop_idx);
+        }
+
+        if self
+            .tool_close_tag
+            .as_deref()
+            .is_some_and(|close_tag| self.tag_ring_buf.ends_with(close_tag))
+        {
+            self.in_tool_payload = false;
+            self.at_post_tool_boundary = true;
+            self.tag_ring_buf.clear();
+        } else if !self.in_tool_payload
+            && self
+                .tool_open_tag
+                .as_deref()
+                .is_some_and(|open_tag| self.tag_ring_buf.ends_with(open_tag))
+        {
+            self.in_tool_payload = true;
+            self.at_post_tool_boundary = false;
+            self.tag_ring_buf.clear();
+        }
+    }
+
+    fn emit_str(&mut self, text: &str, out: &mut String) {
+        for ch in text.chars() {
+            self.emit_char(ch, out);
+        }
+    }
+
     pub fn feed(&mut self, chunk: &str, out: &mut String) {
         for ch in chunk.chars() {
+            if self.in_tool_payload {
+                self.emit_char(ch, out);
+                continue;
+            }
+
             if self.suppressing_line {
                 if ch == '\n' {
                     let line = std::mem::take(&mut self.dropped_line_buf);
                     self.record_dropped_banner(&line);
                     self.suppressing_line = false;
                     self.at_line_start = true;
+                    self.at_post_tool_boundary = false;
                 } else if self.dropped_line_buf.len() < 512 {
                     self.dropped_line_buf.push(ch);
                 }
@@ -2325,9 +2474,11 @@ impl AcpBannerFilter {
             if self.at_line_start || !self.hold_buf.is_empty() {
                 if ch == '\n' && self.hold_buf.is_empty() {
                     if self.has_emitted_non_ws {
-                        out.push('\n');
+                        self.emit_char('\n', out);
+                    } else {
+                        self.at_line_start = true;
+                        self.at_post_tool_boundary = false;
                     }
-                    self.at_line_start = true;
                     continue;
                 }
                 self.at_line_start = false;
@@ -2335,11 +2486,13 @@ impl AcpBannerFilter {
                 let trimmed_start = self.hold_buf.trim_start_matches([' ', '\r']);
                 if trimmed_start.is_empty() {
                     if ch == '\n' {
+                        let flushed = std::mem::take(&mut self.hold_buf);
                         if self.has_emitted_non_ws {
-                            out.push_str(&self.hold_buf);
+                            self.emit_str(&flushed, out);
+                        } else {
+                            self.at_line_start = true;
+                            self.at_post_tool_boundary = false;
                         }
-                        self.hold_buf.clear();
-                        self.at_line_start = true;
                     }
                     continue;
                 }
@@ -2387,22 +2540,27 @@ impl AcpBannerFilter {
                         .iter()
                         .any(|pat| pat.starts_with(trimmed_start));
                 if !still_could_match {
-                    self.has_emitted_non_ws = true;
-                    out.push_str(&self.hold_buf);
-                    self.hold_buf.clear();
-                    if ch == '\n' {
-                        self.at_line_start = true;
-                    }
+                    let flushed = std::mem::take(&mut self.hold_buf);
+                    self.emit_str(&flushed, out);
                 }
                 continue;
             }
 
-            if !self.midline_probe_buf.is_empty() || ch == '⚠' {
+            if self.midline_probe_buf.is_empty()
+                && self.at_post_tool_boundary
+                && (ch == ' ' || ch == '\t')
+            {
+                self.emit_char(ch, out);
+                continue;
+            }
+
+            if !self.midline_probe_buf.is_empty() || (self.at_post_tool_boundary && ch == '⚠') {
                 self.midline_probe_buf.push(ch);
-                if MIDLINE_ACP_BANNER_PREFIXES
+                if POST_TOOL_MIDLINE_BANNER_PREFIXES
                     .iter()
                     .any(|pat| self.midline_probe_buf.starts_with(pat))
                 {
+                    self.at_post_tool_boundary = false;
                     if ch == '\n' {
                         let line = std::mem::take(&mut self.midline_probe_buf);
                         self.record_dropped_banner(&line);
@@ -2416,28 +2574,20 @@ impl AcpBannerFilter {
                     continue;
                 }
                 let still_could_match_midline = ch != '\n'
-                    && MIDLINE_ACP_BANNER_PREFIXES
+                    && POST_TOOL_MIDLINE_BANNER_PREFIXES
                         .iter()
                         .any(|pat| pat.starts_with(&self.midline_probe_buf));
                 if still_could_match_midline {
                     continue;
                 }
-                self.has_emitted_non_ws = true;
-                out.push_str(&self.midline_probe_buf);
-                self.midline_probe_buf.clear();
-                if ch == '\n' {
-                    self.at_line_start = true;
-                }
+                self.at_post_tool_boundary = false;
+                let flushed = std::mem::take(&mut self.midline_probe_buf);
+                self.emit_str(&flushed, out);
                 continue;
             }
 
-            if !ch.is_whitespace() {
-                self.has_emitted_non_ws = true;
-            }
-            out.push(ch);
-            if ch == '\n' {
-                self.at_line_start = true;
-            }
+            self.at_post_tool_boundary = false;
+            self.emit_char(ch, out);
         }
 
         // Also inspect in-progress suppressed banner lines immediately (even if `agy acp`
@@ -2470,16 +2620,15 @@ impl AcpBannerFilter {
             self.suppressing_line = false;
         }
         if !self.midline_probe_buf.is_empty() {
-            let is_midline_banner = MIDLINE_ACP_BANNER_PREFIXES
+            let is_midline_banner = POST_TOOL_MIDLINE_BANNER_PREFIXES
                 .iter()
                 .any(|pat| self.midline_probe_buf.starts_with(pat));
             if is_midline_banner {
                 let line = std::mem::take(&mut self.midline_probe_buf);
                 self.record_dropped_banner(&line);
             } else {
-                self.has_emitted_non_ws = true;
-                out.push_str(&self.midline_probe_buf);
-                self.midline_probe_buf.clear();
+                let flushed = std::mem::take(&mut self.midline_probe_buf);
+                self.emit_str(&flushed, out);
             }
         }
         if !self.hold_buf.is_empty() {
@@ -2495,11 +2644,11 @@ impl AcpBannerFilter {
             } else if is_wrapper {
                 self.hold_buf.clear();
             } else {
-                self.has_emitted_non_ws = true;
-                out.push_str(&self.hold_buf);
-                self.hold_buf.clear();
+                let flushed = std::mem::take(&mut self.hold_buf);
+                self.emit_str(&flushed, out);
             }
         }
+        self.at_post_tool_boundary = false;
         self.at_line_start = true;
     }
 }
@@ -2595,9 +2744,9 @@ mod tests {
     }
 
     #[test]
-    fn banner_filter_detects_midline_banners_without_newline_and_preserves_warning_prose() {
+    fn banner_filter_detects_post_tool_midline_banners_and_preserves_tool_and_prose_warnings() {
         // 1. Mid-line `⚠ Your previous response...` immediately after `</agy_tool_call_abcd>` (no `\n`)
-        let mut f1 = AcpBannerFilter::new();
+        let mut f1 = AcpBannerFilter::with_tool_nonce("abcd");
         let mut out1 = String::new();
         f1.feed(
             "<agy_tool_call_abcd>{\"name\":\"Read\"}</agy_tool_call_abcd>⚠ Your previous",
@@ -2613,19 +2762,19 @@ mod tests {
         );
         assert!(f1.take_malformed_retry());
 
-        // 2. Mid-line transient 503 retry banner without trailing `\n`
-        let mut f2 = AcpBannerFilter::new();
+        // 2. Mid-line transient 503 retry banner without trailing `\n` (including optional spaces)
+        let mut f2 = AcpBannerFilter::with_tool_nonce("abcd");
         let mut out2 = String::new();
         f2.feed(
-            "</agy_tool_call_abcd>⚠ API error (attempt 1): transient 503 — retrying in 1s...",
+            "</agy_tool_call_abcd>  ⚠ API error (attempt 1): transient 503 — retrying in 1s...",
             &mut out2,
         );
-        assert_eq!(out2, "</agy_tool_call_abcd>");
+        assert_eq!(out2, "</agy_tool_call_abcd>  ");
         assert!(f2.take_transient_retry());
         assert_eq!(f2.take_signal(), None);
 
         // 3. Mid-line 429 rate-limit banner surfaces `RateLimited` signal immediately
-        let mut f3 = AcpBannerFilter::new();
+        let mut f3 = AcpBannerFilter::with_tool_nonce("abcd");
         let mut out3 = String::new();
         f3.feed(
             "</agy_tool_call_abcd>⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429)",
@@ -2637,15 +2786,37 @@ mod tests {
             Some((UpstreamBannerSignal::RateLimited, _))
         ));
 
-        // 4. Legitimate mid-line `⚠` prose is preserved intact
-        let mut f4 = AcpBannerFilter::new();
+        // 4. Ordinary assistant prose quoting `⚠ API error (...)` mid-line is preserved intact
+        let mut f4 = AcpBannerFilter::with_tool_nonce("abcd");
         let mut out4 = String::new();
-        f4.feed("Note: ⚠ check", &mut out4);
-        f4.feed(" config before deploying.\n", &mut out4);
+        f4.feed("Docs note: `⚠ API error (attempt 1)` retries", &mut out4);
+        f4.feed(" automatically.\n", &mut out4);
         f4.finish(&mut out4);
-        assert_eq!(out4, "Note: ⚠ check config before deploying.\n");
+        assert_eq!(
+            out4,
+            "Docs note: `⚠ API error (attempt 1)` retries automatically.\n"
+        );
         assert!(!f4.take_malformed_retry());
         assert!(!f4.take_transient_retry());
         assert_eq!(f4.take_signal(), None);
+
+        // 5. Tool payloads (`apply_patch` / `exec`) containing both mid-line and line-start
+        //    `⚠ API error (...)` / `⚠ Individual quota` / `Retries remaining:` are preserved 100%
+        //    across tiny 2-byte chunk splits without eating closing `</agy_tool_call_abcd>` tags!
+        let mut f5 = AcpBannerFilter::with_tool_nonce("abcd");
+        let mut out5 = String::new();
+        let tool_stream = "<agy_tool_call_abcd>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n+ \\\"⚠ API error (attempt 1): transient 503\\\"\\n⚠ Individual quota reached.\\nRetries remaining: 3\\n*** End Patch\"}</agy_tool_call_abcd>⚠ API error (attempt 1): transient 503 — retrying in 1s...";
+        let chars: Vec<char> = tool_stream.chars().collect();
+        for pair in chars.chunks(2) {
+            let chunk: String = pair.iter().collect();
+            f5.feed(&chunk, &mut out5);
+        }
+        f5.finish(&mut out5);
+        assert_eq!(
+            out5,
+            "<agy_tool_call_abcd>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n+ \\\"⚠ API error (attempt 1): transient 503\\\"\\n⚠ Individual quota reached.\\nRetries remaining: 3\\n*** End Patch\"}</agy_tool_call_abcd>"
+        );
+        assert!(f5.take_transient_retry());
+        assert_eq!(f5.take_signal(), None);
     }
 }

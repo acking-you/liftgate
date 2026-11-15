@@ -1015,9 +1015,8 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
 
     if let Some(arg_raw) = envelope.arguments {
         let raw_text = arg_raw.get().trim();
-        if raw_text.starts_with('"')
-            && let Ok(inner_str) = serde_json::from_str::<String>(raw_text)
-        {
+        if raw_text.starts_with('"') {
+            let inner_str = serde_json::from_str::<String>(raw_text).ok()?;
             let inner_trimmed = inner_str.trim();
             if inner_trimmed.starts_with('{') {
                 if serde_json::from_str::<serde::de::IgnoredAny>(inner_trimmed).is_ok() {
@@ -1051,9 +1050,8 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
 
     if let Some(input_raw) = envelope.input {
         let raw_text = input_raw.get().trim();
-        if raw_text.starts_with('"')
-            && let Ok(inner_str) = serde_json::from_str::<String>(raw_text)
-        {
+        if raw_text.starts_with('"') {
+            let inner_str = serde_json::from_str::<String>(raw_text).ok()?;
             return Some(ParsedToolCall {
                 name,
                 arguments: inner_str,
@@ -1796,5 +1794,37 @@ mod tests {
             parsed["code"],
             "const out = await $`rg \"SessionPool\" crates/ -l`.text();\nconsole.log(out);"
         );
+    }
+
+    #[test]
+    fn lone_utf16_surrogate_in_quoted_input_falls_back_to_lenient_salvage_matching_deltas() {
+        let mut parser = IncrementalToolParser::new("cafe", true);
+        let raw = "<agy_tool_call_cafe>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n+bad \\uD800 mid \\uDC00 end\\n*** End Patch\"}</agy_tool_call_cafe>";
+        let mut items = Vec::new();
+        for chunk in raw.as_bytes().chunks(3) {
+            let s = core::str::from_utf8(chunk).expect("ascii chunks");
+            parser.feed(s, &mut items);
+        }
+        parser.finish(&mut items);
+
+        let mut streamed = String::new();
+        let mut final_call = None;
+        for item in items {
+            match item {
+                ParsedStreamItem::ToolCallDelta(d) => streamed.push_str(&d),
+                ParsedStreamItem::ToolCall(c) => final_call = Some(c),
+                ParsedStreamItem::ToolCallStart { .. }
+                | ParsedStreamItem::TextDelta(_)
+                | ParsedStreamItem::ToolCallAborted { .. } => {}
+            }
+        }
+        let call = final_call.expect("salvaged tool call");
+        assert_eq!(call.name, "apply_patch");
+        assert!(call.is_raw_input);
+        assert_eq!(
+            call.arguments,
+            "*** Begin Patch\n+bad \\uD800 mid \\uDC00 end\n*** End Patch"
+        );
+        assert_eq!(streamed, call.arguments);
     }
 }

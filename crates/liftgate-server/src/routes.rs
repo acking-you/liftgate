@@ -39,7 +39,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     acp_client::AcpBackend,
-    error::GatewayError,
+    error::{AcpError, GatewayError},
     session_pool::SessionPool,
     telemetry::{TelemetryHub, unix_timestamp_ms},
     turn_runner::{
@@ -1822,6 +1822,12 @@ fn stream_openai_responses(
         )
         .await;
 
+        if failed_err.is_none() && !open_client_tools.is_empty() {
+            failed_err = Some(Arc::new(AcpError::UpstreamAgentTerminated {
+                detail: "upstream stream ended before closing active tool call".to_owned(),
+            }));
+        }
+
         if let Some(acp_err) = failed_err {
             let gw_err = GatewayError::SharedAcp { source: acp_err };
             tracing::error!(error = ?gw_err, "OpenAI Responses SSE stream failed");
@@ -2903,6 +2909,33 @@ fn stream_anthropic_messages(
                     return;
                 }
             }
+        }
+
+        if !open_tool_blocks.is_empty() {
+            let gw_err = GatewayError::SharedAcp {
+                source: Arc::new(AcpError::UpstreamAgentTerminated {
+                    detail: "upstream stream ended before closing active tool_use block".to_owned(),
+                }),
+            };
+            tracing::error!(
+                error = ?gw_err,
+                open_blocks = open_tool_blocks.len(),
+                "Anthropic Messages SSE stream ended with unclosed tool_use block"
+            );
+            let error_type = gw_err.anthropic_error_type();
+            let _ = send_sse_frame(
+                &sse_tx,
+                "error",
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "type": error_type,
+                        "message": gw_err.anthropic_client_message()
+                    }
+                }),
+            )
+            .await;
+            return;
         }
 
         if !ensure_anthropic_message_started(&sse_tx, &mut message_started, &msg_id, &model_name)
