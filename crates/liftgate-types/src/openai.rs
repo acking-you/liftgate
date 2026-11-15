@@ -10,7 +10,9 @@ use crate::canonical::{
     NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task, parse_base64_data_url,
 };
 use crate::error::ProtocolError;
-use crate::session_key::{INTERNAL_CODEX_LOCAL_SHELL_TOOL, strip_unstable_harness_noise};
+use crate::session_key::{
+    INTERNAL_CODEX_LOCAL_SHELL_TOOL, is_compaction_instructions_prompt, strip_billing_noise,
+};
 
 /// Incoming `POST /v1/responses` request body.
 #[derive(Debug, Deserialize)]
@@ -182,19 +184,24 @@ pub fn normalize_responses_request(
     let mut aux_system_parts = Vec::new();
     let mut messages: Vec<CanonicalMessage> = Vec::new();
     let mut has_conversational_input = false;
+    let mut deferred_compaction_instructions: Option<String> = None;
 
     if let Some(inst) = req.instructions.as_deref() {
-        let cleaned = strip_unstable_harness_noise(inst);
+        let cleaned = strip_billing_noise(inst);
         let trimmed = cleaned.trim();
         if !trimmed.is_empty() {
             aux_system_parts.push(trimmed.to_owned());
             if req.previous_response_id.is_none() {
-                messages.push(CanonicalMessage {
-                    role: CanonicalRole::User,
-                    parts: vec![CanonicalPart::Text(format!(
-                        "<developer_instructions>\n{trimmed}\n</developer_instructions>"
-                    ))],
-                });
+                if is_compaction_instructions_prompt(trimmed) {
+                    deferred_compaction_instructions = Some(trimmed.to_owned());
+                } else {
+                    messages.push(CanonicalMessage {
+                        role: CanonicalRole::User,
+                        parts: vec![CanonicalPart::Text(format!(
+                            "<developer_instructions>\n{trimmed}\n</developer_instructions>"
+                        ))],
+                    });
+                }
             }
         }
     }
@@ -288,20 +295,9 @@ pub fn normalize_responses_request(
                     | "apply_patch_call_output" => {
                         if let Some(call_id) = &item.call_id {
                             has_conversational_input = true;
-                            let output_str = match &item.output {
-                                Some(Value::String(s)) => s.clone(),
-                                Some(other) => serde_json::to_string(other)?,
-                                None => String::new(),
-                            };
-                            push_part(
-                                &mut messages,
-                                CanonicalRole::User,
-                                CanonicalPart::ToolResult {
-                                    call_id: call_id.clone(),
-                                    output: output_str,
-                                    is_error: false,
-                                },
-                            );
+                            for part in convert_tool_output_parts(call_id, item.output.as_ref())? {
+                                push_part(&mut messages, CanonicalRole::User, part);
+                            }
                         }
                     }
                     "reasoning" | "web_search_call" | "item_reference" => {}
@@ -309,8 +305,7 @@ pub fn normalize_responses_request(
                         let role_str = item.role.as_deref().unwrap_or("user");
                         if matches!(role_str, "system" | "developer") {
                             if let Some(content) = &item.content {
-                                let extracted =
-                                    strip_unstable_harness_noise(&extract_plain_text(content));
+                                let extracted = strip_billing_noise(&extract_plain_text(content));
                                 let trimmed = extracted.trim();
                                 if !trimmed.is_empty() {
                                     if !has_conversational_input {
@@ -347,6 +342,17 @@ pub fn normalize_responses_request(
             }
         }
         None => {}
+    }
+
+    if let Some(compaction_inst) = deferred_compaction_instructions {
+        has_conversational_input = true;
+        push_part(
+            &mut messages,
+            CanonicalRole::User,
+            CanonicalPart::Text(format!(
+                "<developer_instructions>\n{compaction_inst}\n</developer_instructions>"
+            )),
+        );
     }
 
     if !has_conversational_input || messages.is_empty() {
@@ -735,6 +741,109 @@ fn convert_message_content(
     }
 }
 
+fn convert_tool_output_parts(
+    call_id: &str,
+    output: Option<&Value>,
+) -> Result<Vec<CanonicalPart>, ProtocolError> {
+    match output {
+        None => Ok(vec![CanonicalPart::ToolResult {
+            call_id: call_id.to_owned(),
+            output: String::new(),
+            is_error: false,
+        }]),
+        Some(Value::String(s)) => Ok(vec![CanonicalPart::ToolResult {
+            call_id: call_id.to_owned(),
+            output: s.clone(),
+            is_error: false,
+        }]),
+        Some(Value::Array(items)) => {
+            let mut text_pieces = Vec::new();
+            let mut image_parts = Vec::new();
+            let mut saw_structured_part = false;
+            for elem in items {
+                let Some(obj) = elem.as_object() else {
+                    continue;
+                };
+                let item_type = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+                match item_type {
+                    "input_image" | "image" => {
+                        saw_structured_part = true;
+                        if let Some(url_val) = obj.get("image_url") {
+                            let raw_url = match url_val {
+                                Value::String(s) => Some(s.as_str()),
+                                Value::Object(m) => m.get("url").and_then(Value::as_str),
+                                _ => None,
+                            };
+                            if let Some(url) = raw_url {
+                                if url.starts_with("data:") {
+                                    let (media_type, data) = parse_base64_data_url(url)?;
+                                    image_parts
+                                        .push(CanonicalPart::ImageBase64 { media_type, data });
+                                } else {
+                                    return Err(ProtocolError::UnsupportedImageUrl);
+                                }
+                            }
+                        } else if let Some(src) = obj.get("source").and_then(Value::as_object) {
+                            let src_type =
+                                src.get("type").and_then(Value::as_str).unwrap_or_default();
+                            let media_type = src
+                                .get("media_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let data = src.get("data").and_then(Value::as_str).unwrap_or_default();
+                            if src_type == "base64" && !media_type.is_empty() && !data.is_empty() {
+                                image_parts.push(CanonicalPart::ImageBase64 {
+                                    media_type: media_type.to_owned(),
+                                    data: data.to_owned(),
+                                });
+                            } else {
+                                return Err(ProtocolError::UnsupportedImageUrl);
+                            }
+                        }
+                    }
+                    "input_text" | "output_text" | "text" => {
+                        saw_structured_part = true;
+                        if let Some(t) = obj.get("text").and_then(Value::as_str) {
+                            text_pieces.push(t.to_owned());
+                        }
+                    }
+                    _ => {
+                        if let Some(t) = obj.get("text").and_then(Value::as_str) {
+                            saw_structured_part = true;
+                            text_pieces.push(t.to_owned());
+                        }
+                    }
+                }
+            }
+            if !saw_structured_part {
+                return Ok(vec![CanonicalPart::ToolResult {
+                    call_id: call_id.to_owned(),
+                    output: serde_json::to_string(items)?,
+                    is_error: false,
+                }]);
+            }
+            let summary_text = if text_pieces.is_empty() && !image_parts.is_empty() {
+                "[Image attached in tool output]".to_owned()
+            } else {
+                text_pieces.join("\n")
+            };
+            let mut out = Vec::with_capacity(1 + image_parts.len());
+            out.push(CanonicalPart::ToolResult {
+                call_id: call_id.to_owned(),
+                output: summary_text,
+                is_error: false,
+            });
+            out.extend(image_parts);
+            Ok(out)
+        }
+        Some(other) => Ok(vec![CanonicalPart::ToolResult {
+            call_id: call_id.to_owned(),
+            output: serde_json::to_string(other)?,
+            is_error: false,
+        }]),
+    }
+}
+
 // ============================================================================
 // Outgoing OpenAI `/v1/responses` Wire Objects & SSE Payloads
 // ============================================================================
@@ -977,6 +1086,8 @@ pub struct CodexModelCatalogEntry {
     pub effective_context_window_percent: i64,
     pub experimental_supported_tools: Vec<String>,
     pub input_modalities: Vec<&'static str>,
+    pub supports_image_detail_original: bool,
+    pub web_search_tool_type: &'static str,
     pub apply_patch_tool_type: &'static str,
 }
 
@@ -1002,6 +1113,7 @@ You are a coding agent running in the Codex CLI, a terminal-based coding assista
 - When searching text or file paths in the shell, prefer `rg` and `rg --files`.
 - Use `apply_patch` for file edits (`*** Begin Patch` ... `*** End Patch`), keep changes surgical and consistent with existing codebase style, and never commit or create git branches unless asked.
 - Validate changes with targeted builds/tests when appropriate in non-interactive or test-focused runs; do not fix unrelated issues outside the user's scope.
+- When `request_user_input_async` or `request_user_input` is available and a critical requirement cannot be derived from workspace inspection, ask concise questions while continuing independent work.
 - For live web searches or reading HTTP/HTTPS URLs, prefer your built-in `search_web` and server-managed `__gateway_web_fetch` tools rather than running `curl` or `Invoke-WebRequest` in local shell commands (which may be blocked by Codex's network sandbox).
 
 # Response Style
@@ -1103,8 +1215,15 @@ pub fn build_codex_model_catalog(
                 context_window,
                 auto_compact_token_limit: auto_compact,
                 effective_context_window_percent: 95,
-                experimental_supported_tools: Vec::new(),
+                experimental_supported_tools: vec![
+                    "request_user_input_async".to_owned(),
+                    "send_user_message_async".to_owned(),
+                    "send_message_to_user_async".to_owned(),
+                    "clock".to_owned(),
+                ],
                 input_modalities: vec!["text", "image"],
+                supports_image_detail_original: true,
+                web_search_tool_type: "text_and_image",
                 apply_patch_tool_type: "freeform",
             }
         })
@@ -1144,4 +1263,69 @@ pub struct OpenAiErrorBody {
     pub error_type: &'static str,
     pub code: &'static str,
     pub param: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::mock_available_models;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_multimodal_images_from_function_call_output_and_advertises_async_user_tools() {
+        let req: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "input": [
+                { "role": "user", "content": "Inspect screenshot.png" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_img_1",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"screenshot.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_img_1",
+                    "output": [
+                        { "type": "input_text", "text": "Loaded screenshot.png (800x600)" },
+                        { "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid CreateResponseRequest");
+
+        let norm = normalize_responses_request(&req).expect("normalized turn");
+        let last_msg = norm.messages.last().expect("tool output message");
+        assert_eq!(last_msg.parts.len(), 2);
+        assert!(matches!(
+            &last_msg.parts[0],
+            CanonicalPart::ToolResult {
+                call_id,
+                output,
+                is_error: false
+            } if call_id == "call_img_1" && output.contains("Loaded screenshot.png") && !output.contains("iVBORw0KGgo")
+        ));
+        assert!(matches!(
+            &last_msg.parts[1],
+            CanonicalPart::ImageBase64 { media_type, data }
+                if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUg=="
+        ));
+
+        let catalog = build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high");
+        let first = catalog.models.first().expect("non-empty catalog");
+        for tool in [
+            "request_user_input_async",
+            "send_user_message_async",
+            "send_message_to_user_async",
+            "clock",
+        ] {
+            assert!(
+                first.experimental_supported_tools.iter().any(|t| t == tool),
+                "missing experimental tool {tool}"
+            );
+        }
+        assert!(first.supports_image_detail_original);
+        assert_eq!(first.web_search_tool_type, "text_and_image");
+    }
 }

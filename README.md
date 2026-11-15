@@ -59,8 +59,9 @@ Any other harness that speaks either API connects the same way
 - **Live model catalog** — `/v1/models` and a Codex catalog list every model
   your account can use, so `/model` pickers show Antigravity models
   ([Codex setup](docs/usage.md#codex-cli)).
-- **Failover and fast lanes** — on an upstream `429` a turn moves to a backup
-  model at once; titles, recaps and Auto Mode classifiers go to the fastest
+- **No silent downgrade & Flash fast lanes** — upstream `429` rate limits surface
+  immediately on the exact model you asked for without silent fallback, while
+  titles, recaps, Auto Mode classifiers and multi-chunk context hydration use the fastest
   Flash model without touching your main session ([model routing](docs/architecture.md#model-routing)).
 - **Web & terminal dashboards** — inspect live turns, evict pooled sessions,
   switch models and tail `agy` logs either in the browser
@@ -71,7 +72,7 @@ Any other harness that speaks either API connects the same way
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/how-it-works-dark.svg">
-  <img src="assets/readme/how-it-works-light.svg" width="100%" alt="Codex CLI, Claude Code and SDKs send stateless HTTP requests to Liftgate, which translates them, reuses a warm session, streams events back and fails over on 429; it talks JSON-RPC over stdio to one agy acp process per session, and only agy holds the credentials for Google Antigravity.">
+  <img src="assets/readme/how-it-works-light.svg" width="100%" alt="Codex CLI, Claude Code and SDKs send stateless HTTP requests to Liftgate, which translates them, reuses a warm session, and streams events back; it talks JSON-RPC over stdio to one agy acp process per session, and only agy holds the credentials for Google Antigravity.">
 </picture>
 
 Standard LLM APIs are stateless: every request carries the whole

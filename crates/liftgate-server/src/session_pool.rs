@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use liftgate_types::{
-    canonical::CanonicalMessage,
+    canonical::{CanonicalMessage, CanonicalToolSpec},
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
@@ -17,9 +17,10 @@ pub struct IdleSessionEntry {
     pub session_id: SessionId,
     pub tool_nonce: Arc<str>,
     pub model_id: ModelId,
-    pub requested_model_id: ModelId,
-    pub failover_pinned: bool,
     pub post_turn_hash: ConversationHash,
+    pub post_turn_dialogue_hash: ConversationHash,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub last_context_used: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
     pub turn_count: u64,
@@ -97,6 +98,23 @@ impl SessionPool {
             .idle_sessions
             .iter()
             .rposition(|e| &e.post_turn_hash == hash)?;
+        guard.total_sessions_reused += 1;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
+        guard.idle_sessions.remove(pos)
+    }
+
+    /// Atomically removes and returns an idle session matching a pure dialogue hash
+    /// (used to run `/compact` summarization against the warm pre-compaction ACP session).
+    #[must_use]
+    pub fn checkout_by_dialogue_hash(&self, hash: &ConversationHash) -> Option<IdleSessionEntry> {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let pos = guard
+            .idle_sessions
+            .iter()
+            .rposition(|e| &e.post_turn_dialogue_hash == hash)?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
         guard.idle_sessions.remove(pos)
@@ -300,8 +318,8 @@ pub struct SessionLeaseGuard<B: AcpBackend> {
     session_id: SessionId,
     tool_nonce: Arc<str>,
     model_id: ModelId,
-    requested_model_id: ModelId,
-    failover_pinned: bool,
+    declared_tools: Vec<CanonicalToolSpec>,
+    last_context_used: u64,
     turn_count: u64,
     created_at_unix_ms: u64,
     pool: Arc<SessionPool>,
@@ -315,6 +333,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
         session_id: SessionId,
         tool_nonce: Arc<str>,
         model_id: ModelId,
+        declared_tools: Vec<CanonicalToolSpec>,
         initial_message_count: usize,
         pool: Arc<SessionPool>,
         backend: Arc<B>,
@@ -332,13 +351,12 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             },
             true,
         );
-        let requested_model_id = model_id.clone();
         Self {
             session_id,
             tool_nonce,
             model_id,
-            requested_model_id,
-            failover_pinned: false,
+            declared_tools,
+            last_context_used: 0,
             turn_count: 1,
             created_at_unix_ms: now_ms,
             pool,
@@ -372,8 +390,8 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             session_id: cached.session_id.clone(),
             tool_nonce: Arc::clone(&cached.tool_nonce),
             model_id: cached.model_id.clone(),
-            requested_model_id: cached.requested_model_id.clone(),
-            failover_pinned: cached.failover_pinned,
+            declared_tools: cached.declared_tools.clone(),
+            last_context_used: cached.last_context_used,
             turn_count: next_turn,
             created_at_unix_ms: cached.created_at_unix_ms,
             pool,
@@ -398,24 +416,17 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     }
 
     #[must_use]
-    pub const fn requested_model_id(&self) -> &ModelId {
-        &self.requested_model_id
+    pub fn declared_tools(&self) -> &[CanonicalToolSpec] {
+        &self.declared_tools
     }
 
     #[must_use]
-    pub const fn is_failover_pinned(&self) -> bool {
-        self.failover_pinned
-    }
-
-    pub fn mark_failover_from(&mut self, requested_model_id: ModelId) {
-        self.requested_model_id = requested_model_id;
-        self.failover_pinned = true;
+    pub const fn last_context_used(&self) -> u64 {
+        self.last_context_used
     }
 
     pub fn set_model_id(&mut self, model_id: ModelId) {
         self.pool.update_lease_model(&self.session_id, &model_id);
-        self.requested_model_id = model_id.clone();
-        self.failover_pinned = false;
         self.model_id = model_id;
     }
 
@@ -423,6 +434,9 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     pub fn commit(
         mut self,
         post_turn_hash: ConversationHash,
+        post_turn_dialogue_hash: ConversationHash,
+        declared_tools: Vec<CanonicalToolSpec>,
+        last_context_used: u64,
         last_response_id: Option<String>,
         accumulated_messages: Vec<CanonicalMessage>,
     ) {
@@ -432,9 +446,10 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             session_id: self.session_id.clone(),
             tool_nonce: Arc::clone(&self.tool_nonce),
             model_id: self.model_id.clone(),
-            requested_model_id: self.requested_model_id.clone(),
-            failover_pinned: self.failover_pinned,
             post_turn_hash,
+            post_turn_dialogue_hash,
+            declared_tools,
+            last_context_used,
             last_response_id,
             accumulated_messages,
             turn_count: self.turn_count,

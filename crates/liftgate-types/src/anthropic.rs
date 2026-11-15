@@ -9,7 +9,7 @@ use crate::canonical::{
     NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task,
 };
 use crate::error::ProtocolError;
-use crate::session_key::strip_unstable_harness_noise;
+use crate::session_key::strip_billing_noise;
 
 pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
 
@@ -65,7 +65,7 @@ impl AnthropicSystemPrompt {
 }
 
 fn sanitize_system_segment(raw: &str) -> Option<String> {
-    let cleaned = strip_unstable_harness_noise(raw);
+    let cleaned = strip_billing_noise(raw);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
@@ -190,6 +190,8 @@ pub struct AnthropicToolResultBlock {
     pub block_type: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub source: Option<AnthropicImageSource>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,15 +300,44 @@ pub fn normalize_anthropic_request(
                             content,
                             is_error,
                         } => {
-                            let output = content
-                                .as_ref()
-                                .map(AnthropicToolResultContent::to_plain_string)
-                                .unwrap_or_default();
+                            let mut image_parts = Vec::new();
+                            let output = match content {
+                                Some(AnthropicToolResultContent::Text(s)) => s,
+                                Some(AnthropicToolResultContent::Blocks(blocks)) => {
+                                    let mut text_chunks = Vec::new();
+                                    for b in blocks {
+                                        if b.block_type == "image" {
+                                            if let Some(src) = b.source {
+                                                if src.source_type == "base64"
+                                                    && !src.media_type.is_empty()
+                                                    && !src.data.is_empty()
+                                                {
+                                                    image_parts.push(CanonicalPart::ImageBase64 {
+                                                        media_type: src.media_type,
+                                                        data: src.data,
+                                                    });
+                                                } else {
+                                                    return Err(ProtocolError::UnsupportedImageUrl);
+                                                }
+                                            }
+                                        } else if let Some(t) = b.text {
+                                            text_chunks.push(t);
+                                        }
+                                    }
+                                    if text_chunks.is_empty() && !image_parts.is_empty() {
+                                        "[Image attached in tool result]".to_owned()
+                                    } else {
+                                        text_chunks.join("\n")
+                                    }
+                                }
+                                None => String::new(),
+                            };
                             parts.push(CanonicalPart::ToolResult {
                                 call_id: tool_use_id,
                                 output,
                                 is_error: is_error.unwrap_or(false),
                             });
+                            parts.extend(image_parts);
                         }
                         AnthropicInputBlock::RedactedThinking { .. }
                         | AnthropicInputBlock::ServerToolUse { .. }
@@ -610,4 +641,62 @@ pub struct AnthropicErrorBody {
     #[serde(rename = "type")]
     pub error_type: &'static str,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_base64_images_nested_inside_anthropic_tool_result_blocks() {
+        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "Read diagram.png" },
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": { "file_path": "diagram.png" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                { "type": "text", "text": "Image read successfully" },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBORw0KGgoAAAANSUhEUg=="
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid AnthropicMessagesRequest");
+
+        let norm = normalize_anthropic_request(req).expect("normalized turn");
+        let last_msg = norm.messages.last().expect("tool result message");
+        assert_eq!(last_msg.parts.len(), 2);
+        assert!(matches!(
+            &last_msg.parts[0],
+            CanonicalPart::ToolResult { call_id, output, is_error: false }
+                if call_id == "toolu_1" && output == "Image read successfully"
+        ));
+        assert!(matches!(
+            &last_msg.parts[1],
+            CanonicalPart::ImageBase64 { media_type, data }
+                if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUg=="
+        ));
+    }
 }

@@ -32,10 +32,13 @@ pub struct WebToolBridgeConfig {
 ///
 /// If the request ends with one or more `User` messages following an `Assistant` message,
 /// `prefix_lookup` holds `(prefix_hash, delta_start_index)` where `prefix_hash` hashes
-/// `(system, tools, web_flags, model, messages[..delta_start_index])`.
+/// `(system, web_flags, model, messages[..delta_start_index])`. Client tools are synced
+/// incrementally on warm sessions via `<client_tools_update>` so mode switches, `ToolSearch`,
+/// lazy app namespaces, and `/compact` never invalidate warm KV caches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRoutingPlan {
     pub prefix_lookup: Option<(ConversationHash, usize)>,
+    pub compaction_lookup: Option<(ConversationHash, usize)>,
     pub base_state_hash_before_reply: ConversationHash,
 }
 
@@ -62,11 +65,26 @@ pub fn compute_routing_plan(
         }
     });
 
+    let compaction_lookup = if is_compaction_summarization_turn(system, messages, tools) {
+        last_assistant_idx.and_then(|idx| {
+            let split_at = idx + 1;
+            if split_at < messages.len() {
+                let prefix_slice = messages.get(..split_at)?;
+                Some((hash_dialogue_state(model, prefix_slice), split_at))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     let base_state_hash_before_reply =
         hash_conversation_state(system, tools, web_cfg, model, messages);
 
     SessionRoutingPlan {
         prefix_lookup,
+        compaction_lookup,
         base_state_hash_before_reply,
     }
 }
@@ -93,27 +111,58 @@ pub fn hash_conversation_with_reply(
 #[must_use]
 pub fn hash_conversation_state(
     system: Option<&str>,
-    tools: &[CanonicalToolSpec],
+    _tools: &[CanonicalToolSpec],
     web_cfg: WebToolBridgeConfig,
     model: &ModelId,
     messages: &[CanonicalMessage],
 ) -> ConversationHash {
-    let mut hasher = init_base_hasher(system, tools, web_cfg, model);
+    let mut hasher = init_base_hasher(system, _tools, web_cfg, model);
     for msg in messages {
         feed_message_hash(&mut hasher, msg);
     }
     hasher.finalize().into()
 }
 
+/// Computes a pure dialogue hash (`(model, non-developer-instruction parts)`) so harness
+/// `/compact` summarization requests (which swap `system`/`instructions` and clear `tools`)
+/// can still hit the warm pre-compaction ACP session with zero cold re-upload.
+#[must_use]
+pub fn hash_dialogue_state(_model: &ModelId, messages: &[CanonicalMessage]) -> ConversationHash {
+    let mut hasher = init_dialogue_hasher();
+    for msg in messages {
+        feed_dialogue_message_hash(&mut hasher, msg);
+    }
+    hasher.finalize().into()
+}
+
+#[must_use]
+pub fn hash_dialogue_with_reply(
+    _model: &ModelId,
+    prior_messages: &[CanonicalMessage],
+    assistant_reply: &CanonicalMessage,
+) -> ConversationHash {
+    let mut hasher = init_dialogue_hasher();
+    for msg in prior_messages {
+        feed_dialogue_message_hash(&mut hasher, msg);
+    }
+    feed_dialogue_message_hash(&mut hasher, assistant_reply);
+    hasher.finalize().into()
+}
+
+fn init_dialogue_hasher() -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agy-acp-dialogue-v1\0");
+    hasher
+}
+
 fn init_base_hasher(
     system: Option<&str>,
-    tools: &[CanonicalToolSpec],
+    _tools: &[CanonicalToolSpec],
     web_cfg: WebToolBridgeConfig,
-    model: &ModelId,
+    _model: &ModelId,
 ) -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"agy-acp-gateway-v2\0");
-    hasher.update(model.as_str().as_bytes());
+    hasher.update(b"agy-acp-gateway-v3\0");
     hasher.update([
         u8::from(web_cfg.enable_native_web_search),
         u8::from(web_cfg.enable_native_web_fetch),
@@ -123,28 +172,13 @@ fn init_base_hasher(
         let cleaned = strip_unstable_harness_noise(sys);
         hasher.update(cleaned.trim().as_bytes());
     }
-    hasher.update(b"\0tools\0");
-    for tool in tools {
-        hasher.update(tool.name.as_bytes());
-        hasher.update(b"\x1f");
-        match &tool.kind {
-            CanonicalToolKind::Function { parameters_json } => {
-                hasher.update(b"fn:");
-                hasher.update(parameters_json.as_bytes());
-            }
-            CanonicalToolKind::Custom { format_json } => {
-                hasher.update(b"custom:");
-                if let Some(fmt) = format_json {
-                    hasher.update(fmt.as_bytes());
-                }
-            }
-        }
-        hasher.update(b"\x1e");
-    }
     hasher
 }
 
 fn feed_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
+    if !message_has_stable_hash_content(msg, false) {
+        return;
+    }
     match msg.role {
         CanonicalRole::User => hasher.update(b"\0role:user\0"),
         CanonicalRole::Assistant => hasher.update(b"\0role:assistant\0"),
@@ -197,6 +231,135 @@ fn feed_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
     }
 }
 
+fn feed_dialogue_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
+    if !message_has_stable_hash_content(msg, true) {
+        return;
+    }
+    match msg.role {
+        CanonicalRole::User => hasher.update(b"\0role:user\0"),
+        CanonicalRole::Assistant => hasher.update(b"\0role:assistant\0"),
+    }
+    for part in &msg.parts {
+        match part {
+            CanonicalPart::Text(text) => {
+                if is_developer_instructions_wrapper(text) {
+                    continue;
+                }
+                let cleaned = strip_unstable_harness_noise(text);
+                let trimmed = cleaned.trim();
+                if !trimmed.is_empty() {
+                    hasher.update(b"txt:");
+                    hasher.update(trimmed.as_bytes());
+                    hasher.update(b"\x1d");
+                }
+            }
+            CanonicalPart::ImageBase64 { media_type, data } => {
+                hasher.update(b"img:");
+                hasher.update(media_type.as_bytes());
+                hasher.update(b":");
+                hasher.update(data.as_bytes());
+                hasher.update(b"\x1d");
+            }
+            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::ToolCall {
+                call_id: _,
+                name,
+                arguments,
+                is_custom,
+            } => {
+                hasher.update(if *is_custom { b"ctool:" } else { b"ftool:" });
+                hasher.update(name.as_bytes());
+                hasher.update(b":");
+                hasher.update(canonicalize_tool_call_for_hash(name, arguments).as_bytes());
+                hasher.update(b"\x1d");
+            }
+            CanonicalPart::ToolResult {
+                call_id: _,
+                output,
+                is_error,
+            } => {
+                let cleaned = strip_unstable_harness_noise(output);
+                hasher.update(if *is_error { b"terr:" } else { b"tres:" });
+                hasher.update(cleaned.trim().as_bytes());
+                hasher.update(b"\x1d");
+            }
+        }
+    }
+}
+
+fn message_has_stable_hash_content(msg: &CanonicalMessage, skip_developer_wrappers: bool) -> bool {
+    for part in &msg.parts {
+        match part {
+            CanonicalPart::Text(text) => {
+                if skip_developer_wrappers && is_developer_instructions_wrapper(text) {
+                    continue;
+                }
+                if !strip_unstable_harness_noise(text).trim().is_empty() {
+                    return true;
+                }
+            }
+            CanonicalPart::ImageBase64 { .. }
+            | CanonicalPart::ToolCall { .. }
+            | CanonicalPart::ToolResult { .. } => return true,
+            CanonicalPart::Reasoning(_) => {}
+        }
+    }
+    false
+}
+
+fn is_developer_instructions_wrapper(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("<developer_instructions>")
+        && trimmed.ends_with("</developer_instructions>")
+}
+
+/// Returns `true` when an `instructions` / `system` string is a harness compaction prompt
+/// (such as OpenAI Codex's `CONTEXT CHECKPOINT COMPACTION` or Claude Code's `/compact` prompt).
+#[must_use]
+pub fn is_compaction_instructions_prompt(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("context checkpoint compaction")
+        || lower.contains("handoff summary for another llm")
+        || (lower.contains("compaction") && lower.contains("another language model"))
+        || lower.contains("create a detailed summary of the conversation so far")
+}
+
+/// Detects whether an incoming turn is a local context-compaction summarization request
+/// so `SessionPool` can reuse the warm pre-compaction session and retire it afterward.
+#[must_use]
+pub fn is_compaction_summarization_turn(
+    system: Option<&str>,
+    messages: &[CanonicalMessage],
+    tools: &[CanonicalToolSpec],
+) -> bool {
+    if !tools.is_empty() {
+        return false;
+    }
+    if system.is_some_and(is_compaction_instructions_prompt) {
+        return true;
+    }
+    let Some(last_user) = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == CanonicalRole::User)
+    else {
+        return false;
+    };
+    for part in &last_user.parts {
+        if let CanonicalPart::Text(t) = part {
+            let lower = t.to_ascii_lowercase();
+            if is_compaction_instructions_prompt(t)
+                || lower.contains("create a detailed summary of the conversation so far")
+                || lower.contains("summarize the conversation so far")
+                || (lower.contains("handoff summary") && lower.contains("progress"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn canonicalize_tool_call_for_hash(name: &str, raw: &str) -> String {
     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw) {
         if name == INTERNAL_CODEX_LOCAL_SHELL_TOOL
@@ -214,28 +377,64 @@ fn canonicalize_tool_call_for_hash(name: &str, raw: &str) -> String {
     raw.trim().to_owned()
 }
 
+/// Strips ONLY non-semantic billing/attribution noise (`x-anthropic-billing-header`, `cch=...`,
+/// `<fast_mode_info>`) while keeping runtime context signals (`<current_time>`,
+/// `<current_time_reminder>`, `<timestamp>`, `<budget:token_budget>`, `<total_tokens>`,
+/// `<context_window>`, `<rollout_budget>`) completely intact for the model.
+#[must_use]
+pub fn strip_billing_noise(input: &str) -> String {
+    let line_filtered = strip_billing_and_cch_tokens(input);
+    let without_fast_mode =
+        strip_tag_blocks(&line_filtered, "<fast_mode_info>", "</fast_mode_info>");
+    collapse_empty_wrapper_blocks(
+        &without_fast_mode,
+        "<system-reminder>",
+        "</system-reminder>",
+    )
+}
+
 /// Strips volatile per-request attribution prefixes and token/timestamp counters injected by
 /// Claude Code (`x-anthropic-billing-header`, `cch=...`, `<total_tokens>`, `<budget:token_budget>`)
-/// and OpenAI Codex (`<current_time>`, `<timestamp>`) so both backend Gemini KV prefix caching
-/// and `SessionPool` stateful prefix-hash matching achieve maximal hit rates.
+/// and OpenAI Codex (`<current_time>`, `<current_time_reminder>`, `<timestamp>`, `<context_window>`,
+/// `<rollout_budget>`) when computing deterministic `SessionPool` prefix hashes.
 #[must_use]
 pub fn strip_unstable_harness_noise(input: &str) -> String {
-    let line_filtered = strip_billing_and_cch_tokens(input);
-    let s1 = strip_tag_blocks(&line_filtered, "<total_tokens>", "</total_tokens>");
+    let base = strip_billing_noise(input);
+    let s1 = strip_tag_blocks(&base, "<total_tokens>", "</total_tokens>");
     let s2 = strip_tag_blocks(&s1, "<budget:token_budget>", "</budget:token_budget>");
-    let s3 = strip_tag_blocks(&s2, "<fast_mode_info>", "</fast_mode_info>");
-    let s4 = strip_tag_blocks(&s3, "<current_time>", "</current_time>");
-    let without_volatile_tags = strip_tag_blocks(&s4, "<timestamp>", "</timestamp>");
+    let s3 = strip_tag_blocks(&s2, "<context_window>", "</context_window>");
+    let s4 = strip_tag_blocks(
+        &s3,
+        "<context_window_reminder>",
+        "</context_window_reminder>",
+    );
+    let s5 = strip_tag_blocks(&s4, "<rollout_budget>", "</rollout_budget>");
+    let s6 = strip_tag_blocks(&s5, "<current_time>", "</current_time>");
+    let s7 = strip_tag_blocks(&s6, "<current_time_reminder>", "</current_time_reminder>");
+    let s8 = strip_tag_blocks(
+        &s7,
+        "<current_time_unavailable>",
+        "</current_time_unavailable>",
+    );
+    let without_volatile_tags = strip_tag_blocks(&s8, "<timestamp>", "</timestamp>");
+    let collapsed_rem = collapse_empty_wrapper_blocks(
+        &without_volatile_tags,
+        "<system-reminder>",
+        "</system-reminder>",
+    );
+    collapse_empty_wrapper_blocks(
+        &collapsed_rem,
+        "<developer_instructions>",
+        "</developer_instructions>",
+    )
+}
 
-    if !without_volatile_tags.contains("<system-reminder>") {
-        return without_volatile_tags;
+fn collapse_empty_wrapper_blocks(input: &str, open: &str, close: &str) -> String {
+    if !input.contains(open) {
+        return input.to_owned();
     }
-
-    // Collapse `<system-reminder>` blocks that became whitespace-only after removing volatile tags
-    let mut out = String::with_capacity(without_volatile_tags.len());
-    let mut rest = without_volatile_tags.as_str();
-    let open = "<system-reminder>";
-    let close = "</system-reminder>";
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
     while let Some(start) = rest.find(open) {
         let Some((before, after_open_pos)) = rest.split_at_checked(start) else {
             break;
@@ -437,7 +636,7 @@ fn slim_schema_value(val: &mut serde_json::Value) {
 }
 
 fn compact_caller_system(raw_sys: &str) -> String {
-    let cleaned = strip_unstable_harness_noise(raw_sys);
+    let cleaned = strip_billing_noise(raw_sys);
     if cleaned.len() <= 8_000 {
         return cleaned.trim().to_owned();
     }
@@ -543,32 +742,7 @@ pub fn build_session_system_append(
         if !client_tools.is_empty() {
             out.push_str("<client_tools>\n");
             for tool in client_tools {
-                out.push_str("- name: ");
-                out.push_str(&tool.name);
-                out.push('\n');
-                if let Some(desc) = &tool.description {
-                    let compacted_desc = compact_tool_description(desc);
-                    if !compacted_desc.is_empty() {
-                        out.push_str("  description: ");
-                        out.push_str(&compacted_desc);
-                        out.push('\n');
-                    }
-                }
-                match &tool.kind {
-                    CanonicalToolKind::Function { parameters_json } => {
-                        out.push_str("  invocation: xml_json_arguments\n  args_schema: ");
-                        out.push_str(&compact_json_schema(parameters_json));
-                        out.push('\n');
-                    }
-                    CanonicalToolKind::Custom { format_json } => {
-                        out.push_str("  invocation: xml_freeform_input\n");
-                        if let Some(fmt) = format_json {
-                            out.push_str("  format: ");
-                            out.push_str(fmt);
-                            out.push('\n');
-                        }
-                    }
-                }
+                render_compact_client_tool(tool, &mut out);
             }
             out.push_str("</client_tools>\n");
         }
@@ -587,12 +761,138 @@ pub fn build_session_system_append(
     out
 }
 
+fn render_compact_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
+    out.push_str("- name: ");
+    out.push_str(&tool.name);
+    out.push('\n');
+    if let Some(desc) = &tool.description {
+        let compacted_desc = compact_tool_description(desc);
+        if !compacted_desc.is_empty() {
+            out.push_str("  description: ");
+            out.push_str(&compacted_desc);
+            out.push('\n');
+        }
+    }
+    match &tool.kind {
+        CanonicalToolKind::Function { parameters_json } => {
+            out.push_str("  invocation: xml_json_arguments\n  args_schema: ");
+            out.push_str(&compact_json_schema(parameters_json));
+            out.push('\n');
+        }
+        CanonicalToolKind::Custom { format_json } => {
+            out.push_str("  invocation: xml_freeform_input\n");
+            if let Some(fmt) = format_json {
+                out.push_str("  format: ");
+                out.push_str(fmt);
+                out.push('\n');
+            }
+        }
+    }
+}
+
+/// Builds an incremental `<client_tools_update>` block when a warm session's active tool list
+/// changes across turns (e.g. Plan <-> Default mode, Claude Code `ToolSearch`, Codex lazy app
+/// connector activation, or `/compact` disabling tools for a summarization turn).
+#[must_use]
+pub fn build_client_tools_delta_xml(
+    prev_tools: &[CanonicalToolSpec],
+    next_tools: &[CanonicalToolSpec],
+    tool_nonce: &str,
+) -> Option<String> {
+    if prev_tools == next_tools {
+        return None;
+    }
+    let mut out = String::with_capacity(512);
+    out.push_str("<client_tools_update>\n");
+    if next_tools.is_empty() {
+        out.push_str(&format!(
+            "External `<client_tools>` are disabled for this turn; respond in plain text without emitting any `<agy_tool_call_{tool_nonce}>` XML blocks.\n"
+        ));
+        out.push_str("</client_tools_update>\n");
+        return Some(out);
+    }
+
+    if prev_tools.is_empty() {
+        let open_tag = format!("<agy_tool_call_{tool_nonce}>");
+        let close_tag = format!("</agy_tool_call_{tool_nonce}>");
+        out.push_str(&format!(
+            "External `<client_tools>` are now enabled. Invoke them ONLY via `{open_tag}\n{{\"name\": \"<exact_tool_name>\", \"arguments\": {{ ... }}}}\n{close_tag}` (or `\"input\"` for custom freeform tools) and stop immediately after the closing tag:\n"
+        ));
+    }
+
+    let added_or_changed: Vec<&CanonicalToolSpec> = next_tools
+        .iter()
+        .filter(|nt| !prev_tools.iter().any(|pt| *pt == **nt))
+        .collect();
+    let removed_names: Vec<&str> = prev_tools
+        .iter()
+        .filter(|pt| !next_tools.iter().any(|nt| nt.name == pt.name))
+        .map(|pt| pt.name.as_str())
+        .collect();
+
+    if !removed_names.is_empty() {
+        out.push_str("Removed client tools (no longer available): ");
+        out.push_str(&removed_names.join(", "));
+        out.push('\n');
+    }
+    if !added_or_changed.is_empty() {
+        out.push_str("Added/updated client tools:\n");
+        for tool in added_or_changed {
+            render_compact_client_tool(tool, &mut out);
+        }
+    }
+    out.push_str("</client_tools_update>\n");
+    Some(out)
+}
+
+/// Combines optional compaction system instructions (e.g. Claude Code `/compact` system prompt)
+/// and optional `<client_tools_update>` into a single leading directive block when reusing a
+/// warm pre-compaction ACP session.
+#[must_use]
+pub fn build_compaction_directive_xml(
+    compaction_system: Option<&str>,
+    tools_delta_xml: Option<&str>,
+) -> Option<String> {
+    let cleaned_sys = compaction_system
+        .map(strip_billing_noise)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let tools_xml = tools_delta_xml.filter(|s| !s.trim().is_empty());
+    if cleaned_sys.is_none() && tools_xml.is_none() {
+        return None;
+    }
+    let mut out = String::with_capacity(512);
+    if let Some(sys) = cleaned_sys {
+        out.push_str("<caller_compaction_instructions>\n");
+        out.push_str(&sys);
+        if !sys.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("</caller_compaction_instructions>\n");
+    }
+    if let Some(t_xml) = tools_xml {
+        out.push_str(t_xml);
+        if !t_xml.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
 /// Maximum total UTF-8 text bytes emitted in a single `session/prompt` request.
 ///
-/// Upstream `agy acp` truncates oversized prompt payloads from the tail near ~250 KB; bounding
-/// cold-replay and delta prompts to 180 KB guarantees recent user turns and `### Current Caller Input`
-/// remain intact at the end of the prompt.
-pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 180_000;
+/// Upstream `agy acp` truncates single-turn text payloads at `191,578` bytes (`<truncated N bytes>`).
+/// Keeping each ACP turn at or below `160,000` bytes provides >31 KB of safety headroom, while
+/// `build_acp_prompt_plan` streams larger histories across lossless hydration chunks.
+pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 160_000;
+
+/// Maximum number of fast Flash seed chunks before the final target-model turn (`5 * 148 KB + 160 KB ≈ 900 KB`).
+pub const MAX_HYDRATION_SEED_CHUNKS: usize = 5;
+
+/// Maximum total lossless hydration bytes (~300k–430k tokens) before 4-tier archival compaction engages.
+pub const MAX_LOSSLESS_HYDRATION_BYTES: usize = 900_000;
+
+const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 148_000;
 
 const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 68_000;
 const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
@@ -600,6 +900,18 @@ const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
 const ARCHIVE_OPEN_HEADER: &str =
     "--- Prior Conversation Context (Read-Only Archive; Do NOT echo these headers) ---\n";
 const ARCHIVE_CLOSE_HEADER: &str = "--- End Prior Conversation Context ---\n\n### Current Caller Input (Respond ONLY for the current assistant step)\n";
+
+/// Multi-step ACP prompt execution plan.
+///
+/// When `seed_chunks` is empty, `final_blocks` fits in a single `session/prompt` turn.
+/// When `seed_chunks` is non-empty, `turn_runner` seeds each chunk (`<= 148 KB`) on the fastest
+/// Flash model in the same ACP session before switching to the requested model for `final_blocks`,
+/// bypassing both upstream's `191,578`-byte single-turn truncation and ~300k post-turn compaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpPromptPlan {
+    pub seed_chunks: Vec<Vec<AcpPromptBlock>>,
+    pub final_blocks: Vec<AcpPromptBlock>,
+}
 
 #[derive(Clone, Copy)]
 struct PartRenderLimits {
@@ -649,11 +961,287 @@ pub fn build_acp_prompt_blocks(
     if estimate_raw_prompt_bytes(history_slice, active_slice) <= MAX_ACP_PROMPT_TEXT_BYTES {
         let uncompacted = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
         if total_text_block_bytes(&uncompacted) <= MAX_ACP_PROMPT_TEXT_BYTES {
-            return uncompacted;
+            return sanitize_slash_command_blocks(uncompacted);
         }
     }
 
-    render_bounded_prompt_blocks(history_slice, active_slice, tool_nonce)
+    sanitize_slash_command_blocks(render_bounded_prompt_blocks(
+        history_slice,
+        active_slice,
+        tool_nonce,
+    ))
+}
+
+/// Builds a lossless multi-chunk ACP prompt plan (`seed_chunks` + `final_blocks`) capable of
+/// carrying up to ~900 KB (~300k–430k tokens) with zero truncation, falling back to 4-tier
+/// priority compaction across `seed_chunks` only for multi-megabyte transcripts.
+#[must_use]
+pub fn build_acp_prompt_plan(
+    messages: &[CanonicalMessage],
+    tool_nonce: &str,
+    is_full_history_replay: bool,
+    leading_directive_xml: Option<&str>,
+) -> AcpPromptPlan {
+    if messages.is_empty() {
+        let text = leading_directive_xml
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(" ")
+            .to_owned();
+        return AcpPromptPlan {
+            seed_chunks: Vec::new(),
+            final_blocks: sanitize_slash_command_blocks(vec![AcpPromptBlock::Text { text }]),
+        };
+    }
+
+    let split_history_at = if is_full_history_replay && messages.len() > 1 {
+        messages
+            .iter()
+            .rposition(|m| m.role == CanonicalRole::Assistant)
+            .map_or(0, |idx| idx + 1)
+    } else {
+        0
+    };
+
+    let (history_slice, active_slice) = messages
+        .split_at_checked(split_history_at)
+        .unwrap_or((&[], messages));
+
+    let directive_bytes = leading_directive_xml.map_or(0, str::len);
+    let raw_est =
+        estimate_raw_prompt_bytes(history_slice, active_slice).saturating_add(directive_bytes);
+
+    if raw_est <= MAX_LOSSLESS_HYDRATION_BYTES {
+        let mut uncompacted =
+            render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+        prepend_directive_to_blocks(&mut uncompacted, leading_directive_xml);
+        let total_bytes = total_text_block_bytes(&uncompacted);
+        if total_bytes <= MAX_ACP_PROMPT_TEXT_BYTES {
+            return AcpPromptPlan {
+                seed_chunks: Vec::new(),
+                final_blocks: sanitize_slash_command_blocks(uncompacted),
+            };
+        }
+        if total_bytes <= MAX_LOSSLESS_HYDRATION_BYTES {
+            return split_blocks_into_hydration_plan(uncompacted);
+        }
+    }
+
+    // Ultra-large multi-megabyte transcript (>900 KB): bound active turn to 148 KB and give
+    // 4-tier archival compaction up to `MAX_HYDRATION_SEED_CHUNKS * 144 KB` (720 KB) of room!
+    let mut active_blocks =
+        render_bounded_active_slice(active_slice, tool_nonce, SEED_CHUNK_TARGET_TEXT_BYTES);
+    if history_slice.is_empty() {
+        prepend_directive_to_blocks(&mut active_blocks, leading_directive_xml);
+        return split_blocks_into_hydration_plan(active_blocks);
+    }
+
+    let history_budget = MAX_HYDRATION_SEED_CHUNKS * 144_000;
+    let history_body = build_compacted_history_body(history_slice, tool_nonce, history_budget);
+    let mut archive_text = String::with_capacity(
+        directive_bytes
+            + ARCHIVE_OPEN_HEADER.len()
+            + history_body.len()
+            + ARCHIVE_CLOSE_HEADER.len(),
+    );
+    if let Some(dir) = leading_directive_xml.filter(|s| !s.trim().is_empty()) {
+        archive_text.push_str(dir);
+        if !archive_text.ends_with('\n') {
+            archive_text.push('\n');
+        }
+    }
+    archive_text.push_str(ARCHIVE_OPEN_HEADER);
+    archive_text.push_str(&history_body);
+    if !archive_text.ends_with('\n') {
+        archive_text.push('\n');
+    }
+    archive_text.push_str(ARCHIVE_CLOSE_HEADER);
+
+    let mut combined = Vec::with_capacity(active_blocks.len() + 1);
+    let mut active_iter = active_blocks.into_iter();
+    match active_iter.next() {
+        Some(AcpPromptBlock::Text { text }) => {
+            archive_text.push_str(&text);
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+        }
+        Some(other) => {
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+            combined.push(other);
+        }
+        None => {
+            combined.push(AcpPromptBlock::Text { text: archive_text });
+        }
+    }
+    combined.extend(active_iter);
+    split_blocks_into_hydration_plan(combined)
+}
+
+fn prepend_directive_to_blocks(blocks: &mut Vec<AcpPromptBlock>, directive: Option<&str>) {
+    let Some(dir) = directive.filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+    match blocks.first_mut() {
+        Some(AcpPromptBlock::Text { text }) => {
+            let mut merged = String::with_capacity(dir.len() + 1 + text.len());
+            merged.push_str(dir);
+            if !merged.ends_with('\n') {
+                merged.push('\n');
+            }
+            merged.push_str(text);
+            *text = merged;
+        }
+        _ => {
+            blocks.insert(
+                0,
+                AcpPromptBlock::Text {
+                    text: dir.to_owned(),
+                },
+            );
+        }
+    }
+}
+
+/// Splits a sequence of `AcpPromptBlock`s into `<= MAX_HYDRATION_SEED_CHUNKS` seed turns
+/// (`<= SEED_CHUNK_TARGET_TEXT_BYTES` each) plus a `final_blocks` turn (`<= MAX_ACP_PROMPT_TEXT_BYTES`).
+fn split_blocks_into_hydration_plan(blocks: Vec<AcpPromptBlock>) -> AcpPromptPlan {
+    let mut flat_segments: Vec<AcpPromptBlock> = Vec::new();
+    for block in blocks {
+        match block {
+            AcpPromptBlock::Image { .. } => flat_segments.push(block),
+            AcpPromptBlock::Text { text } => {
+                if text.len() <= SEED_CHUNK_TARGET_TEXT_BYTES {
+                    flat_segments.push(AcpPromptBlock::Text { text });
+                } else {
+                    let mut rest = text.as_str();
+                    while !rest.is_empty() {
+                        if rest.len() <= SEED_CHUNK_TARGET_TEXT_BYTES {
+                            flat_segments.push(AcpPromptBlock::Text {
+                                text: rest.to_owned(),
+                            });
+                            break;
+                        }
+                        let cut = find_clean_line_split(rest, SEED_CHUNK_TARGET_TEXT_BYTES);
+                        let (chunk_str, after) = rest.split_at_checked(cut).unwrap_or((rest, ""));
+                        flat_segments.push(AcpPromptBlock::Text {
+                            text: chunk_str.to_owned(),
+                        });
+                        rest = after;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut raw_turns: Vec<Vec<AcpPromptBlock>> = Vec::new();
+    let mut cur_turn: Vec<AcpPromptBlock> = Vec::new();
+    let mut cur_bytes = 0usize;
+
+    for seg in flat_segments {
+        let seg_bytes = match &seg {
+            AcpPromptBlock::Text { text } => text.len(),
+            AcpPromptBlock::Image { .. } => 0,
+        };
+        if !cur_turn.is_empty()
+            && cur_bytes.saturating_add(seg_bytes) > SEED_CHUNK_TARGET_TEXT_BYTES
+        {
+            raw_turns.push(std::mem::take(&mut cur_turn));
+            cur_bytes = 0;
+        }
+        cur_bytes = cur_bytes.saturating_add(seg_bytes);
+        cur_turn.push(seg);
+    }
+    if !cur_turn.is_empty() {
+        raw_turns.push(cur_turn);
+    }
+
+    if raw_turns.is_empty() {
+        return AcpPromptPlan {
+            seed_chunks: Vec::new(),
+            final_blocks: vec![AcpPromptBlock::Text {
+                text: " ".to_owned(),
+            }],
+        };
+    }
+
+    let mut final_blocks = raw_turns.pop().unwrap_or_default();
+    // Ensure `final_blocks` is non-empty and ends with text context if it only held an image.
+    if final_blocks.is_empty() {
+        final_blocks.push(AcpPromptBlock::Text {
+            text: "Continue with the current caller request above.".to_owned(),
+        });
+    } else if !final_blocks
+        .iter()
+        .any(|b| matches!(b, AcpPromptBlock::Text { text } if !text.trim().is_empty()))
+    {
+        final_blocks.push(AcpPromptBlock::Text {
+            text: "Inspect the attached image(s) and fulfill the current caller request above."
+                .to_owned(),
+        });
+    }
+
+    // Cap `seed_chunks` to `MAX_HYDRATION_SEED_CHUNKS`, keeping the first chunk (developer/system
+    // instructions + earliest user task) and the most recent chunks if ever exceeded.
+    if raw_turns.len() > MAX_HYDRATION_SEED_CHUNKS {
+        let keep_tail = MAX_HYDRATION_SEED_CHUNKS.saturating_sub(1);
+        let tail_start = raw_turns.len().saturating_sub(keep_tail);
+        let mut bounded = Vec::with_capacity(MAX_HYDRATION_SEED_CHUNKS);
+        if let Some(first) = raw_turns.first().cloned() {
+            bounded.push(first);
+        }
+        if let Some(tail_slice) = raw_turns.get(tail_start..) {
+            bounded.extend(tail_slice.iter().cloned());
+        }
+        raw_turns = bounded;
+    }
+
+    let total_seeds = raw_turns.len();
+    let seed_chunks = raw_turns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut turn_blocks)| {
+            let footer = format!(
+                "\n\n[Context Hydration Segment {}/{total_seeds} — Store the exact context above in session memory. Do NOT invoke any tools yet; reply with ONLY: OK]",
+                idx + 1
+            );
+            match turn_blocks.last_mut() {
+                Some(AcpPromptBlock::Text { text }) => text.push_str(&footer),
+                _ => turn_blocks.push(AcpPromptBlock::Text { text: footer }),
+            }
+            sanitize_slash_command_blocks(turn_blocks)
+        })
+        .collect();
+
+    AcpPromptPlan {
+        seed_chunks,
+        final_blocks: sanitize_slash_command_blocks(final_blocks),
+    }
+}
+
+fn find_clean_line_split(text: &str, max_bytes: usize) -> usize {
+    let safe_end = floor_utf8_boundary(text, max_bytes);
+    let candidate = text.get(..safe_end).unwrap_or("");
+    // Prefer splitting at a newline within the last 16 KB so lines/tags stay intact.
+    let min_newline_pos = safe_end.saturating_sub(16_384);
+    if let Some(rel_nl) = candidate
+        .get(min_newline_pos..)
+        .and_then(|tail| tail.rfind('\n'))
+    {
+        let pos = min_newline_pos + rel_nl + 1;
+        if pos > 0 {
+            return pos;
+        }
+    }
+    safe_end.max(1)
+}
+
+fn sanitize_slash_command_blocks(mut blocks: Vec<AcpPromptBlock>) -> Vec<AcpPromptBlock> {
+    for block in &mut blocks {
+        if let AcpPromptBlock::Text { text } = block
+            && text.trim_start().starts_with('/')
+        {
+            text.insert(0, '\u{200b}');
+        }
+    }
+    blocks
 }
 
 fn render_uncompacted_prompt_blocks(
@@ -1184,7 +1772,7 @@ fn render_parts_into(
     for part in &msg.parts {
         match part {
             CanonicalPart::Text(text) => {
-                let cleaned = strip_unstable_harness_noise(text);
+                let cleaned = strip_billing_noise(text);
                 if !cleaned.trim().is_empty() {
                     if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                         text_acc.push('\n');
@@ -1262,7 +1850,7 @@ fn render_parts_into(
                 if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                     text_acc.push('\n');
                 }
-                let cleaned_output = strip_unstable_harness_noise(output);
+                let cleaned_output = strip_billing_noise(output);
                 let trimmed_output = cleaned_output.trim();
                 let rendered_output = if trimmed_output.len() > limits.max_tool_result_bytes {
                     truncate_middle_utf8_bytes(trimmed_output, limits.max_tool_result_bytes, 13, 20)
@@ -1495,5 +2083,300 @@ mod tests {
         assert!(joined.contains(critical_user_msg));
         assert!(joined.contains("### Current Caller Input"));
         assert!(joined.contains("[Client Tool Result id=call_new_19 status=ok]:"));
+    }
+
+    #[test]
+    fn preserves_timestamps_and_token_budgets_in_prompts_while_keeping_prefix_hash_stable() {
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let sys = "x-anthropic-billing-header: cc_version=2.1.300; cch=abc12;\nYou are a helpful coding assistant.";
+
+        let msg_u1_t1 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![
+                CanonicalPart::Text(
+                    "<current_time_reminder>The current local time is: 2026-11-15T10:00:00+08:00.</current_time_reminder>".to_owned(),
+                ),
+                CanonicalPart::Text(
+                    "<system-reminder>\n<budget:token_budget>200000</budget:token_budget>\n</system-reminder>".to_owned(),
+                ),
+                CanonicalPart::Text("Check current build status.".to_owned()),
+            ],
+        };
+        let rendered_t1 =
+            build_acp_prompt_blocks(std::slice::from_ref(&msg_u1_t1), "deadbeef1234", true);
+        let rendered_text = match rendered_t1.first() {
+            Some(AcpPromptBlock::Text { text }) => text.as_str(),
+            _ => panic!("expected text block"),
+        };
+        assert!(rendered_text.contains("<current_time_reminder>The current local time is: 2026-11-15T10:00:00+08:00.</current_time_reminder>"));
+        assert!(rendered_text.contains("<budget:token_budget>200000</budget:token_budget>"));
+
+        let assistant_t1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Build is green.".to_owned())],
+        };
+        let post_hash = hash_conversation_with_reply(
+            Some(sys),
+            &[],
+            web_cfg,
+            &model,
+            std::slice::from_ref(&msg_u1_t1),
+            &assistant_t1,
+        );
+
+        // Next turn: harness removes old `<current_time_reminder>` from Turn 1, mutates
+        // `<budget:token_budget>`, and inserts a pure volatile `<context_window>` message.
+        let msg_u1_t2 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![
+                CanonicalPart::Text(
+                    "<system-reminder>\n<budget:token_budget>182400</budget:token_budget>\n</system-reminder>".to_owned(),
+                ),
+                CanonicalPart::Text("Check current build status.".to_owned()),
+            ],
+        };
+        let volatile_only_msg = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "<context_window>used=17600 limit=1048576</context_window>".to_owned(),
+            )],
+        };
+        let msg_u2_t2 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Now run clippy.".to_owned())],
+        };
+        let plan = compute_routing_plan(
+            Some(
+                "x-anthropic-billing-header: cc_version=2.1.300; cch=99999;\nYou are a helpful coding assistant.",
+            ),
+            &[],
+            web_cfg,
+            &model,
+            &[msg_u1_t2, volatile_only_msg, assistant_t1, msg_u2_t2],
+        );
+        assert_eq!(plan.prefix_lookup, Some((post_hash, 3)));
+    }
+
+    #[test]
+    fn tool_mutations_and_effort_switches_preserve_warm_prefix_hash_and_emit_tools_delta() {
+        let model_high = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let model_xhigh = ModelId::try_new("gemini-4-carbon-xhigh").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let bash_tool = CanonicalToolSpec {
+            name: "Bash".to_owned(),
+            description: Some("Run shell".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: "{\"type\":\"object\"}".to_owned(),
+            },
+        };
+        let edit_tool = CanonicalToolSpec {
+            name: "Edit".to_owned(),
+            description: Some("Edit file".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: "{\"type\":\"object\"}".to_owned(),
+            },
+        };
+
+        let u1 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Plan the fix.".to_owned())],
+        };
+        let a1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Here is the plan.".to_owned())],
+        };
+        let post_hash = hash_conversation_with_reply(
+            Some("Agent system"),
+            std::slice::from_ref(&bash_tool),
+            web_cfg,
+            &model_high,
+            std::slice::from_ref(&u1),
+            &a1,
+        );
+
+        let u2 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Execute the plan.".to_owned())],
+        };
+        let next_tools = vec![bash_tool.clone(), edit_tool];
+        let plan = compute_routing_plan(
+            Some("Agent system"),
+            &next_tools,
+            web_cfg,
+            &model_xhigh,
+            &[u1, a1, u2],
+        );
+        assert_eq!(plan.prefix_lookup, Some((post_hash, 2)));
+
+        let delta = build_client_tools_delta_xml(
+            std::slice::from_ref(&bash_tool),
+            &next_tools,
+            "1a2b3c4d5e6f",
+        )
+        .expect("expected tool delta");
+        assert!(delta.contains("<client_tools_update>"));
+        assert!(delta.contains("name: Edit"));
+        assert!(!delta.contains("name: Bash"));
+    }
+
+    #[test]
+    fn compaction_summarization_turn_matches_warm_dialogue_hash_for_codex_and_claude() {
+        let model_xhigh = ModelId::try_new("gemini-4-carbon-xhigh").expect("valid model");
+        let model_high = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        let u1 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![
+                CanonicalPart::Text(
+                    "<developer_instructions>\nCodex coding rules\n</developer_instructions>"
+                        .to_owned(),
+                ),
+                CanonicalPart::Text("Implement feature X.".to_owned()),
+            ],
+        };
+        let a1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Implemented feature X.".to_owned())],
+        };
+        let dialogue_hash = hash_dialogue_with_reply(&model_xhigh, std::slice::from_ref(&u1), &a1);
+
+        // 1. Codex `/compact`: drops `<developer_instructions>`, clears `tools`, appends
+        //    `CONTEXT CHECKPOINT COMPACTION` + deferred compaction `instructions`.
+        let codex_u1 = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Implement feature X.".to_owned())],
+        };
+        let codex_compact_prompt = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary."
+                    .to_owned(),
+            )],
+        };
+        let codex_plan = compute_routing_plan(
+            None,
+            &[],
+            web_cfg,
+            &model_high,
+            &[codex_u1.clone(), a1.clone(), codex_compact_prompt],
+        );
+        assert_eq!(codex_plan.compaction_lookup, Some((dialogue_hash, 2)));
+
+        // 2. Claude Code `/compact`: replaces `system` with summarization system prompt and clears `tools`.
+        let cc_compact_prompt = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "Your task is to create a detailed summary of the conversation so far.".to_owned(),
+            )],
+        };
+        let cc_plan = compute_routing_plan(
+            Some("You are a helpful AI assistant tasked with summarizing conversations."),
+            &[],
+            web_cfg,
+            &model_high,
+            &[codex_u1, a1, cc_compact_prompt],
+        );
+        assert_eq!(cc_plan.compaction_lookup, Some((dialogue_hash, 2)));
+    }
+
+    #[test]
+    fn lossless_hydration_plan_splits_420kb_transcript_without_truncation_and_escapes_slash() {
+        let mut messages = Vec::new();
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(format!(
+                "EARLY_NEEDLE_ALPHA_001\n{}",
+                "a".repeat(95_000)
+            ))],
+        });
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(format!(
+                "MID_NEEDLE_BETA_002\n{}",
+                "b".repeat(115_000)
+            ))],
+        });
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(format!(
+                "MID_NEEDLE_GAMMA_003\n{}",
+                "c".repeat(115_000)
+            ))],
+        });
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(format!(
+                "LATE_NEEDLE_DELTA_004\n{}",
+                "d".repeat(85_000)
+            ))],
+        });
+        messages.push(CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "/compact summarize and verify FINAL_NEEDLE_OMEGA_005".to_owned(),
+            )],
+        });
+
+        let plan = build_acp_prompt_plan(&messages, "abcd1234ef56", true, None);
+        assert!(
+            !plan.seed_chunks.is_empty() && plan.seed_chunks.len() <= MAX_HYDRATION_SEED_CHUNKS,
+            "expected 1..={} seed chunks, got {}",
+            MAX_HYDRATION_SEED_CHUNKS,
+            plan.seed_chunks.len()
+        );
+        for (idx, chunk) in plan.seed_chunks.iter().enumerate() {
+            let bytes = total_text_block_bytes(chunk);
+            assert!(
+                bytes <= MAX_ACP_PROMPT_TEXT_BYTES,
+                "seed chunk {idx} len {bytes} exceeded {MAX_ACP_PROMPT_TEXT_BYTES}"
+            );
+        }
+        assert!(total_text_block_bytes(&plan.final_blocks) <= MAX_ACP_PROMPT_TEXT_BYTES);
+
+        let mut combined = String::new();
+        for chunk in &plan.seed_chunks {
+            for block in chunk {
+                if let AcpPromptBlock::Text { text } = block {
+                    combined.push_str(text);
+                }
+            }
+        }
+        for block in &plan.final_blocks {
+            if let AcpPromptBlock::Text { text } = block {
+                assert!(
+                    !text.starts_with('/'),
+                    "leading slash must be escaped so `agy acp` does not intercept slash commands"
+                );
+                combined.push_str(text);
+            }
+        }
+        assert!(!combined.contains("...[omitted"));
+        assert!(!combined.contains("[... omitted"));
+        assert!(combined.contains("EARLY_NEEDLE_ALPHA_001"));
+        assert!(combined.contains("MID_NEEDLE_BETA_002"));
+        assert!(combined.contains("MID_NEEDLE_GAMMA_003"));
+        assert!(combined.contains("LATE_NEEDLE_DELTA_004"));
+        assert!(combined.contains("FINAL_NEEDLE_OMEGA_005"));
+
+        // Direct warm-delta prompt starting with `/compact` must escape the leading slash.
+        let direct_slash = build_acp_prompt_plan(
+            &[CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("/compact focus on auth".to_owned())],
+            }],
+            "abcd1234ef56",
+            false,
+            None,
+        );
+        assert!(direct_slash.seed_chunks.is_empty());
+        match direct_slash.final_blocks.first() {
+            Some(AcpPromptBlock::Text { text }) => {
+                assert!(!text.starts_with('/'));
+                assert_eq!(text, "\u{200b}/compact focus on auth");
+            }
+            _ => panic!("expected text block"),
+        }
     }
 }

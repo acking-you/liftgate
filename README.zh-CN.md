@@ -41,14 +41,14 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 - **工具留在你的智能体里**：ACP 会话运行在空目录且不挂任何 MCP 服务，文件编辑与命令执行仍由 Codex 或 Claude Code 完成；联网搜索与防 SSRF 的网页抓取由网关处理（[纯推理会话](docs/architecture.md#inference-only-sessions)）。
 - **会话预热复用**：按每次请求的历史匹配池中已预热的 ACP 会话，只发送本轮新增内容（[会话复用](docs/architecture.md#session-reuse)）。
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
-- **容灾与快车道**：上游返回 `429` 时立即切换备用模型；标题、摘要与 Auto Mode 分类等辅助请求走最快的 Flash 模型，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
+- **拒绝静默降级与 Flash 快车道**：上游 `429` 限流在 `0ms` 内直接原样返回，绝不暗中偷换模型；标题、摘要、Auto Mode 分类与超长上下文分块预热走最快的 Flash 模型，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
 - **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
 
 ## 工作原理
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/how-it-works-dark.zh-CN.svg">
-  <img src="assets/readme/how-it-works-light.zh-CN.svg" width="100%" alt="Codex CLI、Claude Code 与 SDK 以无状态 HTTP 请求访问 Liftgate；Liftgate 负责转换、复用预热会话、流式回传并在 429 时容灾，经 stdio 上的 JSON-RPC 与每会话一个的 agy acp 进程通信，只有 agy 持有访问 Google Antigravity 的凭据。">
+  <img src="assets/readme/how-it-works-light.zh-CN.svg" width="100%" alt="Codex CLI、Claude Code 与 SDK 以无状态 HTTP 请求访问 Liftgate；Liftgate 负责转换、复用预热会话并流式回传，经 stdio 上的 JSON-RPC 与每会话一个的 agy acp 进程通信，只有 agy 持有访问 Google Antigravity 的凭据。">
 </picture>
 
 标准 LLM API 是无状态的：每次请求都携带完整对话。ACP 则是有状态的编辑器会话。Liftgate 为每个会话保持一个 `agy acp` 进程，只转发新增内容，再把 ACP 更新流式转换成 OpenAI 或 Anthropic 事件。详见[架构](docs/architecture.md)。

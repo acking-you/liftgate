@@ -8,7 +8,7 @@ the client asked for. Contributor rules for this design are in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/readme/how-it-works-dark.svg">
-  <img src="../assets/readme/how-it-works-light.svg" width="100%" alt="Clients send stateless HTTP to Liftgate, which translates, reuses warm sessions, streams and fails over, and talks JSON-RPC over stdio to one agy acp process per session; only agy holds the credentials for Google Antigravity.">
+  <img src="../assets/readme/how-it-works-light.svg" width="100%" alt="Clients send stateless HTTP to Liftgate, which translates, reuses warm sessions, streams events back, and talks JSON-RPC over stdio to one agy acp process per session; only agy holds the credentials for Google Antigravity.">
 </picture>
 
 ## Why ACP
@@ -32,14 +32,17 @@ multi-turn history, images and the client's tool definitions. OpenAI
 `instructions` and `developer` / `system` items go into the prompt as
 `<developer_instructions>` blocks rather than ACP's system-prompt extension,
 which avoids upstream `429`s on large harness prompts and keeps session hashes
-stable. Volatile harness noise (billing headers, `cch=...`, token budgets,
-timestamps) is stripped before hashing and forwarding.
+stable. Billing headers (`cch=...`) are stripped from prompts, while volatile
+reminders (timestamps, token budgets, context-window counters) are preserved for
+the model and normalized only during session hashing. Multimodal images inside
+both user turns and tool outputs (`view_image`, `Read`) become native ACP image
+blocks.
 
 ### Inference-only sessions
 
-Each ACP session runs in its own `agy acp --process-per-session` process,
-inside an isolated empty directory and with `mcpServers: []`. `agy` therefore
-has nothing to edit or execute: it only reasons. Tool calls go back to the
+Each ACP session runs in its own `agy acp --process-per-session --include-default-customizations=false`
+process, inside an isolated empty directory and with `mcpServers: []`. `agy`
+therefore has nothing to edit or execute: it only reasons. Tool calls go back to the
 client, so Codex or Claude Code keeps running file edits and shell commands
 under its own permissions. Liftgate itself serves `web_search` and an
 SSRF-safe `web_fetch` that refuses private, loopback and link-local addresses.
@@ -49,8 +52,14 @@ SSRF-safe `web_fetch` that refuses private, loopback and link-local addresses.
 HTTP clients resend the whole conversation every turn. Liftgate hashes the
 normalized message prefix and looks it up in `SessionPool`, a bounded LRU of
 warm ACP sessions (`--max-idle-sessions`, default 64). On a hit it sends only
-the new turn or tool results; on a miss it opens a new session and sends the
-full history once.
+the new turn or tool results (plus an incremental `<client_tools_update>` if
+tools changed, or `session/set_model` if effort/model changed). Local `/compact`
+summarization turns match the warm coding session via a dialogue hash and retire
+it cleanly afterward. On a cold replay exceeding `160 KB` (`agy acp`'s
+`191,578`-byte single-turn limit), Liftgate hydrates up to `~900 KB` losslessly
+across fast Flash seed turns before switching the session to the target model,
+and retires any session where `UsageUpdate` indicates post-turn backend
+compaction.
 
 ### Streaming
 
@@ -61,10 +70,10 @@ text.
 
 ### Model routing
 
-- **Failover.** When `agy` reports an upstream `429 RESOURCE_EXHAUSTED` or a
-  fatal agent error, the turn moves to a backup model at once instead of
-  waiting out `agy`'s own retries. Backups come from a short preference list
-  of the same tier that your account can use.
+- **Transparent rate-limit errors (no silent downgrade).** When `agy` reports
+  an upstream `429 RESOURCE_EXHAUSTED` or quota error, Liftgate aborts `agy`'s
+  retry wait at once and returns HTTP `429` (`rate_limit_error`) / SSE failure
+  directly on the exact model you requested, never silently switching models.
 - **Fast lanes.** Auxiliary requests (Claude Code Auto Mode classifiers, web
   search sub-requests, title and topic generation, away recaps) go to the
   fastest available `gemini-*-flash-low` model on short-lived sessions, so they

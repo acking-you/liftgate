@@ -301,8 +301,17 @@ impl LiveAcpGeneration {
         let mut cmd = Command::new(&cfg.binary_path);
         cmd.arg("acp")
             .arg("--process-per-session")
-            .arg("--dangerously-skip-permissions")
-            .args(&cfg.extra_args)
+            .arg("--dangerously-skip-permissions");
+        let overrides_customizations = cfg
+            .extra_args
+            .iter()
+            .any(|arg| arg.starts_with("--include-default-customizations"));
+        if !overrides_customizations {
+            // Strip Antigravity IDE default skills/subagents/slash-commands (~4.5k tokens per
+            // session) while keeping built-in `search_web` active.
+            cmd.arg("--include-default-customizations=false");
+        }
+        cmd.args(&cfg.extra_args)
             .current_dir(&canonical_cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

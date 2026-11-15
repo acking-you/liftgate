@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-15
+
 ### Added
+- **Lossless multi-chunk Flash context hydration & upstream compaction recovery**:
+  - Bypasses upstream `agy acp`'s `191,578`-byte single-turn truncation cliff and ~`300k–320k` post-turn background compaction limit by streaming conversations above `160 KB` (up to `~900 KB` / `~300k–430k` tokens) losslessly across `<= 148 KB` hydration turns on `gemini-*-flash-low` before switching the same ACP session to the requested target model.
+  - Monitors ACP `UsageUpdate` frames (`used` vs. `size`) to detect post-turn backend compaction drops (`>= 64k` peak dropping by `> 50%`), delivering the current turn's uncompacted response and retiring the compacted worker afterward so subsequent turns rehydrate cleanly.
+  - Launches `agy acp` with `--include-default-customizations=false` by default (unless overridden via `--acp-arg`), stripping ~`4.5k` tokens of Antigravity IDE default skills/subagents/slash-commands per session while keeping built-in `search_web` enabled.
+- **Warm `/compact` session reuse & tool/effort-invariant KV cache continuity**:
+  - Added pure dialogue-hash matching (`compaction_lookup`) so Codex CLI (`CONTEXT CHECKPOINT COMPACTION`) and Claude Code (`/compact`) summarization turns reuse the already-warm coding ACP session instead of cold-replaying history, then retire the pre-compaction worker cleanly.
+  - Decoupled client tool definitions and mid-session model/effort switches from `SessionPool` prefix hashes, syncing tool mutations incrementally via `<client_tools_update>` so Plan/Act mode switches, `ToolSearch`, lazy `mcp__codex_apps__*` connectors, and `/effort` changes never invalidate warm sessions.
+- **Multimodal tool results & Codex async user-input capabilities**:
+  - Extracted nested `input_image` / base64 `image` payloads inside OpenAI `/v1/responses` `function_call_output` / `custom_tool_call_output` items (`view_image`, Playwright/MCP screenshots) and Anthropic `/v1/messages` `tool_result` blocks into native `AcpPromptBlock::Image` frames instead of serializing raw base64 strings.
+  - Advertised `request_user_input_async`, `send_user_message_async`, `send_message_to_user_async`, and `clock` in `experimental_supported_tools` (plus `supports_image_detail_original = true` and `web_search_tool_type = "text_and_image"`) on `GET /v1/codex-models` and generated Codex catalogs.
 - **Antigravity CLI (`agy`) lifecycle, login & passthrough commands (`lg agy`)**:
   - `lg agy` (`lg agy status`, `--json`, `--offline`) inspects `agy` installation path, local vs. latest upstream version, Google account login status (via live gateway catalog or official `agy models` probe), active proxy policy, and idle auto-update status.
   - `lg agy install` and `lg agy update` download official platform releases (`windows_amd64`, `windows_arm64`, `darwin_arm64`, `darwin_amd64`, `linux_amd64`, `linux_arm64`, `linux_*_musl`, `android_*`), enforce fail-closed SHA-512 verification against the official Antigravity manifest, extract `antigravity` / `agy` archives in safe Rust, smoke-test `--version`, and register user `PATH` via `agy install --skip-aliases`.
@@ -16,6 +28,13 @@ All notable changes to this project will be documented in this file.
 - **Configurable background idle auto-update for `agy` (`lg agy auto-update`)**:
   - Enabled by default (`true`) and toggleable via `lg agy auto-update [on|off|status]` or `--agy-auto-update` / `--no-agy-auto-update` / `AGY_AUTO_UPDATE`.
   - Periodically checks the official Antigravity manifest while the gateway is running, defers updates whenever HTTP turns or ACP streams are active, and hot-swaps `agy` during idle windows with SHA-512 verification, Windows `.exe` lock release, and automatic rollback if the new binary fails ACP handshake.
+
+### Changed
+- **Removed silent cross-model `429` failover**: upstream `429 RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` errors now abort in `0ms` and return directly to the caller as HTTP `429` (`rate_limit_error` / `rate_limit_exceeded`) or SSE `response.failed` / `event: error` on the exact requested model without silently downgrading or switching models.
+
+### Fixed
+- **Preserved timestamps & token-budget reminders without breaking session prefix hashes**: split billing-header scrubbing (`strip_billing_noise`: strips only `x-anthropic-billing-header`, `cch=...`, and `<fast_mode_info>`) from hash normalization (`strip_unstable_harness_noise`), ensuring `<current_time_reminder>`, `<current_time>`, `<timestamp>`, `<budget:token_budget>`, `<context_window>`, and `<rollout_budget>` reach the model intact while volatile reminder mutations never cause `SessionPool` misses.
+- **Eliminated slash-command interception & compaction prompt misordering**: escaped leading `/` characters with `\u{200b}` in outbound ACP text blocks so user `/compact` or `/review` prompts are never intercepted by `agy acp`'s internal slash-command router, and placed Codex compaction `instructions` at the tail of `messages` rather than ahead of the transcript.
 
 ## [0.1.1] - 2026-11-15
 

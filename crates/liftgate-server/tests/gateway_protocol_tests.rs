@@ -36,6 +36,10 @@ enum MockScript {
         thoughts: Vec<String>,
         chunks_template: Vec<String>,
     },
+    ImmediateWithUsage {
+        usage_updates: Vec<(u64, u64)>,
+        chunks_template: Vec<String>,
+    },
     ChunksThenHang {
         chunks_template: Vec<String>,
     },
@@ -49,6 +53,7 @@ enum MockScript {
 struct RecordedPrompt {
     session_id: String,
     text_joined: String,
+    image_blocks: Vec<(String, usize)>,
 }
 
 struct MockAcpBackend {
@@ -147,11 +152,36 @@ impl AcpBackend for MockAcpBackend {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let image_blocks = prompt
+            .iter()
+            .filter_map(|b| match b {
+                AcpPromptBlock::Image { data, mime_type } => Some((mime_type.clone(), data.len())),
+                AcpPromptBlock::Text { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let is_hydration_seed = joined.contains("[Context Hydration Segment ");
 
         self.recorded_prompts.lock().unwrap().push(RecordedPrompt {
             session_id: session_id.as_str().to_owned(),
             text_joined: joined,
+            image_blocks,
         });
+
+        if is_hydration_seed {
+            let _ = updates_tx
+                .send(SessionUpdatePayload::AgentMessageChunk {
+                    content: AcpChunkContent {
+                        content_type: "text".to_owned(),
+                        text: "OK".to_owned(),
+                    },
+                })
+                .await;
+            return Ok(PromptTurnResult {
+                stop_reason: "end_turn".to_owned(),
+                usage: mock_acp_usage(12_000, 1, 0),
+                error: None,
+            });
+        }
 
         let nonce = self
             .session_nonces
@@ -196,6 +226,40 @@ impl AcpBackend for MockAcpBackend {
                                 text: hydrated,
                             },
                         })
+                        .await;
+                }
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage: mock_acp_usage(100, 25, 10),
+                    error: None,
+                })
+            }
+            MockScript::ImmediateWithUsage {
+                usage_updates,
+                chunks_template,
+            } => {
+                if let Some(&(first_used, first_size)) = usage_updates.first() {
+                    let _ = updates_tx
+                        .send(SessionUpdatePayload::UsageUpdate {
+                            used: first_used,
+                            size: first_size,
+                        })
+                        .await;
+                }
+                for raw_chunk in chunks_template {
+                    let hydrated = raw_chunk.replace("{NONCE}", &nonce);
+                    let _ = updates_tx
+                        .send(SessionUpdatePayload::AgentMessageChunk {
+                            content: AcpChunkContent {
+                                content_type: "text".to_owned(),
+                                text: hydrated,
+                            },
+                        })
+                        .await;
+                }
+                for &(used, size) in usage_updates.iter().skip(1) {
+                    let _ = updates_tx
+                        .send(SessionUpdatePayload::UsageUpdate { used, size })
                         .await;
                 }
                 Ok(PromptTurnResult {
@@ -1602,17 +1666,25 @@ async fn openai_codex_local_shell_encrypted_reasoning_and_mid_turn_developer_pre
 }
 
 #[tokio::test(start_paused = true)]
-async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover() {
+async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_no_silent_failover() {
     let backend = Arc::new(MockAcpBackend::new(vec![
         // 1. Primary `gemini-4-carbon-high` (`sess_1`) emits 429 banner WITHOUT trailing newline
-        //    and attempts to hang 3600s -> gateway must abort in 0ms and fail over immediately!
+        //    and attempts to hang 3600s -> gateway must abort in 0ms and surface 429 directly
+        //    WITHOUT silently failing over to another model!
         MockScript::ChunksThenHang {
             chunks_template: vec![
                 "⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429): No capacity available"
                     .to_owned(),
             ],
         },
-        // 2. Backup model (`claude-sonnet-5-5-high`, `sess_2`) succeeds immediately and calls
+        // 2. Non-streaming retry also hits 429 -> returns HTTP 429 `rate_limit_error` directly.
+        MockScript::ChunksThenHang {
+            chunks_template: vec![
+                "⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429): No capacity available"
+                    .to_owned(),
+            ],
+        },
+        // 3. Caller retries on `gemini-4-carbon-high` (`sess_3`), succeeds, and calls
         //    a namespaced Codex tool (`multi_agent_v1.spawn_agent`)!
         MockScript::Immediate {
             thoughts: vec!["Delegating sub-task".to_owned()],
@@ -1620,13 +1692,12 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover()
                 "<agy_tool_call_{NONCE}>{\"name\":\"multi_agent_v1.spawn_agent\",\"arguments\":{\"task\":\"audit workspace\"}}</agy_tool_call_{NONCE}>".to_owned(),
             ],
         },
-        // 3. Concurrent Codex TUI task-title generator -> routed to `gemini-3.8-flash-low` (`sess_3`)
+        // 4. Concurrent Codex TUI task-title generator -> routed to `gemini-3.8-flash-low` (`sess_4`)
         MockScript::Immediate {
             thoughts: vec![],
             chunks_template: vec!["Audit workspace codebase".to_owned()],
         },
-        // 4. Turn 2 continuation with echoed `namespace: "multi_agent_v1"` -> reuses `sess_2`
-        //    pinned to healthy failover model without hitting congested `gemini-4-carbon-high`!
+        // 5. Turn 2 continuation with echoed `namespace: "multi_agent_v1"` -> reuses warm `sess_3`!
         MockScript::Immediate {
             thoughts: vec![],
             chunks_template: vec!["Audit finished cleanly.".to_owned()],
@@ -1675,7 +1746,8 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover()
         }
     ]);
 
-    // Turn 1: Codex 0.166.0 sends `reasoning.effort = "xhigh"` default + 20KB developer prompt
+    // Attempt 1 (streaming): hits 429 -> must emit `response.failed` (`rate_limit_exceeded`) in 0ms
+    // with ZERO silent model failover!
     let req1 = json!({
         "model": "gemini-4-carbon-high",
         "stream": true,
@@ -1687,6 +1759,56 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover()
         ]
     });
 
+    let r_429_stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req1.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_429_stream.status(), StatusCode::OK);
+    let sse_429 = String::from_utf8(
+        r_429_stream
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(sse_429.contains("event: response.failed"));
+    assert!(sse_429.contains("\"code\":\"rate_limit_exceeded\""));
+    assert!(!sse_429.contains("claude-sonnet"));
+
+    // Attempt 2 (non-streaming): hits 429 -> must return HTTP 429 `rate_limit_error` directly.
+    let mut req1_sync = req1.clone();
+    req1_sync["stream"] = json!(false);
+    let r_429_sync = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req1_sync.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_429_sync.status(), StatusCode::TOO_MANY_REQUESTS);
+    let b_429: Value =
+        serde_json::from_slice(&r_429_sync.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(b_429["error"]["type"], "rate_limit_error");
+    assert_eq!(b_429["error"]["code"], "rate_limit_exceeded");
+
+    // Attempt 3: Caller retries on `gemini-4-carbon-high` (`sess_3`) and succeeds!
     let r1 = app
         .clone()
         .oneshot(
@@ -1794,7 +1916,7 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover()
     //    unpacked `multi_agent_v1.spawn_agent`, omitted `mcp__codex_apps__pets.adopt_pet`,
     //    and stripped all tools from the `sess_3` title-generator call!
     let appends = backend.recorded_system_appends.lock().unwrap().clone();
-    assert_eq!(appends.len(), 3);
+    assert_eq!(appends.len(), 4);
     assert!(
         !appends[0].contains("You are a coding agent running in the Codex CLI"),
         "massive Codex developer prompt must be moved out of systemPrompt.append"
@@ -1805,36 +1927,38 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_failover()
         "unused mcp__codex_apps__* bundles must remain deferred"
     );
     assert!(
-        !appends[2].contains("\n<client_tools>\n") && !appends[2].contains("exec_command"),
+        !appends[3].contains("\n<client_tools>\n") && !appends[3].contains("exec_command"),
         "auxiliary Codex title-generator call must strip client tool schemas"
     );
 
-    // 2) Exact `-high` model was NOT mutated to `-xhigh`, failed over immediately on 429 to
-    //    `claude-sonnet-5-5-high`, title call routed to `gemini-3.8-flash-low`, and Turn 2
-    //    stayed pinned on `sess_2` without calling `set_session_model` back to `gemini-4-carbon-high`!
+    // 2) Exact `-high` model was NOT mutated to `-xhigh`, NEVER silently failed over to
+    //    `claude-sonnet-5-5-high` on 429, title call routed to `gemini-3.8-flash-low`, and Turn 2
+    //    reused warm `sess_3` on `gemini-4-carbon-high`!
     let models = backend.recorded_models.lock().unwrap().clone();
     assert_eq!(
         models,
         vec![
             "gemini-4-carbon-high".to_owned(),
-            "claude-sonnet-5-5-high".to_owned(),
+            "gemini-4-carbon-high".to_owned(),
+            "gemini-4-carbon-high".to_owned(),
             "gemini-3.8-flash-low".to_owned(),
         ]
     );
 
     let prompts = backend.recorded_prompts.lock().unwrap();
-    assert_eq!(prompts.len(), 4);
+    assert_eq!(prompts.len(), 5);
     assert_eq!(prompts[0].session_id, "sess_1");
     assert!(prompts[0].text_joined.contains("<developer_instructions>"));
     assert_eq!(prompts[1].session_id, "sess_2");
     assert_eq!(prompts[2].session_id, "sess_3");
+    assert_eq!(prompts[3].session_id, "sess_4");
     assert_eq!(
-        prompts[3].session_id, "sess_2",
-        "Turn 2 must reuse failover-pinned sess_2 with only the tool output delta"
+        prompts[4].session_id, "sess_3",
+        "Turn 2 must reuse warm sess_3 with only the tool output delta"
     );
-    assert!(prompts[3].text_joined.contains("worker spawned ok"));
+    assert!(prompts[4].text_joined.contains("worker spawned ok"));
     assert!(
-        !prompts[3]
+        !prompts[4]
             .text_joined
             .contains("You are a coding agent running in the Codex CLI")
     );
@@ -2643,4 +2767,505 @@ async fn anthropic_streaming_coerces_raw_string_input_for_function_tool_to_valid
     .unwrap();
     assert!(raw_sse.contains("\"type\":\"input_json_delta\""));
     assert!(raw_sse.contains("{\\\"command\\\":\\\"cargo test --workspace\\\"}"));
+}
+
+#[tokio::test]
+async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_restores_target_model()
+{
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
+        thoughts: vec!["Synthesizing across full 380KB hydrated history".to_owned()],
+        chunks_template: vec![
+            "All needles verified: EARLY_NEEDLE_01, MID_NEEDLE_02, LATE_NEEDLE_03.".to_owned(),
+        ],
+    }]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+    let req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "input": [
+            {
+                "role": "user",
+                "content": format!("EARLY_NEEDLE_01\n{}", "x".repeat(120_000))
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": format!("MID_NEEDLE_02\n{}", "y".repeat(130_000)) }]
+            },
+            {
+                "role": "user",
+                "content": format!("LATE_NEEDLE_03\n{}", "z".repeat(120_000))
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Ready for final check." }]
+            },
+            {
+                "role": "user",
+                "content": "Verify every needle from the conversation."
+            }
+        ]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        body["output"][1]["content"][0]["text"],
+        "All needles verified: EARLY_NEEDLE_01, MID_NEEDLE_02, LATE_NEEDLE_03."
+    );
+    // Reported input_tokens must reflect ONLY the final turn's window occupancy (100),
+    // NOT the sum of intermediate Flash hydration turns (which would trigger premature /compact)!
+    assert_eq!(body["usage"]["input_tokens"], 100);
+
+    // Session started on `gemini-3.8-flash-low` for seed turns, then switched to `gemini-4-carbon-high`!
+    let models = backend.recorded_models.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            "gemini-3.8-flash-low".to_owned(),
+            "gemini-4-carbon-high".to_owned(),
+        ]
+    );
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert!(
+        prompts.len() >= 3,
+        "expected >=2 Flash seed chunks + 1 final turn, got {}",
+        prompts.len()
+    );
+    let mut combined = String::new();
+    for p in prompts.iter() {
+        assert_eq!(p.session_id, "sess_1");
+        assert!(
+            p.text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES,
+            "chunk len {} exceeded MAX_ACP_PROMPT_TEXT_BYTES",
+            p.text_joined.len()
+        );
+        combined.push_str(&p.text_joined);
+    }
+    assert!(!combined.contains("...[omitted"));
+    assert!(combined.contains("EARLY_NEEDLE_01"));
+    assert!(combined.contains("MID_NEEDLE_02"));
+    assert!(combined.contains("LATE_NEEDLE_03"));
+    assert!(combined.contains("Verify every needle from the conversation."));
+}
+
+#[tokio::test]
+async fn usage_update_compaction_drop_delivers_current_turn_then_retires_session_for_clean_rehydration()
+ {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1: `agy acp` executes at 340k tokens, streams the full answer, then post-compacts to 20.5k!
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(340_000, 1_048_576), (20_500, 1_048_576)],
+            chunks_template: vec!["Full uncompacted answer on Turn 1.".to_owned()],
+        },
+        // Turn 2: `sess_1` was retired, so Turn 2 rehydrates cleanly on `sess_2`!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Clean answer on fresh sess_2.".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 60);
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": [{ "role": "user", "content": "Analyze full architecture." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        b1["output"][0]["content"][0]["text"],
+        "Full uncompacted answer on Turn 1."
+    );
+
+    // Verify compacted `sess_1` was retired instead of poisoning SessionPool!
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap: Value =
+        serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(snap["session_pool"]["idle_cached_sessions"], 0);
+
+    // Turn 2 creates fresh `sess_2` with full history!
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": [
+                            { "role": "user", "content": "Analyze full architecture." },
+                            { "role": "assistant", "content": [{ "type": "output_text", "text": "Full uncompacted answer on Turn 1." }] },
+                            { "role": "user", "content": "Follow up without losing Turn 1 context." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].session_id, "sess_1");
+    assert_eq!(prompts[1].session_id, "sess_2");
+    assert!(
+        prompts[1]
+            .text_joined
+            .contains("Analyze full architecture.")
+    );
+}
+
+#[tokio::test]
+async fn local_compaction_reuses_warm_coding_session_then_keeps_post_compaction_cache_warm() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. Pre-compaction coding turn (`sess_1`)
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Implemented parser module.".to_owned()],
+        },
+        // 2. `/compact` summarization turn -> MUST reuse warm `sess_1` via `compaction_lookup`
+        //    and then close `sess_1`!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Summary: parser module implemented and verified.".to_owned()],
+        },
+        // 3. First post-compaction turn (`sess_2`)
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Ready to continue from summary.".to_owned()],
+        },
+        // 4. Second post-compaction turn (mutated timestamp + token budget + added tool + effort switch)
+        //    -> MUST reuse warm `sess_2`!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Warm post-compaction continuation succeeded.".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 60);
+    let bash_tool = json!({
+        "type": "function",
+        "name": "exec_command",
+        "description": "Run command",
+        "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } }
+    });
+    let edit_tool = json!({
+        "type": "function",
+        "name": "edit_file",
+        "description": "Edit file",
+        "parameters": { "type": "object", "properties": { "path": { "type": "string" } } }
+    });
+
+    // Turn 1: Coding turn on `gemini-4-carbon-high`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "tools": [bash_tool.clone()],
+                        "input": [
+                            { "role": "developer", "content": "You are a coding agent running in the Codex CLI. Follow strict Rust rules." },
+                            { "role": "user", "content": "Implement the parser module." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Turn 2: Codex local `/compact` request (swaps `instructions` to summarization prompt,
+    // drops `<developer_instructions>`, clears `tools = []`, appends `CONTEXT CHECKPOINT COMPACTION`)
+    let r_compact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "instructions": "You are performing a CONTEXT CHECKPOINT COMPACTION. Summarize key state.",
+                        "tools": [],
+                        "input": [
+                            { "role": "user", "content": "Implement the parser module." },
+                            { "role": "assistant", "content": [{ "type": "output_text", "text": "Implemented parser module." }] },
+                            { "role": "user", "content": "Create a handoff summary for another LLM that will resume the task." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_compact.status(), StatusCode::OK);
+
+    // Turn 3: Post-compaction turn with summary + `<current_time_reminder>` + `<context_window>`
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "tools": [bash_tool.clone()],
+                        "input": [
+                            { "role": "developer", "content": "You are a coding agent running in the Codex CLI. Follow strict Rust rules." },
+                            { "role": "user", "content": "Another language model started to solve this problem:\nSummary: parser module implemented and verified." },
+                            { "role": "user", "content": "<current_time_reminder>2026-11-15T12:00:00+08:00</current_time_reminder>\n<context_window>used=14200 limit=1048576</context_window>\nContinue with server integration." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+
+    // Turn 4: Mutated `<context_window>`, removed old `<current_time_reminder>`, added `edit_file` tool,
+    // and switched model to `gemini-4-carbon-xhigh` -> MUST still hit warm `sess_2`!
+    let r4 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-xhigh",
+                        "stream": false,
+                        "tools": [bash_tool, edit_tool],
+                        "input": [
+                            { "role": "developer", "content": "You are a coding agent running in the Codex CLI. Follow strict Rust rules." },
+                            { "role": "user", "content": "Another language model started to solve this problem:\nSummary: parser module implemented and verified." },
+                            { "role": "user", "content": "<context_window>used=18900 limit=1048576</context_window>\nContinue with server integration." },
+                            { "role": "assistant", "content": [{ "type": "output_text", "text": "Ready to continue from summary." }] },
+                            { "role": "user", "content": "<current_time_reminder>2026-11-15T12:05:00+08:00</current_time_reminder>\nNow edit turn_runner.rs." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert_eq!(prompts[0].session_id, "sess_1");
+    assert_eq!(
+        prompts[1].session_id, "sess_1",
+        "`/compact` summarization turn must reuse warm coding session `sess_1`"
+    );
+    assert!(prompts[1].text_joined.contains("<client_tools_update>"));
+    assert!(
+        prompts[1]
+            .text_joined
+            .contains("CONTEXT CHECKPOINT COMPACTION")
+    );
+    assert!(
+        !prompts[1]
+            .text_joined
+            .contains("Implement the parser module.")
+    );
+
+    assert_eq!(prompts[2].session_id, "sess_2");
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("<current_time_reminder>2026-11-15T12:00:00+08:00</current_time_reminder>")
+    );
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("<context_window>used=14200 limit=1048576</context_window>")
+    );
+
+    assert_eq!(
+        prompts[3].session_id, "sess_2",
+        "post-compaction Turn 4 must reuse warm `sess_2` despite tool/reminder/effort updates"
+    );
+    assert!(prompts[3].text_joined.contains("<client_tools_update>"));
+    assert!(prompts[3].text_joined.contains("name: edit_file"));
+    assert!(
+        prompts[3]
+            .text_joined
+            .contains("<current_time_reminder>2026-11-15T12:05:00+08:00</current_time_reminder>")
+    );
+}
+
+#[tokio::test]
+async fn multimodal_tool_outputs_deliver_native_acp_image_blocks_and_codex_async_user_catalog() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Inspected Codex view_image PNG.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Inspected Claude Read PNG.".to_owned()],
+        },
+    ]));
+    let app = test_app(Arc::clone(&backend), 30);
+
+    // 1. Verify `/v1/codex-models` advertises async user tools + `clock` + multimodal capabilities
+    let cat_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/codex-models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cat_resp.status(), StatusCode::OK);
+    let cat: Value =
+        serde_json::from_slice(&cat_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let exp_tools = cat["models"][0]["experimental_supported_tools"]
+        .as_array()
+        .unwrap();
+    assert!(exp_tools.contains(&json!("request_user_input_async")));
+    assert!(exp_tools.contains(&json!("send_user_message_async")));
+    assert!(exp_tools.contains(&json!("send_message_to_user_async")));
+    assert!(exp_tools.contains(&json!("clock")));
+    assert_eq!(cat["models"][0]["supports_image_detail_original"], true);
+
+    // 2. OpenAI `/v1/responses` `function_call_output` array with `input_image`
+    let oai_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "input": [
+            { "role": "user", "content": "Check UI layout" },
+            { "type": "function_call", "call_id": "call_v1", "name": "view_image", "arguments": "{\"path\":\"ui.png\"}" },
+            {
+                "type": "function_call_output",
+                "call_id": "call_v1",
+                "output": [
+                    { "type": "input_text", "text": "Viewed ui.png" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+                ]
+            }
+        ]
+    });
+    let r_oai = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(oai_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_oai.status(), StatusCode::OK);
+
+    // 3. Anthropic `/v1/messages` `tool_result` with nested base64 `image`
+    let cc_req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 512,
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "Read chart.webp" },
+            {
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "toolu_img", "name": "Read", "input": { "file_path": "chart.webp" } }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_img",
+                    "content": [
+                        { "type": "text", "text": "Loaded chart.webp" },
+                        {
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": "image/webp", "data": "UklGRh4AAABXRUJQVlA4IA==" }
+                        }
+                    ]
+                }]
+            }
+        ]
+    });
+    let r_cc = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(cc_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_cc.status(), StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].image_blocks, vec![("image/png".to_owned(), 24)]);
+    assert!(!prompts[0].text_joined.contains("iVBORw0KGgo"));
+    assert_eq!(prompts[1].image_blocks, vec![("image/webp".to_owned(), 24)]);
+    assert!(!prompts[1].text_joined.contains("UklGRh4AAABXRUJQ"));
 }

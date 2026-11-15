@@ -153,69 +153,6 @@ pub fn select_fastest_gemini_model(available: &[AvailableModel], fallback: &Mode
     ModelId::try_new("gemini-3.8-flash-low").unwrap_or_else(|_| fallback.clone())
 }
 
-/// Returns up to 2 ordered backup `ModelId`s from `available` (excluding `primary`) for instant
-/// zero-wait failover when upstream returns `429 RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED`
-/// before any stream output is emitted.
-#[must_use]
-pub fn select_failover_models(primary: &ModelId, available: &[AvailableModel]) -> Vec<ModelId> {
-    let primary_lower = primary.as_str().to_ascii_lowercase();
-    let is_fast_tier = primary_lower.contains("flash-low") || primary_lower.contains("flash-lite");
-
-    let preferred: &[&str] = if is_fast_tier {
-        &[
-            "gemini-3.8-flash-high",
-            "gemini-4-argon-medium",
-            "gemini-4-carbon-medium",
-            "claude-sonnet-5-5-medium",
-        ]
-    } else {
-        &[
-            "gemini-4-hydrogen-high",
-            "gemini-4-carbon-high",
-            "gemini-4-argon-high",
-            "claude-sonnet-5-5-high",
-            "gemini-3.8-flash-high",
-            "gemini-4-carbon-medium",
-            "gemini-4-hydrogen-xhigh",
-        ]
-    };
-
-    let mut out: Vec<ModelId> = Vec::with_capacity(2);
-    for candidate_id in preferred {
-        if out.len() >= 2 {
-            break;
-        }
-        if candidate_id.eq_ignore_ascii_case(primary.as_str()) {
-            continue;
-        }
-        if let Some(hit) = available
-            .iter()
-            .find(|m| m.model_id.eq_ignore_ascii_case(candidate_id))
-            && !out
-                .iter()
-                .any(|m| m.as_str().eq_ignore_ascii_case(&hit.model_id))
-            && let Ok(id) = ModelId::try_new(&hit.model_id)
-        {
-            out.push(id);
-        }
-    }
-
-    if out.is_empty() {
-        for avail in available {
-            if out.len() >= 2 {
-                break;
-            }
-            if !avail.model_id.eq_ignore_ascii_case(primary.as_str())
-                && let Ok(id) = ModelId::try_new(&avail.model_id)
-            {
-                out.push(id);
-            }
-        }
-    }
-
-    out
-}
-
 fn parse_gemini_version(lower_id: &str) -> (u32, u32) {
     let Some(rest) = lower_id.strip_prefix("gemini-") else {
         return (0, 0);
