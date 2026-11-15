@@ -43,6 +43,14 @@ enum MockScript {
     ChunksThenHang {
         chunks_template: Vec<String>,
     },
+    PacedChunks {
+        chunk_delay: Duration,
+        chunks_template: Vec<String>,
+    },
+    UpdatesThenHang {
+        initial_chunk_template: String,
+        trailing_updates: Vec<SessionUpdatePayload>,
+    },
     WebSearchSplitDelta {
         query: String,
         answer: String,
@@ -291,6 +299,49 @@ impl AcpBackend for MockAcpBackend {
                             },
                         })
                         .await;
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(PromptTurnResult::default())
+            }
+            MockScript::PacedChunks {
+                chunk_delay,
+                chunks_template,
+            } => {
+                for (idx, raw_chunk) in chunks_template.into_iter().enumerate() {
+                    if idx > 0 {
+                        tokio::time::sleep(chunk_delay).await;
+                    }
+                    let hydrated = raw_chunk.replace("{NONCE}", &nonce);
+                    let _ = updates_tx
+                        .send(SessionUpdatePayload::AgentMessageChunk {
+                            content: AcpChunkContent {
+                                content_type: "text".to_owned(),
+                                text: hydrated,
+                            },
+                        })
+                        .await;
+                }
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage: mock_acp_usage(100, 40, 10),
+                    error: None,
+                })
+            }
+            MockScript::UpdatesThenHang {
+                initial_chunk_template,
+                trailing_updates,
+            } => {
+                let hydrated = initial_chunk_template.replace("{NONCE}", &nonce);
+                let _ = updates_tx
+                    .send(SessionUpdatePayload::AgentMessageChunk {
+                        content: AcpChunkContent {
+                            content_type: "text".to_owned(),
+                            text: hydrated,
+                        },
+                    })
+                    .await;
+                for upd in trailing_updates {
+                    let _ = updates_tx.send(upd).await;
                 }
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 Ok(PromptTurnResult::default())
@@ -4202,4 +4253,589 @@ async fn claude_desktop_gateway_routes_discover_safe_models_and_unwrap_route_ids
     assert_eq!(msg_resp.status(), StatusCode::OK);
     let recorded = backend.recorded_models.lock().unwrap();
     assert_eq!(recorded.as_slice(), &["gemini-3.8-flash-low"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_sse_streams_apply_patch_start_and_deltas_live_before_closing_tag() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::PacedChunks {
+        chunk_delay: Duration::from_secs(25),
+        chunks_template: vec![
+            "我先扩展 `config_sync.rs`、`cli.rs` 与 `harness.rs`。\n<agy_tool_call_{NONCE}>\n{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n*** Update File: crates/liftgate/src/app/config_sync.rs\\n".to_owned(),
+            "@@\\n-old_line\\n+new_line_with_\\\"quotes\\\"\\n".to_owned(),
+            "*** End Patch\"}\n</agy_tool_call_{NONCE}>".to_owned(),
+        ],
+    }]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+    let req = json!({
+        "model": "gpt-5.4",
+        "stream": true,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch to files",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [{ "role": "user", "content": "Extend config_sync.rs" }]
+    });
+
+    let start_instant = tokio::time::Instant::now();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+
+    // Read early SSE frames BEFORE the 25s sleep for Chunk 2 elapses!
+    let mut early_sse = String::new();
+    while !(early_sse.contains("response.custom_tool_call_input.delta")
+        && early_sse.contains("\"type\":\"custom_tool_call\""))
+    {
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("must flush message.done + custom_tool_call.added + first delta in <1s without waiting 50s for closing tag")
+            .expect("SSE stream still open")
+            .expect("valid body frame");
+        if let Ok(bytes) = frame.into_data() {
+            early_sse.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+    }
+    assert!(
+        start_instant.elapsed() < Duration::from_secs(1),
+        "early SSE frames must arrive at 0s before Chunk 2's 25s sleep, got {:?}",
+        start_instant.elapsed()
+    );
+
+    // Verify preceding AgentMessage already closed (`response.output_item.done`) AND `apply_patch`
+    // `custom_tool_call` was added (`status: "in_progress"`) before Chunk 2 even starts!
+    let mut saw_early_msg_done = false;
+    let mut saw_early_ctc_added = false;
+    let mut streamed_deltas = Vec::new();
+    for line in early_sse.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let ev: Value = serde_json::from_str(data).unwrap();
+        match ev["type"].as_str() {
+            Some("response.output_item.done") if ev["item"]["type"] == "message" => {
+                assert_eq!(
+                    ev["item"]["content"][0]["text"],
+                    "我先扩展 `config_sync.rs`、`cli.rs` 与 `harness.rs`。\n"
+                );
+                saw_early_msg_done = true;
+            }
+            Some("response.output_item.added") if ev["item"]["type"] == "custom_tool_call" => {
+                assert!(
+                    saw_early_msg_done,
+                    "AgentMessage must finalize before CustomToolCall opens"
+                );
+                assert_eq!(ev["item"]["name"], "apply_patch");
+                assert_eq!(ev["item"]["status"], "in_progress");
+                assert_eq!(ev["item"]["input"], "");
+                saw_early_ctc_added = true;
+            }
+            Some("response.custom_tool_call_input.delta") => {
+                streamed_deltas.push(ev["delta"].as_str().unwrap().to_owned());
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_early_msg_done);
+    assert!(saw_early_ctc_added);
+    assert!(!streamed_deltas.is_empty());
+
+    // Now collect remaining SSE frames (advancing past the two 25s chunk delays)
+    let rest_bytes = body.collect().await.unwrap().to_bytes();
+    let rest_sse = std::str::from_utf8(&rest_bytes).unwrap();
+    let mut done_input: Option<String> = None;
+    let mut item_done_input: Option<String> = None;
+    for line in rest_sse.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let ev: Value = serde_json::from_str(data).unwrap();
+        match ev["type"].as_str() {
+            Some("response.custom_tool_call_input.delta") => {
+                streamed_deltas.push(ev["delta"].as_str().unwrap().to_owned());
+            }
+            Some("response.custom_tool_call_input.done") => {
+                done_input = ev["input"].as_str().map(str::to_owned);
+            }
+            Some("response.output_item.done") if ev["item"]["type"] == "custom_tool_call" => {
+                item_done_input = ev["item"]["input"].as_str().map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    let expected_patch = "*** Begin Patch\n*** Update File: crates/liftgate/src/app/config_sync.rs\n@@\n-old_line\n+new_line_with_\"quotes\"\n*** End Patch";
+    assert!(
+        streamed_deltas.len() >= 3,
+        "expected >=3 incremental delta frames across 3 chunks, got {:?}",
+        streamed_deltas
+    );
+    assert_eq!(streamed_deltas.concat(), expected_patch);
+    assert_eq!(done_input.as_deref(), Some(expected_patch));
+    assert_eq!(item_done_input.as_deref(), Some(expected_patch));
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_tool_thought_native_tool_and_inline_banners_short_circuit_in_zero_ms() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Case 1: Post-tool `AgentThoughtChunk` (internal ACP second sub-call)
+        MockScript::UpdatesThenHang {
+            initial_chunk_template: "<agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\"}</agy_tool_call_{NONCE}>".to_owned(),
+            trailing_updates: vec![SessionUpdatePayload::AgentThoughtChunk {
+                content: AcpChunkContent {
+                    content_type: "text".to_owned(),
+                    text: "Wait, let me inspect the workspace again...".to_owned(),
+                },
+            }],
+        },
+        // Case 2: Post-tool native ACP `ToolCall` (`edit_file` inside `liftgate-empty-cwd`)
+        MockScript::UpdatesThenHang {
+            initial_chunk_template: "<agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\"}</agy_tool_call_{NONCE}>".to_owned(),
+            trailing_updates: vec![SessionUpdatePayload::ToolCall {
+                tool_call_id: "native_edit_1".to_owned(),
+                name: "edit_file".to_owned(),
+                status: "in_progress".to_owned(),
+                kind: "edit".to_owned(),
+                title: "Editing config_sync.rs".to_owned(),
+                args: None,
+                raw_input: None,
+            }],
+        },
+        // Case 3: Inline `⚠ Your previous response...` glued directly after `</agy_tool_call_{NONCE}>` with NO newline
+        MockScript::ChunksThenHang {
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\"}</agy_tool_call_{NONCE}>⚠ Your previous response contained an improperly formatted function call".to_owned(),
+            ],
+        },
+        // Case 4: Inline `⚠ API error (attempt 1): transient 503 — retrying in 1s...` with NO newline
+        MockScript::ChunksThenHang {
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\"}</agy_tool_call_{NONCE}>⚠ API error (attempt 1): transient 503 — retrying in 1s...".to_owned(),
+            ],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+    let req = json!({
+        "model": "gpt-5.4",
+        "stream": true,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [{ "role": "user", "content": "Apply patch" }]
+    });
+
+    for case_num in 1..=4 {
+        let t0 = tokio::time::Instant::now();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "case {case_num} HTTP status");
+        let sse = String::from_utf8(
+            tokio::time::timeout(Duration::from_secs(1), resp.into_body().collect())
+                .await
+                .unwrap_or_else(|_| panic!("case {case_num} hung instead of short-circuiting"))
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "case {case_num} must complete in 0ms virtual time without waiting on 3600s hang"
+        );
+        assert!(
+            sse.contains("event: response.completed"),
+            "case {case_num} must complete cleanly: {sse}"
+        );
+        assert!(
+            sse.contains("\"name\":\"apply_patch\""),
+            "case {case_num} must deliver captured apply_patch tool call"
+        );
+        assert!(
+            !sse.contains("Your previous response") && !sse.contains("transient 503"),
+            "case {case_num} must strip ACP retry banners cleanly"
+        );
+    }
+
+    assert_eq!(
+        backend.aborted_count.load(Ordering::SeqCst),
+        4,
+        "all 4 tainted runaway child sessions must be aborted in background instead of pooled"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn anthropic_sse_streams_early_tool_use_start_and_truncated_xml_tool_fails_cleanly() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. Anthropic `/v1/messages` SSE: multi-chunk `Edit` tool call with 20s delay before closing tag
+        MockScript::PacedChunks {
+            chunk_delay: Duration::from_secs(20),
+            chunks_template: vec![
+                "Updating main.rs.\n<agy_tool_call_{NONCE}>\n{\"name\": \"Edit\", \"arguments\": {\"file_path\": \"src/main.rs\",".to_owned(),
+                " \"old_string\": \"foo\", \"new_string\": \"bar\"}}\n</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        // 2. Truncated tool call at EOF on OpenAI `/v1/responses` SSE -> must emit `response.failed`
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "Applying patch.\n<agy_tool_call_{NONCE}>\n{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n+unfinished".to_owned(),
+            ],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+    let anth_req = json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4096,
+        "stream": true,
+        "tools": [
+            {
+                "name": "Edit",
+                "description": "Edit file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "old_string": { "type": "string" },
+                        "new_string": { "type": "string" }
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }
+            }
+        ],
+        "messages": [{ "role": "user", "content": "Edit src/main.rs" }]
+    });
+
+    let t0 = tokio::time::Instant::now();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(anth_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let mut body1 = r1.into_body();
+
+    let mut early_anth = String::new();
+    while !early_anth.contains("\"type\":\"tool_use\"") {
+        let frame = tokio::time::timeout(Duration::from_secs(1), body1.frame())
+            .await
+            .expect("Anthropic `content_block_start(tool_use)` must flush before 20s closing tag")
+            .expect("stream open")
+            .expect("valid frame");
+        if let Ok(bytes) = frame.into_data() {
+            early_anth.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+    }
+    assert!(t0.elapsed() < Duration::from_secs(1));
+    assert!(early_anth.contains("\"name\":\"Edit\""));
+
+    let rest1 = String::from_utf8(body1.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(rest1.contains("\"type\":\"input_json_delta\""));
+    assert!(
+        rest1.contains("\\\"file_path\\\":\\\"src/main.rs\\\"")
+            || rest1.contains("\\\"file_path\\\": \\\"src/main.rs\\\"")
+    );
+    assert!(rest1.contains("\"stop_reason\":\"tool_use\""));
+
+    // 2. Truncated tool call on `/v1/responses` SSE emits `response.failed` instead of `response.completed`
+    let trunc_req = json!({
+        "model": "gpt-5.4",
+        "stream": true,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply patch",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [{ "role": "user", "content": "Apply patch" }]
+    });
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(trunc_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let sse2 =
+        String::from_utf8(r2.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        sse2.contains("event: response.failed"),
+        "truncated in-progress XML tool call must emit response.failed, got:\n{sse2}"
+    );
+    assert!(
+        !sse2.contains("event: response.completed"),
+        "truncated in-progress XML tool call must never emit response.completed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn apply_patch_containing_acp_warning_banner_literals_streams_intact_without_truncation() {
+    let expected_patch = "*** Begin Patch\n*** Update File: crates/liftgate-server/src/turn_runner.rs\n@@\n+    \"⚠ API error (attempt 1): transient 503 — retrying in 1s...\",\n+    \"⚠ Your previous response contained an improperly formatted function call\",\n*** End Patch";
+    let escaped_patch = expected_patch
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::PacedChunks {
+        chunk_delay: Duration::from_millis(10),
+        chunks_template: vec![
+            "Docs note: `⚠ API error (attempt 1)` is handled below.\n<agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\""
+                .to_owned(),
+            escaped_patch,
+            "\"}</agy_tool_call_{NONCE}>".to_owned(),
+        ],
+    }]));
+
+    let app = test_app(Arc::clone(&backend), 60);
+    let req = json!({
+        "model": "gpt-5.4",
+        "stream": true,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply patch",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [{ "role": "user", "content": "Update banner constants" }]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        sse.contains("event: response.completed"),
+        "patch containing `⚠ API error` must complete cleanly, got:\n{sse}"
+    );
+    assert!(
+        !sse.contains("event: response.failed"),
+        "patch containing `⚠ API error` must not be truncated by banner filter"
+    );
+
+    let mut done_patch: Option<String> = None;
+    let mut message_text = String::new();
+    for line in sse.lines() {
+        if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(val) = serde_json::from_str::<Value>(data)
+        {
+            match val.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(d) = val.get("delta").and_then(Value::as_str) {
+                        message_text.push_str(d);
+                    }
+                }
+                Some("response.output_item.done") => {
+                    if let Some(item) = val.get("item")
+                        && item.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+                    {
+                        done_patch = item.get("input").and_then(Value::as_str).map(str::to_owned);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        message_text,
+        "Docs note: `⚠ API error (attempt 1)` is handled below.\n"
+    );
+    assert_eq!(done_patch.as_deref(), Some(expected_patch));
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_streamed_tool_interrupted_by_thought_or_error_fails_instead_of_completing() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. OpenAI `/v1/responses`: first tool (`exec_command`) completes, second tool (`apply_patch`)
+        //    starts streaming and is interrupted mid-tag by an `AgentThoughtChunk` before closing tag.
+        MockScript::UpdatesThenHang {
+            initial_chunk_template: "<agy_tool_call_{NONCE}>{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"git status\"}}</agy_tool_call_{NONCE}><agy_tool_call_{NONCE}>{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n+partial".to_owned(),
+            trailing_updates: vec![SessionUpdatePayload::AgentThoughtChunk {
+                content: AcpChunkContent {
+                    content_type: "text".to_owned(),
+                    text: "Wait, rethinking...".to_owned(),
+                },
+            }],
+        },
+        // 2. Anthropic `/v1/messages`: assistant prose followed by an open `Edit` tool call that is
+        //    interrupted mid-tag by an upstream `429 RESOURCE_EXHAUSTED` error update.
+        MockScript::UpdatesThenHang {
+            initial_chunk_template: "Applying edit:\n<agy_tool_call_{NONCE}>{\"name\":\"Edit\",\"arguments\":{\"file_path\":\"src/lib.rs\"".to_owned(),
+            trailing_updates: vec![SessionUpdatePayload::Error {
+                message: "RESOURCE_EXHAUSTED (code 429): No capacity available".to_owned(),
+                error: None,
+            }],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 120);
+
+    // Case 1: OpenAI `/v1/responses`
+    let oai_req = json!({
+        "model": "gpt-5.4",
+        "stream": true,
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run command",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "cmd": { "type": "string" } },
+                    "required": ["cmd"]
+                }
+            },
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply patch",
+                "format": { "type": "text" }
+            }
+        ],
+        "input": [{ "role": "user", "content": "Check status and patch" }]
+    });
+    let t0 = tokio::time::Instant::now();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(oai_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let sse1 =
+        String::from_utf8(r1.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "interrupted second streamed tool must abort in 0ms instead of hanging 120s"
+    );
+    assert!(
+        sse1.contains("event: response.custom_tool_call_input.delta"),
+        "expected partial second tool input delta before interruption, got:\n{sse1}"
+    );
+    assert!(
+        sse1.contains("event: response.failed"),
+        "unclosed second streamed tool must emit response.failed, got:\n{sse1}"
+    );
+    assert!(
+        !sse1.contains("event: response.completed"),
+        "unclosed second streamed tool must never emit response.completed"
+    );
+
+    // Case 2: Anthropic `/v1/messages`
+    let anth_req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 4096,
+        "stream": true,
+        "tools": [
+            {
+                "name": "Edit",
+                "description": "Edit file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "file_path": { "type": "string" } },
+                    "required": ["file_path"]
+                }
+            }
+        ],
+        "messages": [{ "role": "user", "content": "Edit src/lib.rs" }]
+    });
+    let t1 = tokio::time::Instant::now();
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(anth_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let sse2 =
+        String::from_utf8(r2.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        t1.elapsed() < Duration::from_secs(1),
+        "mid-tool 429 error must abort in 0ms instead of hanging"
+    );
+    assert!(
+        sse2.contains("\"type\":\"tool_use\""),
+        "expected early tool_use block start before 429 error, got:\n{sse2}"
+    );
+    assert!(
+        sse2.contains("event: error") && sse2.contains("rate_limit_error"),
+        "mid-tool 429 after assistant prose must emit SSE error(rate_limit_error), got:\n{sse2}"
+    );
+    assert!(
+        !sse2.contains("event: message_stop"),
+        "mid-tool 429 with unclosed tool_use block must never emit message_stop"
+    );
 }

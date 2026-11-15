@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Real-time incremental XML client tool call streaming (`apply_patch`, `exec`, `tool_use`, `function_call`)**: `IncrementalToolParser` now emits `ToolCallStart` immediately upon recognizing a valid tool header inside `<agy_tool_call_{nonce}>` and streams decoded `ToolCallDelta` slices for raw/freeform custom tools before `</agy_tool_call_{nonce}>` arrives (failing cleanly with `response.failed` / SSE `error` if truncated mid-stream). OpenAI `/v1/responses` SSE immediately finalizes the preceding `AgentMessage`, opens `response.output_item.added` (`status: "in_progress"`), and streams live `response.custom_tool_call_input.delta` chunks (eliminating 50s+ silent buffering on large patches), while Anthropic `/v1/messages` SSE opens `content_block_start(tool_use)` immediately and Liftgate telemetry transitions to `CallingClientTool` in real time.
+- **Zero-wait post-tool short-circuiting on internal `agy acp` sub-steps, native tool calls, and inline retry banners**: after capturing a client XML tool call or server-side `web_fetch`, `turn_runner` immediately short-circuits trailing `AgentThoughtChunk` sub-calls, unwanted native ACP `ToolCall` invocations (e.g. `edit_file` in `liftgate-empty-cwd`), transient `503` retry banners, and mid-line `⚠` banners glued directly after `</agy_tool_call_{nonce}>` without a newline (while leaving `⚠` diagnostics inside `<agy_tool_call_{nonce}>` payloads and ordinary assistant prose completely untouched, and failing cleanly if an open streamed tool call is interrupted before its closing tag), eliminating 8–26s post-tool turn hangs while keeping clean tool stops intact for warm `SessionPool` reuse.
+
 ## [0.1.7] - 2026-11-16
 
 ### Added

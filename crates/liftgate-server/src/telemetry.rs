@@ -263,6 +263,19 @@ impl ActiveTaskGuard {
         self.hub.notify_change();
     }
 
+    pub fn record_tool_delta(&self, delta_chars: usize) {
+        if delta_chars == 0 {
+            return;
+        }
+        let mut guard = match self.hub.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+            task.output_chars = task.output_chars.saturating_add(delta_chars);
+        }
+    }
+
     pub fn complete(mut self, stop_reason: String, usage: AcpUsage) {
         self.armed = false;
         let now_ms = unix_timestamp_ms();
