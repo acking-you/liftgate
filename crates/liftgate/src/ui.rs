@@ -13,9 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use clap::builder::{Styles, styling};
-use comfy_table::{
-    Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, modifiers, presets,
-};
+use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets};
 use owo_colors::{OwoColorize as _, Style};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -343,9 +341,7 @@ pub fn new_table(headers: &[&str]) -> Table {
     let framed = stdout().is_terminal() || colored;
     let mut table = Table::new();
     if framed {
-        table
-            .load_preset(presets::UTF8_FULL)
-            .apply_modifier(modifiers::UTF8_ROUND_CORNERS);
+        table.load_style(presets::UTF8_FULL.with_rounded_corners());
         if colored {
             table.enforce_styling();
         }
@@ -354,7 +350,7 @@ pub fn new_table(headers: &[&str]) -> Table {
             table.set_width(FALLBACK_TABLE_WIDTH);
         }
     } else {
-        table.load_preset(presets::NOTHING);
+        table.load_style(presets::NOTHING);
     }
 
     let header_cells: Vec<Cell> = headers

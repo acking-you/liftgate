@@ -1562,17 +1562,22 @@ fn extract_zip_binaries(
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
-        let base_name = entry
-            .name()
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(entry.name());
-        let dest = if base_name == expected_liftgate {
-            Some(staged_liftgate)
-        } else if base_name == expected_lg {
-            Some(staged_lg)
-        } else {
-            None
+        let dest = {
+            let entry_name = entry.name().map_err(|err| CliError::UpgradeArchive {
+                asset: archive_name.to_owned(),
+                detail: format!("invalid ZIP entry #{idx} name: {err}"),
+            })?;
+            let base_name = entry_name
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(entry_name.as_ref());
+            if base_name == expected_liftgate {
+                Some(staged_liftgate)
+            } else if base_name == expected_lg {
+                Some(staged_lg)
+            } else {
+                None
+            }
         };
         if let Some(out_path) = dest {
             write_bounded_stream_to_executable(entry, out_path, archive_name)?;

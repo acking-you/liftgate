@@ -167,12 +167,13 @@ impl IncrementalToolParser {
                     }
                     return true;
                 }
-                if self.buffer.starts_with('`') && !self.buffer.starts_with("```") {
-                    if let Some((_, rest)) = self.buffer.split_at_checked(1) {
-                        let owned = rest.to_owned();
-                        self.buffer.clear();
-                        self.buffer.push_str(&owned);
-                    }
+                if self.buffer.starts_with('`')
+                    && !self.buffer.starts_with("```")
+                    && let Some((_, rest)) = self.buffer.split_at_checked(1)
+                {
+                    let owned = rest.to_owned();
+                    self.buffer.clear();
+                    self.buffer.push_str(&owned);
                 }
                 self.strip_closing_wrapper = None;
                 false

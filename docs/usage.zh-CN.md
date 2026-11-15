@@ -6,7 +6,7 @@
 
 ## 准备工作
 
-- **全局安装 `lg` / `liftgate`**：从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包放入 `PATH`（或运行 `cargo binstall liftgate`），亦可使用 **Rust 1.85+** 从源码全局安装：
+- **全局安装 `lg` / `liftgate`**：从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包放入 `PATH`（或运行 `cargo binstall liftgate`），亦可使用 **Rust 1.100.0** 从源码全局安装：
   ```bash
   cargo install --path crates/liftgate --locked
   ```

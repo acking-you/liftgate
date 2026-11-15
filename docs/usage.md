@@ -10,7 +10,7 @@ client at it. Every address below assumes the default
 
 - **Liftgate (`lg` / `liftgate`)**, installed globally from a
   [GitHub Release](https://github.com/acking-you/liftgate/releases) archive,
-  `cargo binstall liftgate`, or built from source with **Rust 1.85+**:
+  `cargo binstall liftgate`, or built from source with **Rust 1.100.0**:
   ```bash
   cargo install --path crates/liftgate --locked
   ```

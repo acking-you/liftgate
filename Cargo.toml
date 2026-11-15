@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.1.7"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/acking-you/liftgate"
 
@@ -17,32 +17,32 @@ repository = "https://github.com/acking-you/liftgate"
 liftgate-types = { path = "crates/liftgate-types", default-features = false }
 liftgate-server = { path = "crates/liftgate-server", default-features = false }
 
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-bytes = { version = "1", default-features = false, features = ["std"] }
-clap = { version = "4.5", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "color", "wrap_help"] }
-clap_complete = { version = "4.5", default-features = false }
-comfy-table = { version = "~7.1", default-features = false, features = ["tty"] }
-crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
-dunce = { version = "1", default-features = false }
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-http-body-util = { version = "0.1", default-features = false }
-libc = { version = "0.2", default-features = false }
-owo-colors = { version = "4", default-features = false }
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
-serde = { version = "1", default-features = false, features = ["derive", "std", "rc"] }
-serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
-sha2 = { version = "0.10", default-features = false, features = ["std"] }
-tar = { version = "0.4", default-features = false }
-thiserror = { version = "2", default-features = false, features = ["std"] }
-tokio = { version = "1", default-features = false }
-tokio-stream = { version = "0.1", default-features = false }
-tokio-util = { version = "0.7", default-features = false }
-tower = { version = "0.5", default-features = false }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
-uuid = { version = "1", default-features = false, features = ["v4", "fast-rng", "std"] }
-windows-sys = { version = "0.59", default-features = false }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "color", "wrap_help"] }
+clap_complete = { version = "4.6.11", default-features = false }
+comfy-table = { version = "8.0.1", default-features = false, features = ["tty"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"] }
+dunce = { version = "1.0.5", default-features = false }
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
+http-body-util = { version = "0.1.5", default-features = false }
+libc = { version = "0.2.191", default-features = false }
+owo-colors = { version = "4.4.0", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std", "rc"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std", "raw_value"] }
+sha2 = { version = "0.11.1", default-features = false }
+tar = { version = "0.4.46", default-features = false }
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+tokio = { version = "1.54.1", default-features = false }
+tokio-stream = { version = "0.1.19", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false }
+tower = { version = "0.5.3", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
+uuid = { version = "1.29.2", default-features = false, features = ["v4", "fast-rng", "std"] }
+windows-sys = { version = "0.61.2", default-features = false }
+zip = { version = "9.6.0", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 lto = "thin"
