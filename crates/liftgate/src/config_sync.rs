@@ -546,6 +546,35 @@ pub fn merge_codex_config_toml(
     no_bypass: bool,
     no_code_mode: bool,
 ) -> String {
+    merge_codex_config_toml_with_mode(
+        existing,
+        gateway_base_url,
+        primary_model,
+        catalog_path,
+        require_env_key,
+        no_bypass,
+        no_code_mode,
+        false,
+    )
+}
+
+/// Non-destructively merges Liftgate's Codex provider (`[model_providers.agy]`), `[features]`
+/// Code Mode / Code Mode Only flags, and root settings into an existing `config.toml` string.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "config synthesis takes explicit orthogonal options without allocating an extra builder"
+)]
+#[must_use]
+pub fn merge_codex_config_toml_with_mode(
+    existing: &str,
+    gateway_base_url: &str,
+    primary_model: &str,
+    catalog_path: &Path,
+    require_env_key: bool,
+    no_bypass: bool,
+    no_code_mode: bool,
+    code_mode_only: bool,
+) -> String {
     let catalog_slash = catalog_path.to_string_lossy().replace('\\', "/");
     let (root_part, tables_part) = split_toml_root_and_tables(existing);
 
@@ -580,7 +609,7 @@ pub fn merge_codex_config_toml(
         out.push_str("suppress_unstable_features_warning = true\n");
     }
 
-    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode);
+    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only);
     let trimmed_tables = merged_tables.trim();
     if !trimmed_tables.is_empty() {
         out.push('\n');
@@ -617,7 +646,7 @@ pub fn strip_codex_config_toml(existing: &str) -> String {
         kept_root.pop();
     }
 
-    let stripped_tables = rewrite_codex_tables(tables_part, false);
+    let stripped_tables = rewrite_codex_tables(tables_part, false, false);
     let trimmed_tables = stripped_tables.trim();
 
     let mut out = String::new();
@@ -1004,7 +1033,11 @@ fn parse_toml_assignment_key(line: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
-fn rewrite_codex_tables(tables_part: &str, enable_code_mode: bool) -> String {
+fn rewrite_codex_tables(
+    tables_part: &str,
+    enable_code_mode: bool,
+    enable_code_mode_only: bool,
+) -> String {
     let mut sections: Vec<(String, String, Vec<&str>)> = Vec::new();
     for line in tables_part.split_inclusive('\n') {
         if let Some(sec_name) = is_toml_section_header(line) {
@@ -1025,7 +1058,12 @@ fn rewrite_codex_tables(tables_part: &str, enable_code_mode: bool) -> String {
             saw_features = true;
             let mut kept: Vec<&str> = body
                 .into_iter()
-                .filter(|l| parse_toml_assignment_key(l) != Some("code_mode"))
+                .filter(|l| {
+                    !matches!(
+                        parse_toml_assignment_key(l),
+                        Some("code_mode" | "code_mode_only")
+                    )
+                })
                 .collect();
             while kept.last().is_some_and(|l| l.trim().is_empty()) {
                 kept.pop();
@@ -1035,6 +1073,9 @@ fn rewrite_codex_tables(tables_part: &str, enable_code_mode: bool) -> String {
                 block.push_str(&header);
                 block.push('\n');
                 block.push_str("code_mode = true");
+                if enable_code_mode_only {
+                    block.push_str("\ncode_mode_only = true");
+                }
                 if !kept.is_empty() {
                     block.push('\n');
                     for l in kept {
@@ -1064,7 +1105,12 @@ fn rewrite_codex_tables(tables_part: &str, enable_code_mode: bool) -> String {
     }
 
     if enable_code_mode && !saw_features {
-        rendered_sections.push("[features]\ncode_mode = true".to_owned());
+        if enable_code_mode_only {
+            rendered_sections
+                .push("[features]\ncode_mode = true\ncode_mode_only = true".to_owned());
+        } else {
+            rendered_sections.push("[features]\ncode_mode = true".to_owned());
+        }
     }
 
     rendered_sections.join("\n\n")

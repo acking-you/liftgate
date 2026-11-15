@@ -143,6 +143,47 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             "/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
         )
+        .route(
+            "/claude-desktop/v1/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/v1/models/{model_id}",
+            get(handle_get_model::<B>),
+        )
+        .route(
+            "/claude-desktop/models/{model_id}",
+            get(handle_get_model::<B>),
+        )
+        .route(
+            "/claude-desktop/v1/messages",
+            post(handle_anthropic_messages::<B>),
+        )
+        .route(
+            "/claude-desktop/messages",
+            post(handle_anthropic_messages::<B>),
+        )
+        .route(
+            "/claude-desktop/v1/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
+        .route(
+            "/claude-desktop/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
+        .route(
+            "/claude-desktop/api/event_logging/batch",
+            post(handle_event_logging_noop),
+        )
+        .route(
+            "/claude-desktop/user/bootstrap",
+            get(handle_claude_desktop_bootstrap::<B>),
+        )
+        .route("/user/bootstrap", get(handle_claude_desktop_bootstrap::<B>))
         .route("/api/event_logging/batch", post(handle_event_logging_noop))
         .route(
             "/api/telemetry/snapshot",
@@ -178,6 +219,112 @@ async fn handle_healthz() -> impl IntoResponse {
 
 async fn handle_event_logging_noop() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+async fn handle_claude_desktop_bootstrap<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
+        return err.into_anthropic_response();
+    }
+    Json(json!({
+        "builtinBrowserEnabled": true,
+    }))
+    .into_response()
+}
+
+async fn handle_claude_desktop_models<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    const MAX_DESKTOP_MODELS: usize = 200;
+    const MAX_DESCRIPTION_CHARS: usize = 100;
+
+    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
+        return err.into_anthropic_response();
+    }
+    let available = state.backend.refresh_models_if_empty().await;
+    let default_id = state.config.default_model.as_str();
+
+    let mut ordered: Vec<(String, String)> = Vec::with_capacity(available.len().max(1));
+    if let Some(primary) = available
+        .iter()
+        .find(|m| m.model_id.eq_ignore_ascii_case(default_id))
+    {
+        let label = if primary.name.is_empty() {
+            primary.model_id.clone()
+        } else {
+            primary.name.clone()
+        };
+        ordered.push((primary.model_id.clone(), label));
+    } else if available.is_empty() {
+        ordered.push((default_id.to_owned(), default_id.to_owned()));
+    }
+
+    for m in available {
+        if ordered
+            .iter()
+            .any(|(existing_id, _)| existing_id.eq_ignore_ascii_case(&m.model_id))
+        {
+            continue;
+        }
+        let label = if m.name.is_empty() {
+            m.model_id.clone()
+        } else {
+            m.name
+        };
+        ordered.push((m.model_id, label));
+        if ordered.len() >= MAX_DESKTOP_MODELS {
+            break;
+        }
+    }
+
+    let data: Vec<Value> = ordered
+        .into_iter()
+        .map(|(model_id, display_name)| {
+            let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
+            let (window, _) =
+                liftgate_types::model::context_limits(&model_id, state.config.long_context);
+            let supports_1m = window >= 1_000_000;
+            let raw_desc = format!(
+                "{}k ctx \u{00b7} Antigravity ACP ({model_id})",
+                window / 1_000
+            );
+            let description: String = raw_desc.chars().take(MAX_DESCRIPTION_CHARS).collect();
+            let mut item = json!({
+                "type": "model",
+                "id": route_id,
+                "display_name": display_name,
+                "created_at": "2026-01-01T00:00:00Z",
+                "description": description,
+            });
+            if supports_1m && let Some(obj) = item.as_object_mut() {
+                obj.insert("supports1m".to_owned(), json!(true));
+                obj.insert("prefer1m".to_owned(), json!(true));
+            }
+            item
+        })
+        .collect();
+
+    let first_id = data
+        .first()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let last_id = data
+        .last()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    Json(json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    }))
+    .into_response()
 }
 
 fn build_model_card(
@@ -2840,7 +2987,10 @@ fn check_auth(headers: &HeaderMap, expected_key: Option<&str>) -> Result<(), Gat
     if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        && let Some(token) = auth.strip_prefix("Bearer ")
+        && auth
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+        && let Some(token) = auth.get(7..)
         && token.trim() == expected
     {
         return Ok(());
@@ -3084,7 +3234,9 @@ async fn handle_ui_static<B: AcpBackend>(
     let is_api_prefix = req_path.starts_with("v1/")
         || req_path == "v1"
         || req_path.starts_with("api/")
-        || req_path == "api";
+        || req_path == "api"
+        || req_path.starts_with("claude-desktop/")
+        || req_path == "claude-desktop";
 
     let (relative, relative_slash) = if req_path.is_empty() {
         (PathBuf::from("index.html"), "index.html".to_owned())
@@ -3193,17 +3345,21 @@ fn guess_mime_type(path: &StdPath) -> &'static str {
 }
 
 async fn cors_middleware(req: Request, next: Next) -> Response {
+    let requested_headers = req
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .cloned();
     if req.method() == Method::OPTIONS {
         let mut preflight = StatusCode::NO_CONTENT.into_response();
-        append_cors_headers(preflight.headers_mut());
+        append_cors_headers(preflight.headers_mut(), requested_headers);
         return preflight;
     }
     let mut resp = next.run(req).await;
-    append_cors_headers(resp.headers_mut());
+    append_cors_headers(resp.headers_mut(), requested_headers);
     resp
 }
 
-fn append_cors_headers(headers: &mut HeaderMap) {
+fn append_cors_headers(headers: &mut HeaderMap, requested_headers: Option<HeaderValue>) {
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
@@ -3214,8 +3370,10 @@ fn append_cors_headers(headers: &mut HeaderMap) {
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static(
-            "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Accept, Cache-Control",
-        ),
+        requested_headers.unwrap_or_else(|| {
+            HeaderValue::from_static(
+                "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Anthropic-Dangerous-Direct-Browser-Access, Accept, Cache-Control",
+            )
+        }),
     );
 }

@@ -16,7 +16,7 @@ Rules for changing this repository.
 ## Architecture
 
 - One-way workspace dependency graph (`resolver = "3"`, `edition = "2024"`, `rust-version = "1.100.0"`):
-  `liftgate` (management CLI binary: daemon lifecycle, embedded UI, config sync & zero-side-effect `claude`/`codex` launchers) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
+  `liftgate` (management CLI binary: daemon lifecycle, embedded UI, config sync & zero-side-effect `claude`/`codex` CLI + `codex-app`/`claude-desktop` GUI launchers) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
 - `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). Release builds embed `web/dist` directly into the `liftgate` binary via `crates/liftgate/build.rs` and serve it at `/`.
 - Cross-platform child supervision (`crates/liftgate-server/src/job.rs`): Win32 Job Object (`KILL_ON_JOB_CLOSE`) on Windows; `process_group(0)` + `killpg` on Unix plus `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux, backed by a chained panic hook.
 
@@ -40,7 +40,7 @@ CI gates live in `.github/workflows/syntax-check.yml`. Run every check relevant 
   cargo test --workspace --all-features --locked
   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
   ```
-- **Platform-gated Rust code** (`job.rs`, `platform.rs`): cross-check targets (`--target x86_64-unknown-linux-gnu`, `--target x86_64-apple-darwin`, `--target x86_64-pc-windows-msvc`) when editing OS-specific blocks.
+- **Platform-gated Rust code** (`job.rs`, `platform.rs`, `desktop.rs`): cross-check targets (`--target x86_64-unknown-linux-gnu`, `--target x86_64-apple-darwin`, `--target x86_64-pc-windows-msvc`) when editing OS-specific blocks.
 - **Web dashboard** (`web/`):
   ```bash
   cd web && bun install --frozen-lockfile && bun run build

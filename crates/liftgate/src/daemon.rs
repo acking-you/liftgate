@@ -1352,6 +1352,34 @@ pub async fn run_doctor(state_paths: &StatePaths, args: DoctorArgs) -> Result<()
             detail: "not detected in PATH (`npm i -g @openai/codex`)".to_owned(),
         }),
     }
+    match crate::desktop::resolve_claude_desktop(None) {
+        Ok(app) => checks.push(CheckRow {
+            name: "Claude Desktop",
+            status: "found",
+            tone: Tone::Ok,
+            detail: app.display_label().to_owned(),
+        }),
+        Err(_) => checks.push(CheckRow {
+            name: "Claude Desktop",
+            status: "optional",
+            tone: Tone::Muted,
+            detail: format!("not detected (`{bin} cd` when installed)"),
+        }),
+    }
+    match crate::desktop::resolve_codex_app(None) {
+        Ok(app) => checks.push(CheckRow {
+            name: "Codex App",
+            status: "found",
+            tone: Tone::Ok,
+            detail: app.display_label().to_owned(),
+        }),
+        Err(_) => checks.push(CheckRow {
+            name: "Codex App",
+            status: "optional",
+            tone: Tone::Muted,
+            detail: format!("not detected (`{bin} cxa` when installed)"),
+        }),
+    }
 
     let daemon = state_paths.read_daemon()?;
     let listen = args
@@ -1771,7 +1799,7 @@ pub(crate) fn tail_file_lines(path: &Path, max_lines: usize) -> Result<String, C
     Ok(slice.join("\n"))
 }
 
-fn configure_detached_command(cmd: &mut Command) {
+pub(crate) fn configure_detached_command(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1800,13 +1828,13 @@ fn configure_detached_command(cmd: &mut Command) {
 /// handle list), preventing piped callers (`lg start | Out-Null`, `$out = lg start`, CI runners)
 /// from hanging on inherited stdout/stderr pipe ends.
 #[cfg(windows)]
-struct StdioInheritGuard {
+pub(crate) struct StdioInheritGuard {
     saved: Vec<(isize, u32)>,
 }
 
 #[cfg(windows)]
 impl StdioInheritGuard {
-    fn suspend_current() -> Self {
+    pub(crate) fn suspend_current() -> Self {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{
             GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,

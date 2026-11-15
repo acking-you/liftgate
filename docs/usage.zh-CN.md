@@ -73,9 +73,9 @@ lg agy mcp -- --help                    # 透传任意官方子命令（`mcp`、
 - **默认零代理直连**：Liftgate 默认**不设置任何代理**，并在拉起 `agy` 时清理父进程残留的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（也不会自动注入系统注册表代理）。只有当你通过 `lg proxy`（持久化于 `~/.liftgate/settings.json`）或 `--agy-proxy` / `AGY_PROXY` 显式配置后，Liftgate 才会在每次启动 `agy` 时强制注入代理环境变量，并自动将 `127.0.0.1,localhost,::1` 写入 `NO_PROXY`。
 - **空闲无感自动热更新**：网关运行时默认开启 `agy` 自动更新（`true`）。后台任务会定期检查官方 Antigravity 清单；发现新版本时**绝不打断进行中的请求**，而是等待网关完全空闲（0 活跃请求、0 活跃流且会话池静置），排空缓存空闲会话并优雅释放旧 `agy` 进程文件锁（含 Windows `.exe` 锁），完成 SHA-512 校验替换后立即拉起新进程——若新版本握手异常还会自动回滚旧二进制。
 
-## 零副作用临时启动（`liftgate codex` / `liftgate claude`）
+## 零副作用临时启动（`lg cx` / `lg cc` / `lg cxa` / `lg cd`）
 
-在**任意项目目录**下直接通过 Liftgate 注入的进程级环境启动 Codex CLI 或 Claude Code，退出后**完全 0 副作用**（不在当前项目生成任何文件，也不改动 `~/.claude/settings.json`、`~/.codex/config.toml` 或父终端环境变量）：
+跨 Windows、macOS、Linux 在**任意目录**下零污染启动 Codex CLI、Claude Code、**Codex App** 或 **Claude Desktop**，退出后**完全 0 残留**（不改动当前项目、`~/.claude/settings.json`、`~/.codex/config.toml`、官方桌面端配置或父终端环境）：
 
 ```bash
 cd /path/to/your/project
@@ -85,10 +85,19 @@ liftgate codex --no-code-mode               # 当前会话关闭 Code Mode，恢
 liftgate claude                             # 在当前目录启动交互式 Claude Code（默认注入 `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`）
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
 liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
+
+# 全平台桌面客户端（适配 Windows MSIX/Squirrel/独立安装、macOS .app、Linux .deb/Flatpak/AppImage）
+lg codex-app                                # 短别名 `lg cxa` 或 `lg cx --app`（隔离 CODEX_HOME + --user-data-dir）
+lg codex-app --ephemeral                    # 使用一次性 Electron Profile，关闭窗口即自动清除
+lg claude-desktop                           # 短别名 `lg cd` 或 `lg cc --desktop`（3P 网关会话注入，退出自动无损还原）
+lg claude-desktop --restart-app             # 若 Claude Desktop 已在运行，优雅重启并切入网关
+lg claude-desktop --restore                 # 手动立即执行回滚日志恢复（断电/强杀亦会在下次启动自动恢复）
 ```
 
-- 若后台网关尚未启动，`liftgate codex` 与 `liftgate claude` 会自动在后台拉起它。
+- 若后台网关尚未启动，`liftgate codex`、`liftgate claude` 及桌面端命令会自动在后台拉起它。
 - 注入的环境变量与临时配置目录（位于 `~/.liftgate/ephemeral/`）仅对子进程生效，进程退出时立即自动删除。
+- **Codex App（`lg cxa`）**：在 `~/.liftgate/desktop/sessions/` 下合成独立物理 `CODEX_HOME`（只读合并 `~/.codex/config.toml` 与 `auth.json`，绝不触碰 `~/.codex`），并通过 `--user-data-dir` 隔离 Electron 数据目录（Windows Microsoft Store MSIX 包通过 `Invoke-CommandInDesktopPackage` 原生包身份激活，且不篡改 `HOME` / `USERPROFILE` / `APPDATA`，确保内置终端中的 `git`、`cargo`、`ssh` 完全正常）。
+- **Claude Desktop（`lg cd`）**：修改前先写入原子回滚日志（`~/.liftgate/desktop-journals/`），覆盖标准目录、Windows MSIX `LocalCache` 与 Linux Flatpak 沙箱目录注入临时第三方推理配置（`deploymentMode: "3p"`，指向本地 `/claude-desktop` 路由），后台守护进程监听窗口关闭后自动精准还原原始 `deploymentMode` 与 Profile 列表，同时完整保留会话期间新增的 `mcpServers` 或偏好设置。
 - 默认开启全自动免确认模式（Codex 传 `--dangerously-bypass-approvals-and-sandbox`，Claude Code 传 `--dangerously-skip-permissions`）；加 `--no-bypass`（或显式传入权限/沙箱参数）即可保留常规权限确认。
 
 ## 上下文窗口与超长上下文选项

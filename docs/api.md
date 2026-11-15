@@ -12,6 +12,7 @@ without the `/v1` prefix.
 | `POST /v1/messages/count_tokens` | Anthropic token count (a local estimate) |
 | `GET /v1/models`, `GET /v1/models/{id}` | the models your Antigravity account can use |
 | `GET /v1/codex-models?default_model=<id>` | the same models as a Codex `model_catalog_json` |
+| `GET /claude-desktop/v1/models`, `POST /claude-desktop/v1/messages` | Claude Desktop 3P gateway namespace (encodes ACP models into Claude-safe `claude-*-lg--<id>` route IDs and unwraps them automatically) |
 | `GET /healthz` | liveness |
 | `GET /api/telemetry/snapshot`, `GET /api/telemetry/events` | dashboard data (snapshot and SSE stream) |
 | `POST /api/telemetry/sessions/{id}/close` | close an idle pooled session |

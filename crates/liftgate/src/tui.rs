@@ -123,6 +123,8 @@ impl Drop for TerminalSession {
 pub enum CockpitAction {
     LaunchCodex,
     LaunchClaude,
+    LaunchCodexApp,
+    LaunchClaudeDesktop,
     OpenTop,
     PickModel,
     OpenWebUi,
@@ -154,6 +156,18 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         label: "Launch Claude Code",
         desc: "Start Claude Code in current dir (auto-starts gateway, 0 file side effects)",
         action: CockpitAction::LaunchClaude,
+    },
+    CockpitItem {
+        hotkey: 'w',
+        label: "Launch Codex App",
+        desc: "Open Codex desktop GUI with isolated ephemeral CODEX_HOME (0 pollution)",
+        action: CockpitAction::LaunchCodexApp,
+    },
+    CockpitItem {
+        hotkey: 'e',
+        label: "Launch Claude Desktop",
+        desc: "Open Claude Desktop GUI in auto-restoring 3P gateway mode (0 pollution)",
+        action: CockpitAction::LaunchClaudeDesktop,
     },
     CockpitItem {
         hotkey: 't',
@@ -385,12 +399,12 @@ fn poll_cockpit_input(selected: &mut usize) -> Result<Option<Option<CockpitActio
 }
 
 fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mut ListState) {
-    let area = centered_rect(86, 26, frame.area());
+    let area = centered_rect(88, 28, frame.area());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
-            Constraint::Min(13),
+            Constraint::Min(15),
             Constraint::Length(2),
         ])
         .split(area);

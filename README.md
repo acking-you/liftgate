@@ -28,8 +28,8 @@ CLI.
 
 <table>
   <tr>
-    <td align="center" width="25%"><a href="docs/usage.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI</b></a><br><sub>OpenAI Responses</sub></td>
-    <td align="center" width="25%"><a href="docs/usage.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code</b></a><br><sub>Anthropic Messages</sub></td>
+    <td align="center" width="25%"><a href="docs/usage.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI &amp; App</b></a><br><sub>OpenAI Responses</sub></td>
+    <td align="center" width="25%"><a href="docs/usage.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code &amp; Desktop</b></a><br><sub>Anthropic Messages</sub></td>
     <td align="center" width="25%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDKs</b></a><br><sub><code>/v1/responses</code></sub></td>
     <td align="center" width="25%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDKs</b></a><br><sub><code>/v1/messages</code></sub></td>
   </tr>
@@ -99,7 +99,9 @@ lg agy login                            # sign in to Google Antigravity interact
 
 lg                                      # open interactive command center in your terminal
 lg cx                                   # launch Codex CLI in current dir (0 side effects on exit)
+lg cxa                                  # launch Codex App across Win/macOS/Linux (0 pollution)
 lg cc                                   # or launch Claude Code in current dir (0 side effects on exit)
+lg cd                                   # or launch Claude Desktop across Win/macOS/Linux (0 pollution)
 ```
 
 Monitor live traffic in the TUI, switch models interactively, or sync configs from anywhere:

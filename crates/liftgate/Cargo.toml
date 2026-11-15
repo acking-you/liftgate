@@ -1,6 +1,6 @@
 [package]
 name = "liftgate"
-description = "Antigravity ACP local API gateway, interactive TUI & web dashboard, and Claude Code / Codex CLI manager"
+description = "Antigravity ACP local API gateway, interactive TUI & web dashboard, and Claude Code / Claude Desktop / Codex CLI & App manager"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -55,6 +55,7 @@ zip = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

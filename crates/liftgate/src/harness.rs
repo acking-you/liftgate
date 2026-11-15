@@ -8,7 +8,10 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::task::JoinSet;
 
-use crate::cli::{ClaudeArgs, CodexArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
+use crate::cli::{
+    ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, PLACEHOLDER_API_KEY,
+    normalize_optional_api_key,
+};
 use crate::client::infer_live_long_context;
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
@@ -25,6 +28,22 @@ pub struct ResolvedCommand {
 }
 
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
+    if args.desktop {
+        return crate::desktop::run_claude_desktop(
+            state_paths,
+            ClaudeDesktopArgs {
+                listen: args.listen,
+                api_key: args.api_key,
+                model: args.model,
+                restart_app: args.restart_app,
+                restore: false,
+                wait: args.wait,
+                claude_desktop_bin: args.claude_desktop_bin,
+                passthrough_args: args.passthrough_args,
+            },
+        )
+        .await;
+    }
     let resolved_cmd = resolve_claude_command(args.claude_bin.as_deref())?;
     let target = ensure_gateway_ready(
         state_paths,
@@ -143,6 +162,27 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
 }
 
 pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32, CliError> {
+    if args.app {
+        return crate::desktop::run_codex_app(
+            state_paths,
+            CodexAppArgs {
+                listen: args.listen,
+                api_key: args.api_key,
+                model: args.model,
+                no_bypass: args.no_bypass,
+                code_mode: args.code_mode,
+                code_mode_only: args.code_mode_only,
+                no_code_mode: args.no_code_mode,
+                restart_app: args.restart_app,
+                ephemeral: args.ephemeral,
+                wait: args.wait,
+                codex_app_bin: args.codex_app_bin,
+                codex_bin: None,
+                passthrough_args: args.passthrough_args,
+            },
+        )
+        .await;
+    }
     let resolved_cmd = resolve_codex_command(args.codex_bin.as_deref())?;
     let target = ensure_gateway_ready(
         state_paths,

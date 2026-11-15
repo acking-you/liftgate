@@ -8,6 +8,8 @@ pub(crate) mod client;
 pub(crate) mod config_sync;
 #[path = "daemon.rs"]
 pub(crate) mod daemon;
+#[path = "desktop.rs"]
+pub(crate) mod desktop;
 #[path = "error.rs"]
 pub(crate) mod error;
 #[path = "harness.rs"]
@@ -32,9 +34,10 @@ use liftgate_server::job::install_panic_cleanup_hook;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{
-    AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs, Cli, CodexArgs,
-    Commands, ConfigArgs, DoctorArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, TopArgs,
-    UiArgs, UpgradeArgs, invoked_bin_name, normalize_harness_args,
+    AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs,
+    ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs, DoctorArgs, ModelsArgs,
+    RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs, invoked_bin_name,
+    normalize_harness_args,
 };
 use crate::error::CliError;
 use crate::state::{StatePaths, resolve_effective_agy_bin};
@@ -103,6 +106,9 @@ async fn dispatch(
 ) -> Result<i32, CliError> {
     let state_paths = StatePaths::resolve(cli.state_dir)?;
     agy_manager::sweep_stale_agy_backups(&state_paths);
+    if !matches!(cli.command, Some(Commands::InternalDesktopWatch(_))) {
+        desktop::sweep_stale_desktop_sessions(&state_paths);
+    }
 
     match cli.command {
         None if bare_interactive_invocation => {
@@ -152,7 +158,15 @@ async fn dispatch(
             Ok(0)
         }
         Some(Commands::Claude(args)) => harness::run_claude(&state_paths, args).await,
+        Some(Commands::ClaudeDesktop(args)) => {
+            desktop::run_claude_desktop(&state_paths, args).await
+        }
         Some(Commands::Codex(args)) => harness::run_codex(&state_paths, args).await,
+        Some(Commands::CodexApp(args)) => desktop::run_codex_app(&state_paths, args).await,
+        Some(Commands::InternalDesktopWatch(args)) => {
+            desktop::run_desktop_watch(args).await?;
+            Ok(0)
+        }
         Some(Commands::Config(args)) => {
             config_sync::run_config(&state_paths, args).await?;
             Ok(0)
@@ -193,6 +207,12 @@ async fn dispatch_cockpit_action(
         }
         CockpitAction::LaunchClaude => {
             harness::run_claude(state_paths, ClaudeArgs::default_interactive()).await
+        }
+        CockpitAction::LaunchCodexApp => {
+            desktop::run_codex_app(state_paths, CodexAppArgs::default_interactive()).await
+        }
+        CockpitAction::LaunchClaudeDesktop => {
+            desktop::run_claude_desktop(state_paths, ClaudeDesktopArgs::default_interactive()).await
         }
         CockpitAction::OpenTop => {
             tui::run_top(

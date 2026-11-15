@@ -142,6 +142,20 @@ pub enum CliError {
         source: std::io::Error,
     },
 
+    #[error("`{app}` desktop application was not found ({hint})")]
+    DesktopAppNotFound {
+        app: &'static str,
+        hint: &'static str,
+    },
+
+    #[error(
+        "`{app}` is already running (PID {pids}); close it first or pass `--restart-app` so Liftgate can inject session config cleanly"
+    )]
+    DesktopAppAlreadyRunning { app: &'static str, pids: String },
+
+    #[error("failed to launch `{app}`: {detail}")]
+    DesktopAppLaunchFailed { app: &'static str, detail: String },
+
     #[error("failed to open browser for `{url}`")]
     BrowserOpen {
         url: String,

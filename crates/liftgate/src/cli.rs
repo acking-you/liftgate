@@ -21,7 +21,9 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg agy login            Sign in to Antigravity interactively (with proxy applied)
   lg proxy 7890           Force `http://127.0.0.1:7890` into `agy` (`lg proxy off` to clear)
   lg cx                   Launch Codex CLI in current dir (0 side effects on exit)
+  lg cxa                  Launch Codex App GUI via Liftgate (0 pollution on exit)
   lg cc                   Launch Claude Code in current dir (0 side effects on exit)
+  lg cd                   Launch Claude Desktop GUI via Liftgate (auto-restores on exit)
   lg top                  Open real-time terminal observability dashboard (TUI)
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
@@ -55,7 +57,7 @@ pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
     name = "liftgate",
     version,
     styles = crate::ui::clap_styles(),
-    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude Code / Codex CLI manager (short alias: `lg`)",
+    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex CLI & Desktop manager (short alias: `lg`)",
     after_help = AFTER_HELP_TEXT
 )]
 pub struct Cli {
@@ -109,9 +111,17 @@ pub enum Commands {
     #[command(visible_alias = "cc")]
     Claude(ClaudeArgs),
 
+    /// Launch Claude Desktop GUI routed through Liftgate with crash-safe auto-restoring 3P session config.
+    #[command(visible_aliases = ["cd", "claude-app"])]
+    ClaudeDesktop(ClaudeDesktopArgs),
+
     /// Launch Codex CLI in the current directory via Liftgate with zero project/global file side effects.
     #[command(visible_alias = "cx", alias = "x")]
     Codex(CodexArgs),
+
+    /// Launch Codex App GUI routed through Liftgate with an isolated ephemeral `CODEX_HOME` (zero pollution).
+    #[command(visible_aliases = ["cxa", "codex-desktop"])]
+    CodexApp(CodexAppArgs),
 
     /// Generate, update, or uninstall project-local or global configuration files for Claude Code and/or Codex CLI.
     #[command(visible_aliases = ["setup", "cfg"])]
@@ -140,6 +150,17 @@ pub enum Commands {
 
     /// Run the HTTP gateway and Web UI in the foreground.
     Serve(ServeArgs),
+
+    /// Internal detached reaper that cleans up or restores desktop session state once the GUI app exits.
+    #[command(name = "__desktop-watch", hide = true)]
+    InternalDesktopWatch(DesktopWatchArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DesktopWatchArgs {
+    /// Path to the desktop session journal file.
+    #[arg(long)]
+    pub journal: PathBuf,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -767,9 +788,25 @@ pub struct ClaudeArgs {
     #[arg(long)]
     pub no_code_mode: bool,
 
+    /// Launch Claude Desktop GUI instead of Claude Code CLI.
+    #[arg(long, visible_alias = "app")]
+    pub desktop: bool,
+
+    /// Restart Claude Desktop automatically if it is already running (used with `--desktop`).
+    #[arg(long)]
+    pub restart_app: bool,
+
+    /// Wait in the foreground until Claude Desktop exits instead of detaching the cleanup watcher (used with `--desktop`).
+    #[arg(short = 'w', long)]
+    pub wait: bool,
+
     /// Explicit path to `claude` executable.
     #[arg(long, env = "CLAUDE_BIN")]
     pub claude_bin: Option<PathBuf>,
+
+    /// Explicit path to Claude Desktop executable or `.app` bundle (used with `--desktop`).
+    #[arg(long, env = "CLAUDE_DESKTOP_BIN")]
+    pub claude_desktop_bin: Option<PathBuf>,
 
     /// Arguments forwarded verbatim to `claude` (works with or without `--`).
     #[arg(last = true, value_name = "CLAUDE_ARGS")]
@@ -786,7 +823,66 @@ impl ClaudeArgs {
             fast_model: None,
             no_bypass: false,
             no_code_mode: false,
+            desktop: false,
+            restart_app: false,
+            wait: false,
             claude_bin: std::env::var_os("CLAUDE_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            claude_desktop_bin: std::env::var_os("CLAUDE_DESKTOP_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ClaudeDesktopArgs {
+    /// Target gateway socket address (auto-starts background gateway if offline).
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+
+    /// Optional gateway API key.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Primary model ID selected by default in Claude Desktop.
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// Gracefully restart Claude Desktop if an instance is already running.
+    #[arg(long)]
+    pub restart_app: bool,
+
+    /// Immediately restore any active or interrupted Liftgate 3P session back to original Claude Desktop state without launching.
+    #[arg(long)]
+    pub restore: bool,
+
+    /// Wait in the foreground until Claude Desktop closes instead of spawning a detached cleanup watcher.
+    #[arg(short = 'w', long)]
+    pub wait: bool,
+
+    /// Explicit path to Claude Desktop executable or `.app` bundle.
+    #[arg(long, env = "CLAUDE_DESKTOP_BIN")]
+    pub claude_desktop_bin: Option<PathBuf>,
+
+    /// Extra arguments forwarded to Claude Desktop.
+    #[arg(last = true, value_name = "CLAUDE_DESKTOP_ARGS")]
+    pub passthrough_args: Vec<String>,
+}
+
+impl ClaudeDesktopArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            restart_app: false,
+            restore: false,
+            wait: false,
+            claude_desktop_bin: std::env::var_os("CLAUDE_DESKTOP_BIN")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
             passthrough_args: Vec::new(),
@@ -824,9 +920,29 @@ pub struct CodexArgs {
     #[arg(long, conflicts_with_all = ["code_mode", "code_mode_only"])]
     pub no_code_mode: bool,
 
+    /// Launch Codex App GUI instead of Codex CLI.
+    #[arg(long, visible_alias = "desktop")]
+    pub app: bool,
+
+    /// Gracefully restart Codex App if an instance is already running (used with `--app`).
+    #[arg(long)]
+    pub restart_app: bool,
+
+    /// Use a disposable Electron `--user-data-dir` deleted on exit instead of `~/.liftgate/desktop/codex-app` (used with `--app`).
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// Wait in the foreground until Codex App closes instead of spawning a detached cleanup watcher (used with `--app`).
+    #[arg(short = 'w', long)]
+    pub wait: bool,
+
     /// Explicit path to `codex` executable.
     #[arg(long, env = "CODEX_BIN")]
     pub codex_bin: Option<PathBuf>,
+
+    /// Explicit path to Codex App executable or `.app` bundle (used with `--app`).
+    #[arg(long, env = "CODEX_APP_BIN")]
+    pub codex_app_bin: Option<PathBuf>,
 
     /// Arguments forwarded verbatim to `codex` (works with or without `--`).
     #[arg(last = true, value_name = "CODEX_ARGS")]
@@ -844,9 +960,94 @@ impl CodexArgs {
             code_mode: false,
             code_mode_only: false,
             no_code_mode: false,
+            app: false,
+            restart_app: false,
+            ephemeral: false,
+            wait: false,
             codex_bin: std::env::var_os("CODEX_BIN")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
+            codex_app_bin: std::env::var_os("CODEX_APP_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CodexAppArgs {
+    /// Target gateway socket address (auto-starts background gateway if offline).
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+
+    /// Optional gateway API key.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Primary model ID configured as default in Codex App.
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// Keep Codex App's standard approval/sandbox prompts instead of `approval_policy = "never"`.
+    #[arg(long)]
+    pub no_bypass: bool,
+
+    /// Explicitly select hybrid Codex Code Mode (`exec` + `wait` JavaScript orchestration alongside direct tools; enabled by default).
+    #[arg(long, conflicts_with_all = ["code_mode_only", "no_code_mode"])]
+    pub code_mode: bool,
+
+    /// Enable strict Codex Code Mode Only (`exec` + `wait` JavaScript tool orchestration exclusively) for this session.
+    #[arg(long, conflicts_with_all = ["code_mode", "no_code_mode"])]
+    pub code_mode_only: bool,
+
+    /// Disable Codex Code Mode (`tool_mode = "direct"`, `features.code_mode = false`) for this session.
+    #[arg(long, conflicts_with_all = ["code_mode", "code_mode_only"])]
+    pub no_code_mode: bool,
+
+    /// Gracefully restart Codex App if an instance is already running.
+    #[arg(long)]
+    pub restart_app: bool,
+
+    /// Use a disposable Electron `--user-data-dir` wiped on exit instead of `~/.liftgate/desktop/codex-app`.
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// Wait in the foreground until Codex App closes instead of spawning a detached cleanup watcher.
+    #[arg(short = 'w', long)]
+    pub wait: bool,
+
+    /// Explicit path to Codex App executable or `.app` bundle.
+    #[arg(long, env = "CODEX_APP_BIN")]
+    pub codex_app_bin: Option<PathBuf>,
+
+    /// Optional explicit `codex` CLI binary injected via `CODEX_CLI_PATH` (uses Codex App's bundled binary by default).
+    #[arg(long)]
+    pub codex_bin: Option<PathBuf>,
+
+    /// Optional workspace path or extra arguments forwarded to Codex App.
+    #[arg(last = true, value_name = "CODEX_APP_ARGS")]
+    pub passthrough_args: Vec<String>,
+}
+
+impl CodexAppArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            no_bypass: false,
+            code_mode: false,
+            code_mode_only: false,
+            no_code_mode: false,
+            restart_app: false,
+            ephemeral: false,
+            wait: false,
+            codex_app_bin: std::env::var_os("CODEX_APP_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            codex_bin: None,
             passthrough_args: Vec::new(),
         }
     }
@@ -947,8 +1148,10 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
         return args;
     };
     let is_claude = matches!(sub_name, "claude" | "cc");
+    let is_claude_desktop = matches!(sub_name, "claude-desktop" | "cd" | "claude-app");
     let is_codex = matches!(sub_name, "codex" | "cx" | "x");
-    if !is_claude && !is_codex {
+    let is_codex_app = matches!(sub_name, "codex-app" | "cxa" | "codex-desktop");
+    if !is_claude && !is_claude_desktop && !is_codex && !is_codex_app {
         return args;
     }
 
@@ -968,6 +1171,16 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--model",
             "--fast-model",
             "--claude-bin",
+            "--claude-desktop-bin",
+        ]
+    } else if is_claude_desktop {
+        &[
+            "--state-dir",
+            "--listen",
+            "--api-key",
+            "-m",
+            "--model",
+            "--claude-desktop-bin",
         ]
     } else {
         &[
@@ -977,19 +1190,38 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "-m",
             "--model",
             "--codex-bin",
+            "--codex-app-bin",
         ]
     };
-    let bool_flags: &[&str] = if is_codex {
+    let bool_flags: &[&str] = if is_codex || is_codex_app {
         &[
             "--no-bypass",
             "--code-mode",
             "--code-mode-only",
             "--no-code-mode",
+            "--app",
+            "--desktop",
+            "--restart-app",
+            "--ephemeral",
+            "-w",
+            "--wait",
             "-h",
             "--help",
         ]
+    } else if is_claude_desktop {
+        &["--restart-app", "--restore", "-w", "--wait", "-h", "--help"]
     } else {
-        &["--no-bypass", "--no-code-mode", "-h", "--help"]
+        &[
+            "--no-bypass",
+            "--no-code-mode",
+            "--desktop",
+            "--app",
+            "--restart-app",
+            "-w",
+            "--wait",
+            "-h",
+            "--help",
+        ]
     };
 
     let mut idx = sub_idx + 1;
@@ -1277,6 +1509,33 @@ mod tests {
         assert!(matches!(
             agy_ext.command,
             Some(Commands::Agy(AgyArgs { action: Some(AgyCommand::External(v)), .. })) if v == vec![OsString::from("agents")]
+        ));
+
+        let cxa_cli = parse_strs(&["lg", "cxa", "-m", "gemini-4-carbon-high", "."]);
+        match cxa_cli.command {
+            Some(Commands::CodexApp(c)) => {
+                assert_eq!(c.model.as_deref(), Some("gemini-4-carbon-high"));
+                assert_eq!(c.passthrough_args, vec!["."]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cd_cli = parse_strs(&["lg", "cd", "--restart-app", "-w"]);
+        assert!(matches!(
+            cd_cli.command,
+            Some(Commands::ClaudeDesktop(c)) if c.restart_app && c.wait
+        ));
+
+        let cx_app = parse_strs(&["lg", "cx", "--app", "--ephemeral"]);
+        assert!(matches!(
+            cx_app.command,
+            Some(Commands::Codex(c)) if c.app && c.ephemeral
+        ));
+
+        let cc_desktop = parse_strs(&["lg", "cc", "--desktop", "--restart-app"]);
+        assert!(matches!(
+            cc_desktop.command,
+            Some(Commands::Claude(c)) if c.desktop && c.restart_app
         ));
     }
 }

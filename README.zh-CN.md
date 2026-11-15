@@ -24,8 +24,8 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 <table>
   <tr>
-    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI</b></a><br><sub>OpenAI Responses</sub></td>
-    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code</b></a><br><sub>Anthropic Messages</sub></td>
+    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI / App</b></a><br><sub>OpenAI Responses</sub></td>
+    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code / Desktop</b></a><br><sub>Anthropic Messages</sub></td>
     <td align="center" width="25%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDK</b></a><br><sub><code>/v1/responses</code></sub></td>
     <td align="center" width="25%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDK</b></a><br><sub><code>/v1/messages</code></sub></td>
   </tr>
@@ -67,7 +67,9 @@ lg agy login                            # 通过官方 `agy acp --login` 交互�
 
 lg                                      # 在终端直接打开交互式控制中心（快捷键一键启动）
 lg cx                                   # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
+lg cxa                                  # 跨 Win/macOS/Linux 启动 Codex App（完全 0 污染）
 lg cc                                   # 或在当前目录直接启动 Claude Code（退出后 0 副作用）
+lg cd                                   # 或跨 Win/macOS/Linux 启动 Claude Desktop（退出自动还原）
 ```
 
 在任意目录下打开终端 TUI 监控、交互式切换模型，或同步项目级与全局客户端配置：

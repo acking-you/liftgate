@@ -100,11 +100,11 @@ lg agy mcp -- --help                    # forwards to `agy mcp ...` (any subcomm
   (rolling back automatically if the new binary fails ACP handshake), and
   resumes serving without dropping configuration.
 
-## Zero-side-effect launch (`liftgate codex` / `liftgate claude`)
+## Zero-side-effect launch (`lg cx` / `lg cc` / `lg cxa` / `lg cd`)
 
-Run Codex CLI or Claude Code inside **any** project directory without modifying
-project files, `~/.claude/settings.json`, `~/.codex/config.toml`, or your caller
-shell environment:
+Run Codex CLI, Claude Code, **Codex App**, or **Claude Desktop** across Windows,
+macOS, and Linux without polluting project files, `~/.claude/settings.json`,
+`~/.codex/config.toml`, native desktop profiles, or your caller shell:
 
 ```bash
 cd /path/to/your/project
@@ -114,13 +114,33 @@ liftgate codex --no-code-mode               # disable Code Mode (`tool_mode = "d
 liftgate claude                             # interactive Claude Code (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` by default)
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
 liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
+
+# Desktop GUI apps (Windows MSIX/Squirrel/standalone, macOS .app bundles, Linux .deb/Flatpak/AppImage)
+lg codex-app                                # alias: `lg cxa` or `lg cx --app` (isolated CODEX_HOME + --user-data-dir)
+lg codex-app --ephemeral                    # use a disposable Electron profile deleted when the window closes
+lg claude-desktop                           # alias: `lg cd` or `lg cc --desktop` (scoped 3P profile, auto-restored on exit)
+lg claude-desktop --restart-app             # gracefully restart a running Claude Desktop instance into Liftgate
+lg claude-desktop --restore                 # manually replay rollback journals if needed
 ```
 
 - If the background gateway is not running yet, `liftgate codex` and
-  `liftgate claude` start it automatically.
+  `liftgate claude` (and their desktop counterparts) start it automatically.
 - Scoped environment variables and temporary settings/catalog files (under
   `~/.liftgate/ephemeral/`) apply **only** to the spawned child process and are
   deleted immediately when the CLI exits.
+- **Codex App (`lg cxa`)** synthesizes a physical session `CODEX_HOME` (reading
+  `~/.codex/config.toml` and `auth.json` read-only without ever modifying
+  `~/.codex`) and passes `--user-data-dir` under `~/.liftgate/desktop/codex-app`
+  (activating MSIX packages on Windows via `Invoke-CommandInDesktopPackage` while
+  preserving `HOME` / `USERPROFILE` / `APPDATA` for child `git`, `cargo`, and
+  `ssh` shells).
+- **Claude Desktop (`lg cd`)** snapshots existing `Claude` / `Claude-3p` state
+  into an atomic rollback journal (`~/.liftgate/desktop-journals/`), activates a
+  scoped Third-Party Inference (`deploymentMode: "3p"`) profile pointed at
+  `/claude-desktop` (including Windows MSIX `LocalCache` and Linux Flatpak
+  paths), watches the GUI process in the background, and surgically restores the
+  original `deploymentMode` and profile library when Claude Desktop closes
+  (preserving any `mcpServers` or preferences edited during the session).
 - By default both launch in autonomous mode (`--dangerously-bypass-approvals-and-sandbox`
   for Codex, `--dangerously-skip-permissions` for Claude Code); pass
   `--no-bypass` (or explicit permission/sandbox flags) to keep standard prompts.

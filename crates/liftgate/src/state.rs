@@ -63,12 +63,34 @@ impl StatePaths {
         self.root.join("ephemeral")
     }
 
+    #[must_use]
+    pub fn desktop_dir(&self) -> PathBuf {
+        self.root.join("desktop")
+    }
+
+    #[must_use]
+    pub fn desktop_journals_dir(&self) -> PathBuf {
+        self.root.join("desktop-journals")
+    }
+
     pub fn ensure_root_dir(&self) -> Result<(), CliError> {
         ensure_private_dir(&self.root)
     }
 
     pub fn ensure_ephemeral_dir(&self) -> Result<PathBuf, CliError> {
         let dir = self.ephemeral_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_desktop_journals_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.desktop_journals_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_desktop_sessions_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.desktop_dir().join("sessions");
         ensure_private_dir(&dir)?;
         Ok(canonicalize_clean(&dir))
     }
@@ -453,7 +475,11 @@ fn sweep_dead_ephemeral_files(dir: &Path) {
         if let Ok(pid) = pid_part.parse::<u32>()
             && !crate::daemon::is_pid_alive(pid)
         {
-            let _ = fs::remove_file(&path);
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir()) {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 }

@@ -4085,3 +4085,121 @@ async fn claude_code_mode_repl_fable_model_and_warm_session_roundtrip() {
         models[0]
     );
 }
+
+#[tokio::test]
+async fn claude_desktop_gateway_routes_discover_safe_models_and_unwrap_route_ids() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
+        thoughts: vec![],
+        chunks_template: vec!["Hello from Claude Desktop 3P".to_owned()],
+    }]));
+    let app = test_app_with_context(Arc::clone(&backend), 10, Some("desktop-key"), true);
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/claude-desktop/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/claude-desktop/v1/messages")
+                .header(
+                    "access-control-request-headers",
+                    "anthropic-dangerous-direct-browser-access, x-stainless-lang, x-api-key",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap(),
+        "anthropic-dangerous-direct-browser-access, x-stainless-lang, x-api-key"
+    );
+
+    let models_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/claude-desktop/v1/models")
+                .header("authorization", "bearer desktop-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(models_resp.status(), StatusCode::OK);
+    let models_json: Value =
+        serde_json::from_slice(&models_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let data = models_json["data"].as_array().expect("models data array");
+    assert!(!data.is_empty());
+    for item in data {
+        let id = item["id"].as_str().unwrap();
+        assert!(
+            liftgate_types::model::is_claude_desktop_safe_model_id(id),
+            "unsafe Claude Desktop model ID: {id}"
+        );
+    }
+
+    let bootstrap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/claude-desktop/user/bootstrap")
+                .header("authorization", "Bearer desktop-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bootstrap_resp.status(), StatusCode::OK);
+    let bootstrap_json: Value = serde_json::from_slice(
+        &bootstrap_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(bootstrap_json["builtinBrowserEnabled"], true);
+
+    let flash_route = liftgate_types::model::encode_claude_desktop_route_id("gemini-3.8-flash-low");
+    let msg_req = json!({
+        "model": format!("{flash_route}[1m]"),
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [{ "role": "user", "content": "ping" }]
+    });
+    let msg_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/claude-desktop/v1/messages")
+                .header("authorization", "Bearer desktop-key")
+                .header("content-type", "application/json")
+                .body(Body::from(msg_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(msg_resp.status(), StatusCode::OK);
+    let recorded = backend.recorded_models.lock().unwrap();
+    assert_eq!(recorded.as_slice(), &["gemini-3.8-flash-low"]);
+}

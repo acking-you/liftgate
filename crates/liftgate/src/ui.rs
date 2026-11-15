@@ -252,6 +252,13 @@ fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
             "Install from source with `cargo install --git https://github.com/acking-you/liftgate liftgate` or specify `--target <triple>`."
                 .to_owned(),
         ),
+        CliError::DesktopAppAlreadyRunning { .. } => Some(
+            "Close the running desktop app window first, or re-run with `--restart-app` to restart it automatically with Liftgate configuration."
+                .to_owned(),
+        ),
+        CliError::DesktopAppNotFound { .. } => Some(format!(
+            "Run `{bin} doctor` to inspect detected desktop installations, or specify an explicit path via `--codex-app-bin` / `--claude-desktop-bin`."
+        )),
         _ => None,
     }
 }
