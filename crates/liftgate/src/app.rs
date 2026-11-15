@@ -18,6 +18,8 @@ pub(crate) mod state;
 pub(crate) mod tui;
 #[path = "ui.rs"]
 pub(crate) mod ui;
+#[path = "upgrade.rs"]
+pub(crate) mod upgrade;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, stdin, stdout};
@@ -29,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{
     ClaudeArgs, Cli, CodexArgs, Commands, ConfigArgs, DoctorArgs, ModelsArgs, RestartArgs,
-    ServeArgs, StartArgs, TopArgs, UiArgs, invoked_bin_name, normalize_harness_args,
+    ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs, invoked_bin_name, normalize_harness_args,
 };
 use crate::error::CliError;
 use crate::state::StatePaths;
@@ -37,6 +39,7 @@ use crate::tui::CockpitAction;
 
 pub async fn entry() -> ExitCode {
     install_panic_cleanup_hook();
+    upgrade::sweep_stale_backups();
 
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let bin_name = invoked_bin_name();
@@ -154,6 +157,10 @@ async fn dispatch(
             daemon::run_doctor(&state_paths, args).await?;
             Ok(0)
         }
+        Some(Commands::Upgrade(args)) => {
+            upgrade::run_upgrade(&state_paths, args).await?;
+            Ok(0)
+        }
         Some(Commands::Alias(args)) => {
             daemon::run_alias(args)?;
             Ok(0)
@@ -249,6 +256,17 @@ async fn dispatch_cockpit_action(
                     listen: None,
                     api_key: None,
                     json: false,
+                },
+            )
+            .await?;
+            Ok(0)
+        }
+        CockpitAction::Upgrade => {
+            upgrade::run_upgrade(
+                state_paths,
+                UpgradeArgs {
+                    repo: "acking-you/liftgate".to_owned(),
+                    ..UpgradeArgs::default()
                 },
             )
             .await?;

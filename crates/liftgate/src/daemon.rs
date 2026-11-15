@@ -56,6 +56,16 @@ pub async fn start_daemon_inner(
     force_restart: bool,
     quiet_banner: bool,
 ) -> Result<DaemonState, CliError> {
+    start_daemon_with_exe(state_paths, None, serve, force_restart, quiet_banner).await
+}
+
+pub async fn start_daemon_with_exe(
+    state_paths: &StatePaths,
+    explicit_exe: Option<&Path>,
+    serve: ServeArgs,
+    force_restart: bool,
+    quiet_banner: bool,
+) -> Result<DaemonState, CliError> {
     if let Some(existing) = state_paths.read_daemon()? {
         let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
         if is_pid_alive(existing.pid)
@@ -131,7 +141,10 @@ pub async fn start_daemon_inner(
         source,
     })?;
 
-    let exe_path = std::env::current_exe().map_err(|source| CliError::DaemonSpawn { source })?;
+    let exe_path = match explicit_exe {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe().map_err(|source| CliError::DaemonSpawn { source })?,
+    };
     let shutdown_token = Uuid::new_v4().to_string();
     let clean_api_key = normalize_optional_api_key(serve.api_key.as_deref());
 
@@ -343,25 +356,36 @@ pub async fn stop_daemon(state_paths: &StatePaths, quiet: bool) -> Result<bool, 
     Ok(true)
 }
 
+pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
+    let defaults = ServeArgs::default();
+    ServeArgs {
+        listen: old.listen,
+        ui_listen: old.ui_listen,
+        default_model: if old.default_model.is_empty() {
+            defaults.default_model
+        } else {
+            old.default_model.clone()
+        },
+        acp_mode: if old.acp_mode.is_empty() {
+            defaults.acp_mode
+        } else {
+            old.acp_mode.clone()
+        },
+        api_key: old.api_key.clone(),
+        agy_bin: old.agy_bin.clone(),
+        acp_cwd: old.acp_cwd.clone(),
+        ui_dir: old.ui_dir.clone(),
+        ..defaults
+    }
+}
+
 pub async fn run_restart(state_paths: &StatePaths, args: RestartArgs) -> Result<(), CliError> {
     let prev = state_paths.read_daemon()?;
     let _ = stop_daemon(state_paths, false).await?;
 
-    let mut serve = ServeArgs::default();
-    if let Some(old) = prev {
-        serve.listen = old.listen;
-        serve.ui_listen = old.ui_listen;
-        if !old.default_model.is_empty() {
-            serve.default_model = old.default_model;
-        }
-        if !old.acp_mode.is_empty() {
-            serve.acp_mode = old.acp_mode;
-        }
-        serve.api_key = old.api_key;
-        serve.agy_bin = old.agy_bin;
-        serve.acp_cwd = old.acp_cwd;
-        serve.ui_dir = old.ui_dir;
-    }
+    let mut serve = prev
+        .as_ref()
+        .map_or_else(ServeArgs::default, serve_args_from_daemon_state);
 
     if let Some(listen) = args.listen {
         serve.listen = listen;

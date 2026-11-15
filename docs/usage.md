@@ -42,6 +42,7 @@ lg m -i                         # interactively filter & switch default model (f
 lg doc                          # check agy, claude, codex, proxy, embedded UI & auth readiness (full: doctor)
 lg r                            # restart preserving (or overriding) settings (full: restart)
 lg down                         # gracefully stop the background service and ACP process tree (full: stop)
+lg upgrade                      # check GitHub Releases (`-c` / `--check`) and self-upgrade `lg` + `liftgate` (aliases: update, self-update)
 lg alias --name lg              # install or remove (`--uninstall`) short executable alias on PATH
 lg completions zsh              # generate shell completions (bash, zsh, fish, powershell, elvish)
 liftgate serve                  # run in the foreground

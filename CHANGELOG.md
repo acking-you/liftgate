@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
+### Added
+- **In-place CLI self-upgrade (`lg upgrade` / `liftgate upgrade`)**:
+  - Queries GitHub Releases (`--check` / `-c`, `--version <tag>`, `--force`, `--proxy <url>`, `--json`, `--no-restart`) with automatic redirect fallback when unauthenticated `api.github.com` requests hit HTTP 403/429 rate limits, and passes any `GITHUB_TOKEN` / `GH_TOKEN` via `stdin` rather than command-line arguments.
+  - Verifies release archives fail-closed against `SHA256SUMS` (and GitHub's native `sha256:` asset digest), extracts `.tar.gz` / `.zip` bundles in pure safe Rust with per-file size caps, smoke-checks `--version`, atomically updates both `lg` and `liftgate` (with rollback and Windows running-`.exe` backup sweeping), and seamlessly restarts any active managed background gateway daemon.
+  - Added `[p] Check & Upgrade CLI` quick action to the bare `lg` interactive command center.
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

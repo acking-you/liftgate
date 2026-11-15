@@ -146,4 +146,30 @@ pub enum CliError {
         path.display()
     )]
     AliasTargetExists { path: PathBuf },
+
+    #[error("invalid upgrade parameter: {reason}")]
+    UpgradeInvalidInput { reason: String },
+
+    #[error("failed to query or download release from `{url}`: {detail}")]
+    UpgradeNetwork { url: String, detail: String },
+
+    #[error("release `{tag}` has no prebuilt archive for target `{target}`")]
+    UpgradeUnsupportedTarget { tag: String, target: String },
+
+    #[error("SHA-256 verification failed for `{asset}` (expected `{expected}`, got `{actual}`)")]
+    UpgradeChecksumMismatch {
+        asset: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("failed to verify or unpack release archive `{asset}`: {detail}")]
+    UpgradeArchive { asset: String, detail: String },
+
+    #[error("permission denied replacing `{}`", path.display())]
+    UpgradePermissionDenied {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

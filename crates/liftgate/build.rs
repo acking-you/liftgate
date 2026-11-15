@@ -9,6 +9,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIFTGATE_SKIP_WEB_BUILD");
     println!("cargo:rerun-if-env-changed=LIFTGATE_REBUILD_WEB");
     println!("cargo:rerun-if-env-changed=LIFTGATE_REQUIRE_EMBEDDED_WEB");
+    if let Ok(target) = env::var("TARGET") {
+        println!("cargo:rustc-env=LIFTGATE_BUILD_TARGET={target}");
+    }
 
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo always sets CARGO_MANIFEST_DIR"),

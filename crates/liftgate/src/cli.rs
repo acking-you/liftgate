@@ -22,6 +22,7 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
   lg st                   Inspect gateway health, session pool & token metrics
+  lg upgrade              Check GitHub Releases & self-upgrade `lg` + `liftgate`
   lg cfg -g               Configure ~/.claude & ~/.codex for bare `claude`/`codex`";
 
 /// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
@@ -116,6 +117,10 @@ pub enum Commands {
     /// Diagnose `agy`, `claude`, `codex`, embedded Web UI, and live gateway readiness.
     #[command(visible_alias = "doc")]
     Doctor(DoctorArgs),
+
+    /// Check GitHub Releases and automatically upgrade `lg` and `liftgate` with SHA-256 verification.
+    #[command(visible_aliases = ["update", "self-update", "upg"])]
+    Upgrade(UpgradeArgs),
 
     /// Install or remove a short CLI executable alias (`lg` by default) on your PATH.
     Alias(AliasArgs),
@@ -418,6 +423,49 @@ pub struct AliasArgs {
     /// Remove the installed alias binary.
     #[arg(long, visible_alias = "remove")]
     pub uninstall: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct UpgradeArgs {
+    /// Only check whether a newer release is available without downloading or modifying binaries.
+    #[arg(short = 'c', long)]
+    pub check: bool,
+
+    /// Target a specific release version/tag (e.g. `v0.1.0` or `0.1.0`) instead of `latest`.
+    #[arg(long, visible_alias = "tag")]
+    pub version: Option<String>,
+
+    /// Re-download and reinstall even if already on (or ahead of) the target release.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Override platform target triple (defaults to this binary's compile-time target).
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// GitHub `owner/repo` slug hosting official releases.
+    #[arg(
+        long,
+        env = "LIFTGATE_UPDATE_REPO",
+        default_value = "acking-you/liftgate"
+    )]
+    pub repo: String,
+
+    /// Optional HTTP/HTTPS/SOCKS5 proxy URL for GitHub API and asset downloads.
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Do not automatically restart a running managed background gateway daemon after upgrading.
+    #[arg(long)]
+    pub no_restart: bool,
+
+    /// Output structured JSON for scripting and automation.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Internal/mirror base URL override (used for self-hosted mirrors and integration tests).
+    #[arg(long, hide = true, env = "LIFTGATE_UPDATE_BASE_URL")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -824,6 +872,18 @@ mod tests {
         assert!(matches!(
             comp_cli.command,
             Some(Commands::Completions(c)) if c.shell == Shell::PowerShell
+        ));
+
+        let upg_cli = parse_strs(&["lg", "upgrade", "--check", "--json"]);
+        assert!(matches!(
+            upg_cli.command,
+            Some(Commands::Upgrade(u)) if u.check && u.json
+        ));
+
+        let upd_alias = parse_strs(&["liftgate", "update", "--version", "v0.1.0"]);
+        assert!(matches!(
+            upd_alias.command,
+            Some(Commands::Upgrade(u)) if u.version.as_deref() == Some("v0.1.0")
         ));
     }
 }

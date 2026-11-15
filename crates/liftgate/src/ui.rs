@@ -237,6 +237,17 @@ fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::GatewayHttpStatus { status: 401, .. } => Some(format!(
             "Pass `--api-key <key>` or export `AGY_GATEWAY_API_KEY` matching the running gateway (`{bin} status`)."
         )),
+        CliError::UpgradeNetwork { .. } => Some(format!(
+            "Check network connectivity, pass `--proxy <url>` (or set `HTTPS_PROXY`), or set `GITHUB_TOKEN` if rate-limited (`{bin} upgrade --check`)."
+        )),
+        CliError::UpgradePermissionDenied { .. } => Some(
+            "Re-run with elevated permissions (e.g. `sudo lg upgrade`) or install into a user-writable directory such as `~/.cargo/bin`."
+                .to_owned(),
+        ),
+        CliError::UpgradeUnsupportedTarget { .. } => Some(
+            "Install from source with `cargo install --git https://github.com/acking-you/liftgate liftgate` or specify `--target <triple>`."
+                .to_owned(),
+        ),
         _ => None,
     }
 }

@@ -98,6 +98,7 @@ lg m -i                  # interactively filter & switch default Antigravity mod
 lg up --open             # start background gateway + open embedded Web dashboard
 lg st                    # health, PID, session pool, token metrics & active turns
 lg cfg -g                # write/merge ~/.claude & ~/.codex configs (--uninstall to remove)
+lg upgrade               # check GitHub Releases (--check) & self-upgrade `lg` + `liftgate`
 lg down                  # gracefully stop the background gateway
 ```
 

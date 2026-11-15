@@ -73,6 +73,7 @@ lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
 lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板
 lg st                    # 查看健康状态、PID、会话池、Token 统计与进行中轮次
 lg cfg -g                # 无损合并 ~/.claude 与 ~/.codex 全局配置（--uninstall 卸载）
+lg upgrade               # 检查 GitHub Releases（--check）并自动校验升级 `lg` + `liftgate`
 lg down                  # 优雅停止后台网关服务
 ```
 

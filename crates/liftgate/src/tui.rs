@@ -129,6 +129,7 @@ pub enum CockpitAction {
     StartOrRestart,
     SyncConfig,
     Doctor,
+    Upgrade,
     StopGateway,
 }
 
@@ -187,6 +188,12 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         label: "Environment Doctor",
         desc: "Check agy, claude, codex, network proxy & login readiness",
         action: CockpitAction::Doctor,
+    },
+    CockpitItem {
+        hotkey: 'p',
+        label: "Check & Upgrade CLI",
+        desc: "Verify SHA256SUMS and self-upgrade lg & liftgate from GitHub Releases",
+        action: CockpitAction::Upgrade,
     },
     CockpitItem {
         hotkey: 'x',
@@ -338,7 +345,7 @@ fn poll_cockpit_input(selected: &mut usize) -> Result<Option<Option<CockpitActio
 }
 
 fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mut ListState) {
-    let area = centered_rect(86, 22, frame.area());
+    let area = centered_rect(86, 23, frame.area());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

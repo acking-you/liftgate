@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,7 @@ clap_complete = { version = "4.5", default-features = false }
 comfy-table = { version = "~7.1", default-features = false, features = ["tty"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
 dunce = { version = "1", default-features = false }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 http-body-util = { version = "0.1", default-features = false }
 libc = { version = "0.2", default-features = false }
 owo-colors = { version = "4", default-features = false }
@@ -32,6 +33,7 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 serde = { version = "1", default-features = false, features = ["derive", "std", "rc"] }
 serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+tar = { version = "0.4", default-features = false }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false }
 tokio-stream = { version = "0.1", default-features = false }
@@ -41,6 +43,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
 uuid = { version = "1", default-features = false, features = ["v4", "fast-rng", "std"] }
 windows-sys = { version = "0.59", default-features = false }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"

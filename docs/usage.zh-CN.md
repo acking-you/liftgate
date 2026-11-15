@@ -29,6 +29,7 @@ lg m -i                         # 交互式搜索并热切换默认模型（全�
 lg doc                          # 自检 agy、claude、codex、代理、内嵌面板与登录模型就绪状态（全称：doctor）
 lg r                            # 重启后台网关（全称：restart）
 lg down                         # 优雅停止后台网关并清理 ACP 子进程树（全称：stop）
+lg upgrade                      # 检查 GitHub Releases（-c / --check）并自动校验升级 lg 与 liftgate（别名：update、self-update）
 lg alias --name lg              # 在 PATH 中安装或移除（--uninstall）短命令别名
 lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh、fish、powershell、elvish）
 liftgate serve                  # 前台运行网关
