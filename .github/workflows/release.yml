@@ -85,28 +85,29 @@ jobs:
             ' CHANGELOG.md)"
           fi
 
-          cat > release_notes.md <<'EOF'
-Every archive ships **both** executables with the production Web Dashboard compiled in:
-- `lg` — short daily-driver CLI alias (interactive cockpit, `lg top` TUI, `lg cx`, `lg cc`, `lg m -i`)
-- `liftgate` — full canonical binary name
-
-### Quick Download Guide
-
-| Platform | Architecture | Recommended Archive |
-|---|---|---|
-| **macOS** | Apple Silicon (M1–M4) | `liftgate-aarch64-apple-darwin.tar.gz` |
-| **macOS** | Intel (x86_64) | `liftgate-x86_64-apple-darwin.tar.gz` |
-| **Windows** | x64 (MSVC) | `liftgate-x86_64-pc-windows-msvc.zip` |
-| **Windows** | ARM64 (Snapdragon / Surface) | `liftgate-aarch64-pc-windows-msvc.zip` |
-| **Windows** | x86 32-bit (MSVC) | `liftgate-i686-pc-windows-msvc.zip` |
-| **Linux (Static)** | x86_64 · zero glibc dep | `liftgate-x86_64-unknown-linux-musl.tar.gz` |
-| **Linux (Static)** | ARM64 · zero glibc dep | `liftgate-aarch64-unknown-linux-musl.tar.gz` |
-| **Linux (Static)** | ARMv7hf / i686 / RISC-V 64 | `liftgate-{armv7-unknown-linux-musleabihf,i686-unknown-linux-musl,riscv64gc-unknown-linux-musl}.tar.gz` |
-| **Linux (glibc)** | x86_64 / ARM64 / ARMv7hf / RISC-V 64 / ppc64le / s390x | `liftgate-*-unknown-linux-gnu*.tar.gz` |
-| **FreeBSD** | x86_64 | `liftgate-x86_64-unknown-freebsd.tar.gz` |
-
-> Verify integrity against `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`). Also installable via `cargo binstall liftgate`.
-EOF
+          {
+            printf '%s\n' \
+              'Every archive ships **both** executables with the production Web Dashboard compiled in:' \
+              '- `lg` — short daily-driver CLI alias (interactive cockpit, `lg top` TUI, `lg cx`, `lg cc`, `lg m -i`)' \
+              '- `liftgate` — full canonical binary name' \
+              '' \
+              '### Quick Download Guide' \
+              '' \
+              '| Platform | Architecture | Recommended Archive |' \
+              '|---|---|---|' \
+              '| **macOS** | Apple Silicon (M1–M4) | `liftgate-aarch64-apple-darwin.tar.gz` |' \
+              '| **macOS** | Intel (x86_64) | `liftgate-x86_64-apple-darwin.tar.gz` |' \
+              '| **Windows** | x64 (MSVC) | `liftgate-x86_64-pc-windows-msvc.zip` |' \
+              '| **Windows** | ARM64 (Snapdragon / Surface) | `liftgate-aarch64-pc-windows-msvc.zip` |' \
+              '| **Windows** | x86 32-bit (MSVC) | `liftgate-i686-pc-windows-msvc.zip` |' \
+              '| **Linux (Static)** | x86_64 · zero glibc dep | `liftgate-x86_64-unknown-linux-musl.tar.gz` |' \
+              '| **Linux (Static)** | ARM64 · zero glibc dep | `liftgate-aarch64-unknown-linux-musl.tar.gz` |' \
+              '| **Linux (Static)** | ARMv7hf / i686 / RISC-V 64 | `liftgate-{armv7-unknown-linux-musleabihf,i686-unknown-linux-musl,riscv64gc-unknown-linux-musl}.tar.gz` |' \
+              '| **Linux (glibc)** | x86_64 / ARM64 / ARMv7hf / RISC-V 64 / ppc64le / s390x | `liftgate-*-unknown-linux-gnu*.tar.gz` |' \
+              '| **FreeBSD** | x86_64 | `liftgate-x86_64-unknown-freebsd.tar.gz` |' \
+              '' \
+              '> Verify integrity against `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`). Also installable via `cargo binstall liftgate`.'
+          } > release_notes.md
           printf '\n%s\n' "${changelog_section}" >> release_notes.md
           cat release_notes.md
 
@@ -230,7 +231,7 @@ EOF
         with:
           key: release-${{ matrix.platform.target }}
 
-      - name: Build `liftgate` and `lg` release binaries
+      - name: Build liftgate and lg release binaries
         shell: bash
         env:
           LIFTGATE_SKIP_WEB_BUILD: "1"
