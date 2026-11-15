@@ -21,14 +21,45 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg agy login            Sign in to Antigravity interactively (with proxy applied)
   lg proxy 7890           Force `http://127.0.0.1:7890` into `agy` (`lg proxy off` to clear)
   lg cx                   Launch Codex CLI in current dir (0 side effects on exit)
+  lg cx resume            Browse & resume Codex sessions (`--last`, `--all`, `<ID>`)
   lg cxa                  Launch Codex App GUI via Liftgate (0 pollution on exit)
   lg cc                   Launch Claude Code in current dir (0 side effects on exit)
+  lg cc -r                Browse & resume Claude sessions (`lg cc resume`, `lg cc -c`)
   lg cd                   Launch Claude Desktop GUI via Liftgate (auto-restores on exit)
   lg top                  Open real-time terminal observability dashboard (TUI)
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
   lg st                   Inspect gateway health, session pool & token metrics
   lg upgrade              Check GitHub Releases & self-upgrade `lg` + `liftgate`";
+
+const CLAUDE_AFTER_HELP: &str = "\
+Native Claude Code Commands & Session Examples:
+  lg cc                           Start an interactive session in current directory
+  lg cc -r / lg cc resume         Open interactive session picker (`Ctrl+A` for all projects)
+  lg cc -c / lg cc continue       Continue most recent session (`lg cc resume --last`)
+  lg cc resume <ID_OR_NAME>       Resume a specific session (alias for `--resume <ID>`)
+  lg cc fork [--last | <ID>]      Fork a previous session (`--resume/--continue --fork-session`)
+  lg cc -p \"summarize changes\"    Print non-interactive response and exit
+  lg cc -w [name]                 Start session in an isolated git worktree
+  lg cc --bg \"refactor module\"    Start a background session
+  lg cc agents | attach | logs | stop | respawn | rm ...
+  lg cc mcp | plugin | doctor | auth | auto-mode | purge ...
+  lg cc -- --help                 Show full native `claude --help`";
+
+const CODEX_AFTER_HELP: &str = "\
+Native Codex CLI Commands & Session Examples:
+  lg cx                           Start an interactive session in current directory
+  lg cx resume                    Open interactive session picker (alias: `-r`, `--resume`)
+  lg cx resume --last             Continue most recent session (alias: `--continue`)
+  lg cx resume --all              Browse & resume sessions across all directories
+  lg cx resume <ID_OR_NAME>       Resume a specific session (optional trailing prompt)
+  lg cx fork [--last | <ID>]      Fork a previous session into a new thread
+  lg cx agents                    Open Agent Command Center to browse & switch sessions
+  lg cx exec \"run cargo test\"     Run non-interactively (`lg cx exec resume --last \"...\"`)
+  lg cx review --uncommitted      Run a non-interactive code review via Liftgate
+  lg cx archive | unarchive | delete <SESSION>
+  lg cx mcp | plugin | features | doctor | queue ...
+  lg cx -- --help                 Show full native `codex --help`";
 
 /// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
 #[must_use]
@@ -108,7 +139,7 @@ pub enum Commands {
     Models(ModelsArgs),
 
     /// Launch Claude Code in the current directory via Liftgate with zero project/global file side effects.
-    #[command(visible_alias = "cc")]
+    #[command(visible_alias = "cc", after_help = CLAUDE_AFTER_HELP)]
     Claude(ClaudeArgs),
 
     /// Launch Claude Desktop GUI routed through Liftgate with crash-safe auto-restoring 3P session config.
@@ -116,7 +147,7 @@ pub enum Commands {
     ClaudeDesktop(ClaudeDesktopArgs),
 
     /// Launch Codex CLI in the current directory via Liftgate with zero project/global file side effects.
-    #[command(visible_alias = "cx", alias = "x")]
+    #[command(visible_alias = "cx", alias = "x", after_help = CODEX_AFTER_HELP)]
     Codex(CodexArgs),
 
     /// Launch Codex App GUI routed through Liftgate with an isolated ephemeral `CODEX_HOME` (zero pollution).
@@ -1147,23 +1178,172 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
     let Some(sub_name) = args.get(sub_idx).and_then(|s| s.to_str()) else {
         return args;
     };
-    let is_claude = matches!(sub_name, "claude" | "cc");
-    let is_claude_desktop = matches!(sub_name, "claude-desktop" | "cd" | "claude-app");
-    let is_codex = matches!(sub_name, "codex" | "cx" | "x");
-    let is_codex_app = matches!(sub_name, "codex-app" | "cxa" | "codex-desktop");
-    if !is_claude && !is_claude_desktop && !is_codex && !is_codex_app {
+    let Some(kind) = HarnessSubcommand::from_name(sub_name) else {
+        return args;
+    };
+    let Some(rest) = args.get(sub_idx + 1..) else {
+        return args;
+    };
+    if rest.is_empty() {
         return args;
     }
 
-    if args
-        .get(sub_idx + 1..)
-        .is_some_and(|rest| rest.iter().any(|t| t == "--"))
-    {
+    let dd_pos = rest.iter().position(|t| t == "--");
+    let pre_dd = match dd_pos {
+        Some(pos) => rest.get(..pos).unwrap_or_default(),
+        None => rest,
+    };
+    let post_dd = dd_pos.and_then(|pos| rest.get(pos..));
+
+    let is_desktop_mode = detect_desktop_mode(kind, pre_dd);
+    let value_flags = harness_value_flags(kind);
+    let bool_flags = harness_bool_flags(kind, is_desktop_mode);
+
+    // Caller explicitly separated Liftgate options from raw child arguments (`lg cx [-m ...] -- ...`).
+    if dd_pos.is_some() && all_tokens_are_liftgate_flags(pre_dd, value_flags, bool_flags) {
         return args;
     }
 
-    let value_flags: &[&str] = if is_claude {
-        &[
+    let native_value_flags = native_single_value_flags(kind);
+    let mut lg_args = Vec::new();
+    let mut child_args = Vec::new();
+    let mut help_positions: Vec<(usize, OsString)> = Vec::new();
+
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        let Some(s) = tok.to_str() else {
+            child_args.push(tok.clone());
+            idx += 1;
+            continue;
+        };
+        if matches!(s, "-h" | "--help") {
+            help_positions.push((child_args.len(), tok.clone()));
+            idx += 1;
+            continue;
+        }
+        if bool_flags.contains(&s) {
+            lg_args.push(tok.clone());
+            idx += 1;
+            continue;
+        }
+        if value_flags.contains(&s) {
+            lg_args.push(tok.clone());
+            if let Some(val) = pre_dd.get(idx + 1) {
+                lg_args.push(val.clone());
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if value_flags
+            .iter()
+            .any(|vf| s.strip_prefix(vf).is_some_and(|rest| rest.starts_with('=')))
+        {
+            lg_args.push(tok.clone());
+            idx += 1;
+            continue;
+        }
+        if native_value_flags.contains(&s) {
+            child_args.push(tok.clone());
+            if let Some(val) = pre_dd.get(idx + 1) {
+                child_args.push(val.clone());
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        child_args.push(tok.clone());
+        idx += 1;
+    }
+
+    if let Some(tail) = post_dd {
+        child_args.extend_from_slice(tail);
+    }
+
+    if child_args.is_empty() {
+        for (_, flag) in help_positions {
+            lg_args.push(flag);
+        }
+    } else {
+        for (offset, (pos, flag)) in help_positions.into_iter().enumerate() {
+            let insert_at = (pos + offset).min(child_args.len());
+            child_args.insert(insert_at, flag);
+        }
+    }
+
+    if !is_desktop_mode {
+        match kind {
+            HarnessSubcommand::Claude => rewrite_claude_session_aliases(&mut child_args),
+            HarnessSubcommand::Codex => rewrite_codex_session_aliases(&mut child_args),
+            HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => {}
+        }
+    }
+
+    let mut out = Vec::with_capacity(sub_idx + 2 + lg_args.len() + child_args.len());
+    if let Some(prefix) = args.get(..=sub_idx) {
+        out.extend_from_slice(prefix);
+    }
+    out.extend(lg_args);
+    if !child_args.is_empty() {
+        out.push(OsString::from("--"));
+        out.extend(child_args);
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessSubcommand {
+    Claude,
+    ClaudeDesktop,
+    Codex,
+    CodexApp,
+}
+
+impl HarnessSubcommand {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "claude" | "cc" => Some(Self::Claude),
+            "claude-desktop" | "cd" | "claude-app" => Some(Self::ClaudeDesktop),
+            "codex" | "cx" | "x" => Some(Self::Codex),
+            "codex-app" | "cxa" | "codex-desktop" => Some(Self::CodexApp),
+            _ => None,
+        }
+    }
+}
+
+fn detect_desktop_mode(kind: HarnessSubcommand, pre_dd: &[OsString]) -> bool {
+    match kind {
+        HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => true,
+        HarnessSubcommand::Codex => pre_dd
+            .iter()
+            .any(|t| matches!(t.to_str(), Some("--app" | "--desktop"))),
+        HarnessSubcommand::Claude => {
+            let has_app = pre_dd.iter().any(|t| t.to_str() == Some("--app"));
+            let has_desktop = pre_dd.iter().any(|t| t.to_str() == Some("--desktop"));
+            let has_lg_desktop_only = pre_dd.iter().any(|t| {
+                t.to_str().is_some_and(|s| {
+                    matches!(s, "--restart-app" | "--wait" | "--claude-desktop-bin")
+                        || s.starts_with("--claude-desktop-bin=")
+                })
+            });
+            let has_session_handoff = pre_dd.iter().any(|t| {
+                t.to_str().is_some_and(|s| {
+                    matches!(
+                        s,
+                        "-c" | "--continue" | "-r" | "--resume" | "resume" | "continue"
+                    ) || s.starts_with("--resume=")
+                })
+            });
+            has_app || (has_desktop && (has_lg_desktop_only || !has_session_handoff))
+        }
+    }
+}
+
+fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
+    match kind {
+        HarnessSubcommand::Claude => &[
             "--state-dir",
             "--listen",
             "--api-key",
@@ -1172,18 +1352,16 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--fast-model",
             "--claude-bin",
             "--claude-desktop-bin",
-        ]
-    } else if is_claude_desktop {
-        &[
+        ],
+        HarnessSubcommand::ClaudeDesktop => &[
             "--state-dir",
             "--listen",
             "--api-key",
             "-m",
             "--model",
             "--claude-desktop-bin",
-        ]
-    } else {
-        &[
+        ],
+        HarnessSubcommand::Codex | HarnessSubcommand::CodexApp => &[
             "--state-dir",
             "--listen",
             "--api-key",
@@ -1191,49 +1369,145 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--model",
             "--codex-bin",
             "--codex-app-bin",
-        ]
-    };
-    let bool_flags: &[&str] = if is_codex || is_codex_app {
-        &[
+        ],
+    }
+}
+
+fn harness_bool_flags(kind: HarnessSubcommand, is_desktop_mode: bool) -> &'static [&'static str] {
+    match kind {
+        HarnessSubcommand::Codex => {
+            if is_desktop_mode {
+                &[
+                    "--no-bypass",
+                    "--code-mode",
+                    "--code-mode-only",
+                    "--no-code-mode",
+                    "--app",
+                    "--desktop",
+                    "--restart-app",
+                    "--ephemeral",
+                    "-w",
+                    "--wait",
+                ]
+            } else {
+                &[
+                    "--no-bypass",
+                    "--code-mode",
+                    "--code-mode-only",
+                    "--no-code-mode",
+                ]
+            }
+        }
+        HarnessSubcommand::CodexApp => &[
             "--no-bypass",
             "--code-mode",
             "--code-mode-only",
             "--no-code-mode",
-            "--app",
-            "--desktop",
             "--restart-app",
             "--ephemeral",
             "-w",
             "--wait",
-            "-h",
-            "--help",
-        ]
-    } else if is_claude_desktop {
-        &["--restart-app", "--restore", "-w", "--wait", "-h", "--help"]
-    } else {
-        &[
-            "--no-bypass",
-            "--no-code-mode",
-            "--desktop",
-            "--app",
-            "--restart-app",
-            "-w",
-            "--wait",
-            "-h",
-            "--help",
-        ]
-    };
+        ],
+        HarnessSubcommand::Claude => {
+            if is_desktop_mode {
+                &[
+                    "--no-bypass",
+                    "--no-code-mode",
+                    "--desktop",
+                    "--app",
+                    "--restart-app",
+                    "-w",
+                    "--wait",
+                ]
+            } else {
+                &["--no-bypass", "--no-code-mode"]
+            }
+        }
+        HarnessSubcommand::ClaudeDesktop => &["--restart-app", "--restore", "-w", "--wait"],
+    }
+}
 
-    let mut idx = sub_idx + 1;
-    while let Some(tok) = args.get(idx) {
+fn native_single_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
+    match kind {
+        HarnessSubcommand::Codex => &[
+            "-c",
+            "--config",
+            "--enable",
+            "--disable",
+            "--remote",
+            "--remote-auth-token-env",
+            "-i",
+            "--image",
+            "--local-provider",
+            "-p",
+            "--profile",
+            "-s",
+            "--sandbox",
+            "-C",
+            "--cd",
+            "--add-dir",
+            "-a",
+            "--ask-for-approval",
+            "-o",
+            "--output-last-message",
+            "--output-schema",
+            "--thread",
+            "--message",
+            "--base",
+            "--commit",
+            "--title",
+            "--thread-source",
+            "--cyber-access-program",
+        ],
+        HarnessSubcommand::Claude => &[
+            "--agent",
+            "--agents",
+            "--append-system-prompt",
+            "--autocompact",
+            "--betas",
+            "--debug-file",
+            "--effort",
+            "--environment",
+            "--fallback-model",
+            "--input-format",
+            "--json-schema",
+            "--max-budget-usd",
+            "--name",
+            "-n",
+            "--output-format",
+            "--permission-mode",
+            "--permission-prompts",
+            "--plugin-dir",
+            "--plugin-url",
+            "--remote-control-session-name-prefix",
+            "--session-id",
+            "--setting-sources",
+            "--settings",
+            "--system-prompt",
+            "--system-prompt-snapshot",
+        ],
+        HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => &[],
+    }
+}
+
+fn all_tokens_are_liftgate_flags(
+    tokens: &[OsString],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> bool {
+    let mut idx = 0usize;
+    while let Some(tok) = tokens.get(idx) {
         let Some(s) = tok.to_str() else {
-            break;
+            return false;
         };
-        if bool_flags.contains(&s) {
+        if matches!(s, "-h" | "--help") || bool_flags.contains(&s) {
             idx += 1;
             continue;
         }
         if value_flags.contains(&s) {
+            if tokens.get(idx + 1).is_none() {
+                return false;
+            }
             idx += 2;
             continue;
         }
@@ -1244,22 +1518,143 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             idx += 1;
             continue;
         }
-        break;
+        return false;
     }
+    true
+}
 
-    if idx >= args.len() {
-        return args;
+fn rewrite_claude_session_aliases(child_args: &mut Vec<OsString>) {
+    let is_alias = matches!(
+        child_args.first().and_then(|s| s.to_str()),
+        Some("resume" | "continue" | "fork")
+    );
+    if !is_alias {
+        return;
     }
+    let tail = child_args.split_off(1);
+    let first_owned = child_args.pop().unwrap_or_default();
+    let Some(first) = first_owned.to_str() else {
+        return;
+    };
+    let second = tail.first().and_then(|s| s.to_str());
+    match first {
+        "resume" => match second {
+            Some("-h" | "--help") => {
+                child_args.extend(tail);
+            }
+            Some("--last") => {
+                child_args.push(OsString::from("--continue"));
+                if let Some(after_last) = tail.get(1..) {
+                    child_args.extend_from_slice(after_last);
+                }
+            }
+            _ => {
+                child_args.push(OsString::from("--resume"));
+                child_args.extend(tail);
+            }
+        },
+        "continue" => {
+            if !matches!(second, Some("-h" | "--help")) {
+                child_args.push(OsString::from("--continue"));
+            }
+            child_args.extend(tail);
+        }
+        "fork" => match second {
+            Some("-h" | "--help") => {
+                child_args.extend(tail);
+            }
+            Some("--last") => {
+                child_args.push(OsString::from("--continue"));
+                child_args.push(OsString::from("--fork-session"));
+                if let Some(after_last) = tail.get(1..) {
+                    child_args.extend_from_slice(after_last);
+                }
+            }
+            Some(target) if !target.starts_with('-') => {
+                child_args.push(OsString::from("--resume"));
+                if let Some(first_tail) = tail.first() {
+                    child_args.push(first_tail.clone());
+                }
+                child_args.push(OsString::from("--fork-session"));
+                if let Some(after_target) = tail.get(1..) {
+                    child_args.extend_from_slice(after_target);
+                }
+            }
+            _ => {
+                child_args.push(OsString::from("--resume"));
+                child_args.push(OsString::from("--fork-session"));
+                child_args.extend(tail);
+            }
+        },
+        _ => {}
+    }
+}
 
-    let mut out = Vec::with_capacity(args.len() + 1);
-    if let Some(prefix) = args.get(..idx) {
-        out.extend_from_slice(prefix);
+fn rewrite_codex_session_aliases(child_args: &mut Vec<OsString>) {
+    const ROOT_VALUE_OPTS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    ];
+
+    let mut idx = 0usize;
+    while let Some(tok) = child_args.get(idx) {
+        let Some(s) = tok.to_str() else {
+            return;
+        };
+        if s == "--" {
+            return;
+        }
+        if matches!(s, "-r" | "--resume") {
+            if let Some(slot) = child_args.get_mut(idx) {
+                *slot = OsString::from("resume");
+            }
+            return;
+        }
+        if let Some(target) = s
+            .strip_prefix("--resume=")
+            .or_else(|| s.strip_prefix("-r="))
+        {
+            let target_owned = target.to_owned();
+            if let Some(slot) = child_args.get_mut(idx) {
+                *slot = OsString::from("resume");
+            }
+            if !target_owned.is_empty() {
+                child_args.insert(idx + 1, OsString::from(target_owned));
+            }
+            return;
+        }
+        if s == "--continue" {
+            if let Some(slot) = child_args.get_mut(idx) {
+                *slot = OsString::from("resume");
+            }
+            child_args.insert(idx + 1, OsString::from("--last"));
+            return;
+        }
+        if !s.starts_with('-') {
+            return;
+        }
+        if ROOT_VALUE_OPTS.contains(&s) {
+            idx += 2;
+            continue;
+        }
+        idx += 1;
     }
-    out.push(OsString::from("--"));
-    if let Some(suffix) = args.get(idx..) {
-        out.extend_from_slice(suffix);
-    }
-    out
 }
 
 fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
@@ -1537,5 +1932,119 @@ mod tests {
             cc_desktop.command,
             Some(Commands::Claude(c)) if c.desktop && c.restart_app
         ));
+    }
+
+    #[test]
+    fn native_session_commands_mixed_flags_and_conflicting_options_route_cleanly() {
+        // Position-independent Liftgate flags after native subcommands
+        let cx_resume = parse_strs(&["lg", "cx", "resume", "--last", "-m", "gemini-3.8-pro-high"]);
+        match cx_resume.command {
+            Some(Commands::Codex(c)) => {
+                assert_eq!(c.model.as_deref(), Some("gemini-3.8-pro-high"));
+                assert_eq!(c.passthrough_args, vec!["resume", "--last"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `--ephemeral` without `--app` forwards to native `codex --ephemeral`
+        let cx_ephemeral = parse_strs(&["lg", "cx", "--ephemeral", "exec", "cargo check"]);
+        match cx_ephemeral.command {
+            Some(Commands::Codex(c)) => {
+                assert!(!c.app && !c.ephemeral);
+                assert_eq!(
+                    c.passthrough_args,
+                    vec!["--ephemeral", "exec", "cargo check"]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Child `--` inside `codex sandbox` does not confuse top-level clap parsing
+        let cx_sandbox = parse_strs(&[
+            "lg", "cx", "sandbox", "windows", "--", "cmd", "/c", "echo", "ok",
+        ]);
+        match cx_sandbox.command {
+            Some(Commands::Codex(c)) => {
+                assert_eq!(
+                    c.passthrough_args,
+                    vec!["sandbox", "windows", "--", "cmd", "/c", "echo", "ok"]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Subcommand `--help` forwards to child instead of intercepting as Liftgate help
+        let norm_sub_help =
+            normalize_harness_args(["lg", "cx", "resume", "--help"].map(OsString::from));
+        assert_eq!(norm_sub_help, vec!["lg", "cx", "--", "resume", "--help"]);
+
+        // Codex `-r` / `--resume` / `--continue` ergonomic aliases (preserving `-c` as `--config`)
+        let cx_short_r = parse_strs(&["lg", "cx", "-r", "--all"]);
+        assert!(matches!(
+            cx_short_r.command,
+            Some(Commands::Codex(c)) if c.passthrough_args == vec!["resume", "--all"]
+        ));
+        let cx_cont = parse_strs(&["lg", "cx", "--continue"]);
+        assert!(matches!(
+            cx_cont.command,
+            Some(Commands::Codex(c)) if c.passthrough_args == vec!["resume", "--last"]
+        ));
+        let cx_cfg = parse_strs(&["lg", "cx", "-c", "model_reasoning_effort='low'", "resume"]);
+        assert!(matches!(
+            cx_cfg.command,
+            Some(Commands::Codex(c)) if c.passthrough_args == vec!["-c", "model_reasoning_effort='low'", "resume"]
+        ));
+
+        // Claude `-w` without `--desktop` forwards to native `claude --worktree`, while `--desktop -w` sets `wait`
+        let cc_worktree = parse_strs(&["lg", "cc", "-w", "feat-branch"]);
+        match cc_worktree.command {
+            Some(Commands::Claude(c)) => {
+                assert!(!c.desktop && !c.wait);
+                assert_eq!(c.passthrough_args, vec!["-w", "feat-branch"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cc_desktop_wait = parse_strs(&["lg", "cc", "--desktop", "-w"]);
+        assert!(matches!(
+            cc_desktop_wait.command,
+            Some(Commands::Claude(c)) if c.desktop && c.wait
+        ));
+
+        // Claude `resume` / `continue` / `fork` aliases + trailing `-m` hoisting
+        let cc_resume = parse_strs(&[
+            "lg",
+            "cc",
+            "resume",
+            "abc-123",
+            "-m",
+            "gemini-3.8-flash-low",
+        ]);
+        match cc_resume.command {
+            Some(Commands::Claude(c)) => {
+                assert_eq!(c.model.as_deref(), Some("gemini-3.8-flash-low"));
+                assert_eq!(c.passthrough_args, vec!["--resume", "abc-123"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cc_resume_last = parse_strs(&["lg", "cc", "resume", "--last"]);
+        assert!(matches!(
+            cc_resume_last.command,
+            Some(Commands::Claude(c)) if c.passthrough_args == vec!["--continue"]
+        ));
+        let cc_fork = parse_strs(&["lg", "cc", "fork", "sess-42"]);
+        assert!(matches!(
+            cc_fork.command,
+            Some(Commands::Claude(c)) if c.passthrough_args == vec!["--resume", "sess-42", "--fork-session"]
+        ));
+
+        // Native `claude --continue --desktop` session handoff passes through instead of launching raw 3P desktop
+        let cc_handoff = parse_strs(&["lg", "cc", "-c", "--desktop"]);
+        match cc_handoff.command {
+            Some(Commands::Claude(c)) => {
+                assert!(!c.desktop);
+                assert_eq!(c.passthrough_args, vec!["-c", "--desktop"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

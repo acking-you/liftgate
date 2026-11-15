@@ -115,6 +115,18 @@ liftgate claude                             # interactive Claude Code (`CLAUDE_C
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
 liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
 
+# Native session browsing, resumption, forking, worktrees & background agents
+lg cx resume                                # interactive Codex session picker (`--all` across projects; alias: `lg cx -r`)
+lg cx resume --last -m gemini-3.8-pro-high  # continue latest session & switch model (Liftgate flags work in any position)
+lg cx fork --last                           # fork most recent Codex session into a new thread
+lg cx agents                                # open Codex Agent Command Center (`archive`, `unarchive`, `delete`, `queue` also work)
+lg cx review --uncommitted                  # run a non-interactive Codex code review via Liftgate
+lg cc -r                                    # interactive Claude session picker (alias: `lg cc resume`; `Ctrl+A` shows all projects)
+lg cc -c                                    # continue most recent Claude session (aliases: `lg cc continue`, `lg cc resume --last`)
+lg cc fork --last                           # fork most recent Claude session (`--continue --fork-session`)
+lg cc -w feat-auth                          # start Claude Code in an isolated git worktree
+lg cc --bg "refactor parser"                # background session (`lg cc agents`, `attach`, `logs`, `stop`, `rm` all work)
+
 # Desktop GUI apps (Windows MSIX/Squirrel/standalone, macOS .app bundles, Linux .deb/Flatpak/AppImage)
 lg codex-app                                # alias: `lg cxa` or `lg cx --app` (isolated CODEX_HOME + --user-data-dir)
 lg codex-app --ephemeral                    # use a disposable Electron profile deleted when the window closes
@@ -144,6 +156,13 @@ lg claude-desktop --restore                 # manually replay rollback journals 
 - By default both launch in autonomous mode (`--dangerously-bypass-approvals-and-sandbox`
   for Codex, `--dangerously-skip-permissions` for Claude Code); pass
   `--no-bypass` (or explicit permission/sandbox flags) to keep standard prompts.
+- Native subcommands and flags work without needing `--`: local inspection/utility
+  commands (`lg cx queue|archive|delete|mcp|plugin|features|-V`, `lg cx resume --help`,
+  `lg cc logs|attach|stop|rm|mcp|plugin|purge|-v`, `lg cc agents --json`) run
+  directly without booting the gateway, while Liftgate flags (`-m`, `--no-bypass`,
+  `--no-code-mode`, `--code-mode-only`, etc.) can appear before or after native
+  arguments. Pass `--` (`lg cx -- --help`, `lg cc -- --help`) whenever you want
+  verbatim raw argument forwarding.
 
 ## Context windows and long context
 

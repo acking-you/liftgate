@@ -99,8 +99,10 @@ lg agy login                            # sign in to Google Antigravity interact
 
 lg                                      # open interactive command center in your terminal
 lg cx                                   # launch Codex CLI in current dir (0 side effects on exit)
+lg cx resume                            # browse & resume Codex sessions (`--last`, `--all`, `fork`, `agents`)
 lg cxa                                  # launch Codex App across Win/macOS/Linux (0 pollution)
 lg cc                                   # or launch Claude Code in current dir (0 side effects on exit)
+lg cc -r                                # browse & resume Claude sessions (`lg cc resume`, `-c`, `fork`, `agents`)
 lg cd                                   # or launch Claude Desktop across Win/macOS/Linux (0 pollution)
 ```
 

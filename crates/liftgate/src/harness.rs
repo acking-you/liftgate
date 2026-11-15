@@ -27,6 +27,33 @@ pub struct ResolvedCommand {
     pub prefix_args: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeInvocationKind {
+    /// Local utility, background job control, help, or version invocation that must run with the
+    /// native subcommand in `argv[1]` and without starting the gateway.
+    DirectPassthrough,
+    /// Subcommand requiring `argv[1]` intact (`respawn`, `doctor`, `ultrareview`) while inheriting
+    /// Liftgate's `ANTHROPIC_*` environment variables.
+    GatewayEnvSubcommand,
+    /// Interactive `claude agents` TUI: keeps `agents` in `argv[1]` while passing Liftgate's
+    /// ephemeral `--settings`, `--model`, permissions, and `ANTHROPIC_*` env for dispatched sessions.
+    AgentsView,
+    /// Interactive, `--print`, `--resume`, or `--continue` coding session.
+    AgentSession,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexInvocationKind {
+    /// Local/session-store/IPC/help/version invocation (`queue`, `archive`, `delete`, `mcp`,
+    /// `plugin`, `features`, `completion`, `sandbox`, `--help`, `-V`, etc.) executed directly.
+    DirectPassthrough,
+    /// Gateway-backed subcommand (`agents`, `review`, `doctor`, `debug`, `app-server`, etc.)
+    /// configured solely via `-c` overrides without `--dangerously-bypass-approvals-and-sandbox`.
+    GatewayConfigOnly,
+    /// Interactive or `exec` / `resume` / `fork` agent session.
+    AgentSession,
+}
+
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
     if args.desktop {
         return crate::desktop::run_claude_desktop(
@@ -45,22 +72,41 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .await;
     }
     let resolved_cmd = resolve_claude_command(args.claude_bin.as_deref())?;
+    let invocation = classify_claude_invocation(&args.passthrough_args);
+
+    let no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+
+    if invocation == ClaudeInvocationKind::DirectPassthrough {
+        let mut cmd = build_base_child_command(&resolved_cmd);
+        cmd.args(&args.passthrough_args)
+            .env("NO_PROXY", &no_proxy)
+            .env("no_proxy", &no_proxy);
+        return spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await;
+    }
+
+    let explicit_passthrough_model = extract_explicit_model_arg(&args.passthrough_args);
+    let requested_model = args
+        .model
+        .as_deref()
+        .or(explicit_passthrough_model)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let target = ensure_gateway_ready(
         state_paths,
         args.listen,
         args.api_key.clone(),
-        args.model.as_deref(),
+        requested_model,
         true,
     )
     .await?;
 
-    let primary_model = args
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&target.default_model)
-        .to_owned();
+    let primary_model = requested_model.unwrap_or(&target.default_model).to_owned();
     let auth_token = normalize_optional_api_key(target.api_key.as_deref())
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
@@ -68,6 +114,21 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
     let long_context = infer_live_long_context(&discovered, target.managed_long_context);
 
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
+
+    if matches!(invocation, ClaudeInvocationKind::GatewayEnvSubcommand) {
+        let mut cmd = build_base_child_command(&resolved_cmd);
+        cmd.args(&args.passthrough_args);
+        apply_claude_gateway_env(
+            &mut cmd,
+            target.client.base_url(),
+            &auth_token,
+            &primary_model,
+            &fast_model,
+            args.no_code_mode,
+            &no_proxy,
+        );
+        return spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await;
+    }
 
     let sync_params = HarnessSyncParams {
         gateway_base_url: target.client.base_url().to_owned(),
@@ -79,10 +140,7 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         long_context,
         discovered_models: discovered,
     };
-    let has_explicit_model = args
-        .passthrough_args
-        .iter()
-        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m="));
+    let has_explicit_model = explicit_passthrough_model.is_some();
     let has_explicit_effort = args
         .passthrough_args
         .iter()
@@ -121,40 +179,42 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
     });
 
     let mut cmd = build_base_child_command(&resolved_cmd);
-    if !args.no_bypass && !has_explicit_perm {
-        cmd.arg("--dangerously-skip-permissions");
+    match invocation {
+        ClaudeInvocationKind::AgentsView => {
+            cmd.arg("agents");
+            if !args.no_bypass && !has_explicit_perm {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            cmd.arg("--settings").arg(ephemeral_settings.path());
+            if !has_explicit_model {
+                cmd.arg("--model").arg(&primary_model);
+            }
+            if let Some(rest) = args.passthrough_args.get(1..) {
+                cmd.args(rest);
+            }
+        }
+        ClaudeInvocationKind::AgentSession => {
+            if !args.no_bypass && !has_explicit_perm {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            cmd.arg("--settings").arg(ephemeral_settings.path());
+            if !has_explicit_model {
+                cmd.arg("--model").arg(&primary_model);
+            }
+            cmd.args(&args.passthrough_args);
+        }
+        ClaudeInvocationKind::DirectPassthrough | ClaudeInvocationKind::GatewayEnvSubcommand => {}
     }
-    cmd.arg("--settings").arg(ephemeral_settings.path());
-    if !has_explicit_model {
-        cmd.arg("--model").arg(&primary_model);
-    }
-    cmd.args(&args.passthrough_args);
 
-    let no_proxy = merge_loopback_no_proxy(
-        std::env::var("NO_PROXY")
-            .ok()
-            .or_else(|| std::env::var("no_proxy").ok())
-            .as_deref(),
+    apply_claude_gateway_env(
+        &mut cmd,
+        target.client.base_url(),
+        &auth_token,
+        &primary_model,
+        &fast_model,
+        args.no_code_mode,
+        &no_proxy,
     );
-    cmd.env_remove("ANTHROPIC_API_KEY")
-        .env_remove("AGY_API_KEY")
-        .env("ANTHROPIC_BASE_URL", target.client.base_url())
-        .env("ANTHROPIC_AUTH_TOKEN", &auth_token)
-        .env("ANTHROPIC_MODEL", &primary_model)
-        .env("ANTHROPIC_DEFAULT_OPUS_MODEL", &primary_model)
-        .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &primary_model)
-        .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &fast_model)
-        .env("ANTHROPIC_SMALL_FAST_MODEL", &fast_model)
-        .env_remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-        .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
-        .env(
-            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
-            if args.no_code_mode { "0" } else { "1" },
-        )
-        .env("NO_PROXY", &no_proxy)
-        .env("no_proxy", &no_proxy);
 
     let exit_code = spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await?;
     drop(ephemeral_settings);
@@ -184,22 +244,41 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .await;
     }
     let resolved_cmd = resolve_codex_command(args.codex_bin.as_deref())?;
+    let invocation = classify_codex_invocation(&args.passthrough_args);
+
+    let no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+
+    if invocation == CodexInvocationKind::DirectPassthrough {
+        let mut cmd = build_base_child_command(&resolved_cmd);
+        cmd.args(&args.passthrough_args)
+            .env("NO_PROXY", &no_proxy)
+            .env("no_proxy", &no_proxy);
+        return spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await;
+    }
+
+    let explicit_passthrough_model = extract_explicit_model_arg(&args.passthrough_args);
+    let requested_model = args
+        .model
+        .as_deref()
+        .or(explicit_passthrough_model)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let target = ensure_gateway_ready(
         state_paths,
         args.listen,
         args.api_key.clone(),
-        args.model.as_deref(),
+        requested_model,
         true,
     )
     .await?;
 
-    let primary_model = args
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&target.default_model)
-        .to_owned();
+    let primary_model = requested_model.unwrap_or(&target.default_model).to_owned();
     let normalized_key = normalize_optional_api_key(target.api_key.as_deref());
     let require_env_key = normalized_key.is_some();
     let auth_token = normalized_key.unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
@@ -237,30 +316,43 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .to_string_lossy()
         .replace('\\', "/");
 
-    let has_explicit_model = args
-        .passthrough_args
-        .iter()
-        .any(|a| a == "-m" || a == "--model" || a.starts_with("-m=") || a.starts_with("--model="));
-    let has_explicit_approval = args.passthrough_args.iter().any(|a| {
-        matches!(
-            a.as_str(),
-            "--dangerously-bypass-approvals-and-sandbox"
-                | "--yolo"
-                | "-s"
-                | "--sandbox"
-                | "-a"
-                | "--ask-for-approval"
-                | "--approve-for-me"
-                | "--full-auto"
-        ) || a.starts_with("-s=")
-            || a.starts_with("--sandbox=")
-            || a.starts_with("-a=")
-            || a.starts_with("--ask-for-approval=")
-    });
+    let has_explicit_model = explicit_passthrough_model.is_some()
+        || has_explicit_codex_config_key(&args.passthrough_args, "model");
+    let has_explicit_approval =
+        args.passthrough_args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "--dangerously-bypass-approvals-and-sandbox"
+                    | "--yolo"
+                    | "-s"
+                    | "--sandbox"
+                    | "-a"
+                    | "--ask-for-approval"
+                    | "--approve-for-me"
+                    | "--full-auto"
+            ) || a.starts_with("-s=")
+                || a.starts_with("--sandbox=")
+                || a.starts_with("-a=")
+                || a.starts_with("--ask-for-approval=")
+        }) || has_explicit_codex_config_key(&args.passthrough_args, "approval_policy")
+            || has_explicit_codex_config_key(&args.passthrough_args, "sandbox_mode");
 
     let mut cmd = build_base_child_command(&resolved_cmd);
-    if !args.no_bypass && !has_explicit_approval {
-        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+    match invocation {
+        CodexInvocationKind::AgentSession => {
+            if !args.no_bypass && !has_explicit_approval {
+                cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+        }
+        CodexInvocationKind::GatewayConfigOnly => {
+            if !args.no_bypass && !has_explicit_approval {
+                cmd.arg("-c")
+                    .arg("approval_policy='never'")
+                    .arg("-c")
+                    .arg("sandbox_mode='danger-full-access'");
+            }
+        }
+        CodexInvocationKind::DirectPassthrough => {}
     }
     let toml_primary = toml_inline_string(&primary_model);
     let toml_catalog = toml_inline_string(&catalog_slash);
@@ -299,12 +391,6 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     }
     cmd.args(&args.passthrough_args);
 
-    let no_proxy = merge_loopback_no_proxy(
-        std::env::var("NO_PROXY")
-            .ok()
-            .or_else(|| std::env::var("no_proxy").ok())
-            .as_deref(),
-    );
     cmd.env_remove("AGY_API_KEY")
         .env("AGY_GATEWAY_API_KEY", &auth_token)
         .env("NO_PROXY", &no_proxy)
@@ -313,6 +399,243 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     let exit_code = spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await?;
     drop(ephemeral_catalog);
     Ok(exit_code)
+}
+
+fn apply_claude_gateway_env(
+    cmd: &mut Command,
+    base_url: &str,
+    auth_token: &str,
+    primary_model: &str,
+    fast_model: &str,
+    no_code_mode: bool,
+    no_proxy: &str,
+) {
+    cmd.env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AGY_API_KEY")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+        .env("ANTHROPIC_MODEL", primary_model)
+        .env("ANTHROPIC_DEFAULT_OPUS_MODEL", primary_model)
+        .env("ANTHROPIC_DEFAULT_SONNET_MODEL", primary_model)
+        .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", fast_model)
+        .env("ANTHROPIC_SMALL_FAST_MODEL", fast_model)
+        .env_remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
+        .env(
+            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
+            if no_code_mode { "0" } else { "1" },
+        )
+        .env("NO_PROXY", no_proxy)
+        .env("no_proxy", no_proxy);
+}
+
+fn classify_claude_invocation(passthrough_args: &[String]) -> ClaudeInvocationKind {
+    let pre_dd = slice_before_double_dash(passthrough_args);
+    if pre_dd.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        return ClaudeInvocationKind::DirectPassthrough;
+    }
+
+    if let Some(first) = pre_dd.first().map(String::as_str) {
+        match first {
+            "agents" => {
+                if pre_dd.iter().any(|a| a == "--json") {
+                    return ClaudeInvocationKind::DirectPassthrough;
+                }
+                return ClaudeInvocationKind::AgentsView;
+            }
+            "help" | "-v" | "--version" | "attach" | "logs" | "stop" | "kill" | "rm" | "mcp"
+            | "plugin" | "plugins" | "auth" | "auto-mode" | "import" | "install" | "purge"
+            | "setup-token" | "update" | "upgrade" | "gateway" => {
+                return ClaudeInvocationKind::DirectPassthrough;
+            }
+            "respawn" | "doctor" | "ultrareview" => {
+                return ClaudeInvocationKind::GatewayEnvSubcommand;
+            }
+            _ => {}
+        }
+    }
+
+    if pre_dd
+        .iter()
+        .any(|a| matches!(a.as_str(), "-v" | "--version"))
+    {
+        return ClaudeInvocationKind::DirectPassthrough;
+    }
+
+    ClaudeInvocationKind::AgentSession
+}
+
+fn classify_codex_invocation(passthrough_args: &[String]) -> CodexInvocationKind {
+    let pre_dd = slice_before_double_dash(passthrough_args);
+    if pre_dd
+        .iter()
+        .any(|a| matches!(a.as_str(), "-h" | "--help" | "-V" | "--version"))
+    {
+        return CodexInvocationKind::DirectPassthrough;
+    }
+
+    let Some((sub, sub_idx)) = find_codex_root_subcommand(pre_dd) else {
+        return CodexInvocationKind::AgentSession;
+    };
+
+    match sub {
+        "help" | "completion" | "queue" | "archive" | "unarchive" | "delete" | "mcp" | "plugin"
+        | "features" | "login" | "logout" | "update" | "apply" | "a" | "cloud" | "sandbox"
+        | "migrate-rollouts" | "migrate-nfs-db" | "app" => CodexInvocationKind::DirectPassthrough,
+        "app-server" => {
+            if matches!(
+                pre_dd.get(sub_idx + 1).map(String::as_str),
+                Some("daemon" | "proxy" | "generate-ts" | "generate-json-schema" | "help")
+            ) {
+                CodexInvocationKind::DirectPassthrough
+            } else {
+                CodexInvocationKind::GatewayConfigOnly
+            }
+        }
+        "agents" | "review" | "doctor" | "debug" | "remote-control" | "exec-server" => {
+            CodexInvocationKind::GatewayConfigOnly
+        }
+        "exec" | "e" => {
+            if pre_dd.get(sub_idx + 1).map(String::as_str) == Some("help") {
+                CodexInvocationKind::DirectPassthrough
+            } else {
+                CodexInvocationKind::AgentSession
+            }
+        }
+        "resume" | "fork" => CodexInvocationKind::AgentSession,
+        _ => CodexInvocationKind::AgentSession,
+    }
+}
+
+fn find_codex_root_subcommand(pre_dd: &[String]) -> Option<(&str, usize)> {
+    const ROOT_VALUE_OPTS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    ];
+    const KNOWN_SUBCOMMANDS: &[&str] = &[
+        "agents",
+        "exec",
+        "e",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "app-server",
+        "remote-control",
+        "app",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "resume",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "migrate-nfs-db",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    ];
+
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        let s = tok.as_str();
+        if !s.starts_with('-') {
+            return KNOWN_SUBCOMMANDS.contains(&s).then_some((s, idx));
+        }
+        if ROOT_VALUE_OPTS.contains(&s) {
+            idx += 2;
+            continue;
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn slice_before_double_dash(args: &[String]) -> &[String] {
+    match args.iter().position(|a| a == "--") {
+        Some(pos) => args.get(..pos).unwrap_or_default(),
+        None => args,
+    }
+}
+
+fn extract_explicit_model_arg(args: &[String]) -> Option<&str> {
+    let pre_dd = slice_before_double_dash(args);
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        let s = tok.as_str();
+        if matches!(s, "-m" | "--model") {
+            return pre_dd
+                .get(idx + 1)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+        }
+        if let Some(val) = s.strip_prefix("--model=").or_else(|| s.strip_prefix("-m=")) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn has_explicit_codex_config_key(args: &[String], key: &str) -> bool {
+    let pre_dd = slice_before_double_dash(args);
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        let s = tok.as_str();
+        let expr = if matches!(s, "-c" | "--config") {
+            idx += 2;
+            pre_dd.get(idx - 1).map(String::as_str)
+        } else if let Some(rest) = s
+            .strip_prefix("--config=")
+            .or_else(|| s.strip_prefix("-c="))
+        {
+            idx += 1;
+            Some(rest)
+        } else {
+            idx += 1;
+            None
+        };
+        if let Some(kv) = expr
+            && let Some((lhs, _)) = kv.split_once('=')
+            && lhs.trim() == key
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn default_claude_effort_level(model_id: &str) -> Option<&'static str> {
@@ -703,5 +1026,153 @@ mod tests {
             Some("low")
         );
         assert_eq!(default_claude_effort_level("claude-sonnet-4-6"), None);
+    }
+
+    #[test]
+    fn classifies_claude_invocations_across_sessions_jobs_and_utilities() {
+        let strs =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_owned()).collect() };
+
+        assert_eq!(
+            classify_claude_invocation(&strs(&[])),
+            ClaudeInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["--resume", "abc"])),
+            ClaudeInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["-c", "-p", "continue work"])),
+            ClaudeInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["fix failing tests"])),
+            ClaudeInvocationKind::AgentSession
+        );
+
+        for sub in [
+            "logs", "attach", "stop", "kill", "rm", "mcp", "plugin", "purge",
+        ] {
+            assert_eq!(
+                classify_claude_invocation(&strs(&[sub, "target"])),
+                ClaudeInvocationKind::DirectPassthrough,
+                "expected DirectPassthrough for claude {sub}"
+            );
+        }
+        assert_eq!(
+            classify_claude_invocation(&strs(&["agents", "--json"])),
+            ClaudeInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["agents"])),
+            ClaudeInvocationKind::AgentsView
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["--version"])),
+            ClaudeInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_claude_invocation(&strs(&["--resume", "--help"])),
+            ClaudeInvocationKind::DirectPassthrough
+        );
+        for sub in ["respawn", "doctor", "ultrareview"] {
+            assert_eq!(
+                classify_claude_invocation(&strs(&[sub])),
+                ClaudeInvocationKind::GatewayEnvSubcommand,
+                "expected GatewayEnvSubcommand for claude {sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_codex_invocations_and_root_options_accurately() {
+        let strs =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_owned()).collect() };
+
+        assert_eq!(
+            classify_codex_invocation(&strs(&[])),
+            CodexInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["explain architecture"])),
+            CodexInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["resume", "--last"])),
+            CodexInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["-C", "../other", "resume", "--all"])),
+            CodexInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["fork", "--last"])),
+            CodexInvocationKind::AgentSession
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["exec", "resume", "--last", "test"])),
+            CodexInvocationKind::AgentSession
+        );
+
+        for sub in ["agents", "review", "doctor", "debug"] {
+            assert_eq!(
+                classify_codex_invocation(&strs(&[sub])),
+                CodexInvocationKind::GatewayConfigOnly,
+                "expected GatewayConfigOnly for codex {sub}"
+            );
+        }
+
+        for sub in [
+            "queue",
+            "archive",
+            "unarchive",
+            "delete",
+            "mcp",
+            "plugin",
+            "features",
+            "completion",
+            "sandbox",
+            "login",
+            "logout",
+        ] {
+            assert_eq!(
+                classify_codex_invocation(&strs(&[sub])),
+                CodexInvocationKind::DirectPassthrough,
+                "expected DirectPassthrough for codex {sub}"
+            );
+        }
+        assert_eq!(
+            classify_codex_invocation(&strs(&["app-server", "daemon", "version"])),
+            CodexInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["app-server", "generate-ts"])),
+            CodexInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["app-server"])),
+            CodexInvocationKind::GatewayConfigOnly
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["exec", "help"])),
+            CodexInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["resume", "--help"])),
+            CodexInvocationKind::DirectPassthrough
+        );
+        assert_eq!(
+            classify_codex_invocation(&strs(&["-V"])),
+            CodexInvocationKind::DirectPassthrough
+        );
+
+        assert_eq!(
+            extract_explicit_model_arg(&strs(&["resume", "-m", "gemini-3.8-pro-high"])),
+            Some("gemini-3.8-pro-high")
+        );
+        assert!(has_explicit_codex_config_key(
+            &strs(&["-c", "model = 'gemini-3.8-flash-low'", "resume"]),
+            "model"
+        ));
     }
 }

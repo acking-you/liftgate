@@ -86,6 +86,18 @@ liftgate claude                             # 在当前目录启动交互式 Cla
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
 liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
 
+# 原生会话查看、恢复、分叉、Git Worktree 与后台任务管理
+lg cx resume                                # 打开 Codex 交互式会话列表（加 `--all` 跨目录查看；兼容别名 `lg cx -r`）
+lg cx resume --last -m gemini-3.8-pro-high  # 恢复最近一次会话并切换模型（Liftgate 参数写在前后任意位置均可识别）
+lg cx fork --last                           # 基于最近一次 Codex 会话分叉新线程
+lg cx agents                                # 打开 Codex Agent 控制中心（`archive`、`unarchive`、`delete`、`queue` 等均原生可用）
+lg cx review --uncommitted                  # 通过 Liftgate 执行非交互式代码审查
+lg cc -r                                    # 打开 Claude 交互式会话选择器（兼容 `lg cc resume`；按 `Ctrl+A` 查看全部项目）
+lg cc -c                                    # 继续当前目录最近一次 Claude 会话（兼容 `lg cc continue`、`lg cc resume --last`）
+lg cc fork --last                           # 分叉最近一次 Claude 会话（自动映射 `--continue --fork-session`）
+lg cc -w feat-auth                          # 在独立 Git Worktree 中启动 Claude Code
+lg cc --bg "重构解析器"                      # 启动后台会话（`lg cc agents`、`attach`、`logs`、`stop`、`rm` 等均原生可用）
+
 # 全平台桌面客户端（适配 Windows MSIX/Squirrel/独立安装、macOS .app、Linux .deb/Flatpak/AppImage）
 lg codex-app                                # 短别名 `lg cxa` 或 `lg cx --app`（隔离 CODEX_HOME + --user-data-dir）
 lg codex-app --ephemeral                    # 使用一次性 Electron Profile，关闭窗口即自动清除
@@ -99,6 +111,7 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 - **Codex App（`lg cxa`）**：在 `~/.liftgate/desktop/sessions/` 下合成独立物理 `CODEX_HOME`（只读合并 `~/.codex/config.toml` 与 `auth.json`，绝不触碰 `~/.codex`），并通过 `--user-data-dir` 隔离 Electron 数据目录（Windows Microsoft Store MSIX 包通过 `Invoke-CommandInDesktopPackage` 原生包身份激活，且不篡改 `HOME` / `USERPROFILE` / `APPDATA`，确保内置终端中的 `git`、`cargo`、`ssh` 完全正常）。
 - **Claude Desktop（`lg cd`）**：修改前先写入原子回滚日志（`~/.liftgate/desktop-journals/`），覆盖标准目录、Windows MSIX `LocalCache` 与 Linux Flatpak 沙箱目录注入临时第三方推理配置（`deploymentMode: "3p"`，指向本地 `/claude-desktop` 路由），后台守护进程监听窗口关闭后自动精准还原原始 `deploymentMode` 与 Profile 列表，同时完整保留会话期间新增的 `mcpServers` 或偏好设置。
 - 默认开启全自动免确认模式（Codex 传 `--dangerously-bypass-approvals-and-sandbox`，Claude Code 传 `--dangerously-skip-permissions`）；加 `--no-bypass`（或显式传入权限/沙箱参数）即可保留常规权限确认。
+- 原生子命令与选项无需额外写 `--`：本地管理/查询类子命令（如 `lg cx queue|archive|delete|mcp|plugin|features|-V`、`lg cx resume --help`、`lg cc logs|attach|stop|rm|mcp|plugin|purge|-v`、`lg cc agents --json`）会保持原生子命令位置并直接离线秒开（无需拉起网关）；Liftgate 自身参数（`-m`、`--no-bypass`、`--no-code-mode`、`--code-mode-only` 等）放在原生子命令前或后均可识别。如需完全禁用别名转换并原样透传参数（如查看完整原生帮助 `lg cx -- --help` / `lg cc -- --help`），显式加上 `--` 即可。
 
 ## 上下文窗口与超长上下文选项
 

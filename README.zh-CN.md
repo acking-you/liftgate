@@ -67,8 +67,10 @@ lg agy login                            # 通过官方 `agy acp --login` 交互�
 
 lg                                      # 在终端直接打开交互式控制中心（快捷键一键启动）
 lg cx                                   # 在当前目录直接启动 Codex CLI（退出后 0 副作用）
+lg cx resume                            # 浏览并恢复 Codex 会话（支持 `--last`、`--all`、`fork`、`agents` 等原生命令）
 lg cxa                                  # 跨 Win/macOS/Linux 启动 Codex App（完全 0 污染）
 lg cc                                   # 或在当前目录直接启动 Claude Code（退出后 0 副作用）
+lg cc -r                                # 浏览并恢复 Claude 会话（支持 `lg cc resume`、`-c`、`fork`、`agents` 等原生命令）
 lg cd                                   # 或跨 Win/macOS/Linux 启动 Claude Desktop（退出自动还原）
 ```
 
