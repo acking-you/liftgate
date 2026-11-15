@@ -3701,3 +3701,387 @@ async fn multimodal_tool_outputs_deliver_native_acp_image_blocks_and_codex_async
     assert_eq!(prompts[1].image_blocks, vec![("image/webp".to_owned(), 24)]);
     assert!(!prompts[1].text_joined.contains("UklGRh4AAABXRUJQ"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn codex_code_mode_multi_turn_sse_guardian_classifier_and_effort_update() {
+    let exec_js = "// @exec: {\"yield_time_ms\": 5000}\nconst [files, git] = await Promise.all([\n  tools.exec_command({ cmd: \"rg --files crates\" }),\n  tools.exec_command({ cmd: \"git status --short\" }),\n]);\nstore(\"files\", files.output);\ntext(`scanned ${String(files.output).split(/\\n/).length} lines`);";
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. Turn 1: model emits `exec` JS cell over XML bridge
+        MockScript::Immediate {
+            thoughts: vec!["Batching workspace inspection in a single exec cell.".to_owned()],
+            chunks_template: vec![format!(
+                "Inspecting workspace files and git status in parallel.\n<agy_tool_call_{{NONCE}}>\n{}\n</agy_tool_call_{{NONCE}}>",
+                json!({ "name": "exec", "input": exec_js })
+            )],
+        },
+        // 2. Interleaved Codex Guardian v2 recursive security classifier sub-request
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "{\"needs_review\":false,\"risk_score\":5,\"rationale\":\"read-only rg and git status\"}".to_owned(),
+            ],
+        },
+        // 3. Turn 2: `exec` yielded running `cell_1` -> model calls `wait` on warm session
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"wait\",\"arguments\":{\"cell_id\":\"cell_1\",\"yield_time_ms\":5000}}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 30);
+
+    // Verify `/v1/codex-models?tool_mode=code_mode` sets `tool_mode` and `supports_reasoning_effort_updates`
+    let cat_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/codex-models?tool_mode=code_mode")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cat_resp.status(), StatusCode::OK);
+    let cat: Value =
+        serde_json::from_slice(&cat_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(cat["models"][0]["tool_mode"], "code_mode");
+    assert_eq!(cat["models"][0]["supports_reasoning_effort_updates"], true);
+    assert_eq!(cat["models"][0]["supports_search_tool"], false);
+
+    // Build an 18 KB+ `exec` tool description (simulating `code_mode_only` with ~170 nested tools)
+    let mut exec_desc = String::from(
+        "Run JavaScript code to orchestrate tool calls. Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.\n\
+         Tool TypeScript declarations:\n```ts\ndeclare const tools: {\n  exec_command(args: { cmd: string }): Promise<{ output: string }>;\n",
+    );
+    for idx in 0..220 {
+        exec_desc.push_str(&format!(
+            "  mcp__workspace__connector_{idx:03}(args: {{ query: string; limit?: number }}): Promise<{{ items: string[] }}>;\n"
+        ));
+    }
+    exec_desc.push_str("};\n```");
+    assert!(exec_desc.len() > 18_000);
+
+    let tools = json!([
+        {
+            "type": "custom",
+            "name": "exec",
+            "description": exec_desc,
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /[\\s\\S]+/"
+            }
+        },
+        {
+            "type": "function",
+            "name": "wait",
+            "description": "Wait on a running `exec` cell or terminate it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cell_id": { "type": "string" },
+                    "yield_time_ms": { "type": "integer" },
+                    "terminate": { "type": "boolean" }
+                },
+                "required": ["cell_id"]
+            }
+        }
+    ]);
+
+    // Turn 1 SSE request
+    let turn1_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": true,
+        "instructions": "You are Codex running in Code Mode.",
+        "tools": tools,
+        "input": [
+            { "role": "user", "content": "Inspect the crate files and git status." }
+        ]
+    });
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(turn1_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let sse1 =
+        String::from_utf8(r1.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+
+    // Parse SSE events to verify `response.custom_tool_call_input.delta` carries `call_id`
+    // and `response.output_item.done` carries the exact uncorrupted `exec` JavaScript source!
+    let mut delta_call_id: Option<String> = None;
+    let mut done_call_id: Option<String> = None;
+    let mut done_input: Option<String> = None;
+    for line in sse1.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match ev["type"].as_str() {
+            Some("response.custom_tool_call_input.delta") => {
+                delta_call_id = ev["call_id"].as_str().map(str::to_owned);
+            }
+            Some("response.output_item.done") if ev["item"]["type"] == "custom_tool_call" => {
+                done_call_id = ev["item"]["call_id"].as_str().map(str::to_owned);
+                done_input = ev["item"]["input"].as_str().map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+    let exec_call_id = done_call_id.expect("expected custom_tool_call output item");
+    assert_eq!(
+        delta_call_id.as_deref(),
+        Some(exec_call_id.as_str()),
+        "Codex 0.169.0 requires `call_id` on `response.custom_tool_call_input.delta`"
+    );
+    assert_eq!(done_input.as_deref(), Some(exec_js));
+
+    // Interleaved Codex Guardian v2 classifier request -> must route to fast Flash ephemerally
+    let guardian_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": false,
+        "instructions": "Predict whether the agent's computer and browser activity needs blocking security review. Review nested calls recursively.",
+        "input": [
+            { "role": "user", "content": "exec cell calling exec_command(rg --files crates) and exec_command(git status --short)" }
+        ]
+    });
+    let r_guard = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(guardian_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_guard.status(), StatusCode::OK);
+
+    // Turn 2: `exec` yielded running `cell_1` + screenshot + mid-thread `configuration_update` (`low`)
+    let turn2_req = json!({
+        "model": "gemini-4-carbon-high",
+        "stream": true,
+        "instructions": "You are Codex running in Code Mode.",
+        "tools": tools,
+        "input": [
+            { "role": "user", "content": "Inspect the crate files and git status." },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Inspecting workspace files and git status in parallel.\n" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": exec_call_id,
+                "name": "exec",
+                "input": exec_js
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": exec_call_id,
+                "output": [
+                    { "type": "input_text", "text": "Script running with cell ID cell_1\nWall time: 5.0 seconds\nOutput:\npartial scan..." },
+                    { "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+                ]
+            },
+            {
+                "type": "configuration_update",
+                "reasoning": { "effort": "low" }
+            }
+        ]
+    });
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(turn2_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let sse2 =
+        String::from_utf8(r2.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(sse2.contains("\"type\":\"function_call\""));
+    assert!(sse2.contains("\"name\":\"wait\""));
+    assert!(sse2.contains("cell_1"));
+
+    let appends = backend.recorded_system_appends.lock().unwrap();
+    assert_eq!(
+        appends.len(),
+        2,
+        "only 1 main session + 1 ephemeral Guardian classifier session should be created"
+    );
+    assert!(appends[0].len() <= liftgate_types::session_key::MAX_SYSTEM_APPEND_BYTES);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[0].session_id, "sess_1");
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("mcp__workspace__connector_219"),
+        "full 18 KB+ `exec` TypeScript declarations must spill losslessly into Turn 1"
+    );
+    assert_eq!(prompts[1].session_id, "sess_2");
+    assert_eq!(
+        prompts[2].session_id, "sess_1",
+        "Turn 2 must reuse warm `sess_1` after `custom_tool_call_output` + `configuration_update`"
+    );
+    assert_eq!(prompts[2].image_blocks, vec![("image/png".to_owned(), 24)]);
+
+    let models = backend.recorded_models.lock().unwrap();
+    assert_eq!(
+        models.as_slice(),
+        &[
+            "gemini-4-carbon-high",
+            "gemini-3.8-flash-low",
+            "gemini-4-carbon-medium"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn claude_code_mode_repl_fable_model_and_warm_session_roundtrip() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "Running a single REPL script to inspect the workspace.\n<agy_tool_call_{NONCE}>\n{\"name\": \"REPL\", \"arguments\": {\"code\": \"const files = await $`rg --files \"crates\"`.text();\nconsole.log(files);\"}}\n</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Found 3 workspace crates.".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 30);
+    let repl_desc = format!(
+        "Execute JavaScript inside the persistent Bun Code Mode sandbox.\n{}\nHelpers: `$`, `edit(path, old, new)`, `create(path, content)`, `view(path)`.",
+        "// REPL sandbox helper line\n".repeat(40)
+    );
+    let tools = json!([
+        {
+            "name": "REPL",
+            "description": repl_desc,
+            "input_schema": {
+                "type": "object",
+                "properties": { "code": { "type": "string" } },
+                "required": ["code"]
+            }
+        },
+        {
+            "name": "mcp__github__list_issues",
+            "description": "List repository issues.",
+            "allowed_callers": ["code_execution_20260120"],
+            "defer_loading": true,
+            "input_schema": { "type": "object" }
+        }
+    ]);
+
+    let req1 = json!({
+        "model": "claude-fable-5-2",
+        "max_tokens": 8192,
+        "container": "cntr_local_1",
+        "stream": false,
+        "tools": tools,
+        "messages": [
+            { "role": "user", "content": "List workspace crates via REPL" }
+        ]
+    });
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req1.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let body1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body1["stop_reason"], "tool_use");
+    let tool_use = body1["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("REPL tool_use block");
+    assert_eq!(tool_use["name"], "REPL");
+    assert_eq!(
+        tool_use["input"]["code"],
+        "const files = await $`rg --files \"crates\"`.text();\nconsole.log(files);"
+    );
+    let repl_id = tool_use["id"].as_str().unwrap().to_owned();
+
+    let req2 = json!({
+        "model": "claude-fable-5-2",
+        "max_tokens": 8192,
+        "container": "cntr_local_1",
+        "stream": false,
+        "tools": tools,
+        "messages": [
+            { "role": "user", "content": "List workspace crates via REPL" },
+            { "role": "assistant", "content": body1["content"] },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": repl_id,
+                    "content": "crates/liftgate/Cargo.toml\ncrates/liftgate-server/Cargo.toml\ncrates/liftgate-types/Cargo.toml\n"
+                }]
+            }
+        ]
+    });
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req2.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let body2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body2["stop_reason"], "end_turn");
+
+    let appends = backend.recorded_system_appends.lock().unwrap();
+    assert_eq!(appends.len(), 1, "Turn 2 must reuse warm REPL session");
+    assert!(
+        appends[0].contains("`edit(path, old, new)`, `create(path, content)`, `view(path)`"),
+        "REPL sandbox description must not be truncated at 600 chars"
+    );
+
+    let models = backend.recorded_models.lock().unwrap();
+    assert!(
+        models[0].starts_with("claude-sonnet-") || models[0].starts_with("claude-opus-"),
+        "claude-fable-5-2 should map to Claude Sonnet/Opus family when available, got {}",
+        models[0]
+    );
+}

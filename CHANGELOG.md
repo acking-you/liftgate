@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-11-16
+
+### Added
+- **End-to-end Code Mode (`exec` + `wait` / `REPL`) adaptation for OpenAI Codex CLI (`0.169+`) and Anthropic Claude Code**:
+  - Preserved full multi-kilobyte embedded TypeScript declarations (`declare const tools: { ... }`, `ALL_TOOLS`, `store`/`load`/`yield_control` helpers, and Claude `REPL` Bun sandbox documentation) up to `36 KB` instead of truncating Code Mode orchestrator tool descriptions at `600` characters, seamlessly spilling `> 16 KB` catalogs into Turn 1's `<client_tools_update>` block without breaking `_meta.antigravity.systemPrompt.append` limits or warm `SessionPool` reuse.
+  - Updated OpenAI `/v1/responses` SSE & input normalization for Codex `0.169+`: included `call_id` (and optional `namespace`) on `response.custom_tool_call_input.delta` / `done` and `CustomToolCall` items, added full round-trip support for `tool_search` (`tool_search_call` / `tool_search_output`), `additional_tools`, `mcp_tool_call_output`, `input_audio` tool outputs, mid-thread `configuration_update` reasoning-effort switches (including `"ultra"` / `"persistent"`), and recursive Codex Guardian v2 security classifier routing to ephemeral `gemini-*-flash-low` sessions.
+  - Hardened `<agy_tool_call_{nonce}>` incremental parsing for multi-line Code Mode JavaScript (`// @exec:` pragmas, regexes, template literals, unescaped inner quotes, bare JS fallback when models follow `exec`'s `"not JSON"` prompt hint literally, and Claude `REPL` `{"code": "..."}` salvage).
+  - Extended Anthropic `/v1/messages` and model resolution with `claude-fable-*` family mapping and `container`, `allowed_callers`, `defer_loading`, and `caller` wire fields.
+  - Enabled Code Mode by default across `lg codex` (`lg cx`), `lg claude` (`lg cc`), `lg config`, `start-agy.*`, and `GET /v1/codex-models` (`tool_mode: "code_mode"` + `features.code_mode = true` on Codex; `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` on Claude Code), with `--code-mode-only` for strict V8-only Codex orchestration and `--no-code-mode` (`?tool_mode=direct`) to opt out.
+
 ## [0.1.6] - 2026-11-15
 
 ### Fixed

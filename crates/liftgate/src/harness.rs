@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 use crate::cli::{ClaudeArgs, CodexArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::client::infer_live_long_context;
 use crate::config_sync::{
-    HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes,
+    HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
     resolve_fast_model,
 };
 use crate::daemon::ensure_gateway_ready;
@@ -56,6 +56,7 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         primary_model: primary_model.clone(),
         fast_model: fast_model.clone(),
         no_bypass: args.no_bypass,
+        no_code_mode: args.no_code_mode,
         long_context,
         discovered_models: discovered,
     };
@@ -129,6 +130,10 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
+        .env(
+            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
+            if args.no_code_mode { "0" } else { "1" },
+        )
         .env("NO_PROXY", &no_proxy)
         .env("no_proxy", &no_proxy);
 
@@ -159,12 +164,29 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     let require_env_key = normalized_key.is_some();
     let auth_token = normalized_key.unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
-    let catalog_bytes = match target.client.fetch_codex_catalog_json(&primary_model).await {
+    let requested_tool_mode = if args.no_code_mode {
+        Some("direct")
+    } else if args.code_mode_only {
+        Some("code_mode_only")
+    } else {
+        Some("code_mode")
+    };
+
+    let catalog_bytes = match target
+        .client
+        .fetch_codex_catalog_json_with_mode(&primary_model, requested_tool_mode)
+        .await
+    {
         Ok(bytes) => bytes,
         Err(_) => {
             let discovered = target.client.fetch_models().await.unwrap_or_default();
             let long_context = infer_live_long_context(&discovered, target.managed_long_context);
-            build_offline_codex_catalog_bytes(&discovered, &primary_model, long_context)?
+            build_offline_codex_catalog_bytes_with_mode(
+                &discovered,
+                &primary_model,
+                long_context,
+                requested_tool_mode,
+            )?
         }
     };
 
@@ -221,6 +243,20 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     }
     cmd.arg("-c")
         .arg("model_providers.agy.wire_api='responses'");
+    if args.no_code_mode {
+        cmd.arg("-c")
+            .arg("features.code_mode=false")
+            .arg("-c")
+            .arg("features.code_mode_only=false");
+    } else {
+        cmd.arg("-c")
+            .arg("suppress_unstable_features_warning=true")
+            .arg("-c")
+            .arg("features.code_mode=true");
+        if args.code_mode_only {
+            cmd.arg("-c").arg("features.code_mode_only=true");
+        }
+    }
     cmd.args(&args.passthrough_args);
 
     let no_proxy = merge_loopback_no_proxy(

@@ -79,8 +79,10 @@ lg agy mcp -- --help                    # 透传任意官方子命令（`mcp`、
 
 ```bash
 cd /path/to/your/project
-liftgate codex                              # 在当前目录启动交互式 Codex CLI
-liftgate claude                             # 在当前目录启动交互式 Claude Code
+liftgate codex                              # 在当前目录启动交互式 Codex CLI（默认开启 Code Mode：`exec` + `wait`）
+liftgate codex --code-mode-only             # 启动纯 Code Mode（仅暴露 `exec` + `wait`）的 Codex CLI
+liftgate codex --no-code-mode               # 当前会话关闭 Code Mode，恢复直连工具模式（`direct`）
+liftgate claude                             # 在当前目录启动交互式 Claude Code（默认注入 `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`）
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
 liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
 ```
@@ -210,6 +212,8 @@ wire_api = "responses"
 
 迁移已有配置时，删除旧的统一 `model_context_window` / `model_auto_compact_token_limit` 覆盖值，或重新执行 `lg config codex --global` 更新托管配置项。新版模型目录的 `max_context_window` 也会在当前 Codex 版本中限制旧全局覆盖；旧客户端可能不支持此上限，仍建议清理残留覆盖。导出的模型目录应与网关当前模式保持一致。
 
+**Code Mode（`exec` + `wait`）**：Liftgate 已完整适配最新 Codex Code Mode（完整保留 `exec` 内嵌的 `declare const tools` TypeScript 类型声明，超过 16 KB `systemPrompt.append` 上限时无损溢出至首轮 `<client_tools_update>`，流式下发带 `call_id` 的 `response.custom_tool_call_input.delta`，支持 `wait` 异步单元轮询、图文/音频输出、`tool_search`、`configuration_update` 热切换推理强度，并将 Guardian 嵌套安全审查分流至极速临时 Flash 会话）。可直接用 `lg cx --code-mode`（混合模式）或 `lg cx --code-mode-only`（纯 Code Mode）启动，也可手动传 `-c features.code_mode=true`（导出 `/v1/codex-models` 时还支持可选参数 `?tool_mode=code_mode`）。
+
 ## Claude Code
 
 推荐使用 `lg cc` 获取逐模型设置。下列手工示例对所有模型采用保守的 110k 自动压缩窗口，仅作用于当前终端：
@@ -251,6 +255,8 @@ claude
 ```
 
 网关未设置 `--api-key` 时，任意非空的 `ANTHROPIC_AUTH_TOKEN` 都能通过 Claude Code 的本地检查；设置了 `--api-key <密钥>` 时，请填对应密钥。
+
+> **关于 Claude Code Mode（`REPL`）的说明**：Liftgate 的 `/v1/messages` 协议层已完整适配 `REPL` 沙箱工具定义保留与引号容错解析、`claude-fable-*` 模型族映射、`container` / `allowed_callers` / `caller` 字段以及 Auto Mode 代码审查分类器分流。但需要注意：Claude Code 官方客户端（`v2.1.323+`）目前在本地硬性限制了设置 `ANTHROPIC_BASE_URL` 或 `ANTHROPIC_AUTH_TOKEN` 时不启用客户端 Code Mode（详见[官方文档](https://code.claude.com/docs/en/code-mode)）；待上游放开自定义网关限制后即可直接无缝使用。
 
 ## 其它客户端
 

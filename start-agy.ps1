@@ -180,6 +180,7 @@ $EnvKeys = @(
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_AUTO_MODE_SERVER",
+    "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
     "NO_PROXY",
@@ -840,6 +841,7 @@ try {
         ANTHROPIC_SMALL_FAST_MODEL                = $FastModel
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC  = "1"
         CLAUDE_CODE_AUTO_MODE_SERVER              = "0"
+        CLAUDE_CODE_EXPERIMENTAL_CODE_MODE        = "1"
         NO_PROXY                                  = "127.0.0.1,localhost,::1"
     }
     if (-not [string]::IsNullOrWhiteSpace($detectedProxy)) {
@@ -904,6 +906,10 @@ model = "$GatewayModel"
 model_provider = "agy"
 model_catalog_json = "$codexCatalogSlash"
 ${codexBypassLines}web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+code_mode = true
 
 [model_providers.agy]
 name = "Liftgate"
@@ -946,6 +952,7 @@ wire_api = "responses"
         ANTHROPIC_SMALL_FAST_MODEL                = $FastModel
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC  = "1"
         CLAUDE_CODE_AUTO_MODE_SERVER              = "0"
+        CLAUDE_CODE_EXPERIMENTAL_CODE_MODE        = "1"
         AGY_GATEWAY_API_KEY                       = $ApiKey
         NO_PROXY                                  = "127.0.0.1,localhost,::1"
     }
@@ -1044,6 +1051,10 @@ wire_api = "responses"
         $codexLaunchArgs.Add("model_providers.agy.env_key='AGY_GATEWAY_API_KEY'")
         $codexLaunchArgs.Add("-c")
         $codexLaunchArgs.Add("model_providers.agy.wire_api='responses'")
+        $codexLaunchArgs.Add("-c")
+        $codexLaunchArgs.Add("suppress_unstable_features_warning=true")
+        $codexLaunchArgs.Add("-c")
+        $codexLaunchArgs.Add("features.code_mode=true")
         foreach ($ca in $ClaudeArgs) {
             $codexLaunchArgs.Add($ca)
         }

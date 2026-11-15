@@ -34,6 +34,8 @@ pub struct AnthropicMessagesRequest {
     #[serde(default)]
     pub output_config: Option<AnthropicOutputConfig>,
     #[serde(default)]
+    pub container: Option<Value>,
+    #[serde(default)]
     pub stream: Option<bool>,
 }
 
@@ -123,6 +125,8 @@ pub enum AnthropicInputBlock {
         name: String,
         #[serde(default)]
         input: Value,
+        #[serde(default)]
+        caller: Option<Value>,
     },
     ToolResult {
         tool_use_id: String,
@@ -212,6 +216,10 @@ pub struct AnthropicToolSpec {
     pub allowed_domains: Vec<String>,
     #[serde(default)]
     pub blocked_domains: Vec<String>,
+    #[serde(default)]
+    pub allowed_callers: Vec<String>,
+    #[serde(default)]
+    pub defer_loading: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,7 +322,12 @@ pub fn normalize_anthropic_request(
                             has_conversational_input = true;
                             parts.push(CanonicalPart::Reasoning(thinking));
                         }
-                        AnthropicInputBlock::ToolUse { id, name, input } => {
+                        AnthropicInputBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                            caller: _,
+                        } => {
                             has_conversational_input = true;
                             let arguments = serde_json::to_string(&input)?;
                             parts.push(CanonicalPart::ToolCall {
@@ -421,6 +434,9 @@ pub fn normalize_anthropic_request(
                     }
                     web_fetch_allowed_domains.extend(tool.allowed_domains);
                     web_fetch_blocked_domains.extend(tool.blocked_domains);
+                    continue;
+                }
+                if tt.starts_with("code_execution") && tool.input_schema.is_none() {
                     continue;
                 }
             }
@@ -851,5 +867,56 @@ mod tests {
             norm_cls.auxiliary_task,
             Some(AuxiliaryTaskKind::AutoModeClassifier)
         );
+
+        // Claude Code Mode (`REPL` tool + `allowed_callers` + `container` + `caller`) normalizes cleanly
+        let req_cm: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5-2",
+            "max_tokens": 8192,
+            "container": "cntr_01",
+            "tools": [
+                {
+                    "name": "REPL",
+                    "description": "Execute JavaScript inside the persistent Bun Code Mode sandbox (`$`, `edit`, `create`, `view`).",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "code": { "type": "string" } },
+                        "required": ["code"]
+                    }
+                },
+                {
+                    "name": "mcp__github__list_prs",
+                    "description": "List pull requests.",
+                    "allowed_callers": ["code_execution_20260120"],
+                    "defer_loading": true,
+                    "input_schema": { "type": "object" }
+                }
+            ],
+            "messages": [
+                { "role": "user", "content": "Check open PRs and Cargo.toml" },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_repl_1",
+                        "name": "REPL",
+                        "caller": { "type": "direct" },
+                        "input": { "code": "console.log(await view('Cargo.toml'));" }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_repl_1",
+                        "content": "[workspace]\nversion = \"0.1.6\"\n"
+                    }]
+                }
+            ]
+        }))
+        .expect("valid Claude Code Mode request");
+        let norm_cm = normalize_anthropic_request(req_cm).expect("Code Mode normalized");
+        assert_eq!(norm_cm.requested_model.as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(norm_cm.client_tools.len(), 2);
+        assert_eq!(norm_cm.client_tools[0].name, "REPL");
     }
 }

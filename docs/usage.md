@@ -108,8 +108,10 @@ shell environment:
 
 ```bash
 cd /path/to/your/project
-liftgate codex                              # interactive Codex CLI routed through Liftgate
-liftgate claude                             # interactive Claude Code routed through Liftgate
+liftgate codex                              # interactive Codex CLI with Code Mode (`exec` + `wait`) enabled by default
+liftgate codex --code-mode-only             # strict Code Mode (`exec` + `wait` JavaScript orchestration only)
+liftgate codex --no-code-mode               # disable Code Mode (`tool_mode = "direct"`) for this session
+liftgate claude                             # interactive Claude Code (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` by default)
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
 liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
 ```
@@ -297,6 +299,15 @@ old global overrides in current Codex versions; older clients may not honor
 that cap, so clearing stale overrides is still recommended. Keep the exported
 catalog synchronized with the gateway's current mode.
 
+**Code Mode (`exec` + `wait`)**: Liftgate supports Codex Code Mode end-to-end
+(preserving the full generated `declare const tools` TypeScript declarations
+inside `exec`, spilling large MCP catalogs past the 16 KB `systemPrompt.append`
+cap without truncation, streaming `response.custom_tool_call_input.delta` with
+`call_id`, handling yielded cells via `wait`, and routing recursive Guardian
+security reviews to fast Flash ephemerally). Launch with `lg cx --code-mode`
+(hybrid) or `lg cx --code-mode-only` (strict), or pass `-c features.code_mode=true`
+(and optional `?tool_mode=code_mode` when exporting `/v1/codex-models`).
+
 ## Claude Code
 
 Prefer `lg cc` for model-specific settings. This manual example uses a
@@ -341,6 +352,15 @@ Or keep them in `~/.claude/settings.json` (or a project's
 
 Without `--api-key`, any non-empty `ANTHROPIC_AUTH_TOKEN` passes Claude Code's
 local check; with `--api-key <key>`, set it to `<key>`.
+
+> **Note on Claude Code Mode (`REPL`)**: Liftgate's `/v1/messages` adapter
+> supports `REPL` sandbox schemas, `claude-fable-*` family resolution,
+> `container` / `allowed_callers` / `caller` fields, and Auto Mode code-review
+> classifiers. However, upstream Claude Code (`v2.1.323+`) currently disables
+> client-side Code Mode whenever `ANTHROPIC_BASE_URL` or `ANTHROPIC_AUTH_TOKEN`
+> is set ([official docs](https://code.claude.com/docs/en/code-mode)). Once
+> Anthropic lifts that client-side restriction for custom gateways, Code Mode
+> works over Liftgate automatically.
 
 ## Other clients
 

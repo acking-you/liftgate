@@ -763,6 +763,10 @@ pub struct ClaudeArgs {
     #[arg(long)]
     pub no_bypass: bool,
 
+    /// Disable Claude Code's experimental Code Mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`) for this session (enabled by default).
+    #[arg(long)]
+    pub no_code_mode: bool,
+
     /// Explicit path to `claude` executable.
     #[arg(long, env = "CLAUDE_BIN")]
     pub claude_bin: Option<PathBuf>,
@@ -781,6 +785,7 @@ impl ClaudeArgs {
             model: None,
             fast_model: None,
             no_bypass: false,
+            no_code_mode: false,
             claude_bin: std::env::var_os("CLAUDE_BIN")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -807,6 +812,18 @@ pub struct CodexArgs {
     #[arg(long)]
     pub no_bypass: bool,
 
+    /// Explicitly select hybrid Codex Code Mode (`exec` + `wait` JavaScript orchestration alongside direct tools; enabled by default).
+    #[arg(long, conflicts_with_all = ["code_mode_only", "no_code_mode"])]
+    pub code_mode: bool,
+
+    /// Enable strict Codex Code Mode Only (`exec` + `wait` JavaScript tool orchestration exclusively) for this session.
+    #[arg(long, conflicts_with_all = ["code_mode", "no_code_mode"])]
+    pub code_mode_only: bool,
+
+    /// Disable Codex Code Mode (`tool_mode = "direct"`, `features.code_mode = false`) for this session.
+    #[arg(long, conflicts_with_all = ["code_mode", "code_mode_only"])]
+    pub no_code_mode: bool,
+
     /// Explicit path to `codex` executable.
     #[arg(long, env = "CODEX_BIN")]
     pub codex_bin: Option<PathBuf>,
@@ -824,6 +841,9 @@ impl CodexArgs {
             api_key: None,
             model: None,
             no_bypass: false,
+            code_mode: false,
+            code_mode_only: false,
+            no_code_mode: false,
             codex_bin: std::env::var_os("CODEX_BIN")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -877,6 +897,10 @@ pub struct ConfigArgs {
     #[arg(long)]
     pub no_bypass: bool,
 
+    /// Disable default Code Mode in generated Claude Code and Codex CLI configurations.
+    #[arg(long)]
+    pub no_code_mode: bool,
+
     /// Do not start or query the live gateway; synthesize config from fallback catalog if offline.
     #[arg(long)]
     pub offline: bool,
@@ -902,6 +926,7 @@ impl ConfigArgs {
             model: None,
             fast_model: None,
             no_bypass: false,
+            no_code_mode: false,
             offline: false,
             print: false,
             uninstall: false,
@@ -954,7 +979,18 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             "--codex-bin",
         ]
     };
-    let bool_flags: &[&str] = &["--no-bypass", "-h", "--help"];
+    let bool_flags: &[&str] = if is_codex {
+        &[
+            "--no-bypass",
+            "--code-mode",
+            "--code-mode-only",
+            "--no-code-mode",
+            "-h",
+            "--help",
+        ]
+    } else {
+        &["--no-bypass", "--no-code-mode", "-h", "--help"]
+    };
 
     let mut idx = sub_idx + 1;
     while let Some(tok) = args.get(idx) {
@@ -1090,9 +1126,10 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let short_claude = parse_strs(&["lg", "cc", "-p", "quick check"]);
+        let short_claude = parse_strs(&["lg", "cc", "--no-code-mode", "-p", "quick check"]);
         match short_claude.command {
             Some(Commands::Claude(c)) => {
+                assert!(c.no_code_mode);
                 assert_eq!(c.passthrough_args, vec!["-p", "quick check"]);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1101,7 +1138,43 @@ mod tests {
         let short_codex = parse_strs(&["lg", "cx", "exec", "cargo test"]);
         match short_codex.command {
             Some(Commands::Codex(c)) => {
+                assert!(!c.code_mode && !c.code_mode_only && !c.no_code_mode);
                 assert_eq!(c.passthrough_args, vec!["exec", "cargo test"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let no_code_mode_codex = parse_strs(&["lg", "cx", "--no-code-mode", "exec", "cargo test"]);
+        match no_code_mode_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert!(c.no_code_mode && !c.code_mode && !c.code_mode_only);
+                assert_eq!(c.passthrough_args, vec!["exec", "cargo test"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let code_mode_codex = parse_strs(&["lg", "cx", "--code-mode", "exec", "cargo check"]);
+        match code_mode_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert!(c.code_mode && !c.code_mode_only);
+                assert_eq!(c.passthrough_args, vec!["exec", "cargo check"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let code_mode_only_codex = parse_strs(&[
+            "lg",
+            "cx",
+            "--code-mode-only",
+            "-m",
+            "gemini-4-carbon-high",
+            "inspect workspace",
+        ]);
+        match code_mode_only_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert!(c.code_mode_only && !c.code_mode);
+                assert_eq!(c.model.as_deref(), Some("gemini-4-carbon-high"));
+                assert_eq!(c.passthrough_args, vec!["inspect workspace"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }

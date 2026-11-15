@@ -26,10 +26,10 @@ use liftgate_types::{
         CreateResponseRequest, LocalShellAction, ModelCard, ModelListResponse,
         OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError, ResponseObject,
         ResponseOutputItem, ResponseTextFormatConfig, ResponsesUsage, WebSearchAction,
-        WebSearchSource, build_codex_model_catalog, normalize_responses_request,
+        WebSearchSource, build_codex_model_catalog_with_tool_mode, normalize_responses_request,
         split_namespaced_tool_name,
     },
-    session_key::INTERNAL_CODEX_LOCAL_SHELL_TOOL,
+    session_key::{INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL},
     telemetry::{GatewayTelemetrySnapshot, TaskProtocol},
 };
 use serde::Deserialize;
@@ -266,8 +266,13 @@ async fn handle_codex_model_catalog<B: AcpBackend>(
     let available = state.backend.refresh_models_if_empty().await;
     let preferred_default =
         query_param(&uri, "default_model").unwrap_or_else(|| state.config.default_model.as_str());
-    let catalog =
-        build_codex_model_catalog(&available, preferred_default, state.config.long_context);
+    let tool_mode = query_param(&uri, "tool_mode");
+    let catalog = build_codex_model_catalog_with_tool_mode(
+        &available,
+        preferred_default,
+        state.config.long_context,
+        tool_mode,
+    );
     Json(catalog).into_response()
 }
 
@@ -351,6 +356,7 @@ struct OpenAiRenderOptions {
     emit_web_search_items: bool,
     force_web_search: bool,
     emit_web_fetch_items: bool,
+    emit_tool_search_items: bool,
     include_encrypted_reasoning: bool,
     query_hint: Option<String>,
 }
@@ -384,6 +390,7 @@ async fn handle_create_response<B: AcpBackend>(
         emit_web_search_items: normalized.enable_native_web_search,
         force_web_search: normalized.force_native_web_search,
         emit_web_fetch_items: normalized.enable_native_web_fetch,
+        emit_tool_search_items: req.tools.iter().any(|t| t.tool_type == "tool_search"),
         include_encrypted_reasoning: normalized.include_encrypted_reasoning,
         query_hint: extract_search_query_hint(&normalized.messages),
     };
@@ -485,7 +492,11 @@ async fn collect_openai_response(
                 is_custom,
             } => {
                 tool_items.push(build_openai_client_tool_item(
-                    call_id, name, arguments, is_custom,
+                    call_id,
+                    name,
+                    arguments,
+                    is_custom,
+                    opts.emit_tool_search_items,
                 ));
             }
             TurnEvent::Completed { usage, .. } => {
@@ -1191,8 +1202,18 @@ fn stream_openai_responses(
                         )
                         .await;
                         finalized_items.push(done_item);
-                    } else if is_custom {
-                        let item_id = format!("ctc_{}", generate_short_nonce());
+                    } else if opts.emit_tool_search_items && name == INTERNAL_CODEX_TOOL_SEARCH_TOOL
+                    {
+                        let item_id = format!("tsc_{}", generate_short_nonce());
+                        let parsed_args =
+                            serde_json::from_str::<Value>(&arguments).unwrap_or_else(|_| json!({}));
+                        let added_item = ResponseOutputItem::ToolSearchCall {
+                            id: item_id.clone(),
+                            status: "in_progress".to_owned(),
+                            call_id: call_id.clone(),
+                            execution: "client".to_owned(),
+                            arguments: parsed_args.clone(),
+                        };
                         let _ = send_sse_frame(
                             &sse_tx,
                             "response.output_item.added",
@@ -1200,14 +1221,48 @@ fn stream_openai_responses(
                                 "type": "response.output_item.added",
                                 "sequence_number": next_seq(&mut seq),
                                 "output_index": idx,
-                                "item": {
-                                    "id": item_id,
-                                    "type": "custom_tool_call",
-                                    "status": "in_progress",
-                                    "call_id": call_id,
-                                    "name": name,
-                                    "input": ""
-                                }
+                                "item": &added_item,
+                            }),
+                        )
+                        .await;
+                        let done_item = ResponseOutputItem::ToolSearchCall {
+                            id: item_id,
+                            status: "completed".to_owned(),
+                            call_id,
+                            execution: "client".to_owned(),
+                            arguments: parsed_args,
+                        };
+                        let _ = send_sse_frame(
+                            &sse_tx,
+                            "response.output_item.done",
+                            &json!({
+                                "type": "response.output_item.done",
+                                "sequence_number": next_seq(&mut seq),
+                                "output_index": idx,
+                                "item": &done_item,
+                            }),
+                        )
+                        .await;
+                        finalized_items.push(done_item);
+                    } else if is_custom {
+                        let (namespace, bare_name) = split_namespaced_tool_name(&name);
+                        let item_id = format!("ctc_{}", generate_short_nonce());
+                        let added_item = ResponseOutputItem::CustomToolCall {
+                            id: item_id.clone(),
+                            status: "in_progress".to_owned(),
+                            call_id: call_id.clone(),
+                            namespace: namespace.clone(),
+                            name: bare_name.clone(),
+                            input: String::new(),
+                        };
+                        let _ = send_sse_frame(
+                            &sse_tx,
+                            "response.output_item.added",
+                            &json!({
+                                "type": "response.output_item.added",
+                                "sequence_number": next_seq(&mut seq),
+                                "output_index": idx,
+                                "item": &added_item,
                             }),
                         )
                         .await;
@@ -1218,6 +1273,7 @@ fn stream_openai_responses(
                                 "type": "response.custom_tool_call_input.delta",
                                 "sequence_number": next_seq(&mut seq),
                                 "item_id": item_id,
+                                "call_id": call_id,
                                 "output_index": idx,
                                 "delta": arguments,
                             }),
@@ -1230,6 +1286,7 @@ fn stream_openai_responses(
                                 "type": "response.custom_tool_call_input.done",
                                 "sequence_number": next_seq(&mut seq),
                                 "item_id": item_id,
+                                "call_id": call_id,
                                 "output_index": idx,
                                 "input": arguments,
                             }),
@@ -1239,7 +1296,8 @@ fn stream_openai_responses(
                             id: item_id,
                             status: "completed".to_owned(),
                             call_id,
-                            name,
+                            namespace,
+                            name: bare_name,
                             input: arguments,
                         };
                         let _ = send_sse_frame(
@@ -1481,6 +1539,7 @@ fn build_openai_client_tool_item(
     name: String,
     arguments: String,
     is_custom: bool,
+    emit_tool_search_items: bool,
 ) -> ResponseOutputItem {
     if name == INTERNAL_CODEX_LOCAL_SHELL_TOOL {
         ResponseOutputItem::LocalShellCall {
@@ -1489,12 +1548,22 @@ fn build_openai_client_tool_item(
             call_id,
             action: parse_local_shell_action(&arguments),
         }
+    } else if emit_tool_search_items && name == INTERNAL_CODEX_TOOL_SEARCH_TOOL {
+        ResponseOutputItem::ToolSearchCall {
+            id: format!("tsc_{}", generate_short_nonce()),
+            status: "completed".to_owned(),
+            call_id,
+            execution: "client".to_owned(),
+            arguments: serde_json::from_str::<Value>(&arguments).unwrap_or_else(|_| json!({})),
+        }
     } else if is_custom {
+        let (namespace, bare_name) = split_namespaced_tool_name(&name);
         ResponseOutputItem::CustomToolCall {
             id: format!("ctc_{}", generate_short_nonce()),
             status: "completed".to_owned(),
             call_id,
-            name,
+            namespace,
+            name: bare_name,
             input: arguments,
         }
     } else {

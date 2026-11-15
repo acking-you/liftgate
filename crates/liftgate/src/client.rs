@@ -166,9 +166,19 @@ impl GatewayClient {
         Ok(parsed.data)
     }
 
-    pub async fn fetch_codex_catalog_json(&self, default_model: &str) -> Result<Vec<u8>, CliError> {
+    pub async fn fetch_codex_catalog_json_with_mode(
+        &self,
+        default_model: &str,
+        tool_mode: Option<&str>,
+    ) -> Result<Vec<u8>, CliError> {
         let encoded = percent_encode_query_component(default_model);
-        let path = format!("/v1/codex-models?default_model={encoded}");
+        let path = match tool_mode.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(mode) => {
+                let encoded_mode = percent_encode_query_component(mode);
+                format!("/v1/codex-models?default_model={encoded}&tool_mode={encoded_mode}")
+            }
+            None => format!("/v1/codex-models?default_model={encoded}"),
+        };
         let url = format!("{}{path}", self.base_url);
         let (status, body) = self.authed_get(&path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {

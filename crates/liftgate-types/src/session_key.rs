@@ -16,6 +16,9 @@ pub const INTERNAL_GATEWAY_WEB_FETCH_TOOL: &str = "__gateway_web_fetch";
 /// Internal tool name used when OpenAI Codex declares built-in `{"type": "local_shell"}`.
 pub const INTERNAL_CODEX_LOCAL_SHELL_TOOL: &str = "__codex_local_shell";
 
+/// Canonical tool name used when OpenAI Codex declares built-in `{"type": "tool_search"}`.
+pub const INTERNAL_CODEX_TOOL_SEARCH_TOOL: &str = "tool_search";
+
 /// Server-executed web-tool mode flags passed into `build_session_system_append`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[expect(
@@ -643,11 +646,29 @@ fn truncate_utf8_chars(input: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn compact_tool_description(raw_desc: &str) -> String {
+const MAX_CODE_MODE_TOOL_DESC_BYTES: usize = 36_000;
+const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
+
+fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
+    if tool.name == "REPL" {
+        return true;
+    }
+    if tool.name == "exec" && matches!(tool.kind, CanonicalToolKind::Custom { .. }) {
+        return true;
+    }
+    tool.description.as_deref().is_some_and(|desc| {
+        desc.contains("declare const tools")
+            || desc.contains("globalThis.tools")
+            || desc.contains("Tool TypeScript declarations:")
+            || desc.contains("// @exec:")
+    })
+}
+
+fn collapse_tool_description(raw_desc: &str) -> String {
     let s1 = strip_tag_blocks(raw_desc, "<example>", "</example>");
     let s2 = strip_tag_blocks(&s1, "<examples>", "</examples>");
     let s3 = strip_tag_blocks(&s2, "<commentary>", "</commentary>");
-    let mut collapsed = String::with_capacity(s3.len().min(700));
+    let mut collapsed = String::with_capacity(s3.len());
     let mut prev_blank = false;
     for line in s3.lines() {
         let trimmed_end = line.trim_end();
@@ -664,7 +685,21 @@ fn compact_tool_description(raw_desc: &str) -> String {
             prev_blank = false;
         }
     }
-    truncate_utf8_chars(collapsed.trim(), 600)
+    collapsed.trim().to_owned()
+}
+
+fn compact_tool_description(raw_desc: &str) -> String {
+    let collapsed = collapse_tool_description(raw_desc);
+    truncate_utf8_chars(&collapsed, 600)
+}
+
+fn compact_code_mode_tool_description(raw_desc: &str, max_bytes: usize) -> String {
+    let collapsed = collapse_tool_description(raw_desc);
+    if collapsed.len() <= max_bytes {
+        collapsed
+    } else {
+        truncate_head_tail_lines(&collapsed, max_bytes, "Code Mode tool declarations")
+    }
 }
 
 fn compact_json_schema(raw_schema: &str) -> String {
@@ -731,7 +766,7 @@ pub fn build_session_system_append(
          in `<developer_instructions>`, `<caller_system_instructions>`, and caller environment blocks.\n\
          - CRITICAL: NEVER emit any native tool/function call (not even an empty one) for external \
          `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, \
-         `Agent`, `apply_patch`, etc.) or after writing XML tool blocks; doing so triggers a \
+         `Agent`, `REPL`, `exec`, `wait`, `apply_patch`, etc.) or after writing XML tool blocks; doing so triggers a \
          `Malformed function call` error. External `<client_tools>` may ONLY be invoked by writing \
          `{open_tag}...{close_tag}` XML blocks in plain assistant text.\n\
          - NEVER emit transcript or role wrapper markers such as `<user>`, `</user>`, `<assistant>`, \
@@ -766,41 +801,18 @@ pub fn build_session_system_append(
         );
     }
 
+    let has_custom_tools = client_tools
+        .iter()
+        .any(|t| matches!(t.kind, CanonicalToolKind::Custom { .. }));
     let need_xml_protocol = !client_tools.is_empty() || web_cfg.enable_native_web_fetch;
     if need_xml_protocol {
-        out.push_str(
-            "- Whenever you want to invoke one or more XML-bridged tools below (including parallel calls \
-             in a single turn), optionally write a brief one-sentence status note before the first XML \
-             block, then emit one XML block per tool call in this EXACT format (no XML attributes, \
-             NEVER wrap the tag in backticks/code fences, and JSON-escape all `\\`, `\"`, and `\\n` inside strings), \
-             and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
-             function calls after the final closing tag — NEVER guess, fabricate, or simulate tool \
-             outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
+        append_xml_invocation_bridge_rules(
+            &mut out,
+            &open_tag,
+            &close_tag,
+            web_cfg,
+            has_custom_tools,
         );
-        out.push_str(&open_tag);
-        out.push('\n');
-        out.push_str("{\"name\": \"<exact_tool_name>\", \"arguments\": { ... }}\n");
-        out.push_str(&close_tag);
-        out.push_str(
-            "\n  (For freeform string tools like `apply_patch`, pass a JSON string in `\"input\"`: \
-             `{\"name\": \"apply_patch\", \"input\": \"...\"}`.)\n",
-        );
-
-        if web_cfg.enable_native_web_fetch {
-            if web_cfg.force_native_web_fetch {
-                out.push_str(&format!(
-                    "- MANDATORY SERVER WEB FETCH: Before answering, fetch the requested web URL by emitting \
-                     `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
-                     and stop; the gateway will immediately fetch the live page and deliver `<gateway_web_fetch_result>`.\n"
-                ));
-            } else {
-                out.push_str(&format!(
-                    "- Server-managed URL fetching IS enabled: to read the full content of any `http://` or `https://` URL, \
-                     emit `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
-                     and stop; the gateway will fetch the URL server-side and return `<gateway_web_fetch_result>` in the same turn.\n"
-                ));
-            }
-        }
 
         if !client_tools.is_empty() {
             out.push_str("<client_tools>\n");
@@ -822,6 +834,58 @@ pub fn build_session_system_append(
     }
 
     out
+}
+
+fn append_xml_invocation_bridge_rules(
+    out: &mut String,
+    open_tag: &str,
+    close_tag: &str,
+    web_cfg: WebToolBridgeConfig,
+    has_custom_tools: bool,
+) {
+    out.push_str(
+        "- Whenever you want to invoke one or more XML-bridged tools below (including parallel calls \
+         in a single turn), optionally write a brief one-sentence status note before the first XML \
+         block, then emit one XML block per tool call in this EXACT format (no XML attributes, \
+         NEVER wrap the tag in backticks/code fences, and JSON-escape all `\\`, `\"`, and `\\n` inside strings), \
+         and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
+         function calls after the final closing tag — NEVER guess, fabricate, or simulate tool \
+         outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
+    );
+    out.push_str(open_tag);
+    out.push('\n');
+    out.push_str("{\"name\": \"<exact_tool_name>\", \"arguments\": { ... }}\n");
+    out.push_str(close_tag);
+    if has_custom_tools {
+        out.push_str(
+            "\n  (For freeform custom tools like `apply_patch` or Code Mode `exec` — even when a tool's \
+             description says \"Accepts raw JavaScript source text, not JSON\" — you MUST still wrap the \
+             call in a JSON `\"input\"` string inside the XML block: \
+             `{\"name\": \"exec\", \"input\": \"<JSON-escaped JS source>\"}` or \
+             `{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n...\"}`.)\n",
+        );
+    } else {
+        out.push_str(
+            "\n  (For freeform string tools like `apply_patch`, pass a JSON string in `\"input\"`: \
+             `{\"name\": \"apply_patch\", \"input\": \"...\"}`.)\n",
+        );
+    }
+
+    if web_cfg.enable_native_web_fetch {
+        if web_cfg.force_native_web_fetch {
+            out.push_str(&format!(
+                "- MANDATORY SERVER WEB FETCH: Before answering, fetch the requested web URL by emitting \
+                 `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                 and stop; the gateway will immediately fetch the live page and deliver `<gateway_web_fetch_result>`.\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "- Server-managed URL fetching IS enabled: to read the full content of any `http://` or `https://` URL, \
+                 emit `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                 and stop; the gateway will fetch the URL server-side and return `<gateway_web_fetch_result>` in the same turn.\n"
+            ));
+        }
+    }
 }
 
 /// Maximum UTF-8 byte budget for `_meta.antigravity.systemPrompt.append` on `session/new`.
@@ -847,15 +911,27 @@ pub fn build_session_system_append_with_spill(
         return (full, None);
     }
 
-    let mut header = build_session_system_append(None, &[], web_cfg, tool_nonce);
+    let base_web_cfg = WebToolBridgeConfig {
+        enable_native_web_fetch: false,
+        force_native_web_fetch: false,
+        ..web_cfg
+    };
+    let mut header = build_session_system_append(None, &[], base_web_cfg, tool_nonce);
     if let Some(base_prefix) = header.strip_suffix("</api_gateway_bridge_rules>\n") {
         let mut bounded = String::with_capacity(MAX_SYSTEM_APPEND_BYTES);
         bounded.push_str(base_prefix);
         let open_tag = format!("<agy_tool_call_{tool_nonce}>");
         let close_tag = format!("</agy_tool_call_{tool_nonce}>");
-        bounded.push_str(&format!(
-            "- Invoke external `<client_tools>` ONLY via `{open_tag}\n{{\"name\": \"<exact_tool_name>\", \"arguments\": {{ ... }}}}\n{close_tag}` (or `\"input\"` for freeform tools) and stop immediately after `{close_tag}`.\n"
-        ));
+        let has_custom_tools = client_tools
+            .iter()
+            .any(|t| matches!(t.kind, CanonicalToolKind::Custom { .. }));
+        append_xml_invocation_bridge_rules(
+            &mut bounded,
+            &open_tag,
+            &close_tag,
+            web_cfg,
+            has_custom_tools,
+        );
 
         let close_rules = "</client_tools>\n</api_gateway_bridge_rules>\n";
         let mut inline_count = 0usize;
@@ -909,7 +985,11 @@ fn render_compact_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
     out.push_str(&tool.name);
     out.push('\n');
     if let Some(desc) = &tool.description {
-        let compacted_desc = compact_tool_description(desc);
+        let compacted_desc = if is_code_mode_orchestrator_tool(tool) {
+            compact_code_mode_tool_description(desc, MAX_CODE_MODE_TOOL_DESC_BYTES)
+        } else {
+            compact_tool_description(desc)
+        };
         if !compacted_desc.is_empty() {
             out.push_str("  description: ");
             out.push_str(&compacted_desc);
@@ -938,7 +1018,11 @@ fn render_slim_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
     out.push_str(&tool.name);
     out.push('\n');
     if let Some(desc) = &tool.description {
-        let short_desc = truncate_utf8_chars(&compact_tool_description(desc), 120);
+        let short_desc = if is_code_mode_orchestrator_tool(tool) {
+            compact_code_mode_tool_description(desc, MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES)
+        } else {
+            truncate_utf8_chars(&compact_tool_description(desc), 120)
+        };
         if !short_desc.is_empty() {
             out.push_str("  description: ");
             out.push_str(&short_desc);
@@ -3342,5 +3426,116 @@ mod tests {
             &[u1, a1, turn_delta, a2, u3],
         );
         assert_eq!(next_routing.prefix_lookup, Some((committed_hash, 4)));
+    }
+
+    #[test]
+    fn preserves_full_code_mode_exec_and_repl_tool_declarations_inline_and_on_spill() {
+        let mut ts_decls = String::from(
+            "Run JavaScript code to orchestrate tool calls. Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.\n\
+             Runtime helpers: `exit()`, `text(...)`, `image(...)`, `store(k, v)`, `load(k)`, `yield_control()`, `ALL_TOOLS`.\n\
+             Tool TypeScript declarations:\n```ts\ndeclare const tools: {\n  apply_patch(args: string): Promise<unknown>;\n  exec_command(args: { cmd: string; workdir?: string }): Promise<{ output: string }>;\n",
+        );
+        for idx in 0..8 {
+            ts_decls.push_str(&format!(
+                "  mcp__workspace__tool_{idx:02}(args: {{ query: string; limit?: number }}): Promise<{{ items: string[] }}>;\n"
+            ));
+        }
+        ts_decls.push_str("};\n```");
+        assert!(ts_decls.len() > 1_200 && ts_decls.len() < 10_000);
+
+        let inline_tools = vec![
+            CanonicalToolSpec {
+                name: "exec".to_owned(),
+                description: Some(ts_decls.clone()),
+                kind: CanonicalToolKind::Custom {
+                    format_json: Some(
+                        r#"{"type":"grammar","syntax":"lark","definition":"start: /[\\s\\S]+/"}"#
+                            .to_owned(),
+                    ),
+                },
+            },
+            CanonicalToolSpec {
+                name: "wait".to_owned(),
+                description: Some("Wait on a yielded `exec` cell ID or terminate it.".to_owned()),
+                kind: CanonicalToolKind::Function {
+                    parameters_json:
+                        r#"{"type":"object","properties":{"cell_id":{"type":"string"},"terminate":{"type":"boolean"}},"required":["cell_id"]}"#
+                            .to_owned(),
+                },
+            },
+        ];
+
+        let (inline_append, inline_spill) = build_session_system_append_with_spill(
+            None,
+            &inline_tools,
+            WebToolBridgeConfig::default(),
+            "9c2e",
+        );
+        assert!(inline_spill.is_none());
+        assert!(inline_append.len() <= MAX_SYSTEM_APPEND_BYTES);
+        assert!(
+            inline_append.contains("mcp__workspace__tool_07"),
+            "Code Mode `exec` TypeScript declarations must NOT be truncated at 600 chars"
+        );
+        assert!(inline_append.contains("{\"name\": \"exec\", \"input\":"));
+
+        // Now build a >18 KB Code Mode `exec` tool (45 nested MCP tools) and verify it keeps
+        // `systemPrompt.append <= 16 KB` while spilling 100% of `declare const tools` into Turn 1!
+        let mut big_decls = ts_decls;
+        big_decls.truncate(big_decls.len().saturating_sub(6));
+        for idx in 8..180 {
+            big_decls.push_str(&format!(
+                "  mcp__enterprise__connector_action_{idx:03}(args: {{ resource_id: string; payload: Record<string, unknown> }}): Promise<{{ ok: boolean }}>;\n"
+            ));
+        }
+        big_decls.push_str("};\n```");
+        assert!(big_decls.len() > 18_000);
+
+        let big_tools = vec![
+            CanonicalToolSpec {
+                name: "exec".to_owned(),
+                description: Some(big_decls),
+                kind: CanonicalToolKind::Custom { format_json: None },
+            },
+            inline_tools[1].clone(),
+        ];
+
+        let (spilled_append, spilled_xml_opt) = build_session_system_append_with_spill(
+            None,
+            &big_tools,
+            WebToolBridgeConfig::default(),
+            "9c2e",
+        );
+        assert!(spilled_append.len() <= MAX_SYSTEM_APPEND_BYTES);
+        assert!(spilled_append.contains("{\"name\": \"exec\", \"input\":"));
+        let spilled_xml = spilled_xml_opt.expect("18 KB+ `exec` tool must spill into Turn 1");
+        assert!(spilled_xml.contains("mcp__enterprise__connector_action_008"));
+        assert!(spilled_xml.contains("mcp__enterprise__connector_action_179"));
+        assert!(spilled_xml.contains("- name: wait"));
+
+        // Claude Code Mode `REPL` tool (>1.5 KB Bun sandbox helper docs) is also preserved intact.
+        let repl_desc = format!(
+            "Execute JavaScript inside the persistent Bun Code Mode sandbox.\n{}\nBuilt-in helpers: `$`, `edit(path, old, new)`, `create(path, content)`, `view(path)`.",
+            "// sandbox capability line\n".repeat(45)
+        );
+        let repl_tools = vec![CanonicalToolSpec {
+            name: "REPL".to_owned(),
+            description: Some(repl_desc),
+            kind: CanonicalToolKind::Function {
+                parameters_json:
+                    r#"{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}"#
+                        .to_owned(),
+            },
+        }];
+        let (repl_append, repl_spill) = build_session_system_append_with_spill(
+            None,
+            &repl_tools,
+            WebToolBridgeConfig::default(),
+            "9c2e",
+        );
+        assert!(repl_spill.is_none());
+        assert!(
+            repl_append.contains("`edit(path, old, new)`, `create(path, content)`, `view(path)`")
+        );
     }
 }

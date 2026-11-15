@@ -11,8 +11,8 @@ use crate::canonical::{
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
-    INTERNAL_CODEX_LOCAL_SHELL_TOOL, is_compaction_instructions_prompt, strip_billing_noise,
-    wrap_developer_instructions_block,
+    INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL,
+    is_compaction_instructions_prompt, strip_billing_noise, wrap_developer_instructions_block,
 };
 
 /// Incoming `POST /v1/responses` request body.
@@ -58,8 +58,9 @@ pub enum ResponseInput {
 }
 
 /// Flexible input item supporting OpenAI Responses API message items, function calls,
-/// custom tool calls, Codex `local_shell_call` / `apply_patch_call`, tool outputs,
-/// and echoed reasoning items.
+/// custom tool calls (`apply_patch`, Code Mode `exec`), `tool_search_call` / `tool_search_output`,
+/// `additional_tools`, `configuration_update`, Codex `local_shell_call` / `apply_patch_call`,
+/// tool outputs, and echoed reasoning/compaction items.
 #[derive(Debug, Deserialize)]
 pub struct ResponseInputItem {
     #[serde(rename = "type", default)]
@@ -75,9 +76,17 @@ pub struct ResponseInputItem {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
-    pub arguments: Option<String>,
+    pub arguments: Option<Value>,
     #[serde(default)]
     pub input: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub execution: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default)]
+    pub reasoning: Option<ResponseReasoningConfig>,
     #[serde(default)]
     pub action: Option<Value>,
     #[serde(default)]
@@ -141,6 +150,8 @@ pub struct ResponseToolSpec {
     #[serde(default)]
     pub function: Option<NestedFunctionDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defer_loading: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ResponseToolSpec>,
@@ -186,6 +197,8 @@ pub fn normalize_responses_request(
     let mut messages: Vec<CanonicalMessage> = Vec::new();
     let mut has_conversational_input = false;
     let mut deferred_compaction_instructions: Option<String> = None;
+    let mut latest_config_effort: Option<ReasoningEffort> = None;
+    let mut dynamic_tools: Vec<Value> = Vec::new();
 
     if let Some(inst) = req.instructions.as_deref() {
         let cleaned = strip_billing_noise(inst);
@@ -228,13 +241,59 @@ pub fn normalize_responses_request(
                                 CanonicalPart::ToolCall {
                                     call_id: call_id.clone(),
                                     name: qualified,
-                                    arguments: item
-                                        .arguments
-                                        .clone()
-                                        .unwrap_or_else(|| "{}".to_owned()),
+                                    arguments: serialize_input_arguments(item.arguments.as_ref()),
                                     is_custom: false,
                                 },
                             );
+                        }
+                    }
+                    "tool_search_call" => {
+                        let call_id = item
+                            .call_id
+                            .clone()
+                            .unwrap_or_else(|| INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned());
+                        has_conversational_input = true;
+                        push_part(
+                            &mut messages,
+                            CanonicalRole::Assistant,
+                            CanonicalPart::ToolCall {
+                                call_id,
+                                name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
+                                arguments: serialize_input_arguments(item.arguments.as_ref()),
+                                is_custom: false,
+                            },
+                        );
+                    }
+                    "tool_search_output" => {
+                        let call_id = item
+                            .call_id
+                            .clone()
+                            .unwrap_or_else(|| INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned());
+                        has_conversational_input = true;
+                        dynamic_tools.extend(item.tools.iter().cloned());
+                        let output_json =
+                            serde_json::to_string(&item.tools).unwrap_or_else(|_| "[]".to_owned());
+                        push_part(
+                            &mut messages,
+                            CanonicalRole::User,
+                            CanonicalPart::ToolResult {
+                                call_id,
+                                output: output_json,
+                                is_error: item.status.as_deref() == Some("failed"),
+                            },
+                        );
+                    }
+                    "additional_tools" => {
+                        dynamic_tools.extend(item.tools.iter().cloned());
+                    }
+                    "configuration_update" => {
+                        if let Some(eff) = item
+                            .reasoning
+                            .as_ref()
+                            .and_then(|r| r.effort.as_deref())
+                            .and_then(ReasoningEffort::from_effort_str)
+                        {
+                            latest_config_effort = Some(eff);
                         }
                     }
                     "custom_tool_call" => {
@@ -290,6 +349,7 @@ pub fn normalize_responses_request(
                     }
                     "function_call_output"
                     | "custom_tool_call_output"
+                    | "mcp_tool_call_output"
                     | "local_shell_call_output"
                     | "apply_patch_call_output" => {
                         if let Some(call_id) = &item.call_id {
@@ -299,7 +359,8 @@ pub fn normalize_responses_request(
                             }
                         }
                     }
-                    "reasoning" | "web_search_call" | "item_reference" => {}
+                    "reasoning" | "web_search_call" | "item_reference" | "compaction"
+                    | "compaction_summary" | "compaction_trigger" | "context_compaction" => {}
                     _ => {
                         let role_str = item.role.as_deref().unwrap_or("user");
                         if matches!(role_str, "system" | "developer") {
@@ -396,6 +457,24 @@ pub fn normalize_responses_request(
                         }
                     }
                 }
+                "tool_search" => {
+                    let params_json = tool.parameters.as_ref().map_or_else(
+                        || {
+                            "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}"
+                                .to_owned()
+                        },
+                        |raw| raw.get().to_owned(),
+                    );
+                    client_tools.push(CanonicalToolSpec {
+                        name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
+                        description: tool.description.clone().or_else(|| {
+                            Some("Search deferred tools and MCP connectors by query.".to_owned())
+                        }),
+                        kind: CanonicalToolKind::Function {
+                            parameters_json: params_json,
+                        },
+                    });
+                }
                 "local_shell" => {
                     client_tools.push(CanonicalToolSpec {
                         name: INTERNAL_CODEX_LOCAL_SHELL_TOOL.to_owned(),
@@ -453,6 +532,23 @@ pub fn normalize_responses_request(
                 _ => {}
             }
         }
+
+        // Activate any deferred tools discovered via `tool_search_output` or `additional_tools`
+        // without duplicating definitions already present in `req.tools`.
+        if !dynamic_tools.is_empty() {
+            let mut extra_specs = Vec::new();
+            for dyn_tool in &dynamic_tools {
+                push_dynamic_tool_value(&mut extra_specs, None, dyn_tool, None);
+            }
+            for spec in extra_specs {
+                if !client_tools
+                    .iter()
+                    .any(|existing| existing.name == spec.name)
+                {
+                    client_tools.push(spec);
+                }
+            }
+        }
     }
 
     let aux_system_hint = (!aux_system_parts.is_empty()).then(|| aux_system_parts.join("\n\n"));
@@ -499,11 +595,12 @@ pub fn normalize_responses_request(
     let (include_thinking, reasoning_effort) = if auxiliary_task.is_some() {
         (false, Some(ReasoningEffort::Low))
     } else {
-        let effort = req
-            .reasoning
-            .as_ref()
-            .and_then(|r| r.effort.as_deref())
-            .and_then(ReasoningEffort::from_effort_str);
+        let effort = latest_config_effort.or_else(|| {
+            req.reasoning
+                .as_ref()
+                .and_then(|r| r.effort.as_deref())
+                .and_then(ReasoningEffort::from_effort_str)
+        });
         let inc = req
             .reasoning
             .as_ref()
@@ -550,6 +647,84 @@ pub fn split_namespaced_tool_name(full_name: &str) -> (Option<String>, String) {
         (Some(ns.to_owned()), fn_name.to_owned())
     } else {
         (None, full_name.to_owned())
+    }
+}
+
+fn serialize_input_arguments(raw: Option<&Value>) -> String {
+    match raw {
+        None | Some(Value::Null) => "{}".to_owned(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
+    }
+}
+
+fn push_dynamic_tool_value(
+    out: &mut Vec<CanonicalToolSpec>,
+    namespace: Option<&str>,
+    val: &Value,
+    fallback_desc: Option<&str>,
+) {
+    let Some(obj) = val.as_object() else {
+        return;
+    };
+    let tool_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    match tool_type {
+        "function" => {
+            if let Some(name) = obj.get("name").and_then(Value::as_str).map(str::trim)
+                && !name.is_empty()
+            {
+                let params_json = obj
+                    .get("parameters")
+                    .and_then(|p| serde_json::to_string(p).ok())
+                    .unwrap_or_else(|| "{}".to_owned());
+                let desc = obj
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| fallback_desc.map(str::to_owned));
+                out.push(CanonicalToolSpec {
+                    name: qualify_namespaced_tool_name(namespace, name),
+                    description: desc,
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: params_json,
+                    },
+                });
+            }
+        }
+        "custom" => {
+            if let Some(name) = obj.get("name").and_then(Value::as_str).map(str::trim)
+                && !name.is_empty()
+            {
+                let format_json = obj
+                    .get("format")
+                    .and_then(|f| serde_json::to_string(f).ok());
+                let desc = obj
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| fallback_desc.map(str::to_owned));
+                out.push(CanonicalToolSpec {
+                    name: qualify_namespaced_tool_name(namespace, name),
+                    description: desc,
+                    kind: CanonicalToolKind::Custom { format_json },
+                });
+            }
+        }
+        "namespace" => {
+            if let Some(ns_name) = obj.get("name").and_then(Value::as_str).map(str::trim)
+                && !ns_name.is_empty()
+                && let Some(sub_tools) = obj.get("tools").and_then(Value::as_array)
+            {
+                let ns_desc = obj.get("description").and_then(Value::as_str);
+                for sub in sub_tools {
+                    push_dynamic_tool_value(out, Some(ns_name), sub, ns_desc);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -808,6 +983,10 @@ fn convert_tool_output_parts(
                             text_pieces.push(t.to_owned());
                         }
                     }
+                    "input_audio" | "audio" => {
+                        saw_structured_part = true;
+                        text_pieces.push("[Audio attached in tool output]".to_owned());
+                    }
                     _ => {
                         if let Some(t) = obj.get("text").and_then(Value::as_str) {
                             saw_structured_part = true;
@@ -935,8 +1114,17 @@ pub enum ResponseOutputItem {
         id: String,
         status: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         name: String,
         input: String,
+    },
+    ToolSearchCall {
+        id: String,
+        status: String,
+        call_id: String,
+        execution: String,
+        arguments: Value,
     },
     LocalShellCall {
         id: String,
@@ -1091,6 +1279,11 @@ pub struct CodexModelCatalogEntry {
     pub experimental_supported_tools: Vec<String>,
     pub input_modalities: Vec<&'static str>,
     pub supports_image_detail_original: bool,
+    pub supports_search_tool: bool,
+    pub supports_reasoning_effort_updates: bool,
+    pub node_repl_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<&'static str>,
     pub web_search_tool_type: &'static str,
     pub apply_patch_tool_type: &'static str,
 }
@@ -1116,6 +1309,7 @@ You are a coding agent running in the Codex CLI, a terminal-based coding assista
 - Before grouped tool calls or long edits, send a brief 1-sentence preamble so the user can follow progress.
 - When searching text or file paths in the shell, prefer `rg` and `rg --files`.
 - Use `apply_patch` for file edits (`*** Begin Patch` ... `*** End Patch`), keep changes surgical and consistent with existing codebase style, and never commit or create git branches unless asked.
+- When Code Mode (`exec` and `wait`) is active, prefer orchestrating multi-step or parallel read/search/inspection calls inside a single `exec` JavaScript cell (`await Promise.all([tools.exec_command(...), ...])`), store reusable intermediate state with `store(key, value)` / `load(key)`, return concise summaries via `text(...)`, and call `wait` if `exec` yields a running cell ID.
 - Validate changes with targeted builds/tests when appropriate in non-interactive or test-focused runs; do not fix unrelated issues outside the user's scope.
 - When `request_user_input_async` or `request_user_input` is available and a critical requirement cannot be derived from workspace inspection, ask concise questions while continuing independent work.
 - For live web searches or reading HTTP/HTTPS URLs, prefer your built-in `search_web` and server-managed `__gateway_web_fetch` tools rather than running `curl` or `Invoke-WebRequest` in local shell commands (which may be blocked by Codex's network sandbox).
@@ -1133,6 +1327,33 @@ pub fn build_codex_model_catalog(
     default_model: &str,
     long_context: bool,
 ) -> CodexModelCatalogResponse {
+    build_codex_model_catalog_with_tool_mode(available, default_model, long_context, None)
+}
+
+/// Builds a Codex `model_catalog_json` document with an optional explicit `tool_mode`
+/// (`"code_mode"`, `"code_mode_only"`, or `"direct"`). Defaults to `"code_mode"` when `tool_mode`
+/// is `None`, enabling Codex's V8 JavaScript programmatic tool orchestration (`exec` + `wait`)
+/// alongside direct tools out of the box.
+#[must_use]
+pub fn build_codex_model_catalog_with_tool_mode(
+    available: &[AvailableModel],
+    default_model: &str,
+    long_context: bool,
+    tool_mode: Option<&str>,
+) -> CodexModelCatalogResponse {
+    let resolved_tool_mode = match tool_mode.map(str::trim) {
+        None | Some("") => Some("code_mode"),
+        Some(m) if m.eq_ignore_ascii_case("code_mode") => Some("code_mode"),
+        Some(m) if m.eq_ignore_ascii_case("code_mode_only") => Some("code_mode_only"),
+        Some(m)
+            if m.eq_ignore_ascii_case("direct")
+                || m.eq_ignore_ascii_case("off")
+                || m.eq_ignore_ascii_case("none") =>
+        {
+            Some("direct")
+        }
+        Some(_) => Some("code_mode"),
+    };
     let mut ordered: Vec<(u8, usize, &str, String)> = available
         .iter()
         .enumerate()
@@ -1225,6 +1446,10 @@ pub fn build_codex_model_catalog(
                 ],
                 input_modalities: vec!["text", "image"],
                 supports_image_detail_original: true,
+                supports_search_tool: false,
+                supports_reasoning_effort_updates: true,
+                node_repl_disabled: false,
+                tool_mode: resolved_tool_mode,
                 web_search_tool_type: "text_and_image",
                 apply_patch_tool_type: "freeform",
             }
@@ -1343,6 +1568,114 @@ mod tests {
             );
         }
         assert!(first.supports_image_detail_original);
+        assert!(first.supports_reasoning_effort_updates);
+        assert!(!first.supports_search_tool);
+        assert!(!first.node_repl_disabled);
+        assert_eq!(first.tool_mode, Some("code_mode"));
         assert_eq!(first.web_search_tool_type, "text_and_image");
+
+        let direct_cat = build_codex_model_catalog_with_tool_mode(
+            &mock_available_models(),
+            "gemini-4-carbon-high",
+            false,
+            Some("direct"),
+        );
+        assert_eq!(direct_cat.models[0].tool_mode, Some("direct"));
+
+        let cmo_cat = build_codex_model_catalog_with_tool_mode(
+            &mock_available_models(),
+            "gemini-4-carbon-high",
+            false,
+            Some("code_mode_only"),
+        );
+        assert_eq!(cmo_cat.models[0].tool_mode, Some("code_mode_only"));
+    }
+
+    #[test]
+    fn normalizes_codex_code_mode_tool_search_and_configuration_update_items() {
+        let raw_payload = json!({
+            "model": "gemini-4-carbon-high",
+            "reasoning": { "effort": "medium" },
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "description": "Run JavaScript code.\ndeclare const tools: { exec_command(args: { cmd: string }): Promise<{ output: string }>; };",
+                    "format": { "type": "grammar", "syntax": "lark", "definition": "start: /[\\s\\S]+/" }
+                },
+                {
+                    "type": "function",
+                    "name": "wait",
+                    "description": "Wait on a running cell.",
+                    "parameters": { "type": "object", "properties": { "cell_id": { "type": "string" } }, "required": ["cell_id"] }
+                },
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": "Search deferred tools.",
+                    "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
+                }
+            ],
+            "input": [
+                { "role": "user", "content": "Search calendar tools and inspect repo" },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "search-1",
+                    "execution": "client",
+                    "arguments": { "query": "calendar", "limit": 2 }
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "search-1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "mcp__calendar__list_events",
+                        "description": "List events.",
+                        "defer_loading": true,
+                        "parameters": { "type": "object" }
+                    }]
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_exec_1",
+                    "name": "exec",
+                    "input": "const r = await tools.exec_command({ cmd: \"cargo --version\" });\ntext(r.output);"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_exec_1",
+                    "output": [
+                        { "type": "input_text", "text": "Script completed\ncargo 1.86.0" },
+                        { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+                    ]
+                },
+                {
+                    "type": "configuration_update",
+                    "reasoning": { "effort": "ultra" }
+                }
+            ]
+        });
+        let req: CreateResponseRequest = serde_json::from_slice(
+            &serde_json::to_vec(&raw_payload).expect("serializable payload"),
+        )
+        .expect("valid Code Mode + tool_search + configuration_update request");
+
+        let norm = normalize_responses_request(&req).expect("normalized Code Mode turn");
+        assert_eq!(norm.reasoning_effort, Some(ReasoningEffort::XHigh));
+        let tool_names: Vec<&str> = norm.client_tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            tool_names,
+            vec!["exec", "wait", "tool_search", "mcp__calendar__list_events"]
+        );
+        let last_msg = norm.messages.last().expect("custom tool output message");
+        assert!(matches!(
+            last_msg.parts.last(),
+            Some(CanonicalPart::ToolResult { call_id, output, is_error: false })
+                if call_id == "call_exec_1"
+                    && output.contains("cargo 1.86.0")
+                    && output.contains("[Audio attached in tool output]")
+        ));
     }
 }

@@ -106,8 +106,10 @@ pub fn resolve_model_id(
         if let Some(id) = select_claude_family_model("opus", effort_hint, available) {
             return id;
         }
-    } else if lower.contains("sonnet") {
-        if let Some(id) = select_claude_family_model("sonnet", effort_hint, available) {
+    } else if lower.contains("sonnet") || lower.contains("fable") {
+        if let Some(id) = select_claude_family_model("sonnet", effort_hint, available)
+            .or_else(|| select_claude_family_model("opus", effort_hint, available))
+        {
             return id;
         }
     } else if lower.contains("orchestrator") {

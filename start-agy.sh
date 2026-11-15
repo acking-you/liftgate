@@ -351,6 +351,7 @@ sync_claude_settings() {
       ANTHROPIC_SMALL_FAST_MODEL: fastModel,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       CLAUDE_CODE_AUTO_MODE_SERVER: "0",
+      CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1",
       NO_PROXY: "127.0.0.1,localhost,::1",
     };
     const proxyUrl = process.env.DETECTED_PROXY || "";
@@ -452,6 +453,7 @@ env_obj = {
     "ANTHROPIC_SMALL_FAST_MODEL": fast_model,
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+    "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1",
     "NO_PROXY": "127.0.0.1,localhost,::1",
 }
 proxy_url = os.environ.get("DETECTED_PROXY") or ""
@@ -541,6 +543,10 @@ model = "${MODEL}"
 model_provider = "agy"
 model_catalog_json = "${CODEX_CATALOG_PATH}"
 ${CODEX_BYPASS_LINES}web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+code_mode = true
 
 [model_providers.agy]
 name = "Liftgate"
@@ -566,6 +572,7 @@ export ANTHROPIC_SMALL_FAST_MODEL="${FAST_MODEL}"
 unset CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
 export CLAUDE_CODE_AUTO_MODE_SERVER="0"
+export CLAUDE_CODE_EXPERIMENTAL_CODE_MODE="1"
 export AGY_GATEWAY_API_KEY="${API_KEY}"
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="127.0.0.1,localhost,::1"
@@ -587,6 +594,7 @@ export ANTHROPIC_SMALL_FAST_MODEL="${FAST_MODEL}"
 unset CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
 export CLAUDE_CODE_AUTO_MODE_SERVER="0"
+export CLAUDE_CODE_EXPERIMENTAL_CODE_MODE="1"
 export AGY_GATEWAY_API_KEY="${API_KEY}"
 export NO_PROXY="127.0.0.1,localhost,::1"
 EOF
@@ -641,6 +649,8 @@ if [[ "${LAUNCH_CODEX}" -eq 1 ]]; then
     "-c" "model_providers.agy.base_url='${GW_URL}/v1'"
     "-c" "model_providers.agy.env_key='AGY_GATEWAY_API_KEY'"
     "-c" "model_providers.agy.wire_api='responses'"
+    "-c" "suppress_unstable_features_warning=true"
+    "-c" "features.code_mode=true"
   )
   if [[ ${#CLI_ARGS[@]} -gt 0 ]]; then
     CODEX_LAUNCH_ARGS+=("${CLI_ARGS[@]}")

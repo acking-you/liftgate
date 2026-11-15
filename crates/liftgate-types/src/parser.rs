@@ -514,7 +514,7 @@ fn parse_tool_call_body(raw_body: &str) -> Option<ParsedToolCall> {
     if let Some(call) = parse_strict_envelope(&repaired) {
         return Some(call);
     }
-    salvage_freeform_input_envelope(cleaned)
+    salvage_freeform_input_envelope(cleaned).or_else(|| salvage_raw_custom_tool_body(cleaned))
 }
 
 fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
@@ -654,8 +654,9 @@ fn repair_llm_json(input: &str) -> String {
     out
 }
 
-/// Salvages freeform string envelopes (`{"name": "apply_patch", "input": "..."}`) when the model
-/// left unescaped `"` characters inside a multi-line patch body.
+/// Salvages freeform string envelopes (`{"name": "apply_patch", "input": "..."}`,
+/// `{"name": "exec", "input": "..."}`, or Claude Code Mode `{"name": "REPL", "arguments": {"code": "..."}}`)
+/// when the model left unescaped `"` characters inside a multi-line patch or JavaScript body.
 fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
     let inner_obj = cleaned.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
     let after_name_key = inner_obj
@@ -670,16 +671,48 @@ fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
     }
 
     let after_comma = after_name_val.trim_start().strip_prefix(',')?.trim_start();
-    let after_input_key = after_comma
-        .strip_prefix("\"input\"")?
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start();
-    let without_trailing_comma = after_input_key
+    let (is_arguments_key, after_val_key) =
+        if let Some(rest) = after_comma.strip_prefix("\"input\"") {
+            (false, rest.trim_start().strip_prefix(':')?.trim_start())
+        } else if let Some(rest) = after_comma.strip_prefix("\"arguments\"") {
+            (true, rest.trim_start().strip_prefix(':')?.trim_start())
+        } else {
+            return None;
+        };
+
+    let without_trailing_comma = after_val_key
         .trim_end()
         .strip_suffix(',')
-        .unwrap_or(after_input_key)
+        .unwrap_or(after_val_key)
         .trim_end();
+
+    if is_arguments_key
+        && name == "REPL"
+        && let Some(inner_args) = without_trailing_comma
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+    {
+        let code_val = inner_args
+            .trim()
+            .strip_prefix("\"code\"")?
+            .trim_start()
+            .strip_prefix(':')?
+            .trim();
+        let code_without_comma = code_val.strip_suffix(',').unwrap_or(code_val).trim_end();
+        let raw_code = code_without_comma.strip_prefix('"')?.strip_suffix('"')?;
+        let trailing_bs = raw_code.bytes().rev().take_while(|&b| b == b'\\').count();
+        if trailing_bs % 2 != 0 {
+            return None;
+        }
+        let decoded_code = unescape_lenient_json_string(raw_code);
+        let serialized = serde_json::json!({ "code": decoded_code }).to_string();
+        return Some(ParsedToolCall {
+            name,
+            arguments: serialized,
+            is_raw_input: false,
+        });
+    }
+
     let raw_body = without_trailing_comma
         .strip_prefix('"')?
         .strip_suffix('"')?;
@@ -693,6 +726,45 @@ fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
         arguments: unescape_lenient_json_string(raw_body),
         is_raw_input: true,
     })
+}
+
+/// Salvages raw custom-tool bodies emitted directly inside `<agy_tool_call_{nonce}>` without a
+/// JSON envelope (for example when a model obeys Codex Code Mode `exec`'s upstream prompt hint
+/// `"Accepts raw JavaScript source text, not JSON"` literally, or writes a bare `*** Begin Patch`).
+fn salvage_raw_custom_tool_body(cleaned: &str) -> Option<ParsedToolCall> {
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') {
+        return None;
+    }
+    if trimmed.starts_with("*** Begin Patch") {
+        return Some(ParsedToolCall {
+            name: "apply_patch".to_owned(),
+            arguments: trimmed.to_owned(),
+            is_raw_input: true,
+        });
+    }
+    if looks_like_code_mode_js(trimmed) {
+        return Some(ParsedToolCall {
+            name: "exec".to_owned(),
+            arguments: trimmed.to_owned(),
+            is_raw_input: true,
+        });
+    }
+    None
+}
+
+fn looks_like_code_mode_js(src: &str) -> bool {
+    src.starts_with("// @exec:")
+        || src.contains("tools.")
+        || src.contains("globalThis.tools")
+        || src.contains("ALL_TOOLS")
+        || src.contains("yield_control(")
+        || ((src.contains("await ") || src.starts_with("const ") || src.starts_with("let "))
+            && (src.contains("text(")
+                || src.contains("store(")
+                || src.contains("load(")
+                || src.contains("exit(")
+                || src.contains("notify(")))
 }
 
 fn take_quoted_json_string(input: &str) -> Option<(String, &str)> {
@@ -955,6 +1027,81 @@ mod tests {
                 arguments: "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n+pub const HEADER: &str = \"x-token\";\n*** End Patch".to_owned(),
                 is_raw_input: true,
             })]
+        );
+    }
+
+    #[test]
+    fn parses_codex_code_mode_exec_envelopes_and_raw_js_fallback() {
+        // 1. Standard JSON envelope with pragma, regexes, template literals, and arrow comparisons
+        let mut p1 = IncrementalToolParser::new("9c2e", true);
+        let js_src = "// @exec: {\"yield_time_ms\": 5000}\nconst [a, b] = await Promise.all([\n  tools.exec_command({ cmd: \"rg --files crates\" }),\n  tools.exec_command({ cmd: \"git status --short\" }),\n]);\nconst lines = String(a.output ?? \"\").split(/\\r?\\n/).filter((x) => x.length <= 80);\nstore(\"files\", lines);\ntext(`found ${lines.length} files`);";
+        let env1 = format!(
+            "<agy_tool_call_9c2e>\n{}\n</agy_tool_call_9c2e>",
+            serde_json::json!({ "name": "exec", "input": js_src })
+        );
+        let mut out1 = Vec::new();
+        p1.feed(&env1, &mut out1);
+        p1.finish(&mut out1);
+        assert_eq!(
+            out1,
+            vec![ParsedStreamItem::ToolCall(ParsedToolCall {
+                name: "exec".to_owned(),
+                arguments: js_src.to_owned(),
+                is_raw_input: true,
+            })]
+        );
+
+        // 2. Salvages `exec` envelope with unescaped inner quotes + raw newlines
+        let mut p2 = IncrementalToolParser::new("9c2e", true);
+        let env2 = "<agy_tool_call_9c2e>\n{\"name\": \"exec\", \"input\": \"const r = await tools.exec_command({ cmd: \"cargo --version\" });\ntext(r.output);\"}\n</agy_tool_call_9c2e>";
+        let mut out2 = Vec::new();
+        p2.feed(env2, &mut out2);
+        p2.finish(&mut out2);
+        assert_eq!(
+            out2,
+            vec![ParsedStreamItem::ToolCall(ParsedToolCall {
+                name: "exec".to_owned(),
+                arguments: "const r = await tools.exec_command({ cmd: \"cargo --version\" });\ntext(r.output);".to_owned(),
+                is_raw_input: true,
+            })]
+        );
+
+        // 3. Salvages bare JavaScript source inside `<agy_tool_call_...>` if model took `exec`
+        //    `"Accepts raw JavaScript source text, not JSON"` literally
+        let mut p3 = IncrementalToolParser::new("9c2e", true);
+        let env3 = "<agy_tool_call_9c2e>\n// @exec: {\"yield_time_ms\": 10000}\nconst res = await tools.exec_command({ cmd: \"cargo test\" });\ntext(res.output);\n</agy_tool_call_9c2e>";
+        let mut out3 = Vec::new();
+        p3.feed(env3, &mut out3);
+        p3.finish(&mut out3);
+        assert_eq!(
+            out3,
+            vec![ParsedStreamItem::ToolCall(ParsedToolCall {
+                name: "exec".to_owned(),
+                arguments: "// @exec: {\"yield_time_ms\": 10000}\nconst res = await tools.exec_command({ cmd: \"cargo test\" });\ntext(res.output);".to_owned(),
+                is_raw_input: true,
+            })]
+        );
+    }
+
+    #[test]
+    fn salvages_claude_code_mode_repl_with_unescaped_quotes_and_bun_shell() {
+        let mut parser = IncrementalToolParser::new("abcd", true);
+        let payload = "<agy_tool_call_abcd>\n{\"name\": \"REPL\", \"arguments\": {\"code\": \"const out = await $`rg \"SessionPool\" crates/ -l`.text();\nconsole.log(out);\"}}\n</agy_tool_call_abcd>";
+        let mut items = Vec::new();
+        parser.feed(payload, &mut items);
+        parser.finish(&mut items);
+
+        assert_eq!(items.len(), 1);
+        let Some(ParsedStreamItem::ToolCall(call)) = items.first() else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.name, "REPL");
+        assert!(!call.is_raw_input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&call.arguments).expect("valid REPL JSON arguments");
+        assert_eq!(
+            parsed["code"],
+            "const out = await $`rg \"SessionPool\" crates/ -l`.text();\nconsole.log(out);"
         );
     }
 }

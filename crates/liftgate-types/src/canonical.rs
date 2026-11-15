@@ -29,7 +29,7 @@ impl ReasoningEffort {
             "minimal" | "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "xhigh" | "max" => Some(Self::XHigh),
+            "xhigh" | "max" | "ultra" | "persistent" => Some(Self::XHigh),
             _ => None,
         }
     }
@@ -257,6 +257,16 @@ fn is_auto_mode_classifier_prompt(sys: &str, user_text: &str) -> bool {
     if user_text.starts_with("## Pre-gathered recon (mechanically collected")
         || user_text.contains("Err on the side of blocking.")
         || sys.contains("Err on the side of blocking.")
+    {
+        return true;
+    }
+    // Codex Guardian v2 / Code Mode & Node REPL recursive tool-call security classifier
+    if (sys.contains("needs blocking security review")
+        || user_text.contains("needs blocking security review"))
+        && (sys.contains("Review nested calls")
+            || user_text.contains("Review nested calls")
+            || sys.contains("Predict whether the agent's")
+            || user_text.contains("Predict whether the agent's"))
     {
         return true;
     }

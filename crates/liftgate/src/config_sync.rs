@@ -5,7 +5,7 @@ use liftgate_server::platform::{canonicalize_clean, merge_loopback_no_proxy};
 use liftgate_types::{
     config::ModelId,
     model::{context_limits, resolve_model_id, select_fastest_gemini_model},
-    openai::build_codex_model_catalog,
+    openai::build_codex_model_catalog_with_tool_mode,
 };
 use serde_json::{Map, Value, json};
 
@@ -32,6 +32,7 @@ const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_AUTO_MODE_SERVER",
+    "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
     "NO_PROXY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -47,6 +48,7 @@ const MANAGED_CODEX_ROOT_KEYS: &[&str] = &[
     "approval_policy",
     "sandbox_mode",
     "web_search",
+    "suppress_unstable_features_warning",
     "model_context_window",
     "model_auto_compact_token_limit",
 ];
@@ -58,6 +60,7 @@ pub struct HarnessSyncParams {
     pub primary_model: String,
     pub fast_model: String,
     pub no_bypass: bool,
+    pub no_code_mode: bool,
     pub long_context: bool,
     pub discovered_models: Vec<DiscoveredModel>,
 }
@@ -184,6 +187,10 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         env_map.insert(
             "CLAUDE_CODE_AUTO_MODE_SERVER".to_owned(),
             Value::String("0".to_owned()),
+        );
+        env_map.insert(
+            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE".to_owned(),
+            Value::String(if params.no_code_mode { "0" } else { "1" }.to_owned()),
         );
         env_map.insert("NO_PROXY".to_owned(), Value::String(no_proxy));
         env_map.remove("HTTP_PROXY");
@@ -476,17 +483,24 @@ pub fn uninstall_claude_config(target_path: &Path) -> Result<bool, CliError> {
     Ok(true)
 }
 
-/// Builds fallback Codex model catalog bytes offline when the gateway is not queried.
-pub fn build_offline_codex_catalog_bytes(
+/// Builds fallback Codex model catalog bytes when the gateway is not queried, with an optional
+/// `tool_mode` override (`None` defaults to `"code_mode"`).
+pub fn build_offline_codex_catalog_bytes_with_mode(
     discovered: &[DiscoveredModel],
     primary_model: &str,
     long_context: bool,
+    tool_mode: Option<&str>,
 ) -> Result<Vec<u8>, CliError> {
     let available: Vec<_> = discovered
         .iter()
         .map(DiscoveredModel::to_available_model)
         .collect();
-    let mut catalog = build_codex_model_catalog(&available, primary_model, long_context);
+    let mut catalog = build_codex_model_catalog_with_tool_mode(
+        &available,
+        primary_model,
+        long_context,
+        tool_mode,
+    );
     for entry in &mut catalog.models {
         if let Some(model) = discovered.iter().find(|m| m.id == entry.slug) {
             let (window, compact) = model.context_limits(long_context);
@@ -518,9 +532,10 @@ pub fn resolve_codex_paths(
     }
 }
 
-/// Non-destructively merges Liftgate's Codex provider (`[model_providers.agy]`) and root settings
-/// into an existing `config.toml` string, keeping top-level keys before the first `[table]` header
-/// and preserving all unrelated `[mcp_servers.*]`, `[projects.*]`, and `[profiles.*]` sections.
+/// Non-destructively merges Liftgate's Codex provider (`[model_providers.agy]`), `[features]`
+/// Code Mode toggle, and root settings into an existing `config.toml` string, keeping top-level
+/// keys before the first `[table]` header and preserving all unrelated `[mcp_servers.*]`,
+/// `[projects.*]`, `[profiles.*]`, and user `[features]` keys.
 #[must_use]
 pub fn merge_codex_config_toml(
     existing: &str,
@@ -529,6 +544,7 @@ pub fn merge_codex_config_toml(
     catalog_path: &Path,
     require_env_key: bool,
     no_bypass: bool,
+    no_code_mode: bool,
 ) -> String {
     let catalog_slash = catalog_path.to_string_lossy().replace('\\', "/");
     let (root_part, tables_part) = split_toml_root_and_tables(existing);
@@ -560,9 +576,12 @@ pub fn merge_codex_config_toml(
         out.push_str("sandbox_mode = \"danger-full-access\"\n");
     }
     out.push_str("web_search = \"live\"\n");
+    if !no_code_mode {
+        out.push_str("suppress_unstable_features_warning = true\n");
+    }
 
-    let stripped_tables = remove_toml_section(tables_part, "model_providers.agy");
-    let trimmed_tables = stripped_tables.trim();
+    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode);
+    let trimmed_tables = merged_tables.trim();
     if !trimmed_tables.is_empty() {
         out.push('\n');
         out.push_str(trimmed_tables);
@@ -580,7 +599,8 @@ pub fn merge_codex_config_toml(
     out
 }
 
-/// Strips Liftgate's `[model_providers.agy]` section and managed root keys from `config.toml`.
+/// Strips Liftgate's `[model_providers.agy]` section, managed `[features]` `code_mode` key, and
+/// managed root keys from `config.toml`.
 #[must_use]
 pub fn strip_codex_config_toml(existing: &str) -> String {
     let (root_part, tables_part) = split_toml_root_and_tables(existing);
@@ -597,7 +617,7 @@ pub fn strip_codex_config_toml(existing: &str) -> String {
         kept_root.pop();
     }
 
-    let stripped_tables = remove_toml_section(tables_part, "model_providers.agy");
+    let stripped_tables = rewrite_codex_tables(tables_part, false);
     let trimmed_tables = stripped_tables.trim();
 
     let mut out = String::new();
@@ -623,6 +643,7 @@ pub struct CodexSyncRequest<'a> {
     pub primary_model: &'a str,
     pub require_env_key: bool,
     pub no_bypass: bool,
+    pub no_code_mode: bool,
     pub print_only: bool,
 }
 
@@ -644,6 +665,7 @@ pub fn write_or_update_codex_config(req: &CodexSyncRequest<'_>) -> Result<String
         req.catalog_path,
         req.require_env_key,
         req.no_bypass,
+        req.no_code_mode,
     );
     if !req.print_only {
         write_file_atomic(req.catalog_path, req.catalog_bytes, false)?;
@@ -797,6 +819,7 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
             primary_model: primary_model.clone(),
             fast_model: fast_model.clone(),
             no_bypass: args.no_bypass,
+            no_code_mode: args.no_code_mode,
             long_context,
             discovered_models: discovered_models.clone(),
         };
@@ -816,17 +839,32 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
 
     if want_codex {
         let (codex_cfg, codex_cat) = resolve_codex_paths(args.global, args.dir.as_deref())?;
+        let requested_tool_mode = if args.no_code_mode {
+            Some("direct")
+        } else {
+            Some("code_mode")
+        };
         let catalog_bytes = if let Some(t) = &live_target {
-            match t.client.fetch_codex_catalog_json(&primary_model).await {
+            match t
+                .client
+                .fetch_codex_catalog_json_with_mode(&primary_model, requested_tool_mode)
+                .await
+            {
                 Ok(bytes) => bytes,
-                Err(_) => build_offline_codex_catalog_bytes(
+                Err(_) => build_offline_codex_catalog_bytes_with_mode(
                     &discovered_models,
                     &primary_model,
                     long_context,
+                    requested_tool_mode,
                 )?,
             }
         } else {
-            build_offline_codex_catalog_bytes(&discovered_models, &primary_model, long_context)?
+            build_offline_codex_catalog_bytes_with_mode(
+                &discovered_models,
+                &primary_model,
+                long_context,
+                requested_tool_mode,
+            )?
         };
 
         let rendered = write_or_update_codex_config(&CodexSyncRequest {
@@ -837,6 +875,7 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
             primary_model: &primary_model,
             require_env_key,
             no_bypass: args.no_bypass,
+            no_code_mode: args.no_code_mode,
             print_only: args.print,
         })?;
         if args.print {
@@ -965,18 +1004,70 @@ fn parse_toml_assignment_key(line: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
-fn remove_toml_section(tables_part: &str, target_section: &str) -> String {
-    let mut out = String::with_capacity(tables_part.len());
-    let mut skipping = false;
+fn rewrite_codex_tables(tables_part: &str, enable_code_mode: bool) -> String {
+    let mut sections: Vec<(String, String, Vec<&str>)> = Vec::new();
     for line in tables_part.split_inclusive('\n') {
         if let Some(sec_name) = is_toml_section_header(line) {
-            skipping = sec_name == target_section;
-        }
-        if !skipping {
-            out.push_str(line);
+            sections.push((sec_name.to_owned(), line.trim_end().to_owned(), Vec::new()));
+        } else if let Some((_, _, body)) = sections.last_mut() {
+            body.push(line);
         }
     }
-    out
+
+    let mut rendered_sections: Vec<String> = Vec::new();
+    let mut saw_features = false;
+
+    for (sec_name, header, body) in sections {
+        if sec_name == "model_providers.agy" {
+            continue;
+        }
+        if sec_name == "features" {
+            saw_features = true;
+            let mut kept: Vec<&str> = body
+                .into_iter()
+                .filter(|l| parse_toml_assignment_key(l) != Some("code_mode"))
+                .collect();
+            while kept.last().is_some_and(|l| l.trim().is_empty()) {
+                kept.pop();
+            }
+            if enable_code_mode {
+                let mut block = String::new();
+                block.push_str(&header);
+                block.push('\n');
+                block.push_str("code_mode = true");
+                if !kept.is_empty() {
+                    block.push('\n');
+                    for l in kept {
+                        block.push_str(l);
+                    }
+                }
+                rendered_sections.push(block.trim_end().to_owned());
+            } else if kept.iter().any(|l| !l.trim().is_empty()) {
+                let mut block = String::new();
+                block.push_str(&header);
+                block.push('\n');
+                for l in kept {
+                    block.push_str(l);
+                }
+                rendered_sections.push(block.trim_end().to_owned());
+            }
+            continue;
+        }
+
+        let mut block = String::new();
+        block.push_str(&header);
+        block.push('\n');
+        for l in body {
+            block.push_str(l);
+        }
+        rendered_sections.push(block.trim_end().to_owned());
+    }
+
+    if enable_code_mode && !saw_features {
+        rendered_sections.push("[features]\ncode_mode = true".to_owned());
+    }
+
+    rendered_sections.join("\n\n")
 }
 
 #[cfg(test)]
@@ -1005,6 +1096,7 @@ mod tests {
             primary_model: "gemini-4-carbon-high".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: false,
+            no_code_mode: false,
             long_context: false,
             discovered_models: vec![DiscoveredModel {
                 id: "gemini-4-carbon-high".to_owned(),
@@ -1021,6 +1113,7 @@ mod tests {
             existing["env"]["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:8787"
         );
+        assert_eq!(existing["env"]["CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"], "1");
         assert_eq!(existing["model"], "gemini-4-carbon-high");
         assert_eq!(existing["skipDangerousModePermissionPrompt"], true);
         assert!(
@@ -1043,14 +1136,21 @@ mod tests {
 
         let mut standard_perms = params.clone();
         standard_perms.no_bypass = true;
+        standard_perms.no_code_mode = true;
         merged_claude_settings_into(&mut existing, &standard_perms);
         assert!(existing.get("skipDangerousModePermissionPrompt").is_none());
         assert!(existing.get("permissions").is_none());
+        assert_eq!(existing["env"]["CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"], "0");
 
         strip_claude_settings(&mut existing);
         assert_eq!(existing["alwaysThinkingEnabled"], true);
         assert_eq!(existing["env"]["CUSTOM_USER_VAR"], "keep-me");
         assert!(existing["env"].get("ANTHROPIC_BASE_URL").is_none());
+        assert!(
+            existing["env"]
+                .get("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE")
+                .is_none()
+        );
         assert!(existing.get("modelOverrides").is_none());
         assert_eq!(
             existing["modelSettings"]["gemini-4-carbon-high"]["effortLevel"],
@@ -1076,6 +1176,7 @@ mod tests {
             primary_model: "gemini-4-carbon-high".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
+            no_code_mode: false,
             long_context: false,
             discovered_models: Vec::new(),
         };
@@ -1119,6 +1220,7 @@ mod tests {
             primary_model: "gemini-4-carbon-high".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
+            no_code_mode: false,
             long_context: false,
             discovered_models: models,
         };
@@ -1142,10 +1244,11 @@ mod tests {
             110000
         );
         let catalog: Value = serde_json::from_slice(
-            &build_offline_codex_catalog_bytes(
+            &build_offline_codex_catalog_bytes_with_mode(
                 &params.discovered_models,
                 &params.primary_model,
                 false,
+                None,
             )
             .unwrap(),
         )
@@ -1157,6 +1260,7 @@ mod tests {
             .unwrap();
         assert_eq!(gemini["context_window"], 1000000);
         assert_eq!(gemini["auto_compact_token_limit"], 850000);
+        assert_eq!(gemini["tool_mode"], "code_mode");
         let legacy: DiscoveredModel = serde_json::from_value(json!({
             "id": "gemini-4-carbon-high", "context_window": 1000000
         }))
@@ -1176,6 +1280,7 @@ mod tests {
             primary_model: "gemini-4-carbon".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
+            no_code_mode: false,
             long_context: infer_live_long_context(&alias_models, None),
             discovered_models: alias_models,
         };
@@ -1192,7 +1297,7 @@ mod tests {
 
     #[test]
     fn codex_toml_merge_is_idempotent_keeps_root_before_tables_and_uninstalls_cleanly() {
-        let original = "# User header\ncustom_flag = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n\n[projects.\"D:\\\\repo\"]\ntrust_level = \"trusted\"\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
+        let original = "# User header\ncustom_flag = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n\n[projects.\"D:\\\\repo\"]\ntrust_level = \"trusted\"\n\n[features]\nfast_mode = true\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
         let catalog = Path::new(r"C:\Users\alice\.codex\agy-models.json");
 
         let merged_once = merge_codex_config_toml(
@@ -1202,6 +1307,7 @@ mod tests {
             catalog,
             true,
             false,
+            false,
         );
         let merged_twice = merge_codex_config_toml(
             &merged_once,
@@ -1209,6 +1315,7 @@ mod tests {
             "gemini-4-carbon-high",
             catalog,
             true,
+            false,
             false,
         );
         assert_eq!(merged_once, merged_twice);
@@ -1219,6 +1326,9 @@ mod tests {
             .find("model = \"gemini-4-carbon-high\"")
             .unwrap();
         assert!(model_pos < first_table_pos);
+        assert!(merged_twice.contains("suppress_unstable_features_warning = true"));
+        assert!(merged_twice.contains("code_mode = true"));
+        assert!(merged_twice.contains("fast_mode = true"));
         assert!(merged_twice.contains("C:/Users/alice/.codex/agy-models.json"));
         assert!(merged_twice.contains("[mcp_servers.demo]"));
         assert!(merged_twice.contains("custom_flag = true"));
@@ -1228,6 +1338,9 @@ mod tests {
         let stripped = strip_codex_config_toml(&merged_twice);
         assert!(!stripped.contains("[model_providers.agy]"));
         assert!(!stripped.contains("model_provider"));
+        assert!(!stripped.contains("suppress_unstable_features_warning"));
+        assert!(!stripped.contains("code_mode"));
+        assert!(stripped.contains("fast_mode = true"));
         assert!(stripped.contains("custom_flag = true"));
         assert!(stripped.contains("[mcp_servers.demo]"));
     }
