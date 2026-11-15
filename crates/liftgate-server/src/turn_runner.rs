@@ -68,6 +68,15 @@ pub enum TurnEvent {
         outcome: WebFetchOutcome,
     },
     TextDelta(String),
+    ClientToolCallStart {
+        call_id: String,
+        name: String,
+        is_custom: bool,
+    },
+    ClientToolCallDelta {
+        call_id: String,
+        delta: String,
+    },
     ClientToolCall {
         call_id: String,
         name: String,
@@ -475,6 +484,13 @@ const TRANSCRIPT_RUNAWAY_MARKERS: [&str; 8] = [
 
 const MAX_POST_TOOL_BRIDGE_NON_WS_CHARS: usize = 120;
 
+struct StreamingClientToolState {
+    name: String,
+    call_id: String,
+    is_custom: bool,
+    emitted_start: bool,
+}
+
 /// Mutable per-turn stream accumulator shared across `forward_acp_update` and multi-step `web_fetch`.
 struct TurnStreamState {
     parsed_buf: Vec<ParsedStreamItem>,
@@ -485,6 +501,8 @@ struct TurnStreamState {
     seen_search_ids: HashSet<String>,
     seen_client_tools: HashSet<(String, String)>,
     pending_web_fetches: Vec<(String, String)>,
+    active_streaming_tool: Option<StreamingClientToolState>,
+    truncated_tool_abort: Option<String>,
     emitted_client_tool: bool,
     halted_post_tool_runaway: bool,
     tainted_session: bool,
@@ -504,6 +522,8 @@ impl TurnStreamState {
             seen_search_ids: HashSet::new(),
             seen_client_tools: HashSet::new(),
             pending_web_fetches: Vec::new(),
+            active_streaming_tool: None,
+            truncated_tool_abort: None,
             emitted_client_tool: false,
             halted_post_tool_runaway: false,
             tainted_session: false,
@@ -659,6 +679,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
         last_step_started_ms = unix_timestamp_ms();
         state.halted_post_tool_runaway = false;
         state.post_tool_spill_buf.clear();
+        state.active_streaming_tool = None;
+        state.truncated_tool_abort = None;
 
         let (acp_tx, mut acp_rx) = mpsc::channel::<SessionUpdatePayload>(channel_cap);
         let mut parser = IncrementalToolParser::new(&active_tool_nonce, has_xml_tools);
@@ -700,11 +722,15 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         ).await {
                             return;
                         }
-                        if banner_filter.take_malformed_retry()
+                        if state.truncated_tool_abort.is_some() {
+                            break;
+                        }
+                        if (banner_filter.take_malformed_retry()
+                            || banner_filter.take_transient_retry())
                             && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
                         {
                             tracing::info!(
-                                "short-circuiting internal ACP malformed-call retry because XML tool call was already captured"
+                                "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
                             );
                             state.halted_post_tool_runaway = true;
                         }
@@ -790,11 +816,14 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 {
                     return;
                 }
-                if banner_filter.take_malformed_retry()
+                if state.truncated_tool_abort.is_some() {
+                    break;
+                }
+                if (banner_filter.take_malformed_retry() || banner_filter.take_transient_retry())
                     && (state.emitted_client_tool || !state.pending_web_fetches.is_empty())
                 {
                     tracing::info!(
-                        "short-circuiting internal ACP malformed-call retry because XML tool call was already captured"
+                        "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
                     );
                     state.halted_post_tool_runaway = true;
                 }
@@ -852,6 +881,21 @@ async fn run_turn_pipeline<B: AcpBackend>(
             return;
         }
 
+        if let Some(aborted_tool) = state.truncated_tool_abort.take() {
+            if let Some(old_lease) = lease.take() {
+                old_lease.finish_ephemeral();
+            }
+            let err = AcpError::UpstreamAgentTerminated {
+                detail: format!(
+                    "upstream stream truncated or corrupted in-progress `{aborted_tool}` tool call before closing tag"
+                ),
+            };
+            tracing::error!(error = ?err, "aborting turn immediately due to corrupted in-progress XML tool call");
+            task_guard.fail(err.to_string());
+            let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+            return;
+        }
+
         match prompt_outcome {
             Some(Ok(turn_res)) => {
                 last_turn_error = turn_res
@@ -861,7 +905,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     .filter(|s| !s.is_empty() && s != "null" && s != "{}");
 
                 if !state.halted_post_tool_runaway {
-                    if !filter_out.is_empty() {
+                    if !filter_out.is_empty() && state.truncated_tool_abort.is_none() {
                         state.parsed_buf.clear();
                         parser.feed(&filter_out, &mut state.parsed_buf);
                         if !emit_parsed_items(&req, &task_guard, &mut state, &events_tx, &cancel)
@@ -871,12 +915,30 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         }
                     }
 
-                    state.parsed_buf.clear();
-                    parser.finish(&mut state.parsed_buf);
-                    if !emit_parsed_items(&req, &task_guard, &mut state, &events_tx, &cancel).await
-                    {
-                        return;
+                    if state.truncated_tool_abort.is_none() {
+                        state.parsed_buf.clear();
+                        parser.finish(&mut state.parsed_buf);
+                        if !emit_parsed_items(&req, &task_guard, &mut state, &events_tx, &cancel)
+                            .await
+                        {
+                            return;
+                        }
                     }
+                }
+
+                if let Some(aborted_tool) = state.truncated_tool_abort.take() {
+                    if let Some(old_lease) = lease.take() {
+                        old_lease.finish_ephemeral();
+                    }
+                    let err = AcpError::UpstreamAgentTerminated {
+                        detail: format!(
+                            "upstream stream truncated or corrupted in-progress `{aborted_tool}` tool call before closing tag"
+                        ),
+                    };
+                    tracing::error!(error = ?err, "aborting turn due to truncated in-progress XML tool call");
+                    task_guard.fail(err.to_string());
+                    let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+                    return;
                 }
 
                 accumulate_usage(&mut cumulative_usage, turn_res.usage);
@@ -1322,8 +1384,15 @@ async fn forward_acp_update(
     match upd {
         SessionUpdatePayload::AgentThoughtChunk { content } => {
             if !content.text.is_empty() {
+                if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                    tracing::info!(
+                        "short-circuiting post-tool internal ACP reasoning sub-step because XML tool call was already captured"
+                    );
+                    state.halted_post_tool_runaway = true;
+                    return true;
+                }
                 task_guard.record_thought(content.text.chars().count());
-                if req.include_thinking && !req.omit_thinking_text && !state.emitted_client_tool {
+                if req.include_thinking && !req.omit_thinking_text {
                     return send_cancel_safe(
                         events_tx,
                         TurnEvent::ThoughtDelta(content.text),
@@ -1343,6 +1412,15 @@ async fn forward_acp_update(
             args,
             raw_input,
         } => {
+            if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                tracing::info!(
+                    acp_tool = %name,
+                    acp_kind = %kind,
+                    "short-circuiting post-tool native ACP tool call because XML tool call was already captured"
+                );
+                state.halted_post_tool_runaway = true;
+                return true;
+            }
             if is_acp_web_search(&kind, &name, &title) {
                 if state.seen_search_ids.insert(tool_call_id.clone()) {
                     task_guard.record_web_search();
@@ -1601,6 +1679,8 @@ async fn emit_parsed_items_inner(
                         .filter(|c| !c.is_whitespace())
                         .count();
                     if contains_runaway_marker(&state.post_tool_spill_buf)
+                        || is_malformed_function_call_banner(&state.post_tool_spill_buf)
+                        || classify_upstream_error_text(&state.post_tool_spill_buf).is_some()
                         || non_ws_chars > MAX_POST_TOOL_BRIDGE_NON_WS_CHARS
                     {
                         tracing::warn!(
@@ -1644,11 +1724,88 @@ async fn emit_parsed_items_inner(
                     return false;
                 }
             }
+            ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                state.post_tool_spill_buf.clear();
+
+                if name == INTERNAL_GATEWAY_WEB_FETCH_TOOL && req.enable_native_web_fetch {
+                    state.active_streaming_tool = Some(StreamingClientToolState {
+                        name,
+                        call_id: String::new(),
+                        is_custom: false,
+                        emitted_start: false,
+                    });
+                    continue;
+                }
+
+                let already_seen_name = state
+                    .seen_client_tools
+                    .iter()
+                    .any(|(seen_name, _)| seen_name == &name);
+                if already_seen_name {
+                    state.active_streaming_tool = Some(StreamingClientToolState {
+                        name,
+                        call_id: String::new(),
+                        is_custom: false,
+                        emitted_start: false,
+                    });
+                    continue;
+                }
+
+                state.flush_text_part();
+                let matched_spec = req.client_tools.iter().find(|t| t.name == name);
+                let is_custom = match matched_spec {
+                    Some(spec) => matches!(spec.kind, CanonicalToolKind::Custom { .. }),
+                    None => is_raw_input,
+                };
+                task_guard.record_client_tool(&name);
+                let call_id = format!("call_{}", generate_short_nonce());
+                state.active_streaming_tool = Some(StreamingClientToolState {
+                    name: name.clone(),
+                    call_id: call_id.clone(),
+                    is_custom,
+                    emitted_start: true,
+                });
+                if !send_cancel_safe(
+                    events_tx,
+                    TurnEvent::ClientToolCallStart {
+                        call_id,
+                        name,
+                        is_custom,
+                    },
+                    cancel,
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            ParsedStreamItem::ToolCallDelta(delta) => {
+                if let Some(active) = state.active_streaming_tool.as_ref()
+                    && active.emitted_start
+                    && active.is_custom
+                    && !delta.is_empty()
+                {
+                    task_guard.record_tool_delta(delta.chars().count());
+                    if !send_cancel_safe(
+                        events_tx,
+                        TurnEvent::ClientToolCallDelta {
+                            call_id: active.call_id.clone(),
+                            delta,
+                        },
+                        cancel,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
+            }
             ParsedStreamItem::ToolCall(ParsedToolCall {
                 name,
                 arguments,
                 is_raw_input,
             }) => {
+                let active_stream = state.active_streaming_tool.take();
                 // Valid parallel tool call arrived before any runaway marker -> clear bridge spill
                 state.post_tool_spill_buf.clear();
 
@@ -1676,11 +1833,18 @@ async fn emit_parsed_items_inner(
                 state.flush_text_part();
                 state.emitted_client_tool = true;
 
-                task_guard.record_client_tool(&name);
                 let matched_spec = req.client_tools.iter().find(|t| t.name == name);
-                let is_custom = match matched_spec {
-                    Some(spec) => matches!(spec.kind, CanonicalToolKind::Custom { .. }),
-                    None => is_raw_input,
+                let (call_id, is_custom) = if let Some(active) =
+                    active_stream.filter(|a| a.emitted_start && a.name == name)
+                {
+                    (active.call_id, active.is_custom)
+                } else {
+                    task_guard.record_client_tool(&name);
+                    let is_custom = match matched_spec {
+                        Some(spec) => matches!(spec.kind, CanonicalToolKind::Custom { .. }),
+                        None => is_raw_input,
+                    };
+                    (format!("call_{}", generate_short_nonce()), is_custom)
                 };
                 let arguments = normalize_emitted_tool_arguments(
                     arguments,
@@ -1688,7 +1852,6 @@ async fn emit_parsed_items_inner(
                     is_raw_input,
                     matched_spec,
                 );
-                let call_id = format!("call_{}", generate_short_nonce());
                 state.assistant_parts.push(CanonicalPart::ToolCall {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -1709,6 +1872,11 @@ async fn emit_parsed_items_inner(
                 {
                     return false;
                 }
+            }
+            ParsedStreamItem::ToolCallAborted { name } => {
+                state.active_streaming_tool = None;
+                state.truncated_tool_abort = Some(name);
+                break;
             }
         }
     }
@@ -1995,7 +2163,9 @@ pub struct AcpBannerFilter {
     suppressing_line: bool,
     has_emitted_non_ws: bool,
     saw_malformed_function_call_retry: bool,
+    saw_transient_retry_banner: bool,
     hold_buf: String,
+    midline_probe_buf: String,
     dropped_line_buf: String,
     signal: Option<(UpstreamBannerSignal, String)>,
     suppressed_banners: Vec<String>,
@@ -2006,6 +2176,14 @@ const ACP_BANNER_LINE_PREFIXES: [&str; 4] = [
     "Your previous response contained an improperly formatted function call",
     "Please retry with a properly formatted function call",
     "Retries remaining:",
+];
+
+const MIDLINE_ACP_BANNER_PREFIXES: [&str; 5] = [
+    "⚠ Your previous response",
+    "⚠ API error",
+    "⚠ Individual quota",
+    "⚠ Agent execution terminated",
+    "⚠ Quota",
 ];
 
 const LEADING_STRAY_WRAPPER_LINES: [&str; 9] = [
@@ -2028,7 +2206,9 @@ impl AcpBannerFilter {
             suppressing_line: false,
             has_emitted_non_ws: false,
             saw_malformed_function_call_retry: false,
+            saw_transient_retry_banner: false,
             hold_buf: String::new(),
+            midline_probe_buf: String::new(),
             dropped_line_buf: String::new(),
             signal: None,
             suppressed_banners: Vec::new(),
@@ -2041,6 +2221,10 @@ impl AcpBannerFilter {
 
     pub fn take_malformed_retry(&mut self) -> bool {
         std::mem::replace(&mut self.saw_malformed_function_call_retry, false)
+    }
+
+    pub fn take_transient_retry(&mut self) -> bool {
+        std::mem::replace(&mut self.saw_transient_retry_banner, false)
     }
 
     pub fn take_suppressed_banners(&mut self) -> Vec<String> {
@@ -2117,6 +2301,7 @@ impl AcpBannerFilter {
             return;
         }
 
+        self.saw_transient_retry_banner = true;
         tracing::warn!(
             banner = %dropped,
             "filtered internal `agy acp` retry/diagnostic banner from assistant stream"
@@ -2212,6 +2397,40 @@ impl AcpBannerFilter {
                 continue;
             }
 
+            if !self.midline_probe_buf.is_empty() || ch == '⚠' {
+                self.midline_probe_buf.push(ch);
+                if MIDLINE_ACP_BANNER_PREFIXES
+                    .iter()
+                    .any(|pat| self.midline_probe_buf.starts_with(pat))
+                {
+                    if ch == '\n' {
+                        let line = std::mem::take(&mut self.midline_probe_buf);
+                        self.record_dropped_banner(&line);
+                        self.at_line_start = true;
+                    } else {
+                        self.dropped_line_buf.clear();
+                        self.dropped_line_buf.push_str(&self.midline_probe_buf);
+                        self.midline_probe_buf.clear();
+                        self.suppressing_line = true;
+                    }
+                    continue;
+                }
+                let still_could_match_midline = ch != '\n'
+                    && MIDLINE_ACP_BANNER_PREFIXES
+                        .iter()
+                        .any(|pat| pat.starts_with(&self.midline_probe_buf));
+                if still_could_match_midline {
+                    continue;
+                }
+                self.has_emitted_non_ws = true;
+                out.push_str(&self.midline_probe_buf);
+                self.midline_probe_buf.clear();
+                if ch == '\n' {
+                    self.at_line_start = true;
+                }
+                continue;
+            }
+
             if !ch.is_whitespace() {
                 self.has_emitted_non_ws = true;
             }
@@ -2235,6 +2454,12 @@ impl AcpBannerFilter {
             {
                 self.saw_malformed_function_call_retry = true;
             }
+            if !self.saw_transient_retry_banner
+                && (self.dropped_line_buf.contains("API error")
+                    || self.dropped_line_buf.contains("retrying in"))
+            {
+                self.saw_transient_retry_banner = true;
+            }
         }
     }
 
@@ -2243,6 +2468,19 @@ impl AcpBannerFilter {
             let line = std::mem::take(&mut self.dropped_line_buf);
             self.record_dropped_banner(&line);
             self.suppressing_line = false;
+        }
+        if !self.midline_probe_buf.is_empty() {
+            let is_midline_banner = MIDLINE_ACP_BANNER_PREFIXES
+                .iter()
+                .any(|pat| self.midline_probe_buf.starts_with(pat));
+            if is_midline_banner {
+                let line = std::mem::take(&mut self.midline_probe_buf);
+                self.record_dropped_banner(&line);
+            } else {
+                self.has_emitted_non_ws = true;
+                out.push_str(&self.midline_probe_buf);
+                self.midline_probe_buf.clear();
+            }
         }
         if !self.hold_buf.is_empty() {
             let trimmed = self.hold_buf.trim();
@@ -2354,5 +2592,60 @@ mod tests {
             reconcile_turn_context_usage(summed_six_subcalls, &state_no_upd, 97_971, 30_000);
         assert!(rec_fallback.total_tokens < 200_000);
         assert!(rec_fallback.total_tokens >= 97_971);
+    }
+
+    #[test]
+    fn banner_filter_detects_midline_banners_without_newline_and_preserves_warning_prose() {
+        // 1. Mid-line `⚠ Your previous response...` immediately after `</agy_tool_call_abcd>` (no `\n`)
+        let mut f1 = AcpBannerFilter::new();
+        let mut out1 = String::new();
+        f1.feed(
+            "<agy_tool_call_abcd>{\"name\":\"Read\"}</agy_tool_call_abcd>⚠ Your previous",
+            &mut out1,
+        );
+        f1.feed(
+            " response contained an improperly formatted function call",
+            &mut out1,
+        );
+        assert_eq!(
+            out1,
+            "<agy_tool_call_abcd>{\"name\":\"Read\"}</agy_tool_call_abcd>"
+        );
+        assert!(f1.take_malformed_retry());
+
+        // 2. Mid-line transient 503 retry banner without trailing `\n`
+        let mut f2 = AcpBannerFilter::new();
+        let mut out2 = String::new();
+        f2.feed(
+            "</agy_tool_call_abcd>⚠ API error (attempt 1): transient 503 — retrying in 1s...",
+            &mut out2,
+        );
+        assert_eq!(out2, "</agy_tool_call_abcd>");
+        assert!(f2.take_transient_retry());
+        assert_eq!(f2.take_signal(), None);
+
+        // 3. Mid-line 429 rate-limit banner surfaces `RateLimited` signal immediately
+        let mut f3 = AcpBannerFilter::new();
+        let mut out3 = String::new();
+        f3.feed(
+            "</agy_tool_call_abcd>⚠ API error (attempt 1/8): RESOURCE_EXHAUSTED (code 429)",
+            &mut out3,
+        );
+        assert_eq!(out3, "</agy_tool_call_abcd>");
+        assert!(matches!(
+            f3.take_signal(),
+            Some((UpstreamBannerSignal::RateLimited, _))
+        ));
+
+        // 4. Legitimate mid-line `⚠` prose is preserved intact
+        let mut f4 = AcpBannerFilter::new();
+        let mut out4 = String::new();
+        f4.feed("Note: ⚠ check", &mut out4);
+        f4.feed(" config before deploying.\n", &mut out4);
+        f4.finish(&mut out4);
+        assert_eq!(out4, "Note: ⚠ check config before deploying.\n");
+        assert!(!f4.take_malformed_retry());
+        assert!(!f4.take_transient_retry());
+        assert_eq!(f4.take_signal(), None);
     }
 }

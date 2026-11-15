@@ -18,7 +18,23 @@ pub struct ParsedToolCall {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedStreamItem {
     TextDelta(String),
+    /// Emitted once inside `<agy_tool_call_{nonce}>` as soon as a valid tool header is recognized,
+    /// before the closing `</agy_tool_call_{nonce}>` arrives.
+    ToolCallStart {
+        name: String,
+        /// `true` when the header commits to raw/freeform string input (`"input": "` or bare
+        /// `*** Begin Patch` / `// @exec:`), enabling live `ToolCallDelta` chunks.
+        is_raw_input: bool,
+    },
+    /// Incremental decoded raw-input slice for an active `is_raw_input == true` tool call.
+    /// Concatenating all `ToolCallDelta` chunks for a call equals the final `ParsedToolCall.arguments`.
+    ToolCallDelta(String),
     ToolCall(ParsedToolCall),
+    /// Emitted if an already-started tool call (`ToolCallStart`) is truncated or corrupted before
+    /// a valid tool payload completes.
+    ToolCallAborted {
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +43,51 @@ enum ParserMode {
     /// Saw `<agy_tool_call_{nonce}` without its closing `>` yet (e.g. optional XML attributes).
     InOpenTagHeader,
     InTag,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum InTagProgress {
+    #[default]
+    ProbingHeader,
+    WaitUntilClose,
+    StartedBuffered {
+        name: String,
+    },
+    StreamingQuotedInput {
+        name: String,
+        raw_cursor: usize,
+        emitted_decoded_bytes: usize,
+    },
+    StreamingBareBody {
+        name: String,
+        raw_cursor: usize,
+        emitted_decoded_bytes: usize,
+    },
+}
+
+impl InTagProgress {
+    fn started_name(&self) -> Option<&str> {
+        match self {
+            Self::ProbingHeader | Self::WaitUntilClose => None,
+            Self::StartedBuffered { name }
+            | Self::StreamingQuotedInput { name, .. }
+            | Self::StreamingBareBody { name, .. } => Some(name.as_str()),
+        }
+    }
+
+    fn emitted_decoded_bytes(&self) -> Option<usize> {
+        match self {
+            Self::StreamingQuotedInput {
+                emitted_decoded_bytes,
+                ..
+            }
+            | Self::StreamingBareBody {
+                emitted_decoded_bytes,
+                ..
+            } => Some(*emitted_decoded_bytes),
+            Self::ProbingHeader | Self::WaitUntilClose | Self::StartedBuffered { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +105,7 @@ pub struct IncrementalToolParser {
     close_tag: String,
     enabled: bool,
     mode: ParserMode,
+    in_tag_progress: InTagProgress,
     buffer: String,
     /// Tracks whether an odd number of single-backtick spans is currently open on the active line.
     line_single_backtick_open: bool,
@@ -63,6 +125,7 @@ impl IncrementalToolParser {
             close_tag: format!("</agy_tool_call_{nonce}>"),
             enabled,
             mode: ParserMode::Text,
+            in_tag_progress: InTagProgress::ProbingHeader,
             buffer: String::new(),
             line_single_backtick_open: false,
             pending_open_wrapper: String::new(),
@@ -129,8 +192,19 @@ impl IncrementalToolParser {
             }
             ParserMode::InTag => {
                 self.mode = ParserMode::Text;
+                let progress = mem::take(&mut self.in_tag_progress);
                 if let Some(call) = parse_tool_call_body(&leftover) {
+                    if let Some(streamed_bytes) = progress.emitted_decoded_bytes()
+                        && let Some(rem) = call.arguments.get(streamed_bytes..)
+                        && !rem.is_empty()
+                    {
+                        out.push(ParsedStreamItem::ToolCallDelta(rem.to_owned()));
+                    }
                     out.push(ParsedStreamItem::ToolCall(call));
+                } else if let Some(started_name) = progress.started_name() {
+                    out.push(ParsedStreamItem::ToolCallAborted {
+                        name: started_name.to_owned(),
+                    });
                 } else {
                     let mut raw = String::with_capacity(
                         pending_wrapper.len() + self.open_tag.len() + leftover.len(),
@@ -272,6 +346,7 @@ impl IncrementalToolParser {
                             self.buffer.clear();
                             self.buffer.push_str(&owned_rem);
                             self.mode = ParserMode::InTag;
+                            self.in_tag_progress = InTagProgress::ProbingHeader;
                         } else if next_ch.is_ascii_whitespace() {
                             let before_owned = before.to_owned();
                             let owned_after = after_prefix.to_owned();
@@ -327,6 +402,7 @@ impl IncrementalToolParser {
                         self.buffer.clear();
                         self.buffer.push_str(&owned_rem);
                         self.mode = ParserMode::InTag;
+                        self.in_tag_progress = InTagProgress::ProbingHeader;
                     } else if self.buffer.len() > 256 {
                         // Malformed header without `>` — flush as literal text
                         let leftover = mem::take(&mut self.buffer);
@@ -359,11 +435,22 @@ impl IncrementalToolParser {
                         self.buffer.clear();
                         self.buffer.push_str(&owned_rem);
                         self.mode = ParserMode::Text;
+                        let progress = mem::take(&mut self.in_tag_progress);
 
                         let pending_wrapper = mem::take(&mut self.pending_open_wrapper);
                         if let Some(call) = parse_tool_call_body(&body_owned) {
                             self.strip_closing_wrapper = classify_closing_wrapper(&pending_wrapper);
+                            if let Some(streamed_bytes) = progress.emitted_decoded_bytes()
+                                && let Some(rem) = call.arguments.get(streamed_bytes..)
+                                && !rem.is_empty()
+                            {
+                                out.push(ParsedStreamItem::ToolCallDelta(rem.to_owned()));
+                            }
                             out.push(ParsedStreamItem::ToolCall(call));
+                        } else if let Some(started_name) = progress.started_name() {
+                            out.push(ParsedStreamItem::ToolCallAborted {
+                                name: started_name.to_owned(),
+                            });
                         } else {
                             let mut raw = String::with_capacity(
                                 pending_wrapper.len()
@@ -378,12 +465,413 @@ impl IncrementalToolParser {
                             self.emit_text_delta(raw, out);
                         }
                     } else {
+                        self.advance_in_tag_streaming(out);
                         break;
                     }
                 }
             }
         }
     }
+
+    fn advance_in_tag_streaming(&mut self, out: &mut Vec<ParsedStreamItem>) {
+        if self.in_tag_progress == InTagProgress::ProbingHeader {
+            match probe_in_tag_header(&self.buffer) {
+                HeaderProbe::NeedMoreBytes => return,
+                HeaderProbe::WaitUntilClose => {
+                    self.in_tag_progress = InTagProgress::WaitUntilClose;
+                    return;
+                }
+                HeaderProbe::StartBuffered { name } => {
+                    out.push(ParsedStreamItem::ToolCallStart {
+                        name: name.clone(),
+                        is_raw_input: false,
+                    });
+                    self.in_tag_progress = InTagProgress::StartedBuffered { name };
+                    return;
+                }
+                HeaderProbe::StartStreamingQuotedInput { name, raw_cursor } => {
+                    out.push(ParsedStreamItem::ToolCallStart {
+                        name: name.clone(),
+                        is_raw_input: true,
+                    });
+                    self.in_tag_progress = InTagProgress::StreamingQuotedInput {
+                        name,
+                        raw_cursor,
+                        emitted_decoded_bytes: 0,
+                    };
+                }
+                HeaderProbe::StartStreamingBareBody { name, raw_cursor } => {
+                    out.push(ParsedStreamItem::ToolCallStart {
+                        name: name.clone(),
+                        is_raw_input: true,
+                    });
+                    self.in_tag_progress = InTagProgress::StreamingBareBody {
+                        name,
+                        raw_cursor,
+                        emitted_decoded_bytes: 0,
+                    };
+                }
+            }
+        }
+
+        let close_hold = longest_tag_prefix_at_end(&self.buffer, &self.close_tag);
+        let inspect_end = self.buffer.len().saturating_sub(close_hold);
+
+        match &mut self.in_tag_progress {
+            InTagProgress::ProbingHeader
+            | InTagProgress::WaitUntilClose
+            | InTagProgress::StartedBuffered { .. } => {}
+            InTagProgress::StreamingQuotedInput {
+                raw_cursor,
+                emitted_decoded_bytes,
+                ..
+            } => {
+                if let Some(available) = self.buffer.get(*raw_cursor..inspect_end)
+                    && !available.is_empty()
+                {
+                    let (decoded, consumed_raw) = decode_json_string_prefix(available);
+                    *raw_cursor += consumed_raw;
+                    if !decoded.is_empty() {
+                        *emitted_decoded_bytes += decoded.len();
+                        out.push(ParsedStreamItem::ToolCallDelta(decoded));
+                    }
+                }
+            }
+            InTagProgress::StreamingBareBody {
+                raw_cursor,
+                emitted_decoded_bytes,
+                ..
+            } => {
+                if let Some(inspect_slice) = self.buffer.get(..inspect_end) {
+                    let trimmed_slice =
+                        inspect_slice.trim_end_matches(|c: char| c.is_whitespace() || c == '`');
+                    if let Some(chunk_slice) = trimmed_slice.get(*raw_cursor..)
+                        && !chunk_slice.is_empty()
+                    {
+                        *raw_cursor = trimmed_slice.len();
+                        *emitted_decoded_bytes += chunk_slice.len();
+                        out.push(ParsedStreamItem::ToolCallDelta(chunk_slice.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum HeaderProbe {
+    NeedMoreBytes,
+    WaitUntilClose,
+    StartBuffered { name: String },
+    StartStreamingQuotedInput { name: String, raw_cursor: usize },
+    StartStreamingBareBody { name: String, raw_cursor: usize },
+}
+
+fn skip_ascii_ws(buf: &str, mut pos: usize) -> usize {
+    if let Some(rest) = buf.get(pos..) {
+        pos += rest
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+    }
+    pos
+}
+
+fn skip_optional_opening_fence(buf: &str) -> Option<usize> {
+    let pos = skip_ascii_ws(buf, 0);
+    let rest = buf.get(pos..)?;
+    if rest.is_empty() || rest == "`" || rest == "``" {
+        return None;
+    }
+    if let Some(after_ticks) = rest.strip_prefix("```") {
+        let nl_rel = after_ticks.find('\n')?;
+        return Some(skip_ascii_ws(buf, pos + 3 + nl_rel + 1));
+    }
+    Some(pos)
+}
+
+fn probe_in_tag_header(buf: &str) -> HeaderProbe {
+    let Some(start) = skip_optional_opening_fence(buf) else {
+        return if buf.len() > 512 {
+            HeaderProbe::WaitUntilClose
+        } else {
+            HeaderProbe::NeedMoreBytes
+        };
+    };
+    let Some(body) = buf.get(start..) else {
+        return HeaderProbe::NeedMoreBytes;
+    };
+    if body.is_empty() {
+        return HeaderProbe::NeedMoreBytes;
+    }
+
+    if body.starts_with('{') {
+        let key1_pos = skip_ascii_ws(buf, start + 1);
+        let Some(key1_rest) = buf.get(key1_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if key1_rest.is_empty()
+            || ("\"name\"".starts_with(key1_rest) && key1_rest.len() < "\"name\"".len())
+        {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if !key1_rest.starts_with("\"name\"") {
+            return HeaderProbe::WaitUntilClose;
+        }
+
+        let colon1_pos = skip_ascii_ws(buf, key1_pos + "\"name\"".len());
+        let Some(colon1_rest) = buf.get(colon1_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if colon1_rest.is_empty() {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if !colon1_rest.starts_with(':') {
+            return HeaderProbe::WaitUntilClose;
+        }
+
+        let name_val_pos = skip_ascii_ws(buf, colon1_pos + 1);
+        let Some(name_val_rest) = buf.get(name_val_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if name_val_rest.is_empty() {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if !name_val_rest.starts_with('"') {
+            return HeaderProbe::WaitUntilClose;
+        }
+
+        let Some((raw_name, after_name_slice)) = take_quoted_json_string(name_val_rest) else {
+            return if name_val_rest.len() > 256 {
+                HeaderProbe::WaitUntilClose
+            } else {
+                HeaderProbe::NeedMoreBytes
+            };
+        };
+        let name = raw_name.trim().to_owned();
+        if name.is_empty() {
+            return HeaderProbe::WaitUntilClose;
+        }
+
+        let after_name_pos = buf.len() - after_name_slice.len();
+        let sep_pos = skip_ascii_ws(buf, after_name_pos);
+        let Some(sep_rest) = buf.get(sep_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if sep_rest.is_empty() {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if sep_rest.starts_with('}') {
+            return HeaderProbe::StartBuffered { name };
+        }
+        if !sep_rest.starts_with(',') {
+            return HeaderProbe::WaitUntilClose;
+        }
+
+        let key2_pos = skip_ascii_ws(buf, sep_pos + 1);
+        let Some(key2_rest) = buf.get(key2_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if key2_rest.is_empty()
+            || ("\"input\"".starts_with(key2_rest) && key2_rest.len() < "\"input\"".len())
+            || ("\"arguments\"".starts_with(key2_rest) && key2_rest.len() < "\"arguments\"".len())
+        {
+            return HeaderProbe::NeedMoreBytes;
+        }
+
+        if key2_rest.starts_with("\"input\"") {
+            let colon2_pos = skip_ascii_ws(buf, key2_pos + "\"input\"".len());
+            let Some(colon2_rest) = buf.get(colon2_pos..) else {
+                return HeaderProbe::NeedMoreBytes;
+            };
+            if colon2_rest.is_empty() {
+                return HeaderProbe::NeedMoreBytes;
+            };
+            if !colon2_rest.starts_with(':') {
+                return HeaderProbe::WaitUntilClose;
+            }
+            let val2_pos = skip_ascii_ws(buf, colon2_pos + 1);
+            let Some(val2_rest) = buf.get(val2_pos..) else {
+                return HeaderProbe::NeedMoreBytes;
+            };
+            if val2_rest.is_empty() {
+                return HeaderProbe::NeedMoreBytes;
+            }
+            if val2_rest.starts_with('"') {
+                return HeaderProbe::StartStreamingQuotedInput {
+                    name,
+                    raw_cursor: val2_pos + 1,
+                };
+            }
+            return HeaderProbe::StartBuffered { name };
+        }
+
+        if key2_rest.starts_with("\"arguments\"") {
+            let colon2_pos = skip_ascii_ws(buf, key2_pos + "\"arguments\"".len());
+            let Some(colon2_rest) = buf.get(colon2_pos..) else {
+                return HeaderProbe::NeedMoreBytes;
+            };
+            if colon2_rest.is_empty() {
+                return HeaderProbe::NeedMoreBytes;
+            }
+            if !colon2_rest.starts_with(':') {
+                return HeaderProbe::WaitUntilClose;
+            }
+            let val2_pos = skip_ascii_ws(buf, colon2_pos + 1);
+            let Some(val2_rest) = buf.get(val2_pos..) else {
+                return HeaderProbe::NeedMoreBytes;
+            };
+            if val2_rest.is_empty() {
+                return HeaderProbe::NeedMoreBytes;
+            }
+            return HeaderProbe::StartBuffered { name };
+        }
+
+        return HeaderProbe::WaitUntilClose;
+    }
+
+    if "*** Begin Patch".starts_with(body) && body.len() < "*** Begin Patch".len() {
+        return HeaderProbe::NeedMoreBytes;
+    }
+    if let Some(after_patch_hdr) = body.strip_prefix("*** Begin Patch") {
+        if after_patch_hdr.is_empty() {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if after_patch_hdr.starts_with('\n') || after_patch_hdr.starts_with("\r\n") {
+            return HeaderProbe::StartStreamingBareBody {
+                name: "apply_patch".to_owned(),
+                raw_cursor: start,
+            };
+        }
+        return HeaderProbe::WaitUntilClose;
+    }
+
+    if "// @exec:".starts_with(body) && body.len() < "// @exec:".len() {
+        return HeaderProbe::NeedMoreBytes;
+    }
+    if body.starts_with("// @exec:") {
+        if body.contains('\n') {
+            return HeaderProbe::StartStreamingBareBody {
+                name: "exec".to_owned(),
+                raw_cursor: start,
+            };
+        }
+        return if body.len() > 256 {
+            HeaderProbe::WaitUntilClose
+        } else {
+            HeaderProbe::NeedMoreBytes
+        };
+    }
+
+    HeaderProbe::WaitUntilClose
+}
+
+/// Decodes a prefix of a JSON `"input": "..."` string body up to (but excluding) the first
+/// unescaped `"` or any incomplete trailing `\` escape sequence, returning `(decoded, raw_bytes_consumed)`.
+fn decode_json_string_prefix(available: &str) -> (String, usize) {
+    let mut out = String::with_capacity(available.len());
+    let mut pos = 0usize;
+
+    while let Some(rem) = available.get(pos..) {
+        let Some(ch) = rem.chars().next() else {
+            break;
+        };
+        if ch == '"' {
+            // Stop at the first unescaped quote: either it closes `"input"` or (if unescaped inner
+            // quote) will be resolved once `</agy_tool_call_{nonce}>` arrives.
+            break;
+        }
+        if ch != '\\' {
+            out.push(ch);
+            pos += ch.len_utf8();
+            continue;
+        }
+
+        let Some(after_bs) = rem.get(1..) else {
+            break;
+        };
+        let Some(esc) = after_bs.chars().next() else {
+            // Incomplete `\` at chunk boundary — wait for next chunk.
+            break;
+        };
+        match esc {
+            '"' => {
+                out.push('"');
+                pos += 2;
+            }
+            '\\' => {
+                out.push('\\');
+                pos += 2;
+            }
+            '/' => {
+                out.push('/');
+                pos += 2;
+            }
+            'b' => {
+                out.push('\u{0008}');
+                pos += 2;
+            }
+            'f' => {
+                out.push('\u{000C}');
+                pos += 2;
+            }
+            'n' => {
+                out.push('\n');
+                pos += 2;
+            }
+            'r' => {
+                out.push('\r');
+                pos += 2;
+            }
+            't' => {
+                out.push('\t');
+                pos += 2;
+            }
+            'u' => {
+                if after_bs.len() < 5 {
+                    break;
+                }
+                if let Some(hex4) = after_bs.get(1..5)
+                    && let Ok(code) = u16::from_str_radix(hex4, 16)
+                {
+                    if let Some(decoded) = char::from_u32(u32::from(code)) {
+                        out.push(decoded);
+                        pos += 6;
+                    } else if (0xD800..=0xDBFF).contains(&code) {
+                        if after_bs.len() < 11 {
+                            break;
+                        }
+                        if after_bs.get(5..7) == Some("\\u")
+                            && let Some(lo_hex) = after_bs.get(7..11)
+                            && let Ok(lo) = u16::from_str_radix(lo_hex, 16)
+                            && (0xDC00..=0xDFFF).contains(&lo)
+                            && let Some(pair_ch) = char::from_u32(
+                                0x10000
+                                    + (((u32::from(code) - 0xD800) << 10)
+                                        | (u32::from(lo) - 0xDC00)),
+                            )
+                        {
+                            out.push(pair_ch);
+                            pos += 12;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    out.push_str("\\u");
+                    pos += 2;
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+                pos += 1 + other.len_utf8();
+            }
+        }
+    }
+
+    (out, pos)
 }
 
 fn advance_line_backtick_state(open: &mut bool, text: &str) {
@@ -806,12 +1294,29 @@ fn unescape_lenient_json_string(raw: &str) -> String {
             Some((u_idx, 'u')) => {
                 if let Some(hex4) = raw.get(u_idx + 1..u_idx + 5)
                     && let Ok(code) = u16::from_str_radix(hex4, 16)
-                    && let Some(decoded) = char::from_u32(u32::from(code))
                 {
-                    for _ in 0..4 {
-                        let _ = chars.next();
+                    if let Some(decoded) = char::from_u32(u32::from(code)) {
+                        for _ in 0..4 {
+                            let _ = chars.next();
+                        }
+                        out.push(decoded);
+                    } else if (0xD800..=0xDBFF).contains(&code)
+                        && raw.get(u_idx + 5..u_idx + 7) == Some("\\u")
+                        && let Some(lo_hex) = raw.get(u_idx + 7..u_idx + 11)
+                        && let Ok(lo) = u16::from_str_radix(lo_hex, 16)
+                        && (0xDC00..=0xDFFF).contains(&lo)
+                        && let Some(pair_ch) = char::from_u32(
+                            0x10000
+                                + (((u32::from(code) - 0xD800) << 10) | (u32::from(lo) - 0xDC00)),
+                        )
+                    {
+                        for _ in 0..10 {
+                            let _ = chars.next();
+                        }
+                        out.push(pair_ch);
+                    } else {
+                        out.push_str("\\u");
                     }
-                    out.push(decoded);
                 } else {
                     out.push_str("\\u");
                 }
@@ -848,15 +1353,26 @@ mod tests {
         parser.finish(&mut items);
 
         let mut text = String::new();
+        let mut starts = Vec::new();
         let mut calls = Vec::new();
         for item in items {
             match item {
                 ParsedStreamItem::TextDelta(delta) => text.push_str(&delta),
+                ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                    starts.push((name, is_raw_input));
+                }
+                ParsedStreamItem::ToolCallDelta(delta) => {
+                    panic!("function arguments object should not stream raw deltas: {delta}");
+                }
                 ParsedStreamItem::ToolCall(call) => calls.push(call),
+                ParsedStreamItem::ToolCallAborted { name } => {
+                    panic!("unexpected aborted tool call: {name}");
+                }
             }
         }
 
         assert_eq!(text, "Checking files...\nDone");
+        assert_eq!(starts, vec![("Bash".to_owned(), false)]);
         assert_eq!(
             calls,
             vec![ParsedToolCall {
@@ -879,7 +1395,10 @@ mod tests {
             .into_iter()
             .filter_map(|it| match it {
                 ParsedStreamItem::ToolCall(c) => Some(c),
-                ParsedStreamItem::TextDelta(_) => None,
+                ParsedStreamItem::TextDelta(_)
+                | ParsedStreamItem::ToolCallStart { .. }
+                | ParsedStreamItem::ToolCallDelta(_)
+                | ParsedStreamItem::ToolCallAborted { .. } => None,
             })
             .collect();
         assert_eq!(calls.len(), 2);
@@ -924,6 +1443,9 @@ mod tests {
             match item {
                 ParsedStreamItem::TextDelta(d) => text.push_str(&d),
                 ParsedStreamItem::ToolCall(c) => calls.push(c),
+                ParsedStreamItem::ToolCallStart { .. }
+                | ParsedStreamItem::ToolCallDelta(_)
+                | ParsedStreamItem::ToolCallAborted { .. } => {}
             }
         }
         assert_eq!(
@@ -969,22 +1491,42 @@ mod tests {
         parser.finish(&mut items);
 
         let mut text = String::new();
+        let mut starts = Vec::new();
+        let mut streamed_input = String::new();
+        let mut delta_count = 0usize;
         let mut calls = Vec::new();
         for item in items {
             match item {
                 ParsedStreamItem::TextDelta(d) => text.push_str(&d),
+                ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                    starts.push((name, is_raw_input));
+                }
+                ParsedStreamItem::ToolCallDelta(d) => {
+                    delta_count += 1;
+                    streamed_input.push_str(&d);
+                }
                 ParsedStreamItem::ToolCall(c) => calls.push(c),
+                ParsedStreamItem::ToolCallAborted { name } => {
+                    panic!("unexpected aborted tool call: {name}");
+                }
             }
         }
         assert_eq!(
             text,
             "我现在更新 `crates/liftgate-server/src/routes.rs` 和 `tests.rs`，加入测试。"
         );
+        assert_eq!(starts, vec![("apply_patch".to_owned(), true)]);
+        assert!(
+            delta_count > 5,
+            "expected incremental streaming deltas across 4-byte chunks, got {delta_count}"
+        );
+        let expected_patch = "*** Begin Patch\n*** Update File: src/routes.rs\n@@\n+#[derive(Clone, Debug)]\n+pub struct AdminShutdownHandle {}\n*** End Patch";
+        assert_eq!(streamed_input, expected_patch);
         assert_eq!(
             calls,
             vec![ParsedToolCall {
                 name: "apply_patch".to_owned(),
-                arguments: "*** Begin Patch\n*** Update File: src/routes.rs\n@@\n+#[derive(Clone, Debug)]\n+pub struct AdminShutdownHandle {}\n*** End Patch".to_owned(),
+                arguments: expected_patch.to_owned(),
                 is_raw_input: true,
             }]
         );
@@ -1004,6 +1546,9 @@ mod tests {
             match item {
                 ParsedStreamItem::TextDelta(d) => text.push_str(&d),
                 ParsedStreamItem::ToolCall(c) => calls.push(c),
+                ParsedStreamItem::ToolCallStart { .. }
+                | ParsedStreamItem::ToolCallDelta(_)
+                | ParsedStreamItem::ToolCallAborted { .. } => {}
             }
         }
         assert_eq!(text, "Updated `routes.rs`\n");
@@ -1027,6 +1572,154 @@ mod tests {
                 arguments: "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n+pub const HEADER: &str = \"x-token\";\n*** End Patch".to_owned(),
                 is_raw_input: true,
             })]
+        );
+    }
+
+    #[test]
+    fn streams_quoted_input_surrogate_pairs_escapes_and_extra_fields_across_tiny_chunks() {
+        let mut parser = IncrementalToolParser::new("abcd", true);
+        // Exercises: escaped quotes `\"`, invalid escape `\users`, UTF-16 surrogate pair `\uD83D\uDE00` (😀),
+        // unescaped inner quotes (exercising salvage flush of remainder), and trailing JSON field `"extra": 1`
+        // in strict mode.
+        let strict_payload = "<agy_tool_call_abcd>{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n+let icon = \\\"\\uD83D\\uDE00\\\";\\n+let p = \\users\\demo;\\n*** End Patch\", \"extra\": 1}</agy_tool_call_abcd>";
+        let mut items = Vec::new();
+        let mut cursor = strict_payload;
+        while !cursor.is_empty() {
+            let mut step = 1;
+            while step < cursor.len() && !cursor.is_char_boundary(step) {
+                step += 1;
+            }
+            let (head, tail) = cursor.split_at_checked(step).expect("char boundary");
+            parser.feed(head, &mut items);
+            cursor = tail;
+        }
+        parser.finish(&mut items);
+
+        let mut streamed = String::new();
+        let mut saw_start = false;
+        let mut final_call = None;
+        for item in items {
+            match item {
+                ParsedStreamItem::TextDelta(t) => panic!("unexpected text delta: {t}"),
+                ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                    assert_eq!(name, "apply_patch");
+                    assert!(is_raw_input);
+                    assert!(streamed.is_empty(), "ToolCallStart must precede deltas");
+                    saw_start = true;
+                }
+                ParsedStreamItem::ToolCallDelta(d) => {
+                    assert!(saw_start);
+                    streamed.push_str(&d);
+                }
+                ParsedStreamItem::ToolCall(c) => {
+                    final_call = Some(c);
+                }
+                ParsedStreamItem::ToolCallAborted { name } => {
+                    panic!("unexpected abort: {name}");
+                }
+            }
+        }
+        let call = final_call.expect("completed tool call");
+        assert_eq!(
+            call.arguments,
+            "*** Begin Patch\n+let icon = \"😀\";\n+let p = \\users\\demo;\n*** End Patch"
+        );
+        assert_eq!(streamed, call.arguments);
+
+        // Also verify unescaped inner quotes with surrogate pairs across 2-byte chunks
+        let mut parser2 = IncrementalToolParser::new("abcd", true);
+        let salvaged_payload = "<agy_tool_call_abcd>{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n+const EMOJI: &str = \\uD83D\\uDE00 \"raw\";\\n*** End Patch\"}</agy_tool_call_abcd>";
+        let mut items2 = Vec::new();
+        let mut cursor2 = salvaged_payload;
+        while !cursor2.is_empty() {
+            let mut step = cursor2.len().min(2);
+            while step < cursor2.len() && !cursor2.is_char_boundary(step) {
+                step += 1;
+            }
+            let (head, tail) = cursor2.split_at_checked(step).expect("char boundary");
+            parser2.feed(head, &mut items2);
+            cursor2 = tail;
+        }
+        parser2.finish(&mut items2);
+
+        let mut streamed2 = String::new();
+        let mut call2 = None;
+        for item in items2 {
+            match item {
+                ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                    assert_eq!(name, "apply_patch");
+                    assert!(is_raw_input);
+                }
+                ParsedStreamItem::ToolCallDelta(d) => streamed2.push_str(&d),
+                ParsedStreamItem::ToolCall(c) => call2 = Some(c),
+                ParsedStreamItem::TextDelta(t) => panic!("unexpected text: {t}"),
+                ParsedStreamItem::ToolCallAborted { name } => panic!("unexpected abort: {name}"),
+            }
+        }
+        let call2 = call2.expect("salvaged tool call");
+        assert_eq!(
+            call2.arguments,
+            "*** Begin Patch\n+const EMOJI: &str = 😀 \"raw\";\n*** End Patch"
+        );
+        assert_eq!(streamed2, call2.arguments);
+    }
+
+    #[test]
+    fn streams_bare_patch_and_exec_bodies_and_aborts_truncated_calls() {
+        let mut parser = IncrementalToolParser::new("abcd", true);
+        let bare_patch = "<agy_tool_call_abcd>\n```diff\n*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch\n```\n</agy_tool_call_abcd>";
+        let mut items = Vec::new();
+        let mut cursor = bare_patch;
+        while !cursor.is_empty() {
+            let step = cursor.len().min(5);
+            let (head, tail) = cursor.split_at_checked(step).expect("ASCII");
+            parser.feed(head, &mut items);
+            cursor = tail;
+        }
+        parser.finish(&mut items);
+
+        let mut streamed = String::new();
+        let mut call = None;
+        for item in items {
+            match item {
+                ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                    assert_eq!(name, "apply_patch");
+                    assert!(is_raw_input);
+                }
+                ParsedStreamItem::ToolCallDelta(d) => streamed.push_str(&d),
+                ParsedStreamItem::ToolCall(c) => call = Some(c),
+                ParsedStreamItem::TextDelta(t) => panic!("unexpected text: {t}"),
+                ParsedStreamItem::ToolCallAborted { name } => panic!("unexpected abort: {name}"),
+            }
+        }
+        let call = call.expect("bare patch call");
+        assert_eq!(streamed, call.arguments);
+        assert_eq!(
+            call.arguments,
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch"
+        );
+
+        // Truncated in-progress call at EOF emits ToolCallAborted instead of leaking raw XML into assistant text
+        let mut trunc_parser = IncrementalToolParser::new("abcd", true);
+        let mut trunc_items = Vec::new();
+        trunc_parser.feed(
+            "Intro\n<agy_tool_call_abcd>{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n+half",
+            &mut trunc_items,
+        );
+        trunc_parser.finish(&mut trunc_items);
+        assert_eq!(
+            trunc_items,
+            vec![
+                ParsedStreamItem::TextDelta("Intro\n".to_owned()),
+                ParsedStreamItem::ToolCallStart {
+                    name: "apply_patch".to_owned(),
+                    is_raw_input: true,
+                },
+                ParsedStreamItem::ToolCallDelta("*** Begin Patch\n+half".to_owned()),
+                ParsedStreamItem::ToolCallAborted {
+                    name: "apply_patch".to_owned(),
+                },
+            ]
         );
     }
 

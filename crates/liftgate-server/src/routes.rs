@@ -632,6 +632,7 @@ async fn collect_openai_response(
                 }
             }
             TurnEvent::TextDelta(delta) => msg_text.push_str(&delta),
+            TurnEvent::ClientToolCallStart { .. } | TurnEvent::ClientToolCallDelta { .. } => {}
             TurnEvent::ClientToolCall {
                 call_id,
                 name,
@@ -738,6 +739,13 @@ async fn collect_openai_response(
     Json(resp).into_response()
 }
 
+struct OpenStreamingToolItem {
+    idx: usize,
+    item_id: String,
+    is_custom: bool,
+    emitted_any_delta: bool,
+}
+
 fn stream_openai_responses(
     mut turn: ActiveTurnStream,
     mut resp: ResponseObject,
@@ -782,6 +790,7 @@ fn stream_openai_responses(
         let mut active_message: Option<(usize, String, String)> = None;
         let mut open_searches: HashMap<String, (usize, String, Option<String>)> = HashMap::new();
         let mut open_fetches: HashMap<String, (usize, String, String)> = HashMap::new();
+        let mut open_client_tools: HashMap<String, OpenStreamingToolItem> = HashMap::new();
         let mut used_web_grounding = false;
         let mut emitted_search_count: usize = 0;
         let mut leading_ws_buf = String::new();
@@ -1284,6 +1293,113 @@ fn stream_openai_responses(
                         return;
                     }
                 }
+                TurnEvent::ClientToolCallStart {
+                    call_id,
+                    name,
+                    is_custom,
+                } => {
+                    leading_ws_buf.clear();
+                    close_active_reasoning(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_reasoning,
+                        opts.include_encrypted_reasoning,
+                        &mut finalized_items,
+                    )
+                    .await;
+                    close_active_message(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_message,
+                        used_web_grounding,
+                        &mut finalized_items,
+                    )
+                    .await;
+
+                    if name == INTERNAL_CODEX_LOCAL_SHELL_TOOL
+                        || (opts.emit_tool_search_items && name == INTERNAL_CODEX_TOOL_SEARCH_TOOL)
+                    {
+                        continue;
+                    }
+
+                    let idx = output_index;
+                    output_index += 1;
+                    let (namespace, bare_name) = split_namespaced_tool_name(&name);
+                    let (item_id, added_item) = if is_custom {
+                        let item_id = format!("ctc_{}", generate_short_nonce());
+                        (
+                            item_id.clone(),
+                            ResponseOutputItem::CustomToolCall {
+                                id: item_id,
+                                status: "in_progress".to_owned(),
+                                call_id: call_id.clone(),
+                                namespace,
+                                name: bare_name,
+                                input: String::new(),
+                            },
+                        )
+                    } else {
+                        let item_id = format!("fc_{}", generate_short_nonce());
+                        (
+                            item_id.clone(),
+                            ResponseOutputItem::FunctionCall {
+                                id: item_id,
+                                status: "in_progress".to_owned(),
+                                call_id: call_id.clone(),
+                                namespace,
+                                name: bare_name,
+                                arguments: String::new(),
+                            },
+                        )
+                    };
+                    if !send_sse_frame(
+                        &sse_tx,
+                        "response.output_item.added",
+                        &json!({
+                            "type": "response.output_item.added",
+                            "sequence_number": next_seq(&mut seq),
+                            "output_index": idx,
+                            "item": &added_item,
+                        }),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    open_client_tools.insert(
+                        call_id,
+                        OpenStreamingToolItem {
+                            idx,
+                            item_id,
+                            is_custom,
+                            emitted_any_delta: false,
+                        },
+                    );
+                }
+                TurnEvent::ClientToolCallDelta { call_id, delta } => {
+                    if !delta.is_empty()
+                        && let Some(open) = open_client_tools.get_mut(&call_id)
+                        && open.is_custom
+                    {
+                        open.emitted_any_delta = true;
+                        if !send_sse_frame(
+                            &sse_tx,
+                            "response.custom_tool_call_input.delta",
+                            &json!({
+                                "type": "response.custom_tool_call_input.delta",
+                                "sequence_number": next_seq(&mut seq),
+                                "item_id": &open.item_id,
+                                "call_id": call_id,
+                                "output_index": open.idx,
+                                "delta": delta,
+                            }),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
                 TurnEvent::ClientToolCall {
                     call_id,
                     name,
@@ -1307,6 +1423,113 @@ fn stream_openai_responses(
                         &mut finalized_items,
                     )
                     .await;
+
+                    if let Some(open) = open_client_tools.remove(&call_id) {
+                        let (namespace, bare_name) = split_namespaced_tool_name(&name);
+                        if open.is_custom {
+                            if !open.emitted_any_delta {
+                                let _ = send_sse_frame(
+                                    &sse_tx,
+                                    "response.custom_tool_call_input.delta",
+                                    &json!({
+                                        "type": "response.custom_tool_call_input.delta",
+                                        "sequence_number": next_seq(&mut seq),
+                                        "item_id": &open.item_id,
+                                        "call_id": &call_id,
+                                        "output_index": open.idx,
+                                        "delta": &arguments,
+                                    }),
+                                )
+                                .await;
+                            }
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.custom_tool_call_input.done",
+                                &json!({
+                                    "type": "response.custom_tool_call_input.done",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "item_id": &open.item_id,
+                                    "call_id": &call_id,
+                                    "output_index": open.idx,
+                                    "input": &arguments,
+                                }),
+                            )
+                            .await;
+                            let done_item = ResponseOutputItem::CustomToolCall {
+                                id: open.item_id,
+                                status: "completed".to_owned(),
+                                call_id,
+                                namespace,
+                                name: bare_name,
+                                input: arguments,
+                            };
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.output_item.done",
+                                &json!({
+                                    "type": "response.output_item.done",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": open.idx,
+                                    "item": &done_item,
+                                }),
+                            )
+                            .await;
+                            finalized_items.push(done_item);
+                        } else {
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.function_call_arguments.delta",
+                                &json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "item_id": &open.item_id,
+                                    "output_index": open.idx,
+                                    "delta": &arguments,
+                                }),
+                            )
+                            .await;
+                            let mut args_done = json!({
+                                "type": "response.function_call_arguments.done",
+                                "sequence_number": next_seq(&mut seq),
+                                "item_id": &open.item_id,
+                                "output_index": open.idx,
+                                "name": &bare_name,
+                                "arguments": &arguments,
+                            });
+                            if let Some(ns) = &namespace
+                                && let Some(obj) = args_done.as_object_mut()
+                            {
+                                obj.insert("namespace".to_owned(), json!(ns));
+                            }
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.function_call_arguments.done",
+                                &args_done,
+                            )
+                            .await;
+                            let done_item = ResponseOutputItem::FunctionCall {
+                                id: open.item_id,
+                                status: "completed".to_owned(),
+                                call_id,
+                                namespace,
+                                name: bare_name,
+                                arguments,
+                            };
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.output_item.done",
+                                &json!({
+                                    "type": "response.output_item.done",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": open.idx,
+                                    "item": &done_item,
+                                }),
+                            )
+                            .await;
+                            finalized_items.push(done_item);
+                        }
+                        continue;
+                    }
 
                     let idx = output_index;
                     output_index += 1;
@@ -2115,6 +2338,7 @@ async fn collect_anthropic_messages(
                 });
             }
             TurnEvent::TextDelta(delta) => current_text.push_str(&delta),
+            TurnEvent::ClientToolCallStart { .. } | TurnEvent::ClientToolCallDelta { .. } => {}
             TurnEvent::ClientToolCall {
                 call_id,
                 name,
@@ -2239,6 +2463,7 @@ fn stream_anthropic_messages(
         let mut has_tool_use = false;
         let mut emitted_search_srv_ids: HashSet<String> = HashSet::new();
         let mut pending_search_result_srv_ids: Vec<String> = Vec::new();
+        let mut open_tool_blocks: HashMap<String, usize> = HashMap::new();
         let mut post_search_text_buf = String::new();
         let mut web_search_requests: u64 = 0;
         let mut web_fetch_requests: u64 = 0;
@@ -2516,12 +2741,7 @@ fn stream_anthropic_messages(
                         return;
                     }
                 }
-                TurnEvent::ClientToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } => {
+                TurnEvent::ClientToolCallStart { call_id, name, .. } => {
                     if !ensure_anthropic_message_started(
                         &sse_tx,
                         &mut message_started,
@@ -2552,8 +2772,7 @@ fn stream_anthropic_messages(
                         "toolu_{}",
                         call_id.strip_prefix("call_").unwrap_or(&call_id)
                     );
-
-                    let _ = send_sse_frame(
+                    if !send_sse_frame(
                         &sse_tx,
                         "content_block_start",
                         &json!({
@@ -2567,7 +2786,69 @@ fn stream_anthropic_messages(
                             }
                         }),
                     )
+                    .await
+                    {
+                        return;
+                    }
+                    open_tool_blocks.insert(call_id, idx);
+                }
+                TurnEvent::ClientToolCallDelta { .. } => {}
+                TurnEvent::ClientToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    if !ensure_anthropic_message_started(
+                        &sse_tx,
+                        &mut message_started,
+                        &msg_id,
+                        &model_name,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    leading_ws.clear();
+                    flush_pending_anthropic_searches(
+                        &sse_tx,
+                        &mut next_block_idx,
+                        &mut pending_search_result_srv_ids,
+                        &mut post_search_text_buf,
+                        &mut emitted_any_block,
+                    )
                     .await;
+                    close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                    close_anthropic_text(&sse_tx, &mut active_text_idx).await;
+
+                    has_tool_use = true;
+                    emitted_any_block = true;
+                    let idx = if let Some(opened_idx) = open_tool_blocks.remove(&call_id) {
+                        opened_idx
+                    } else {
+                        let idx = next_block_idx;
+                        next_block_idx += 1;
+                        let toolu_id = format!(
+                            "toolu_{}",
+                            call_id.strip_prefix("call_").unwrap_or(&call_id)
+                        );
+                        let _ = send_sse_frame(
+                            &sse_tx,
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": toolu_id,
+                                    "name": name,
+                                    "input": {}
+                                }
+                            }),
+                        )
+                        .await;
+                        idx
+                    };
                     let partial_json = match serde_json::from_str::<Value>(&arguments) {
                         Ok(Value::Object(_)) => arguments,
                         _ => json!({ "raw": arguments }).to_string(),
