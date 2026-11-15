@@ -12,6 +12,7 @@ use crate::canonical::{
 use crate::error::ProtocolError;
 use crate::session_key::{
     INTERNAL_CODEX_LOCAL_SHELL_TOOL, is_compaction_instructions_prompt, strip_billing_noise,
+    wrap_developer_instructions_block,
 };
 
 /// Incoming `POST /v1/responses` request body.
@@ -194,12 +195,10 @@ pub fn normalize_responses_request(
             if req.previous_response_id.is_none() {
                 if is_compaction_instructions_prompt(trimmed) {
                     deferred_compaction_instructions = Some(trimmed.to_owned());
-                } else {
+                } else if let Some(wrapped) = wrap_developer_instructions_block(trimmed) {
                     messages.push(CanonicalMessage {
                         role: CanonicalRole::User,
-                        parts: vec![CanonicalPart::Text(format!(
-                            "<developer_instructions>\n{trimmed}\n</developer_instructions>"
-                        ))],
+                        parts: vec![CanonicalPart::Text(wrapped)],
                     });
                 }
             }
@@ -311,13 +310,15 @@ pub fn normalize_responses_request(
                                     if !has_conversational_input {
                                         aux_system_parts.push(trimmed.to_owned());
                                     }
-                                    push_part(
-                                        &mut messages,
-                                        CanonicalRole::User,
-                                        CanonicalPart::Text(format!(
-                                            "<developer_instructions>\n{trimmed}\n</developer_instructions>"
-                                        )),
-                                    );
+                                    if let Some(wrapped) =
+                                        wrap_developer_instructions_block(trimmed)
+                                    {
+                                        push_part(
+                                            &mut messages,
+                                            CanonicalRole::User,
+                                            CanonicalPart::Text(wrapped),
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -344,14 +345,14 @@ pub fn normalize_responses_request(
         None => {}
     }
 
-    if let Some(compaction_inst) = deferred_compaction_instructions {
+    if let Some(compaction_inst) = deferred_compaction_instructions
+        && let Some(wrapped) = wrap_developer_instructions_block(&compaction_inst)
+    {
         has_conversational_input = true;
         push_part(
             &mut messages,
             CanonicalRole::User,
-            CanonicalPart::Text(format!(
-                "<developer_instructions>\n{compaction_inst}\n</developer_instructions>"
-            )),
+            CanonicalPart::Text(wrapped),
         );
     }
 

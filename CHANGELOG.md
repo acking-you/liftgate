@@ -2,7 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.4] - 2026-11-15
+
+### Fixed
+- Unify harness-agnostic system prompt handling across the canonical engine (`NormalizedTurnRequest::materialize_system_instructions`), OpenAI `/v1/responses`, and Anthropic `/v1/messages` (including `role: "system" | "developer"` message entries): caller system prompts always normalize into `<developer_instructions>` inside `messages` instead of `_meta.antigravity.systemPrompt.append`, eliminating false upstream `429 RESOURCE_EXHAUSTED` rejections across Claude Code, Codex CLI, OpenCode, and third-party harnesses while preserving warm `SessionPool` prefix reuse, `/compact` dialogue matching, and Auto Mode classification.
+- Cap `_meta.antigravity.systemPrompt.append` at `16 KB` (`MAX_SYSTEM_APPEND_BYTES`), automatically spilling excess `<client_tools>` schemas (e.g. OpenCode or multi-MCP setups) into Turn 1's `<client_tools_update>` directive, and slim oversized `<developer_instructions>` blocks on single-turn prompts without ever truncating caller user inputs or tool outputs.
+- Align `lg cc` ephemeral `effortLevel` with the selected model suffix (`-xhigh`/`-high`/`-thinking` -> `high`, `-medium` -> `medium`, `-low` -> `low`) unless `--effort` or `--model` is passed explicitly, preventing Claude Code's default `medium` effort from silently downgrading `-high` models.
+- Clear `HANDLE_FLAG_INHERIT` on parent stdio handles while spawning the Windows background daemon and avoid combining mutually exclusive `DETACHED_PROCESS | CREATE_NO_WINDOW` flags so piped invocations (`lg start | Out-Null`, CI scripts) return immediately without holding parent pipes open.
+
+### Changed
+- Propagate live `--long-context` policy across `lg cc`, `lg cx`, `lg cfg`, `lg models`, `lg status`, and `lg top` without promoting legacy gateways, and resolve caller model aliases against the discovered catalog when computing per-model Claude Code `autoCompactWindow` thresholds.
+- Resolve `opus`, `sonnet`, and `orchestrator` family aliases dynamically against the newest matching entries in the live ACP catalog (including `claude-opus-4-6-thinking`, `claude-sonnet-4-6`, and `gemini-pro-orchestrator-argon`).
+- Preserve user-authored top-level Claude Code `autoCompactWindow` values during `lg cfg` merge and `--uninstall`, removing the `110000` fallback only when Liftgate's managed picker is present.
+- Avoid duplicate active-turn rendering in single-turn prompt assembly and add compile-time context-window and chunk-size invariants.
 
 ## [0.1.3] - 2026-11-15
 

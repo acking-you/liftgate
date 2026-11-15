@@ -29,10 +29,10 @@ service. Liftgate does none of that:
 
 Each request is normalized into one ACP `session/prompt`: instructions,
 multi-turn history, images and the client's tool definitions. OpenAI
-`instructions` and `developer` / `system` items go into the prompt as
-`<developer_instructions>` blocks rather than ACP's system-prompt extension,
-which avoids upstream `429`s on large harness prompts and keeps session hashes
-stable. Billing headers (`cch=...`) are stripped from prompts, while volatile
+`instructions` / `developer` / `system` items and Anthropic `system` prompts go
+into the prompt as `<developer_instructions>` blocks rather than ACP's
+system-prompt extension, which avoids upstream `429`s on large harness prompts
+and keeps session hashes stable. Billing headers (`cch=...`) are stripped from prompts, while volatile
 reminders (timestamps, token budgets, context-window counters) are preserved for
 the model and normalized only during session hashing. Multimodal images inside
 both user turns and tool outputs (`view_image`, `Read`) become native ACP image

@@ -22,7 +22,7 @@ Rules for changing this repository.
 
 ## Protocol & Session Invariants
 
-- OpenAI `/v1/responses` `instructions` and `developer`/`system` items normalize into `<developer_instructions>` blocks in `messages` (never into `_meta.antigravity.systemPrompt.append`), avoiding upstream `429` rejections on large harness prompts while keeping `SessionPool` prefix hashes deterministic across turns.
+- OpenAI `/v1/responses` (`instructions` and `developer`/`system` items) and Anthropic `/v1/messages` (`system` prompts) normalize into `<developer_instructions>` blocks in `messages` (never into `_meta.antigravity.systemPrompt.append`), avoiding upstream `429` rejections on large harness prompts while keeping `SessionPool` prefix hashes deterministic across turns.
 - Billing/telemetry noise (`x-anthropic-billing-header`, `cch=...`, `<fast_mode_info>`) is stripped via `session_key::strip_billing_noise` when forwarding prompts, whereas legitimate harness context signals (`<current_time_reminder>`, `<timestamp>`, `<budget:token_budget>`, `<context_window>`, `<rollout_budget>`) are preserved in forwarded prompts and normalized only inside `session_key::strip_unstable_harness_noise` for deterministic prefix hashing.
 - Client tool list mutations and mid-session model/effort switches sync incrementally on warm sessions (`<client_tools_update>` + `session/set_model`), and `/compact` summarization turns match warm sessions via `compaction_lookup` before retiring the pre-compaction session.
 - Never silently fail over across models on upstream `429` / capacity errors: abort stalled upstream retries immediately and return `429` (`rate_limit_error`) on the requested model.

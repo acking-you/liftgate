@@ -149,6 +149,23 @@ pub struct NormalizedTurnRequest {
     pub stream: bool,
 }
 
+impl NormalizedTurnRequest {
+    /// Enforces the canonical ACP gateway invariant across every protocol adapter (OpenAI,
+    /// Anthropic, and future harnesses such as OpenCode): drains any caller `system_instructions`
+    /// into `<developer_instructions>` blocks inside `messages` so `_meta.antigravity.systemPrompt.append`
+    /// never carries caller system prompts.
+    pub fn materialize_system_instructions(&mut self) {
+        if let Some(sys) = self.system_instructions.take() {
+            crate::session_key::materialize_system_prompt_into_messages(
+                Some(&sys),
+                self.previous_response_id.is_some(),
+                &self.client_tools,
+                &mut self.messages,
+            );
+        }
+    }
+}
+
 /// Detects whether an incoming normalized turn is a harness-internal classifier or background
 /// utility call (such as Claude Code's Auto Mode Stage 1/2 safety classifier, `WebSearch` sub-call,
 /// `WebFetch` HTML->Markdown extractor, away-summary recap, or session title generator).

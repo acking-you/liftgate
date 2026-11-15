@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::cli::{ClaudeArgs, CodexArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
+use crate::client::infer_live_long_context;
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes,
     resolve_fast_model,
@@ -45,6 +46,7 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let discovered = target.client.fetch_models().await.unwrap_or_default();
+    let long_context = infer_live_long_context(&discovered, target.managed_long_context);
 
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
 
@@ -54,10 +56,28 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         primary_model: primary_model.clone(),
         fast_model: fast_model.clone(),
         no_bypass: args.no_bypass,
-        long_context: false,
+        long_context,
         discovered_models: discovered,
     };
-    let settings_map = build_claude_settings_map(&sync_params);
+    let has_explicit_model = args
+        .passthrough_args
+        .iter()
+        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m="));
+    let has_explicit_effort = args
+        .passthrough_args
+        .iter()
+        .any(|a| a == "--effort" || a.starts_with("--effort="));
+
+    let mut settings_map = build_claude_settings_map(&sync_params);
+    if !has_explicit_effort
+        && !has_explicit_model
+        && let Some(effort_level) = default_claude_effort_level(&primary_model)
+    {
+        settings_map.insert(
+            "effortLevel".to_owned(),
+            Value::String(effort_level.to_owned()),
+        );
+    }
     let settings_bytes =
         serde_json::to_vec_pretty(&Value::Object(settings_map)).map_err(|source| {
             CliError::StateJson {
@@ -69,10 +89,6 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
     let ephemeral_settings =
         EphemeralFileGuard::create(state_paths, "claude-settings", "json", &settings_bytes)?;
 
-    let has_explicit_model = args
-        .passthrough_args
-        .iter()
-        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m="));
     let has_explicit_perm = args.passthrough_args.iter().any(|a| {
         matches!(
             a.as_str(),
@@ -147,7 +163,8 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         Ok(bytes) => bytes,
         Err(_) => {
             let discovered = target.client.fetch_models().await.unwrap_or_default();
-            build_offline_codex_catalog_bytes(&discovered, &primary_model, false)?
+            let long_context = infer_live_long_context(&discovered, target.managed_long_context);
+            build_offline_codex_catalog_bytes(&discovered, &primary_model, long_context)?
         }
     };
 
@@ -220,6 +237,19 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     let exit_code = spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await?;
     drop(ephemeral_catalog);
     Ok(exit_code)
+}
+
+fn default_claude_effort_level(model_id: &str) -> Option<&'static str> {
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.ends_with("-xhigh") || lower.ends_with("-high") || lower.ends_with("-thinking") {
+        Some("high")
+    } else if lower.ends_with("-medium") {
+        Some("medium")
+    } else if lower.ends_with("-low") {
+        Some("low")
+    } else {
+        None
+    }
 }
 
 fn toml_inline_string(val: &str) -> String {
@@ -576,5 +606,26 @@ mod tests {
             resolve_codex_command(Some(&missing)),
             Err(CliError::HarnessNotFound { tool: "codex", .. })
         ));
+    }
+
+    #[test]
+    fn infers_default_claude_effort_level_from_model_suffix() {
+        assert_eq!(
+            default_claude_effort_level("gemini-4-carbon-high"),
+            Some("high")
+        );
+        assert_eq!(
+            default_claude_effort_level("claude-opus-4-6-thinking"),
+            Some("high")
+        );
+        assert_eq!(
+            default_claude_effort_level("gemini-4-argon-medium"),
+            Some("medium")
+        );
+        assert_eq!(
+            default_claude_effort_level("gemini-3.8-flash-low"),
+            Some("low")
+        );
+        assert_eq!(default_claude_effort_level("claude-sonnet-4-6"), None);
     }
 }

@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::cli::{RestartArgs, ServeArgs, TopArgs};
-use crate::client::{DiscoveredModel, GatewayClient};
+use crate::client::{DiscoveredModel, GatewayClient, infer_live_long_context};
 use crate::config_sync::resolve_fast_model;
 use crate::daemon::{
     build_authenticated_dashboard_url, ensure_gateway_ready, is_pid_alive, open_browser,
@@ -652,6 +652,7 @@ pub async fn run_model_picker(
         .unwrap_or(0);
     let mut table_state = TableState::default();
 
+    let long_context = infer_live_long_context(models, None);
     let chosen = loop {
         let filtered: Vec<&DiscoveredModel> = models
             .iter()
@@ -682,6 +683,7 @@ pub async fn run_model_picker(
                     &filtered,
                     current_default,
                     fast_model,
+                    long_context,
                     &mut table_state,
                 );
             })
@@ -769,6 +771,7 @@ fn draw_model_picker(
     filtered: &[&DiscoveredModel],
     current_default: &str,
     fast_model: &str,
+    long_context: bool,
     table_state: &mut TableState,
 ) {
     let area = centered_rect(92, 24, frame.area());
@@ -819,11 +822,7 @@ fn draw_model_picker(
     let rows: Vec<Row<'_>> = filtered
         .iter()
         .map(|m| {
-            let ctx_k = if m.context_window > 0 {
-                format!("{}k", m.context_window / 1_000)
-            } else {
-                "1000k".to_owned()
-            };
+            let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
             let role = match (m.id == current_default, m.id == fast_model) {
                 (true, true) => "★ default · ⚡ fast",
                 (true, false) => "★ default",
@@ -2124,16 +2123,13 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 }
 
 fn draw_models_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
+    let long_context = infer_live_long_context(&app.data.models, None);
     let rows: Vec<Row<'_>> = app
         .data
         .models
         .iter()
         .map(|m| {
-            let ctx_k = if m.context_window > 0 {
-                format!("{}k", m.context_window / 1_000)
-            } else {
-                "1000k".to_owned()
-            };
+            let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
             let is_def = m.id == app.data.default_model;
             let is_fast = m.id == app.data.fast_model;
             let role = match (is_def, is_fast) {

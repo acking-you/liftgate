@@ -21,7 +21,9 @@ use crate::cli::{
     AliasArgs, DoctorArgs, LogsArgs, ModelsArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs,
     UiArgs, invoked_bin_name, normalize_optional_api_key,
 };
-use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
+use crate::client::{
+    DiscoveredModel, GatewayClient, infer_live_long_context, percent_encode_query_component,
+};
 use crate::config_sync::resolve_fast_model;
 use crate::error::CliError;
 use crate::harness::{resolve_claude_command, resolve_codex_command};
@@ -40,6 +42,7 @@ pub struct ActiveGatewayTarget {
     pub dashboard_url: String,
     pub default_model: String,
     pub api_key: Option<String>,
+    pub managed_long_context: Option<bool>,
 }
 
 pub async fn run_start(state_paths: &StatePaths, args: StartArgs) -> Result<(), CliError> {
@@ -128,12 +131,13 @@ pub async fn start_daemon_with_exe(
                     ui::kv(
                         "AGY Policy",
                         &format!(
-                            "proxy={existing_proxy_label} · idle-auto-update={}",
+                            "proxy={existing_proxy_label} · idle-auto-update={} · long-context={}",
                             if existing.agy_auto_update {
                                 "on"
                             } else {
                                 "off"
-                            }
+                            },
+                            if existing.long_context { "on" } else { "off" }
                         ),
                     );
                     if !config_matches {
@@ -245,9 +249,12 @@ pub async fn start_daemon_with_exe(
 
     configure_detached_command(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| CliError::DaemonSpawn { source })?;
+    let mut child = {
+        #[cfg(windows)]
+        let _stdio_guard = StdioInheritGuard::suspend_current();
+        cmd.spawn()
+            .map_err(|source| CliError::DaemonSpawn { source })?
+    };
     let pid = child.id();
 
     let client = GatewayClient::new(serve.listen, clean_api_key.clone());
@@ -316,13 +323,14 @@ pub async fn start_daemon_with_exe(
         ui::kv(
             "AGY Policy",
             &format!(
-                "proxy={} · idle-auto-update={}",
+                "proxy={} · idle-auto-update={} · long-context={}",
                 effective_proxy
                     .as_ref()
                     .map(ProxyUrl::redacted_display)
                     .as_deref()
                     .unwrap_or("none"),
-                if effective_auto_update { "on" } else { "off" }
+                if effective_auto_update { "on" } else { "off" },
+                if long_context { "on" } else { "off" }
             ),
         );
         ui::kv("Service Logs", &state.log_file.display().to_string());
@@ -539,6 +547,7 @@ pub async fn ensure_gateway_ready(
                 dashboard_url: dash_url,
                 default_model: preferred_model.unwrap_or(model_fallback).to_owned(),
                 api_key: key,
+                managed_long_context: matching_daemon.map(|d| d.long_context),
                 client,
             });
         }
@@ -565,6 +574,7 @@ pub async fn ensure_gateway_ready(
             dashboard_url: format!("{}/", daemon.dashboard_base_url()),
             default_model: daemon.default_model,
             api_key: daemon.api_key,
+            managed_long_context: Some(daemon.long_context),
             client,
         });
     }
@@ -581,6 +591,7 @@ pub async fn ensure_gateway_ready(
                     daemon.default_model
                 },
                 api_key: key,
+                managed_long_context: Some(daemon.long_context),
                 client,
             });
         }
@@ -600,6 +611,7 @@ pub async fn ensure_gateway_ready(
                 .unwrap_or(&default_serve.default_model)
                 .to_owned(),
             api_key: fallback_key,
+            managed_long_context: None,
             client: fallback_client,
         });
     }
@@ -624,6 +636,7 @@ pub async fn ensure_gateway_ready(
         dashboard_url: format!("{}/", daemon.dashboard_base_url()),
         default_model: daemon.default_model,
         api_key: daemon.api_key,
+        managed_long_context: Some(daemon.long_context),
         client,
     })
 }
@@ -682,6 +695,18 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             t.acp_process.auto_update_enabled
         });
 
+    let effective_long_context = if healthy {
+        infer_live_long_context(
+            models.as_deref().unwrap_or_default(),
+            daemon
+                .as_ref()
+                .filter(|_| managed_alive)
+                .map(|d| d.long_context),
+        )
+    } else {
+        state_paths.read_settings()?.long_context
+    };
+
     if args.json {
         let payload = json!({
             "status": state_label,
@@ -690,6 +715,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             "gateway_url": client.base_url(),
             "dashboard_url": dashboard_url,
             "auth_enabled": api_key.is_some(),
+            "long_context": effective_long_context,
             "state_dir": state_paths.root(),
             "log_file": state_paths.log_file(),
             "models_count": models.as_ref().map(Vec::len),
@@ -774,6 +800,14 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 "disabled"
             }
         ),
+    );
+    ui::kv(
+        "Context Policy",
+        if effective_long_context {
+            "experimental long-context (1M Gemini / Flash hydration)"
+        } else {
+            "native single-turn (280k Gemini / 200k Claude / 128k GPT-OSS)"
+        },
     );
     ui::kv("Service Log", &state_paths.log_file().display().to_string());
 
@@ -1058,17 +1092,23 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
     .await?;
     let models: Vec<DiscoveredModel> = target.client.fetch_models().await?;
     let fast_model = resolve_fast_model(None, &target.default_model, &models);
+    let long_context = infer_live_long_context(&models, target.managed_long_context);
 
     if args.json {
         let payload = json!({
             "default_model": target.default_model,
             "fast_model": fast_model,
+            "long_context": long_context,
             "count": models.len(),
-            "models": models.iter().map(|m| json!({
-                "id": m.id,
-                "display_name": m.display_name,
-                "context_window": m.context_window,
-            })).collect::<Vec<_>>(),
+            "models": models.iter().map(|m| {
+                let (context_window, auto_compact_token_limit) = m.context_limits(long_context);
+                json!({
+                    "id": m.id,
+                    "display_name": m.display_name,
+                    "context_window": context_window,
+                    "auto_compact_token_limit": auto_compact_token_limit,
+                })
+            }).collect::<Vec<_>>(),
         });
         println!(
             "{}",
@@ -1134,11 +1174,7 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
 
     let mut table = ui::new_table(&["Model ID", "Display Name", "Context", "Role"]);
     for m in &models {
-        let ctx_k = if m.context_window > 0 {
-            format!("{}k", m.context_window / 1_000)
-        } else {
-            "1000k".to_owned()
-        };
+        let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
         let is_default = m.id == target.default_model;
         let is_fast = m.id == fast_model;
         let id_cell = if is_default && ui::use_color() {
@@ -1739,10 +1775,10 @@ fn configure_detached_command(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
-        };
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        // Avoid combining `DETACHED_PROCESS` with `CREATE_NO_WINDOW`, which conflicts in Win32
+        // `CreateProcessW` and prevents stdio pipe handle isolation when `lg start` is piped.
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     #[cfg(unix)]
@@ -1755,6 +1791,67 @@ fn configure_detached_command(cmd: &mut Command) {
                 let _ = libc::setsid();
                 Ok(())
             });
+        }
+    }
+}
+
+/// Temporarily clears `HANDLE_FLAG_INHERIT` on the parent CLI's stdio handles around Windows
+/// background daemon spawning (`CreateProcessW` passes `bInheritHandles = TRUE` without a narrow
+/// handle list), preventing piped callers (`lg start | Out-Null`, `$out = lg start`, CI runners)
+/// from hanging on inherited stdout/stderr pipe ends.
+#[cfg(windows)]
+struct StdioInheritGuard {
+    saved: Vec<(isize, u32)>,
+}
+
+#[cfg(windows)]
+impl StdioInheritGuard {
+    fn suspend_current() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+            SetHandleInformation,
+        };
+
+        let raw_handles = [
+            std::io::stdin().as_raw_handle() as isize,
+            std::io::stdout().as_raw_handle() as isize,
+            std::io::stderr().as_raw_handle() as isize,
+        ];
+        let mut saved = Vec::with_capacity(3);
+        for raw in raw_handles {
+            if raw == 0 || (raw as HANDLE) == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut flags: u32 = 0;
+            // SAFETY: `raw` is a live process stdio handle obtained via `AsRawHandle`;
+            // `flags` points to stack storage and we only toggle `HANDLE_FLAG_INHERIT`.
+            unsafe {
+                if GetHandleInformation(raw as HANDLE, &raw mut flags) != 0
+                    && (flags & HANDLE_FLAG_INHERIT) != 0
+                    && SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) != 0
+                {
+                    saved.push((raw, flags));
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdioInheritGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for &(raw, flags) in &self.saved {
+            // SAFETY: Restores the original `HANDLE_FLAG_INHERIT` bit recorded in `suspend_current`.
+            unsafe {
+                let _ = SetHandleInformation(
+                    raw as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    flags & HANDLE_FLAG_INHERIT,
+                );
+            }
         }
     }
 }

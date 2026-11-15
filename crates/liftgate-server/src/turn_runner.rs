@@ -13,8 +13,9 @@ use liftgate_types::{
     parser::{IncrementalToolParser, ParsedStreamItem, ParsedToolCall},
     session_key::{
         AcpPromptPlan, INTERNAL_GATEWAY_WEB_FETCH_TOOL, WebToolBridgeConfig, build_acp_prompt_plan,
-        build_client_tools_delta_xml, build_compaction_directive_xml, build_session_system_append,
-        compute_routing_plan, hash_conversation_with_reply, hash_dialogue_with_reply,
+        build_client_tools_delta_xml, build_compaction_directive_xml,
+        build_session_system_append_with_spill, compute_routing_plan, hash_conversation_with_reply,
+        hash_dialogue_with_reply,
     },
     telemetry::TaskProtocol,
 };
@@ -122,6 +123,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             req.enable_native_web_fetch = false;
         }
     }
+    req.materialize_system_instructions();
 
     let requested_label = req
         .requested_model
@@ -343,7 +345,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         }
 
         let nonce = gateway_process_tool_nonce();
-        let system_append = build_session_system_append(
+        let (system_append, initial_tools_spill) = build_session_system_append_with_spill(
             req.system_instructions.as_deref(),
             &req.client_tools,
             web_cfg,
@@ -370,7 +372,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             &req.messages,
             guard.tool_nonce(),
             true,
-            None,
+            initial_tools_spill.as_deref(),
             cfg.long_context,
         )?;
         let initial_rpc_model = if plan.seed_chunks.is_empty() {

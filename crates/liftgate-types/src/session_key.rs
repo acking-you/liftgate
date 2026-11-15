@@ -314,6 +314,68 @@ fn is_developer_instructions_wrapper(text: &str) -> bool {
         && trimmed.ends_with("</developer_instructions>")
 }
 
+/// Cleans non-semantic billing noise from a caller `system` / `developer` instruction string
+/// and wraps it in `<developer_instructions>` (idempotently, never double-wrapping).
+#[must_use]
+pub fn wrap_developer_instructions_block(raw_text: &str) -> Option<String> {
+    let cleaned = strip_billing_noise(raw_text);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_developer_instructions_wrapper(trimmed) {
+        Some(trimmed.to_owned())
+    } else {
+        Some(format!(
+            "<developer_instructions>\n{trimmed}\n</developer_instructions>"
+        ))
+    }
+}
+
+/// Protocol-agnostic normalizer that materializes top-level caller `system` / `instructions`
+/// into `<developer_instructions>` blocks inside `messages` instead of
+/// `_meta.antigravity.systemPrompt.append`, keeping every harness (Claude Code, Codex CLI,
+/// OpenCode, etc.) immune to upstream `systemPrompt.append` `429` rejections while preserving
+/// warm `SessionPool` prefix and `/compact` dialogue hashes.
+pub fn materialize_system_prompt_into_messages(
+    raw_system: Option<&str>,
+    has_previous_response_anchor: bool,
+    client_tools: &[CanonicalToolSpec],
+    messages: &mut Vec<CanonicalMessage>,
+) {
+    if has_previous_response_anchor {
+        return;
+    }
+    let Some(sys_raw) = raw_system else {
+        return;
+    };
+    let Some(wrapped) = wrap_developer_instructions_block(sys_raw) else {
+        return;
+    };
+    if client_tools.is_empty() && is_compaction_instructions_prompt(&wrapped) {
+        if let Some(last_user) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == CanonicalRole::User)
+        {
+            last_user.parts.push(CanonicalPart::Text(wrapped));
+        } else {
+            messages.push(CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text(wrapped)],
+            });
+        }
+    } else {
+        messages.insert(
+            0,
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text(wrapped)],
+            },
+        );
+    }
+}
+
 /// Returns `true` when an `instructions` / `system` string is a harness compaction prompt
 /// (such as OpenAI Codex's `CONTEXT CHECKPOINT COMPACTION` or Claude Code's `/compact` prompt).
 #[must_use]
@@ -323,6 +385,7 @@ pub fn is_compaction_instructions_prompt(text: &str) -> bool {
         || lower.contains("handoff summary for another llm")
         || (lower.contains("compaction") && lower.contains("another language model"))
         || lower.contains("create a detailed summary of the conversation so far")
+        || lower.contains("tasked with summarizing conversations")
 }
 
 /// Detects whether an incoming turn is a local context-compaction summarization request
@@ -666,7 +729,7 @@ pub fn build_session_system_append(
          - Ignore any internal ACP host directory such as `liftgate-empty-cwd`; it is only an \
          inert gateway sandbox folder. External `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, \
          `Grep`, `Glob`, etc.) execute directly in the caller's actual workspace directory described \
-         in `<caller_system_instructions>` and caller environment blocks.\n\
+         in `<developer_instructions>`, `<caller_system_instructions>`, and caller environment blocks.\n\
          - CRITICAL: NEVER emit any native tool/function call (not even an empty one) for external \
          `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, \
          `Agent`, `apply_patch`, etc.) or after writing XML tool blocks; doing so triggers a \
@@ -760,6 +823,87 @@ pub fn build_session_system_append(
     }
 
     out
+}
+
+/// Maximum UTF-8 byte budget for `_meta.antigravity.systemPrompt.append` on `session/new`.
+///
+/// Upstream `agy acp` rejects oversized `systemPrompt.append` payloads with `429 RESOURCE_EXHAUSTED`.
+/// Capping `systemPrompt.append` at `16,000` bytes and spilling any excess `<client_tools>`
+/// schemas into the initial `session/prompt` directive protects tool-heavy harnesses (such as
+/// OpenCode or multi-MCP setups) without dropping a single tool definition.
+pub const MAX_SYSTEM_APPEND_BYTES: usize = 16_000;
+
+/// Builds `_meta.antigravity.systemPrompt.append` bounded to `MAX_SYSTEM_APPEND_BYTES`, returning
+/// `(system_append, overflow_tools_directive_xml)` when a large `<client_tools>` catalog spills
+/// into the initial `session/prompt` turn.
+#[must_use]
+pub fn build_session_system_append_with_spill(
+    caller_system: Option<&str>,
+    client_tools: &[CanonicalToolSpec],
+    web_cfg: WebToolBridgeConfig,
+    tool_nonce: &str,
+) -> (String, Option<String>) {
+    let full = build_session_system_append(caller_system, client_tools, web_cfg, tool_nonce);
+    if full.len() <= MAX_SYSTEM_APPEND_BYTES || client_tools.is_empty() {
+        return (full, None);
+    }
+
+    let mut header = build_session_system_append(None, &[], web_cfg, tool_nonce);
+    if let Some(base_prefix) = header.strip_suffix("</api_gateway_bridge_rules>\n") {
+        let mut bounded = String::with_capacity(MAX_SYSTEM_APPEND_BYTES);
+        bounded.push_str(base_prefix);
+        let open_tag = format!("<agy_tool_call_{tool_nonce}>");
+        let close_tag = format!("</agy_tool_call_{tool_nonce}>");
+        bounded.push_str(&format!(
+            "- Invoke external `<client_tools>` ONLY via `{open_tag}\n{{\"name\": \"<exact_tool_name>\", \"arguments\": {{ ... }}}}\n{close_tag}` (or `\"input\"` for freeform tools) and stop immediately after `{close_tag}`.\n"
+        ));
+
+        let close_rules = "</client_tools>\n</api_gateway_bridge_rules>\n";
+        let mut inline_count = 0usize;
+        let mut tool_buf = String::new();
+        for tool in client_tools {
+            tool_buf.clear();
+            render_compact_client_tool(tool, &mut tool_buf);
+            let open_cost = if inline_count == 0 {
+                "<client_tools>\n".len()
+            } else {
+                0
+            };
+            if bounded.len() + open_cost + tool_buf.len() + close_rules.len()
+                <= MAX_SYSTEM_APPEND_BYTES
+            {
+                if inline_count == 0 {
+                    bounded.push_str("<client_tools>\n");
+                }
+                bounded.push_str(&tool_buf);
+                inline_count += 1;
+            } else {
+                break;
+            }
+        }
+        if inline_count > 0 {
+            bounded.push_str(close_rules);
+        } else {
+            bounded.push_str("</api_gateway_bridge_rules>\n");
+        }
+        header = bounded;
+
+        if let Some(spilled) = client_tools.get(inline_count..)
+            && !spilled.is_empty()
+        {
+            let mut spill_xml = String::with_capacity(4096);
+            spill_xml.push_str(
+                "<client_tools_update>\nAdditional active `<client_tools>` for this session:\n",
+            );
+            for tool in spilled {
+                render_compact_client_tool(tool, &mut spill_xml);
+            }
+            spill_xml.push_str("</client_tools_update>\n");
+            return (header, Some(spill_xml));
+        }
+    }
+
+    (header, None)
 }
 
 fn render_compact_client_tool(tool: &CanonicalToolSpec, out: &mut String) {
@@ -899,6 +1043,21 @@ const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 148_000;
 const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 68_000;
 const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
 
+const _: () = {
+    assert!(
+        MAX_SYSTEM_APPEND_BYTES * 4 < MAX_ACP_PROMPT_TEXT_BYTES,
+        "systemPrompt.append cap must stay well below a single ACP prompt turn budget"
+    );
+    assert!(
+        MAX_ACP_PROMPT_TEXT_BYTES > SEED_CHUNK_TARGET_TEXT_BYTES + 1_024,
+        "hydration seed chunks plus footer framing must stay below the single-turn ACP ceiling"
+    );
+    assert!(
+        SEED_CHUNK_TARGET_TEXT_BYTES > MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES,
+        "seed chunk budget must exceed the active-slice share of a bounded cold replay"
+    );
+};
+
 const ARCHIVE_OPEN_HEADER: &str =
     "--- Prior Conversation Context (Read-Only Archive; Do NOT echo these headers) ---\n";
 const ARCHIVE_CLOSE_HEADER: &str = "--- End Prior Conversation Context ---\n\n### Current Caller Input (Respond ONLY for the current assistant step)\n";
@@ -1017,16 +1176,30 @@ pub fn build_acp_prompt_plan(
 
     if !long_context {
         let budget = MAX_ACP_PROMPT_TEXT_BYTES.saturating_sub(directive_bytes);
-        let active = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
-        if total_text_block_bytes(&active) > budget {
-            return Err(ProtocolError::PromptTooLarge {
-                bytes: total_text_block_bytes(&active),
-            });
+        let mut active = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
+        let active_bytes = total_text_block_bytes(&active);
+        if active_bytes > budget {
+            if let Some(slimmed_blocks) =
+                slim_developer_instructions_in_slice(active_slice, tool_nonce, budget)
+            {
+                active = slimmed_blocks;
+            } else {
+                return Err(ProtocolError::PromptTooLarge {
+                    bytes: active_bytes,
+                });
+            }
         }
-        let mut blocks = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
-        if total_text_block_bytes(&blocks) > budget {
-            blocks = render_history_around_active(history_slice, active, tool_nonce, budget);
-        }
+        let mut blocks = if history_slice.is_empty() {
+            active
+        } else {
+            let uncompacted =
+                render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+            if total_text_block_bytes(&uncompacted) > budget {
+                render_history_around_active(history_slice, active, tool_nonce, budget)
+            } else {
+                uncompacted
+            }
+        };
         prepend_directive_to_blocks(&mut blocks, leading_directive_xml);
         let blocks = sanitize_slash_command_blocks(blocks);
         let bytes = total_text_block_bytes(&blocks);
@@ -1353,6 +1526,93 @@ fn render_history_around_active(
     }
     combined.extend(active_iter);
     combined
+}
+
+/// Slims ONLY `<developer_instructions>` blocks when an active turn exceeds the single-turn ACP
+/// byte ceiling (for example, when a harness like OpenCode or Claude Code injects massive monorepo
+/// `AGENTS.md` / skill rules into `system`), keeping 100% of the caller's actual conversational
+/// prompt, tool calls, tool outputs, and images completely lossless.
+fn slim_developer_instructions_in_slice(
+    active_slice: &[CanonicalMessage],
+    tool_nonce: &str,
+    budget: usize,
+) -> Option<Vec<AcpPromptBlock>> {
+    let dev_part_count: usize = active_slice
+        .iter()
+        .flat_map(|m| &m.parts)
+        .filter(|p| matches!(p, CanonicalPart::Text(t) if is_developer_instructions_wrapper(t)))
+        .count();
+    if dev_part_count == 0 {
+        return None;
+    }
+
+    // Pass 1: strip verbose `<examples>`, `<example>`, and `<commentary>` blocks inside
+    // `<developer_instructions>` only.
+    let mut slimmed: Vec<CanonicalMessage> = active_slice.to_vec();
+    for msg in &mut slimmed {
+        for part in &mut msg.parts {
+            if let CanonicalPart::Text(text) = part
+                && is_developer_instructions_wrapper(text)
+            {
+                let s1 = strip_tag_blocks(text, "<examples>", "</examples>");
+                let s2 = strip_tag_blocks(&s1, "<example>", "</example>");
+                *text = strip_tag_blocks(&s2, "<commentary>", "</commentary>");
+            }
+        }
+    }
+
+    let pass1_blocks = render_uncompacted_prompt_blocks(&[], &slimmed, tool_nonce);
+    if total_text_block_bytes(&pass1_blocks) <= budget {
+        return Some(pass1_blocks);
+    }
+
+    // Pass 2: measure exact byte footprint of all non-`<developer_instructions>` parts; if the
+    // caller's own prompt/tool inputs alone exceed `budget`, refuse to truncate them (`None`).
+    let mut non_dev_probe = slimmed.clone();
+    for msg in &mut non_dev_probe {
+        msg.parts.retain(
+            |p| !matches!(p, CanonicalPart::Text(t) if is_developer_instructions_wrapper(t)),
+        );
+    }
+    let non_dev_bytes = total_text_block_bytes(&render_uncompacted_prompt_blocks(
+        &[],
+        &non_dev_probe,
+        tool_nonce,
+    ));
+    if non_dev_bytes.saturating_add(512) >= budget {
+        return None;
+    }
+
+    let available_dev_bytes = budget.saturating_sub(non_dev_bytes.saturating_add(256));
+    let per_dev_budget = available_dev_bytes / dev_part_count;
+    if per_dev_budget < 512 {
+        return None;
+    }
+
+    for msg in &mut slimmed {
+        for part in &mut msg.parts {
+            if let CanonicalPart::Text(text) = part
+                && is_developer_instructions_wrapper(text)
+            {
+                let inner = text
+                    .trim()
+                    .strip_prefix("<developer_instructions>")
+                    .and_then(|s| s.strip_suffix("</developer_instructions>"))
+                    .unwrap_or(text.as_str())
+                    .trim();
+                let body_budget = per_dev_budget.saturating_sub(64);
+                let bounded = if inner.len() > body_budget {
+                    truncate_middle_utf8_bytes(inner, body_budget, 13, 20)
+                } else {
+                    inner.to_owned()
+                };
+                *text = format!("<developer_instructions>\n{bounded}\n</developer_instructions>");
+            }
+        }
+    }
+
+    let pass2_blocks = render_uncompacted_prompt_blocks(&[], &slimmed, tool_nonce);
+    (total_text_block_bytes(&pass2_blocks) <= budget).then_some(pass2_blocks)
 }
 
 fn render_bounded_active_slice(
@@ -2404,5 +2664,88 @@ mod tests {
             }
             _ => panic!("expected text block"),
         }
+    }
+
+    #[test]
+    fn spills_massive_mcp_tool_catalog_past_16kb_cap_and_slims_only_developer_instructions() {
+        let many_tools: Vec<CanonicalToolSpec> = (0..60)
+            .map(|i| CanonicalToolSpec {
+                name: format!("mcp__opencode_server__tool_{i:02}"),
+                description: Some(format!(
+                    "Detailed OpenCode MCP tool {i} description: {}",
+                    "capability ".repeat(35)
+                )),
+                kind: CanonicalToolKind::Function {
+                    parameters_json:
+                        r#"{"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}"#
+                            .to_owned(),
+                },
+            })
+            .collect();
+
+        let (append, spill) = build_session_system_append_with_spill(
+            None,
+            &many_tools,
+            WebToolBridgeConfig::default(),
+            "abcd12",
+        );
+        assert!(
+            append.len() <= MAX_SYSTEM_APPEND_BYTES,
+            "systemPrompt.append len {} exceeded cap {}",
+            append.len(),
+            MAX_SYSTEM_APPEND_BYTES
+        );
+        let spill_xml = spill.expect("60 verbose MCP tools must spill excess schemas into Turn 1");
+        assert!(spill_xml.starts_with("<client_tools_update>"));
+        assert!(spill_xml.contains("mcp__opencode_server__tool_59"));
+        assert!(append.contains("mcp__opencode_server__tool_00"));
+
+        // Giant 135 KB `<developer_instructions>` + 35 KB user prompt (> 160 KB total) must slim
+        // ONLY `<developer_instructions>` while preserving 100% of the user prompt losslessly.
+        let user_prompt = format!("USER_START_MARKER\n{}\nUSER_END_MARKER", "u".repeat(35_000));
+        let giant_dev = format!(
+            "<developer_instructions>\nHEAD_RULE\n{}\nTAIL_RULE\n</developer_instructions>",
+            "r".repeat(135_000)
+        );
+        let plan = build_acp_prompt_plan(
+            &[
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::Text(giant_dev)],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::Text(user_prompt.clone())],
+                },
+            ],
+            "abcd12",
+            true,
+            None,
+            false,
+        )
+        .expect("giant developer_instructions should slim instead of failing Turn 1");
+        let rendered = match plan.final_blocks.first() {
+            Some(AcpPromptBlock::Text { text }) => text,
+            _ => panic!("expected text block"),
+        };
+        assert!(rendered.len() <= MAX_ACP_PROMPT_TEXT_BYTES);
+        assert!(
+            rendered.contains(&user_prompt),
+            "caller user prompt must remain 100% intact and uncompacted"
+        );
+        assert!(rendered.contains("HEAD_RULE"));
+        assert!(rendered.contains("TAIL_RULE"));
+
+        // Conversely, an oversized raw user prompt (> 160 KB) MUST still fail with `PromptTooLarge`.
+        let oversized_user = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "u".repeat(MAX_ACP_PROMPT_TEXT_BYTES + 1_024),
+            )],
+        };
+        assert!(matches!(
+            build_acp_prompt_plan(&[oversized_user], "abcd12", true, None, false),
+            Err(ProtocolError::PromptTooLarge { .. })
+        ));
     }
 }

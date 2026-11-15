@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use liftgate_server::platform::{canonicalize_clean, merge_loopback_no_proxy};
 use liftgate_types::{
     config::ModelId,
-    model::{context_limits, select_fastest_gemini_model},
+    model::{context_limits, resolve_model_id, select_fastest_gemini_model},
     openai::build_codex_model_catalog,
 };
 use serde_json::{Map, Value, json};
@@ -13,7 +13,7 @@ use crate::cli::{
     ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, invoked_bin_name,
     normalize_optional_api_key,
 };
-use crate::client::DiscoveredModel;
+use crate::client::{DiscoveredModel, infer_live_long_context};
 use crate::daemon::{ensure_gateway_ready, resolve_client_api_key};
 use crate::error::CliError;
 use crate::state::{StatePaths, format_connect_url, user_home_dir, write_file_atomic};
@@ -36,6 +36,9 @@ const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
 ];
+
+/// Global Claude Code `autoCompactWindow` written for models absent from `modelSettings`.
+const CLAUDE_FALLBACK_AUTO_COMPACT_WINDOW: u64 = 110_000;
 
 const MANAGED_CODEX_ROOT_KEYS: &[&str] = &[
     "model",
@@ -259,15 +262,33 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
 /// and every canonical alias, taking the smallest window when several IDs share a capability map.
 fn merge_claude_context_settings(existing: &mut Map<String, Value>, params: &HarnessSyncParams) {
     let mut windows = std::collections::BTreeMap::<String, u64>::new();
+    let available: Vec<_> = params
+        .discovered_models
+        .iter()
+        .map(DiscoveredModel::to_available_model)
+        .collect();
+    let fallback_model = ModelId::try_new(&params.primary_model)
+        .or_else(|_| ModelId::try_new("gemini-4-carbon-high"))
+        .expect("compile-time fallback model id is non-empty");
     let resolve = |id: &str| {
-        params
+        if let Some(exact) = params
             .discovered_models
             .iter()
-            .find(|m| m.id == id)
-            .map_or_else(
-                || context_limits(id, params.long_context).1,
-                |m| m.context_limits(params.long_context).1,
-            )
+            .find(|m| m.id.eq_ignore_ascii_case(id))
+        {
+            return exact.context_limits(params.long_context).1;
+        }
+        if !available.is_empty() {
+            let mapped = resolve_model_id(Some(id), None, &available, &fallback_model);
+            if let Some(hit) = params
+                .discovered_models
+                .iter()
+                .find(|m| m.id.eq_ignore_ascii_case(mapped.as_str()))
+            {
+                return hit.context_limits(params.long_context).1;
+            }
+        }
+        context_limits(id, params.long_context).1
     };
     let mut add = |id: &str, limit: u64| {
         windows
@@ -298,7 +319,10 @@ fn merge_claude_context_settings(existing: &mut Map<String, Value>, params: &Har
         }
     }
     // Applies to unlisted models; known models override it in the same settings scope.
-    existing.insert("autoCompactWindow".to_owned(), json!(110_000));
+    // Never overwrite a user-chosen global value: it only acts as a fallback anyway.
+    existing
+        .entry("autoCompactWindow")
+        .or_insert_with(|| json!(CLAUDE_FALLBACK_AUTO_COMPACT_WINDOW));
     let settings = existing.entry("modelSettings").or_insert_with(|| json!({}));
     if !settings.is_object() {
         *settings = json!({});
@@ -336,9 +360,9 @@ fn strip_managed_claude_context(existing: &mut Map<String, Value>) {
             }
         }
     }
-    if !ids.is_empty()
-        && let Some(Value::Object(overrides)) = existing.get("modelOverrides")
-    {
+    // Without our picker there is nothing we wrote, so leave every context field untouched.
+    let has_managed_picker = !ids.is_empty();
+    if has_managed_picker && let Some(Value::Object(overrides)) = existing.get("modelOverrides") {
         for (canonical, id) in overrides {
             ids.push(canonical.clone());
             if let Some(id) = id.as_str() {
@@ -359,7 +383,10 @@ fn strip_managed_claude_context(existing: &mut Map<String, Value>) {
             existing.remove("modelSettings");
         }
     }
-    if existing.get("autoCompactWindow").and_then(Value::as_u64) == Some(110_000) {
+    if has_managed_picker
+        && existing.get("autoCompactWindow").and_then(Value::as_u64)
+            == Some(CLAUDE_FALLBACK_AUTO_COMPACT_WINDOW)
+    {
         existing.remove("autoCompactWindow");
     }
 }
@@ -715,15 +742,6 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
 
     let daemon = state_paths.read_daemon()?;
     let default_serve = ServeArgs::default();
-    let long_context = if live_target.is_some() {
-        // Live discovery below carries the running gateway's policy. Never let saved preferences
-        // turn a missing/old live policy into an experimental one.
-        false
-    } else {
-        default_serve
-            .long_context
-            .unwrap_or(state_paths.read_settings()?.long_context)
-    };
     let resolved_listen = args
         .listen
         .or_else(|| daemon.as_ref().map(|d| d.listen))
@@ -757,6 +775,13 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
         t.client.fetch_models().await.unwrap_or_default()
     } else {
         Vec::new()
+    };
+    let long_context = if let Some(t) = &live_target {
+        infer_live_long_context(&discovered_models, t.managed_long_context)
+    } else {
+        default_serve
+            .long_context
+            .unwrap_or(state_paths.read_settings()?.long_context)
     };
     let fast_model = resolve_fast_model(
         args.fast_model.as_deref(),
@@ -1044,6 +1069,43 @@ mod tests {
     }
 
     #[test]
+    fn claude_global_auto_compact_window_is_only_managed_when_liftgate_wrote_it() {
+        let params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-3.8-flash-low".to_owned(),
+            no_bypass: true,
+            long_context: false,
+            discovered_models: Vec::new(),
+        };
+
+        // A user-chosen global window survives both merge and uninstall.
+        let mut custom: Map<String, Value> =
+            serde_json::from_value(json!({ "autoCompactWindow": 300000 })).unwrap();
+        merged_claude_settings_into(&mut custom, &params);
+        assert_eq!(custom["autoCompactWindow"], 300000);
+        strip_claude_settings(&mut custom);
+        assert_eq!(custom["autoCompactWindow"], 300000);
+
+        // Without a Liftgate picker, a value equal to our fallback is still the user's.
+        let mut unmanaged: Map<String, Value> =
+            serde_json::from_value(json!({ "autoCompactWindow": 110000 })).unwrap();
+        strip_claude_settings(&mut unmanaged);
+        assert_eq!(unmanaged["autoCompactWindow"], 110000);
+
+        // Our own fallback is written once and removed cleanly.
+        let mut managed = Map::new();
+        merged_claude_settings_into(&mut managed, &params);
+        assert_eq!(managed["autoCompactWindow"], 110000);
+        let merged_once = managed.clone();
+        merged_claude_settings_into(&mut managed, &params);
+        assert_eq!(managed, merged_once);
+        strip_claude_settings(&mut managed);
+        assert!(managed.get("autoCompactWindow").is_none());
+    }
+
+    #[test]
     fn context_policy_tracks_live_models_and_limits_shared_claude_aliases() {
         let models: Vec<DiscoveredModel> = serde_json::from_value(json!([
             {"id": "gemini-4-carbon-high", "context_window": 1000000, "auto_compact_token_limit": 850000},
@@ -1100,6 +1162,32 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.context_limits(false), (280000, 245000));
+
+        // Alias primary models (`gemini-4-carbon`) on a `--long-context` gateway must resolve
+        // against the live catalog instead of clamping canonical aliases back down to 245k.
+        let alias_models: Vec<DiscoveredModel> = serde_json::from_value(json!([
+            {"id": "gemini-4-carbon-high", "context_window": 1000000, "auto_compact_token_limit": 850000},
+            {"id": "gemini-3.8-flash-low", "context_window": 1000000, "auto_compact_token_limit": 850000}
+        ]))
+        .unwrap();
+        let alias_params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "gemini-4-carbon".to_owned(),
+            fast_model: "gemini-3.8-flash-low".to_owned(),
+            no_bypass: true,
+            long_context: infer_live_long_context(&alias_models, None),
+            discovered_models: alias_models,
+        };
+        let alias_settings = build_claude_settings_map(&alias_params);
+        assert_eq!(
+            alias_settings["modelSettings"]["gemini-4-carbon"]["autoCompactWindow"],
+            850000
+        );
+        assert_eq!(
+            alias_settings["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"],
+            850000
+        );
     }
 
     #[test]

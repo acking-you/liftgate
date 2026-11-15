@@ -9,7 +9,9 @@ use crate::canonical::{
     NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task,
 };
 use crate::error::ProtocolError;
-use crate::session_key::strip_billing_noise;
+use crate::session_key::{
+    materialize_system_prompt_into_messages, strip_billing_noise, wrap_developer_instructions_block,
+};
 
 pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
 
@@ -223,13 +225,21 @@ pub struct AnthropicThinkingConfig {
 }
 
 /// Normalizes an `AnthropicMessagesRequest` into a `NormalizedTurnRequest`.
+///
+/// Important ACP compatibility invariant: caller `system` prompts (such as Claude Code's ~30–40 KB
+/// workspace + harness system instructions) are emitted as `<developer_instructions>` blocks
+/// inside `messages` rather than `_meta.antigravity.systemPrompt.append`, avoiding upstream
+/// `429 RESOURCE_EXHAUSTED` rejections on large harness prompts while preserving deterministic
+/// `SessionPool` prefix and `/compact` dialogue hashes across turns.
 pub fn normalize_anthropic_request(
     req: AnthropicMessagesRequest,
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
-    let mut system_instructions = req
+    let mut aux_system = req
         .system
         .map(AnthropicSystemPrompt::into_joined_text)
-        .filter(|s| !s.trim().is_empty());
+        .map(|s| strip_billing_noise(&s))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
 
     if let Some(schema) = req
         .output_config
@@ -242,17 +252,19 @@ pub fn normalize_anthropic_request(
         let directive = format!(
             "Respond ONLY with valid JSON conforming strictly to this JSON schema:\n{schema_json}"
         );
-        match &mut system_instructions {
+        match &mut aux_system {
             Some(existing) => {
                 existing.push_str("\n\n");
                 existing.push_str(&directive);
             }
-            None => system_instructions = Some(directive),
+            None => aux_system = Some(directive),
         }
     }
 
-    let mut messages = Vec::with_capacity(req.messages.len());
+    let mut conv_messages = Vec::with_capacity(req.messages.len());
+    let mut has_conversational_input = false;
     for msg in req.messages {
+        let is_system_or_developer = matches!(msg.role.as_str(), "system" | "developer");
         let role = if msg.role == "assistant" {
             CanonicalRole::Assistant
         } else {
@@ -262,15 +274,30 @@ pub fn normalize_anthropic_request(
         let mut parts = Vec::new();
         match msg.content {
             AnthropicMessageContent::Text(s) => {
-                parts.push(CanonicalPart::Text(s));
+                if is_system_or_developer {
+                    if let Some(wrapped) = wrap_developer_instructions_block(&s) {
+                        parts.push(CanonicalPart::Text(wrapped));
+                    }
+                } else {
+                    has_conversational_input = true;
+                    parts.push(CanonicalPart::Text(s));
+                }
             }
             AnthropicMessageContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
                         AnthropicInputBlock::Text { text } => {
-                            parts.push(CanonicalPart::Text(text));
+                            if is_system_or_developer {
+                                if let Some(wrapped) = wrap_developer_instructions_block(&text) {
+                                    parts.push(CanonicalPart::Text(wrapped));
+                                }
+                            } else {
+                                has_conversational_input = true;
+                                parts.push(CanonicalPart::Text(text));
+                            }
                         }
                         AnthropicInputBlock::Image { source } => {
+                            has_conversational_input = true;
                             if source.source_type == "base64"
                                 && !source.media_type.is_empty()
                                 && !source.data.is_empty()
@@ -284,9 +311,11 @@ pub fn normalize_anthropic_request(
                             }
                         }
                         AnthropicInputBlock::Thinking { thinking, .. } => {
+                            has_conversational_input = true;
                             parts.push(CanonicalPart::Reasoning(thinking));
                         }
                         AnthropicInputBlock::ToolUse { id, name, input } => {
+                            has_conversational_input = true;
                             let arguments = serde_json::to_string(&input)?;
                             parts.push(CanonicalPart::ToolCall {
                                 call_id: id,
@@ -300,6 +329,7 @@ pub fn normalize_anthropic_request(
                             content,
                             is_error,
                         } => {
+                            has_conversational_input = true;
                             let mut image_parts = Vec::new();
                             let output = match content {
                                 Some(AnthropicToolResultContent::Text(s)) => s,
@@ -350,11 +380,11 @@ pub fn normalize_anthropic_request(
         }
 
         if !parts.is_empty() {
-            messages.push(CanonicalMessage { role, parts });
+            conv_messages.push(CanonicalMessage { role, parts });
         }
     }
 
-    if messages.is_empty() {
+    if !has_conversational_input || conv_messages.is_empty() {
         return Err(ProtocolError::EmptyInput);
     }
 
@@ -411,11 +441,19 @@ pub fn normalize_anthropic_request(
     }
 
     let auxiliary_task = detect_auxiliary_task(
-        system_instructions.as_deref(),
-        &messages,
+        aux_system.as_deref(),
+        &conv_messages,
         &client_tools,
         enable_native_web_search,
         enable_native_web_fetch,
+    );
+
+    let mut messages = conv_messages;
+    materialize_system_prompt_into_messages(
+        aux_system.as_deref(),
+        false,
+        &client_tools,
+        &mut messages,
     );
 
     let force_native_web_search = enable_native_web_search
@@ -455,7 +493,7 @@ pub fn normalize_anthropic_request(
 
     Ok(NormalizedTurnRequest {
         requested_model: Some(req.model),
-        system_instructions,
+        system_instructions: None,
         messages,
         client_tools,
         enable_native_web_search,
@@ -698,5 +736,120 @@ mod tests {
             CanonicalPart::ImageBase64 { media_type, data }
                 if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUg=="
         ));
+    }
+
+    #[test]
+    fn moves_claude_system_prompt_out_of_system_append_and_preserves_prefix_and_compact_hashes() {
+        use crate::canonical::AuxiliaryTaskKind;
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+            hash_dialogue_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        // Turn 1: massive Claude Code system prompt + volatile billing header
+        let req1: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": [
+                { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.325; cch=11111;" },
+                { "type": "text", "text": format!("You are Claude Code.\n{}", "rule\n".repeat(8_000)) }
+            ],
+            "tools": [{ "name": "Read", "description": "Read file" }],
+            "messages": [{ "role": "user", "content": "Inspect Cargo.toml" }]
+        }))
+        .expect("valid Turn 1 request");
+        let norm1 = normalize_anthropic_request(req1).expect("Turn 1 normalized");
+        assert!(
+            norm1.system_instructions.is_none(),
+            "Claude system prompt must never populate _meta.antigravity.systemPrompt.append"
+        );
+        assert_eq!(norm1.messages.len(), 2);
+        assert!(matches!(
+            norm1.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t))
+                if t.starts_with("<developer_instructions>")
+                    && !t.contains("x-anthropic-billing-header")
+        ));
+
+        let a1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(
+                "Cargo.toml has version 0.1.4.".to_owned(),
+            )],
+        };
+        let turn1_state_hash = hash_conversation_with_reply(
+            None,
+            &norm1.client_tools,
+            web_cfg,
+            &model,
+            &norm1.messages,
+            &a1,
+        );
+        let turn1_dialogue_hash = hash_dialogue_with_reply(&model, &norm1.messages, &a1);
+
+        // Turn 2: mutated `cch=...` billing header -> must hit Turn 1's warm SessionPool hash
+        let req2: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": [
+                { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.325; cch=99999;" },
+                { "type": "text", "text": format!("You are Claude Code.\n{}", "rule\n".repeat(8_000)) }
+            ],
+            "tools": [{ "name": "Read", "description": "Read file" }],
+            "messages": [
+                { "role": "user", "content": "Inspect Cargo.toml" },
+                { "role": "assistant", "content": "Cargo.toml has version 0.1.4." },
+                { "role": "user", "content": "Now inspect CHANGELOG.md" }
+            ]
+        }))
+        .expect("valid Turn 2 request");
+        let norm2 = normalize_anthropic_request(req2).expect("Turn 2 normalized");
+        let plan2 =
+            compute_routing_plan(None, &norm2.client_tools, web_cfg, &model, &norm2.messages);
+        assert_eq!(plan2.prefix_lookup, Some((turn1_state_hash, 3)));
+
+        // `/compact` turn: replaces `system` with summarization instructions and clears `tools`
+        let req_compact: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": "You are a helpful AI assistant tasked with summarizing conversations.",
+            "tools": [],
+            "messages": [
+                { "role": "user", "content": "Inspect Cargo.toml" },
+                { "role": "assistant", "content": "Cargo.toml has version 0.1.4." },
+                { "role": "user", "content": "Your task is to create a detailed summary of the conversation so far." }
+            ]
+        }))
+        .expect("valid compact request");
+        let norm_compact = normalize_anthropic_request(req_compact).expect("compact normalized");
+        let plan_compact = compute_routing_plan(
+            None,
+            &norm_compact.client_tools,
+            web_cfg,
+            &model,
+            &norm_compact.messages,
+        );
+        assert_eq!(
+            plan_compact.compaction_lookup,
+            Some((turn1_dialogue_hash, 2))
+        );
+
+        // Auto Mode classifier detection remains intact
+        let req_cls: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 256,
+            "system": "You are an auto mode classifier evaluating tool safety.",
+            "messages": [{ "role": "user", "content": "<transcript>Bash: cargo test</transcript>" }]
+        }))
+        .expect("valid classifier request");
+        let norm_cls = normalize_anthropic_request(req_cls).expect("classifier normalized");
+        assert_eq!(
+            norm_cls.auxiliary_task,
+            Some(AuxiliaryTaskKind::AutoModeClassifier)
+        );
     }
 }

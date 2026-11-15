@@ -54,6 +54,41 @@ impl DiscoveredModel {
     }
 }
 
+/// Infers whether a running gateway has experimental `--long-context` active from its `/v1/models`
+/// catalog, falling back to `managed_fallback` only when no Gemini model has reported yet.
+///
+/// Legacy gateways that omit `auto_compact_token_limit` (`0`) always resolve to `false` so
+/// local preferences never promote an older server into experimental 1M limits.
+#[must_use]
+pub fn infer_live_long_context(
+    discovered: &[DiscoveredModel],
+    managed_fallback: Option<bool>,
+) -> bool {
+    let mut saw_gemini = false;
+    for model in discovered {
+        if !model
+            .id
+            .trim()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("gemini-"))
+        {
+            continue;
+        }
+        saw_gemini = true;
+        if model.auto_compact_token_limit > 280_000
+            && model.auto_compact_token_limit <= model.context_window
+            && model.context_window <= 1_000_000
+        {
+            return true;
+        }
+    }
+    if saw_gemini {
+        false
+    } else {
+        managed_fallback.unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscoveredModelList {
     #[serde(default)]
@@ -366,5 +401,41 @@ mod tests {
         let (c2, b2) = parse_http_response(chunked).unwrap();
         assert_eq!(c2, 200);
         assert_eq!(b2, b"{\"ok\":1}");
+    }
+
+    #[test]
+    fn infers_live_long_context_without_promoting_legacy_gateways() {
+        let default_v013 = vec![DiscoveredModel {
+            id: "gemini-4-carbon-high".to_owned(),
+            display_name: String::new(),
+            context_window: 280_000,
+            auto_compact_token_limit: 245_000,
+        }];
+        assert!(!infer_live_long_context(&default_v013, Some(true)));
+
+        let experimental_v013 = vec![DiscoveredModel {
+            id: "gemini-4-carbon-high".to_owned(),
+            display_name: String::new(),
+            context_window: 1_000_000,
+            auto_compact_token_limit: 850_000,
+        }];
+        assert!(infer_live_long_context(&experimental_v013, None));
+
+        let legacy_v012 = vec![DiscoveredModel {
+            id: "gemini-4-carbon-high".to_owned(),
+            display_name: String::new(),
+            context_window: 1_000_000,
+            auto_compact_token_limit: 0,
+        }];
+        assert!(!infer_live_long_context(&legacy_v012, Some(true)));
+
+        let non_gemini_only = vec![DiscoveredModel {
+            id: "claude-sonnet-5-5-high".to_owned(),
+            display_name: String::new(),
+            context_window: 200_000,
+            auto_compact_token_limit: 170_000,
+        }];
+        assert!(infer_live_long_context(&non_gemini_only, Some(true)));
+        assert!(!infer_live_long_context(&non_gemini_only, None));
     }
 }
