@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use comfy_table::{Attribute, Cell, Color as TableColor};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -34,11 +33,10 @@ use tokio::time::timeout;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::cli::{UpgradeArgs, invoked_bin_name};
+use crate::cli::UpgradeArgs;
 use crate::daemon;
 use crate::error::CliError;
 use crate::state::StatePaths;
-use crate::ui::{self, Spinner, Tone};
 
 const CURRENT_VERSION_RAW: &str = env!("CARGO_PKG_VERSION");
 const COMPILE_TARGET: &str = env!("LIFTGATE_BUILD_TARGET");
@@ -217,6 +215,14 @@ pub struct UpgradeOutcome {
     pub published_at: Option<String>,
     pub installed_binaries: Vec<String>,
     pub daemon_restarted: bool,
+    #[serde(skip_serializing)]
+    pub repo: String,
+    #[serde(skip_serializing)]
+    pub release_title: String,
+    #[serde(skip_serializing)]
+    pub prerelease: bool,
+    #[serde(skip_serializing)]
+    pub notes_excerpt: Option<String>,
 }
 
 struct StageDirGuard {
@@ -272,20 +278,7 @@ fn sweep_stale_backups_in_dir(dir: &Path) {
     }
 }
 
-pub async fn run_upgrade(state_paths: &StatePaths, args: UpgradeArgs) -> Result<(), CliError> {
-    let current_exe = std::env::current_exe().map_err(|source| CliError::StateIo {
-        path: PathBuf::from("current_exe"),
-        source,
-    })?;
-    let outcome = execute_upgrade(state_paths, &args, &current_exe).await?;
-    if args.json {
-        let text = serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| "{}".to_owned());
-        println!("{text}");
-    }
-    Ok(())
-}
-
-async fn execute_upgrade(
+pub async fn execute_upgrade(
     state_paths: &StatePaths,
     args: &UpgradeArgs,
     current_exe: &Path,
@@ -308,23 +301,14 @@ async fn execute_upgrade(
         .unwrap_or(COMPILE_TARGET);
     validate_target_triple(desired_target)?;
 
-    let quiet_ui = args.json;
-    let check_spinner =
-        (!quiet_ui).then(|| Spinner::start(format!("Checking GitHub Releases ({})…", args.repo)));
-
-    let plan_res = resolve_release_plan(
+    let plan = resolve_release_plan(
         &args.repo,
         requested_tag.as_deref(),
         desired_target,
         args.proxy.as_deref(),
         args.base_url.as_deref(),
     )
-    .await;
-
-    if let Some(sp) = check_spinner {
-        sp.finish_and_clear().await;
-    }
-    let plan = plan_res?;
+    .await?;
 
     let target_ver_str = plan
         .tag
@@ -343,9 +327,6 @@ async fn execute_upgrade(
     let update_available = cmp == Ordering::Less;
 
     if args.check {
-        if !quiet_ui {
-            render_check_summary(&plan, &target_ver_str, cmp);
-        }
         let status = match cmp {
             Ordering::Less => "update_available",
             Ordering::Equal => "up_to_date",
@@ -367,24 +348,16 @@ async fn execute_upgrade(
             published_at: plan.published_at,
             installed_binaries: Vec::new(),
             daemon_restarted: false,
+            repo: plan.repo,
+            release_title: plan.release_title,
+            prerelease: plan.prerelease,
+            notes_excerpt: plan.notes_excerpt,
         });
     }
 
     // Skip download when already up-to-date (or ahead on latest) unless `--force` or explicit `--version` downgrade.
     if !args.force {
         if cmp == Ordering::Equal {
-            if !quiet_ui {
-                ui::headline(
-                    Tone::Ok,
-                    &format!("Liftgate is already on the latest release (v{CURRENT_VERSION_RAW})"),
-                );
-                ui::kv("Target Binary", &current_exe.display().to_string());
-                ui::kv_accent("Release Page", &plan.release_url);
-                ui::cmd_hint(
-                    "Force reinstall",
-                    &format!("{} upgrade --force", invoked_bin_name()),
-                );
-            }
             return Ok(UpgradeOutcome {
                 status: "up_to_date",
                 current_version: CURRENT_VERSION_RAW.to_owned(),
@@ -401,22 +374,13 @@ async fn execute_upgrade(
                 published_at: plan.published_at,
                 installed_binaries: Vec::new(),
                 daemon_restarted: false,
+                repo: plan.repo,
+                release_title: plan.release_title,
+                prerelease: plan.prerelease,
+                notes_excerpt: plan.notes_excerpt,
             });
         }
         if cmp == Ordering::Greater && requested_tag.is_none() {
-            if !quiet_ui {
-                ui::headline(
-                    Tone::Ok,
-                    &format!(
-                        "Installed build (v{CURRENT_VERSION_RAW}) is ahead of latest release ({})",
-                        plan.tag
-                    ),
-                );
-                ui::cmd_hint(
-                    "Install released build anyway",
-                    &format!("{} upgrade --force", invoked_bin_name()),
-                );
-            }
             return Ok(UpgradeOutcome {
                 status: "ahead_of_release",
                 current_version: CURRENT_VERSION_RAW.to_owned(),
@@ -433,19 +397,16 @@ async fn execute_upgrade(
                 published_at: plan.published_at,
                 installed_binaries: Vec::new(),
                 daemon_restarted: false,
+                repo: plan.repo,
+                release_title: plan.release_title,
+                prerelease: plan.prerelease,
+                notes_excerpt: plan.notes_excerpt,
             });
         }
     }
 
     let stage = StageDirGuard::create(state_paths)?;
-    let sums_spinner = (!quiet_ui).then(|| {
-        Spinner::start(format!(
-            "Downloading & verifying {} ({})…",
-            plan.archive_name, plan.tag
-        ))
-    });
-
-    let download_and_stage_res =
+    let (staged, verified_sha256) =
         async {
             let sums_bytes = fetch_bytes_bounded(
                 &plan.checksums_url,
@@ -495,17 +456,26 @@ async fn execute_upgrade(
             }
 
             let unpacked = unpack_release_binaries(&archive_path, &plan.archive_name, &stage.path)?;
+            let invoked_from_desktop = current_exe
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("liftgate-desktop"));
+            if invoked_from_desktop && unpacked.desktop_bin.is_none() {
+                return Err(CliError::UpgradeArchive {
+                    asset: plan.archive_name.clone(),
+                    detail: "release archive for this target does not bundle `liftgate-desktop`"
+                        .to_owned(),
+                });
+            }
             if plan.target_triple == COMPILE_TARGET {
                 smoke_check_staged_binary(&unpacked.liftgate_bin).await?;
+                if let Some(desktop_bin) = &unpacked.desktop_bin {
+                    smoke_check_staged_binary(desktop_bin).await?;
+                }
             }
             Ok::<(StagedBinaries, String), CliError>((unpacked, actual_sha256))
         }
-        .await;
-
-    if let Some(sp) = sums_spinner {
-        sp.finish_and_clear().await;
-    }
-    let (staged, verified_sha256) = download_and_stage_res?;
+        .await?;
 
     // Check if a managed background daemon is running so we unlock `liftgate.exe` on Windows
     // and bring the daemon back online running the newly installed version.
@@ -518,7 +488,7 @@ async fn execute_upgrade(
         .map(daemon::serve_args_from_daemon_state);
 
     if saved_daemon_serve.is_some() {
-        let _ = daemon::stop_daemon(state_paths, true).await?;
+        let _ = daemon::stop_daemon(state_paths).await?;
     }
 
     let install_targets = plan_install_targets(current_exe, &staged, &plan.target_triple);
@@ -539,31 +509,12 @@ async fn execute_upgrade(
             })
             .or_else(|| install_targets.first())
             .map(|(_, dest)| dest.as_path());
-        if daemon::start_daemon_with_exe(state_paths, new_daemon_exe, serve_cfg, false, true)
+        if daemon::start_daemon_with_exe(state_paths, new_daemon_exe, serve_cfg, false)
             .await
             .is_ok()
         {
             daemon_restarted = true;
         }
-    }
-
-    if !quiet_ui {
-        ui::headline(
-            Tone::Ok,
-            &format!(
-                "Upgraded Liftgate CLI  v{CURRENT_VERSION_RAW} → v{target_ver_str} ({})",
-                plan.tag
-            ),
-        );
-        ui::kv("Platform", &plan.target_triple);
-        ui::kv("Verified SHA256", &verified_sha256);
-        for p in &installed_paths {
-            ui::kv_accent("Updated Binary", p);
-        }
-        if daemon_restarted {
-            ui::kv("Gateway Daemon", "restarted cleanly on upgraded binary");
-        }
-        ui::kv_accent("Release Notes", &plan.release_url);
     }
 
     Ok(UpgradeOutcome {
@@ -582,87 +533,11 @@ async fn execute_upgrade(
         published_at: plan.published_at,
         installed_binaries: installed_paths,
         daemon_restarted,
+        repo: plan.repo,
+        release_title: plan.release_title,
+        prerelease: plan.prerelease,
+        notes_excerpt: plan.notes_excerpt,
     })
-}
-
-fn render_check_summary(plan: &ResolvedReleasePlan, target_ver: &str, cmp: Ordering) {
-    let bin = invoked_bin_name();
-    let (tone, badge_str, state_label) = match cmp {
-        Ordering::Less => (Tone::Warn, "UPDATE AVAILABLE", "newer release ready"),
-        Ordering::Equal => (Tone::Ok, "UP TO DATE", "running latest release"),
-        Ordering::Greater => (Tone::Info, "AHEAD OF RELEASE", "local build is newer"),
-    };
-
-    ui::banner(
-        "Liftgate Release Check",
-        Some((tone, badge_str)),
-        Some(&format!(
-            "installed=v{CURRENT_VERSION_RAW} · latest=v{target_ver} · repo={}",
-            plan.repo
-        )),
-    );
-
-    let mut table = ui::new_table(&["Property", "Value"]);
-    let ver_color = match cmp {
-        Ordering::Less => TableColor::Yellow,
-        Ordering::Equal => TableColor::Green,
-        Ordering::Greater => TableColor::Cyan,
-    };
-    let state_cell = Cell::new(format!("{state_label} ({})", plan.release_title));
-    table.add_row(vec![
-        ui::dim_cell("Status"),
-        if ui::use_color() {
-            state_cell.fg(ver_color).add_attribute(Attribute::Bold)
-        } else {
-            state_cell
-        },
-    ]);
-    table.add_row(vec![
-        ui::dim_cell("Installed"),
-        Cell::new(format!("v{CURRENT_VERSION_RAW}")),
-    ]);
-    let release_cell = Cell::new(format!(
-        "{} ({})",
-        plan.tag,
-        if plan.prerelease {
-            "pre-release"
-        } else {
-            "stable"
-        }
-    ));
-    table.add_row(vec![
-        ui::dim_cell("Target Release"),
-        if ui::use_color() {
-            release_cell.fg(ver_color).add_attribute(Attribute::Bold)
-        } else {
-            release_cell
-        },
-    ]);
-    table.add_row(vec![
-        ui::dim_cell("Platform Asset"),
-        Cell::new(match plan.archive_size {
-            Some(sz) if sz > 0 => format!("{} ({})", plan.archive_name, format_bytes(sz)),
-            _ => plan.archive_name.clone(),
-        }),
-    ]);
-    if let Some(pub_at) = &plan.published_at {
-        table.add_row(vec![ui::dim_cell("Published At"), Cell::new(pub_at)]);
-    }
-    table.add_row(vec![
-        ui::dim_cell("Release URL"),
-        ui::accent_cell(&plan.release_url),
-    ]);
-    println!();
-    println!("{table}");
-
-    if let Some(excerpt) = &plan.notes_excerpt {
-        println!();
-        ui::note(Tone::Muted, excerpt);
-    }
-    if cmp == Ordering::Less {
-        println!();
-        ui::cmd_hint("Download & install now", &format!("{bin} upgrade"));
-    }
 }
 
 async fn resolve_release_plan(
@@ -1480,6 +1355,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 struct StagedBinaries {
     liftgate_bin: PathBuf,
     lg_bin: PathBuf,
+    desktop_bin: Option<PathBuf>,
 }
 
 fn unpack_release_binaries(
@@ -1493,9 +1369,15 @@ fn unpack_release_binaries(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
     let expected_liftgate = if is_zip { "liftgate.exe" } else { "liftgate" };
     let expected_lg = if is_zip { "lg.exe" } else { "lg" };
+    let expected_desktop = if is_zip {
+        "liftgate-desktop.exe"
+    } else {
+        "liftgate-desktop"
+    };
 
     let staged_liftgate = stage_dir.join(format!("staged-{expected_liftgate}"));
     let staged_lg = stage_dir.join(format!("staged-{expected_lg}"));
+    let staged_desktop = stage_dir.join(format!("staged-{expected_desktop}"));
 
     if is_zip {
         extract_zip_binaries(
@@ -1503,8 +1385,10 @@ fn unpack_release_binaries(
             archive_name,
             expected_liftgate,
             expected_lg,
+            expected_desktop,
             &staged_liftgate,
             &staged_lg,
+            &staged_desktop,
         )?;
     } else {
         extract_targz_binaries(
@@ -1512,8 +1396,10 @@ fn unpack_release_binaries(
             archive_name,
             expected_liftgate,
             expected_lg,
+            expected_desktop,
             &staged_liftgate,
             &staged_lg,
+            &staged_desktop,
         )?;
     }
 
@@ -1534,16 +1420,23 @@ fn unpack_release_binaries(
     Ok(StagedBinaries {
         liftgate_bin: staged_liftgate,
         lg_bin: staged_lg,
+        desktop_bin: staged_desktop.is_file().then_some(staged_desktop),
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "archive extractor maps three expected binary names directly to staged paths"
+)]
 fn extract_zip_binaries(
     archive_path: &Path,
     archive_name: &str,
     expected_liftgate: &str,
     expected_lg: &str,
+    expected_desktop: &str,
     staged_liftgate: &Path,
     staged_lg: &Path,
+    staged_desktop: &Path,
 ) -> Result<(), CliError> {
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
@@ -1575,6 +1468,8 @@ fn extract_zip_binaries(
                 Some(staged_liftgate)
             } else if base_name == expected_lg {
                 Some(staged_lg)
+            } else if base_name == expected_desktop {
+                Some(staged_desktop)
             } else {
                 None
             }
@@ -1586,13 +1481,19 @@ fn extract_zip_binaries(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "archive extractor maps three expected binary names directly to staged paths"
+)]
 fn extract_targz_binaries(
     archive_path: &Path,
     archive_name: &str,
     expected_liftgate: &str,
     expected_lg: &str,
+    expected_desktop: &str,
     staged_liftgate: &Path,
     staged_lg: &Path,
+    staged_desktop: &Path,
 ) -> Result<(), CliError> {
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
@@ -1624,6 +1525,8 @@ fn extract_targz_binaries(
             Some(staged_liftgate)
         } else if base_name == expected_lg {
             Some(staged_lg)
+        } else if base_name == expected_desktop {
+            Some(staged_desktop)
         } else {
             None
         };
@@ -1726,18 +1629,22 @@ fn plan_install_targets(
 
     let canonical_liftgate = install_dir.join(format!("liftgate{ext}"));
     let canonical_lg = install_dir.join(format!("lg{ext}"));
+    let canonical_desktop = install_dir.join(format!("liftgate-desktop{ext}"));
 
     let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
     let current_stem = current_exe
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("liftgate");
-    let primary_src = if current_stem.eq_ignore_ascii_case("liftgate") {
-        staged.liftgate_bin.clone()
+    if current_stem.eq_ignore_ascii_case("liftgate-desktop") {
+        if let Some(desktop_src) = &staged.desktop_bin {
+            targets.push((desktop_src.clone(), current_exe.to_path_buf()));
+        }
+    } else if current_stem.eq_ignore_ascii_case("liftgate") {
+        targets.push((staged.liftgate_bin.clone(), current_exe.to_path_buf()));
     } else {
-        staged.lg_bin.clone()
+        targets.push((staged.lg_bin.clone(), current_exe.to_path_buf()));
     };
-    targets.push((primary_src, current_exe.to_path_buf()));
 
     let is_cargo_build_dir = install_dir
         .file_name()
@@ -1756,6 +1663,14 @@ fn plan_install_targets(
         let already_listed = targets.iter().any(|(_, p)| same_file_path(p, &candidate));
         if !already_listed && (!is_cargo_build_dir || candidate.is_file()) {
             targets.push((src.clone(), candidate));
+        }
+    }
+    if let Some(desktop_src) = &staged.desktop_bin {
+        let already_listed = targets
+            .iter()
+            .any(|(_, p)| same_file_path(p, &canonical_desktop));
+        if !already_listed && (!is_cargo_build_dir || canonical_desktop.is_file()) {
+            targets.push((desktop_src.clone(), canonical_desktop));
         }
     }
 
@@ -1901,7 +1816,7 @@ fn normalize_tag_input(raw: &str) -> Result<String, CliError> {
         });
     }
     if trimmed.starts_with('v') || trimmed.starts_with('V') {
-        Ok(format!("v{}", &trimmed[1..]))
+        Ok(format!("v{}", trimmed.get(1..).unwrap_or_default()))
     } else {
         Ok(format!("v{trimmed}"))
     }
@@ -1918,18 +1833,6 @@ fn validate_target_triple(target: &str) -> Result<(), CliError> {
         });
     }
     Ok(())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const KIB: f64 = 1024.0;
-    if bytes >= 1024 * 1024 {
-        format!("{:.2} MiB", (bytes as f64) / MIB)
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", (bytes as f64) / KIB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]
@@ -2184,6 +2087,50 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CliError::UpgradeChecksumMismatch { .. }));
         assert_eq!(fs::read(&installed_lg).unwrap(), new_lg_payload);
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn unpack_and_plan_install_targets_bundles_desktop_binary_when_present() {
+        let temp_root = std::env::temp_dir().join(format!("lg-upgrade-desktop-{}", Uuid::new_v4()));
+        let stage_dir = temp_root.join("stage");
+        let bin_dir = temp_root.join("bin");
+        fs::create_dir_all(&stage_dir).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let archive_path = stage_dir.join("liftgate-x86_64-pc-windows-msvc.zip");
+        let mut cursor = io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("liftgate-x86_64-pc-windows-msvc/liftgate.exe", opts)
+                .unwrap();
+            zip.write_all(b"LIFTGATE-EXE").unwrap();
+            zip.start_file("liftgate-x86_64-pc-windows-msvc/lg.exe", opts)
+                .unwrap();
+            zip.write_all(b"LG-EXE").unwrap();
+            zip.start_file("liftgate-x86_64-pc-windows-msvc/liftgate-desktop.exe", opts)
+                .unwrap();
+            zip.write_all(b"DESKTOP-EXE").unwrap();
+            zip.finish().unwrap();
+        }
+        fs::write(&archive_path, cursor.into_inner()).unwrap();
+
+        let staged = unpack_release_binaries(
+            &archive_path,
+            "liftgate-x86_64-pc-windows-msvc.zip",
+            &stage_dir,
+        )
+        .unwrap();
+        assert!(staged.desktop_bin.is_some());
+
+        let current_desktop = bin_dir.join("liftgate-desktop.exe");
+        fs::write(&current_desktop, b"OLD-DESKTOP").unwrap();
+        let targets = plan_install_targets(&current_desktop, &staged, "x86_64-pc-windows-msvc");
+        assert_eq!(targets.len(), 3);
+        assert!(same_file_path(&targets[0].1, &current_desktop));
 
         let _ = fs::remove_dir_all(&temp_root);
     }

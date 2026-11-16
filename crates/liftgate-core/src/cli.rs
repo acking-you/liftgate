@@ -2,7 +2,8 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::builder::{Styles, styling};
+use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use liftgate_types::config::{
     DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
@@ -12,6 +13,28 @@ use liftgate_types::config::{
 /// Sentinel placeholder token injected into client harnesses when the local gateway runs
 /// without API key authentication.
 pub const PLACEHOLDER_API_KEY: &str = "local-agy";
+
+/// Clap v4 color theme used by `--help` and CLI parse errors.
+#[must_use]
+pub fn clap_styles() -> Styles {
+    Styles::styled()
+        .header(styling::AnsiColor::Cyan.on_default().bold())
+        .usage(styling::AnsiColor::Cyan.on_default().bold())
+        .literal(styling::AnsiColor::Green.on_default().bold())
+        .placeholder(styling::AnsiColor::Cyan.on_default())
+        .valid(styling::AnsiColor::Yellow.on_default())
+        .error(styling::AnsiColor::Red.on_default().bold())
+        .invalid(styling::AnsiColor::Yellow.on_default().bold())
+}
+
+/// Generates shell completion script text for `shell` and executable `bin_name`.
+#[must_use]
+pub fn render_completions(shell: Shell, bin_name: &str) -> String {
+    let mut cmd = Cli::command();
+    let mut buf = Vec::with_capacity(4096);
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 const AFTER_HELP_TEXT: &str = "\
 Quick Examples (both `lg` and `liftgate` work identically):
@@ -87,7 +110,7 @@ pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
 #[command(
     name = "liftgate",
     version,
-    styles = crate::ui::clap_styles(),
+    styles = clap_styles(),
     about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex CLI & Desktop manager (short alias: `lg`)",
     after_help = AFTER_HELP_TEXT
 )]
@@ -431,7 +454,7 @@ pub struct RestartArgs {
     pub open: bool,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct StatusArgs {
     /// Target gateway socket address override.
     #[arg(long)]

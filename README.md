@@ -70,6 +70,12 @@ Any other harness that speaks either API connects the same way
   switch models and tail `agy` logs either in the browser
   (`http://127.0.0.1:8787/`) or right inside your terminal with `lg top`
   ([dashboard](docs/usage.md#dashboard)).
+- **Native GPUI desktop app (`liftgate-desktop`)** — standalone cross-platform
+  desktop control center built on `gpui-kit` with Warm Editorial Light/Dark
+  themes and bilingual `中文` / `EN` UI (automatically following OS appearance and
+  system locale by default), live SSE telemetry, one-click CLI/GUI
+  launchers, config sync, default & title model switcher, `agy`/proxy manager, environment
+  doctor and self-upgrade — zero external CLI binary required.
 
 ## How it works
 
@@ -92,6 +98,7 @@ Grab a prebuilt archive from
 
 ```bash
 cargo install --path crates/liftgate --locked  # installs both `lg` and `liftgate` (embeds Web UI when Bun is present)
+cargo install --path crates/liftgate-desktop --locked  # optional: install standalone GPUI desktop app (`liftgate-desktop`)
 
 lg agy install                          # download & SHA-512-verify official `agy` CLI (if not installed yet)
 lg proxy 7890                           # optional: force proxy into `agy` (`lg proxy off` restores default direct mode)

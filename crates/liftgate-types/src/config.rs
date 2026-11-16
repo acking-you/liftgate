@@ -83,6 +83,12 @@ impl ModelId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Default high-capability model identifier used when no explicit model is supplied.
+    #[must_use]
+    pub fn fallback_primary() -> Self {
+        Self(Arc::from("gemini-4-carbon-high"))
+    }
 }
 
 impl fmt::Display for ModelId {

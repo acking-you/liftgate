@@ -31,38 +31,19 @@ pkg-fmt = "zip"
 pkg-fmt = "zip"
 
 [dependencies]
+liftgate-core = { workspace = true }
 liftgate-server = { workspace = true }
 liftgate-types = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = { workspace = true }
-dunce = { workspace = true }
-flate2 = { workspace = true }
 owo-colors = { workspace = true }
 ratatui = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-tar = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "fs", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "fs", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
-zip = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

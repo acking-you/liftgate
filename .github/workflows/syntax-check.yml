@@ -89,6 +89,24 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install Linux GUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            libvulkan-dev
+
       - name: Cache Rust dependencies
         uses: actions/cache@v6
         with:

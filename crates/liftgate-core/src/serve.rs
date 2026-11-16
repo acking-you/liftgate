@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use liftgate_server::{
     acp_client::{LiveAcpClient, LiveAcpConfig},
+    job::install_panic_cleanup_hook as install_server_panic_hook,
     platform::{canonicalize_clean, prepare_isolated_session_cwd, wait_for_shutdown_signal},
     routes::{AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router, serve_router},
     session_pool::SessionPool,
@@ -20,9 +21,26 @@ use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
     resolve_effective_agy_proxy,
 };
-use crate::ui::print_serve_ready_banner;
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
+
+/// Installs the cross-platform panic hook that tears down supervised `agy acp` child trees.
+pub fn install_panic_cleanup_hook() {
+    install_server_panic_hook();
+}
+
+/// Summary of an initialized foreground gateway server right after its listeners are ready.
+#[derive(Clone, Debug)]
+pub struct ServeReadyInfo {
+    pub listen_url: String,
+    pub dashboard_url: String,
+    pub default_model: String,
+    pub acp_mode: String,
+    pub auth_enabled: bool,
+    pub full_ui_embedded: bool,
+    pub agy_proxy_display: Option<String>,
+    pub agy_auto_update: bool,
+}
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui.rs"));
@@ -93,6 +111,14 @@ pub fn active_embedded_ui() -> (&'static [EmbeddedUiAsset], bool) {
 }
 
 pub async fn run_serve(state_paths: &StatePaths, args: ServeArgs) -> Result<(), CliError> {
+    run_serve_with_hook(state_paths, args, None).await
+}
+
+pub async fn run_serve_with_hook(
+    state_paths: &StatePaths,
+    args: ServeArgs,
+    on_ready: Option<&(dyn Fn(&ServeReadyInfo) + Send + Sync)>,
+) -> Result<(), CliError> {
     let default_model = ModelId::try_new(&args.default_model)?;
     let acp_mode = AcpModeId::try_new(&args.acp_mode)?;
     let limits = GatewayLimits::try_new(
@@ -253,17 +279,20 @@ pub async fn run_serve(state_paths: &StatePaths, args: ServeArgs) -> Result<(), 
         .map_or_else(|| listen_url.clone(), format_connect_url);
     let proxy_banner = agy_proxy
         .as_ref()
-        .map(liftgate_types::config::ProxyUrl::redacted_display);
-    print_serve_ready_banner(
-        &listen_url,
-        &dash_url,
-        &default_model_str,
-        &acp_mode_str,
+        .map(|p| p.redacted_display().into_owned());
+    let ready_info = ServeReadyInfo {
+        listen_url,
+        dashboard_url: dash_url,
+        default_model: default_model_str,
+        acp_mode: acp_mode_str,
         auth_enabled,
-        full_bundle_embedded,
-        proxy_banner.as_deref(),
-        auto_update_enabled,
-    );
+        full_ui_embedded: full_bundle_embedded,
+        agy_proxy_display: proxy_banner,
+        agy_auto_update: auto_update_enabled,
+    };
+    if let Some(cb) = on_ready {
+        cb(&ready_info);
+    }
 
     if let Some(extra_listener) = ui_listener {
         let ui_router = build_router(app_state);

@@ -87,9 +87,10 @@ jobs:
 
           {
             printf '%s\n' \
-              'Every archive ships **both** executables with the production Web Dashboard compiled in:' \
+              'Every archive ships the CLI executables with the production Web Dashboard compiled in (and desktop OS archives also bundle `liftgate-desktop`):' \
               '- `lg` — short daily-driver CLI alias (interactive cockpit, `lg top` TUI, `lg cx`, `lg cc`, `lg m -i`)' \
               '- `liftgate` — full canonical binary name' \
+              '- `liftgate-desktop` — native GPUI desktop control center (included in macOS ARM64/Intel, Windows x64/ARM64, and Linux x86_64 glibc archives)' \
               '' \
               '### Quick Download Guide' \
               '' \
@@ -131,78 +132,95 @@ jobs:
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             cross_toolchain: true
+            include_desktop: false
           - name: Linux ARM64 (musl static)
             os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
             cross_toolchain: true
+            include_desktop: false
           - name: Linux ARMv7hf (musl static)
             os: ubuntu-24.04
             target: armv7-unknown-linux-musleabihf
             cross_toolchain: true
+            include_desktop: false
           - name: Linux i686 (musl static)
             os: ubuntu-24.04
             target: i686-unknown-linux-musl
             cross_toolchain: true
+            include_desktop: false
           - name: Linux RISC-V 64 (musl static)
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-musl
             cross_toolchain: true
+            include_desktop: false
 
           # --- Linux GNU (glibc) ---
           - name: Linux x86_64 (gnu)
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             cross_toolchain: false
+            include_desktop: true
           - name: Linux ARM64 (gnu)
             os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             cross_toolchain: true
+            include_desktop: false
           - name: Linux ARMv7hf (gnu)
             os: ubuntu-24.04
             target: armv7-unknown-linux-gnueabihf
             cross_toolchain: true
+            include_desktop: false
           - name: Linux RISC-V 64 (gnu)
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
             cross_toolchain: true
+            include_desktop: false
           - name: Linux PowerPC 64 LE (gnu)
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
             cross_toolchain: true
+            include_desktop: false
           - name: Linux IBM Z s390x (gnu)
             os: ubuntu-24.04
             target: s390x-unknown-linux-gnu
             cross_toolchain: true
+            include_desktop: false
 
           # --- BSD ---
           - name: FreeBSD x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-freebsd
             cross_toolchain: true
+            include_desktop: false
 
           # --- macOS (Apple Silicon + Intel) ---
           - name: macOS ARM64 (Apple Silicon)
             os: macos-latest
             target: aarch64-apple-darwin
             cross_toolchain: false
+            include_desktop: true
           - name: macOS x86_64 (Intel)
             os: macos-latest
             target: x86_64-apple-darwin
             cross_toolchain: false
+            include_desktop: true
 
           # --- Windows (MSVC x64, ARM64, x86) ---
           - name: Windows x86_64 (MSVC)
             os: windows-latest
             target: x86_64-pc-windows-msvc
             cross_toolchain: false
+            include_desktop: true
           - name: Windows ARM64 (MSVC)
             os: windows-latest
             target: aarch64-pc-windows-msvc
             cross_toolchain: false
+            include_desktop: true
           - name: Windows i686 (MSVC)
             os: windows-latest
             target: i686-pc-windows-msvc
             cross_toolchain: false
+            include_desktop: false
 
     steps:
       - name: Checkout
@@ -220,6 +238,41 @@ jobs:
           targets: ${{ matrix.platform.target }}
           components: clippy, rustfmt
 
+      - name: Install Linux GUI system dependencies
+        if: runner.os == 'Linux' && matrix.platform.include_desktop
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            libvulkan-dev
+
+      - name: Locate Windows SDK HLSL compiler (fxc.exe)
+        if: runner.os == 'Windows' && matrix.platform.include_desktop
+        shell: pwsh
+        run: |
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          if (Test-Path -LiteralPath $kitsRoot) {
+            $fxc = Get-ChildItem -LiteralPath $kitsRoot -Filter fxc.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($fxc) {
+              "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              Write-Host "Using GPUI_FXC_PATH=$($fxc.FullName)"
+            }
+          }
+
       - name: Set up cross-compilation toolchain
         if: matrix.platform.cross_toolchain
         uses: taiki-e/setup-cross-toolchain-action@v1
@@ -232,7 +285,7 @@ jobs:
         with:
           key: release-${{ matrix.platform.target }}
 
-      - name: Build liftgate and lg release binaries
+      - name: Build release binaries
         shell: bash
         env:
           LIFTGATE_SKIP_WEB_BUILD: "1"
@@ -241,6 +294,10 @@ jobs:
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.platform.target }}" \
             -p liftgate --bin liftgate --bin lg
+          if [ "${{ matrix.platform.include_desktop }}" = "true" ]; then
+            cargo build --locked --release --target "${{ matrix.platform.target }}" \
+              -p liftgate-desktop --bin liftgate-desktop
+          fi
 
       - name: Package release archive
         shell: bash
@@ -256,12 +313,19 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${target}/release/liftgate.exe" "${stage}/"
             cp "target/${target}/release/lg.exe" "${stage}/"
+            if [ "${{ matrix.platform.include_desktop }}" = "true" ]; then
+              cp "target/${target}/release/liftgate-desktop.exe" "${stage}/"
+            fi
             cp start-agy.ps1 start-agy.cmd "${stage}/"
             (cd dist && 7z a -tzip "${pkg}.zip" "${pkg}" >/dev/null)
           else
             cp "target/${target}/release/liftgate" "${stage}/"
             cp "target/${target}/release/lg" "${stage}/"
             chmod +x "${stage}/liftgate" "${stage}/lg"
+            if [ "${{ matrix.platform.include_desktop }}" = "true" ]; then
+              cp "target/${target}/release/liftgate-desktop" "${stage}/"
+              chmod +x "${stage}/liftgate-desktop"
+            fi
             cp start-agy.sh "${stage}/"
             chmod +x "${stage}/start-agy.sh"
             tar -czf "dist/${pkg}.tar.gz" -C dist "${pkg}"

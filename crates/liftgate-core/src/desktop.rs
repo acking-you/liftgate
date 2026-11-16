@@ -55,7 +55,61 @@ use crate::daemon::{configure_detached_command, ensure_gateway_ready, is_pid_ali
 use crate::error::CliError;
 use crate::harness::resolve_codex_command;
 use crate::state::{StatePaths, now_unix_ms, user_home_dir, write_file_atomic};
-use crate::ui::{self, Tone};
+
+/// Structured launch or session-restore outcome returned by desktop app launchers.
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopLaunchOutcome {
+    pub kind: DesktopKind,
+    pub headline: String,
+    pub rows: Vec<(&'static str, String)>,
+    pub restored_sessions: Option<usize>,
+    pub waited_foreground: bool,
+    pub watcher_fallback_warn: bool,
+}
+
+/// Discovery and running-process snapshot for a single desktop application.
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopAppInfo {
+    pub installed: bool,
+    pub display_label: Option<String>,
+    pub running_pids: Vec<u32>,
+}
+
+/// Aggregated status of Codex App, Claude Desktop, and active Liftgate rollback journals.
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopAppsStatus {
+    pub codex_app: DesktopAppInfo,
+    pub claude_desktop: DesktopAppInfo,
+    pub active_journals: usize,
+}
+
+/// Inspects installed paths, running PIDs, and active Liftgate session journals for desktop apps.
+#[must_use]
+pub fn inspect_desktop_apps(state_paths: &StatePaths) -> DesktopAppsStatus {
+    let codex_bin = resolve_codex_app(None).ok();
+    let claude_bin = resolve_claude_desktop(None).ok();
+    let active_journals = fs::read_dir(state_paths.desktop_journals_dir())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    DesktopAppsStatus {
+        codex_app: DesktopAppInfo {
+            installed: codex_bin.is_some(),
+            display_label: codex_bin.map(|b| b.display_label().to_owned()),
+            running_pids: find_running_desktop_pids(DesktopKind::CodexApp, None),
+        },
+        claude_desktop: DesktopAppInfo {
+            installed: claude_bin.is_some(),
+            display_label: claude_bin.map(|b| b.display_label().to_owned()),
+            running_pids: find_running_desktop_pids(DesktopKind::ClaudeDesktop, None),
+        },
+        active_journals,
+    }
+}
 
 /// Deterministic UUID v4 reserved for Liftgate's temporary Claude Desktop 3P profile.
 pub const LIFTGATE_CLAUDE_3P_PROFILE_ID: &str = "00000000-0000-4000-8000-000000878700";
@@ -303,7 +357,10 @@ async fn retire_legacy_v1_codex_app_sessions(state_paths: &StatePaths) {
 }
 
 /// Launches **Codex App** routed through Liftgate with an isolated ephemeral `CODEX_HOME`.
-pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Result<i32, CliError> {
+pub async fn launch_codex_app(
+    state_paths: &StatePaths,
+    args: CodexAppArgs,
+) -> Result<DesktopLaunchOutcome, CliError> {
     sweep_stale_desktop_sessions(state_paths);
     retire_legacy_v1_codex_app_sessions(state_paths).await;
 
@@ -457,12 +514,13 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
     .await?;
 
     finalize_or_watch_session(
+        DesktopKind::CodexApp,
         &journal_path,
         &mut guard,
         tracked_pids,
         args.wait,
         "Codex App launched via Liftgate (zero-pollution)",
-        &[
+        vec![
             ("App", app_bin.display_label().to_owned()),
             ("Gateway", format!("{}/v1", target.client.base_url())),
             ("Default Model", primary_model),
@@ -476,26 +534,25 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
 
 /// Launches **Claude Desktop** routed through Liftgate's `/claude-desktop` 3P endpoint,
 /// restoring original user configuration automatically once Claude Desktop closes.
-pub async fn run_claude_desktop(
+pub async fn launch_claude_desktop(
     state_paths: &StatePaths,
     args: ClaudeDesktopArgs,
-) -> Result<i32, CliError> {
+) -> Result<DesktopLaunchOutcome, CliError> {
     if args.restore {
         let restored = force_restore_claude_desktop_sessions(state_paths)?;
-        if restored > 0 {
-            ui::headline(
-                Tone::Ok,
-                &format!(
-                    "Restored {restored} Claude Desktop Liftgate session(s) to original state"
-                ),
-            );
+        let headline = if restored > 0 {
+            format!("Restored {restored} Claude Desktop Liftgate session(s) to original state")
         } else {
-            ui::headline(
-                Tone::Info,
-                "No active or leftover Liftgate Claude Desktop session state found",
-            );
-        }
-        return Ok(0);
+            "No active or leftover Liftgate Claude Desktop session state found".to_owned()
+        };
+        return Ok(DesktopLaunchOutcome {
+            kind: DesktopKind::ClaudeDesktop,
+            headline,
+            rows: Vec::new(),
+            restored_sessions: Some(restored),
+            waited_foreground: false,
+            watcher_fallback_warn: false,
+        });
     }
 
     sweep_stale_desktop_sessions(state_paths);
@@ -608,12 +665,13 @@ pub async fn run_claude_desktop(
     .await?;
 
     finalize_or_watch_session(
+        DesktopKind::ClaudeDesktop,
         &journal_path,
         &mut guard,
         tracked_pids,
         args.wait,
         "Claude Desktop launched via Liftgate (auto-restore armed)",
-        &[
+        vec![
             ("App", app_bin.display_label().to_owned()),
             ("3P Gateway", gateway_3p_url),
             ("Default Model", primary_model),
@@ -717,41 +775,32 @@ pub fn run_desktop_msix_launch(args: DesktopMsixLaunchArgs) -> Result<(), CliErr
 }
 
 async fn finalize_or_watch_session(
+    kind: DesktopKind,
     journal_path: &Path,
     guard: &mut ForegroundJournalGuard,
     tracked_pids: Vec<u32>,
     wait_foreground: bool,
     headline_text: &str,
-    kv_rows: &[(&str, String)],
-) -> Result<i32, CliError> {
+    kv_rows: Vec<(&'static str, String)>,
+) -> Result<DesktopLaunchOutcome, CliError> {
     if let Some(journal) = guard.journal.as_mut() {
         journal.tracked_pids = tracked_pids;
         write_journal_file(journal_path, journal)?;
     }
 
-    ui::headline(Tone::Ok, headline_text);
-    for (k, v) in kv_rows {
-        if v.starts_with("http://") || v.starts_with("https://") {
-            ui::kv_accent(k, v);
-        } else {
-            ui::kv(k, v);
-        }
-    }
-
     if wait_foreground {
-        ui::note(
-            Tone::Info,
-            "Waiting for application to close (press Ctrl+C to restore and detach)...",
-        );
         if let Some(journal) = guard.journal.as_ref() {
             wait_for_desktop_session_exit(journal, true).await;
         }
         guard.finish();
-        ui::note(
-            Tone::Ok,
-            "Desktop session cleaned up with zero residual changes.",
-        );
-        return Ok(0);
+        return Ok(DesktopLaunchOutcome {
+            kind,
+            headline: headline_text.to_owned(),
+            rows: kv_rows,
+            restored_sessions: None,
+            waited_foreground: true,
+            watcher_fallback_warn: false,
+        });
     }
 
     match spawn_detached_watcher(journal_path) {
@@ -761,18 +810,28 @@ async fn finalize_or_watch_session(
                 let _ = write_journal_file(journal_path, journal);
             }
             guard.disarm();
-            Ok(0)
+            Ok(DesktopLaunchOutcome {
+                kind,
+                headline: headline_text.to_owned(),
+                rows: kv_rows,
+                restored_sessions: None,
+                waited_foreground: false,
+                watcher_fallback_warn: false,
+            })
         }
         Err(_) => {
-            ui::note(
-                Tone::Warn,
-                "Detached watcher unavailable; waiting in foreground to guarantee zero-pollution cleanup...",
-            );
             if let Some(journal) = guard.journal.as_ref() {
                 wait_for_desktop_session_exit(journal, true).await;
             }
             guard.finish();
-            Ok(0)
+            Ok(DesktopLaunchOutcome {
+                kind,
+                headline: headline_text.to_owned(),
+                rows: kv_rows,
+                restored_sessions: None,
+                waited_foreground: true,
+                watcher_fallback_warn: true,
+            })
         }
     }
 }
@@ -1243,7 +1302,7 @@ fn restore_claude_desktop_backups(backups: &[ClaudePathSetBackup]) {
     }
 }
 
-fn force_restore_claude_desktop_sessions(state_paths: &StatePaths) -> Result<usize, CliError> {
+pub fn force_restore_claude_desktop_sessions(state_paths: &StatePaths) -> Result<usize, CliError> {
     let dir = state_paths.desktop_journals_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(it) => it,

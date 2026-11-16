@@ -12,29 +12,20 @@ use std::io::{IsTerminal as _, Write as _, stderr, stdout};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use clap::builder::{Styles, styling};
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets};
+use liftgate_core::ReportTone;
 use owo_colors::{OwoColorize as _, Style};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::error::CliError;
+use liftgate_core::error::{CliError, recovery_hint_for_error};
+pub use liftgate_core::format::{
+    format_duration_secs, format_latency_ms, format_relative_ms, format_tokens, format_utc_hms,
+    progress_bar,
+};
 
 const FALLBACK_TABLE_WIDTH: u16 = 120;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Clap v4 color theme used by `--help` and CLI parse errors.
-#[must_use]
-pub fn clap_styles() -> Styles {
-    Styles::styled()
-        .header(styling::AnsiColor::Cyan.on_default().bold())
-        .usage(styling::AnsiColor::Cyan.on_default().bold())
-        .literal(styling::AnsiColor::Green.on_default().bold())
-        .placeholder(styling::AnsiColor::Cyan.on_default())
-        .valid(styling::AnsiColor::Yellow.on_default())
-        .error(styling::AnsiColor::Red.on_default().bold())
-        .invalid(styling::AnsiColor::Yellow.on_default().bold())
-}
 
 /// Returns `true` when ANSI colors should be emitted on `stdout`.
 #[must_use]
@@ -78,6 +69,19 @@ pub enum Tone {
     Err,
     /// Low-emphasis no-op (`·` dim).
     Muted,
+}
+
+impl From<ReportTone> for Tone {
+    fn from(value: ReportTone) -> Self {
+        match value {
+            ReportTone::Ok => Self::Ok,
+            ReportTone::Info => Self::Info,
+            ReportTone::Action => Self::Action,
+            ReportTone::Warn => Self::Warn,
+            ReportTone::Err => Self::Err,
+            ReportTone::Muted => Self::Muted,
+        }
+    }
 }
 
 impl Tone {
@@ -215,51 +219,6 @@ pub fn print_cli_error(err: &CliError, bin_name: &str) {
         let arrow = paint_stderr("→", Style::new().cyan().bold());
         let text = paint_stderr(&hint, Style::new().cyan());
         eprintln!("  {arrow} {text}");
-    }
-}
-
-fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
-    match err {
-        CliError::AgyBinaryNotFound => Some(format!(
-            "Run `{bin} agy install` to download & install Antigravity CLI automatically, then `{bin} agy login` to sign in."
-        )),
-        CliError::NoSystemProxyDetected => Some(format!(
-            "Set an explicit proxy with `{bin} proxy 7890` (or `{bin} proxy socks5://127.0.0.1:1080`), or clear with `{bin} proxy off`."
-        )),
-        CliError::AgyInstallFailed { .. } => Some(format!(
-            "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
-        )),
-        CliError::GatewayUnreachable { .. } => Some(format!(
-            "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
-        )),
-        CliError::PortOccupiedUnmanaged { .. } => Some(format!(
-            "Run `{bin} status` to inspect the active listener, or bind another port with `--listen 127.0.0.1:8788`."
-        )),
-        CliError::DaemonExitedEarly { .. } | CliError::DaemonHealthTimeout { .. } => Some(format!(
-            "Inspect `{bin} logs -n 80` and `{bin} doctor` for startup diagnostics."
-        )),
-        CliError::GatewayHttpStatus { status: 401, .. } => Some(format!(
-            "Pass `--api-key <key>` or export `AGY_GATEWAY_API_KEY` matching the running gateway (`{bin} status`)."
-        )),
-        CliError::UpgradeNetwork { .. } => Some(format!(
-            "Check network connectivity, pass `--proxy <url>` (or set `HTTPS_PROXY`), or set `GITHUB_TOKEN` if rate-limited (`{bin} upgrade --check`)."
-        )),
-        CliError::UpgradePermissionDenied { .. } => Some(
-            "Re-run with elevated permissions (e.g. `sudo lg upgrade`) or install into a user-writable directory such as `~/.cargo/bin`."
-                .to_owned(),
-        ),
-        CliError::UpgradeUnsupportedTarget { .. } => Some(
-            "Install from source with `cargo install --git https://github.com/acking-you/liftgate liftgate` or specify `--target <triple>`."
-                .to_owned(),
-        ),
-        CliError::DesktopAppAlreadyRunning { .. } => Some(
-            "Close the running desktop app window first, or re-run with `--restart-app` to restart it automatically with Liftgate configuration."
-                .to_owned(),
-        ),
-        CliError::DesktopAppNotFound { .. } => Some(format!(
-            "Run `{bin} doctor` to inspect detected desktop installations, or specify an explicit path via `--codex-app-bin` / `--claude-desktop-bin`."
-        )),
-        _ => None,
     }
 }
 
@@ -509,88 +468,6 @@ impl Drop for Spinner {
             let _ = stderr().flush();
         }
     }
-}
-
-/// Formats elapsed seconds into compact human units (`42s`, `5m 12s`, `2h 09m`, `1d 04h`).
-#[must_use]
-pub fn format_duration_secs(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3_600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else if secs < 86_400 {
-        format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
-    } else {
-        format!("{}d {:02}h", secs / 86_400, (secs % 86_400) / 3_600)
-    }
-}
-
-/// Formats millisecond latency into compact human units (`140ms`, `2.4s`, `1m 12s`).
-#[must_use]
-pub fn format_latency_ms(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format_duration_secs(ms / 1_000)
-    }
-}
-
-/// Formats token counts into compact readable units (`0`, `940`, `18.4k`, `1.25M`).
-#[must_use]
-pub fn format_tokens(tokens: u64) -> String {
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 1_000_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        format!("{:.2}M", tokens as f64 / 1_000_000.0)
-    }
-}
-
-/// Formats a Unix-millisecond timestamp relative to `now_ms` (`just now`, `14s ago`, `3m ago`).
-#[must_use]
-pub fn format_relative_ms(timestamp_ms: u64, now_ms: u64) -> String {
-    if timestamp_ms == 0 {
-        return "—".to_owned();
-    }
-    let delta_secs = now_ms.saturating_sub(timestamp_ms) / 1_000;
-    if delta_secs < 5 {
-        "just now".to_owned()
-    } else if delta_secs < 60 {
-        format!("{delta_secs}s ago")
-    } else if delta_secs < 3_600 {
-        format!("{}m ago", delta_secs / 60)
-    } else if delta_secs < 86_400 {
-        format!("{}h ago", delta_secs / 3_600)
-    } else {
-        format!("{}d ago", delta_secs / 86_400)
-    }
-}
-
-/// Formats a Unix-millisecond timestamp as `HH:MM:SS UTC`.
-#[must_use]
-pub fn format_utc_hms(timestamp_ms: u64) -> String {
-    let total_secs = timestamp_ms / 1_000;
-    let day_secs = total_secs % 86_400;
-    let hours = day_secs / 3_600;
-    let mins = (day_secs % 3_600) / 60;
-    let secs = day_secs % 60;
-    format!("{hours:02}:{mins:02}:{secs:02}Z")
-}
-
-/// Builds a compact Unicode bar (`▰▰▰▰▱▱▱▱`) representing `filled / total`.
-#[must_use]
-pub fn progress_bar(filled: usize, total: usize, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let clamped_total = total.max(1);
-    let ratio = (filled.min(clamped_total) * width) / clamped_total;
-    let active = "▰".repeat(ratio);
-    let empty = "▱".repeat(width.saturating_sub(ratio));
-    format!("{active}{empty}")
 }
 
 /// Prints a single log line with structured level and timestamp highlighting on TTYs.

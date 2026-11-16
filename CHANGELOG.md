@@ -4,9 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Standalone native GPUI desktop application (`liftgate-desktop`)**:
+  - Built on `gpui-kit 0.9` with a Warm Editorial / StaticFlow (`ackingliu.top`) Light & Dark design palette (`#faf9f5` warm paper / `#141413` ink / `#c96442` terracotta accent / `.sf-term` `#111110` terminal panels), defaulting automatically to the current OS appearance (live-tracking system dark/light changes) and OS locale (`中文` / `English`), with one-click overrides persisted in `~/.liftgate/desktop-ui.json`.
+  - Runs completely standalone with zero external `liftgate` / `lg` CLI binary dependency via built-in headless `serve`, `__desktop-watch`, and `__desktop-msix-launch` subcommands.
+  - Covers 100% of CLI capabilities across six fully bilingual (`中文` / `English`) workspaces: **Overview & Gateway** (`ServeArgs` configuration, managed daemon lifecycle, embedded Web dashboard launcher), **Live Telemetry & Sessions** (auto-reconnecting `/api/telemetry/events` SSE stream, warm `SessionPool` eviction, searchable protocol-filtered turn inspector), **AI Launchers & Config Sync** (zero-side-effect Claude Code & Codex CLI system-terminal launchers with Code Mode toggles, zero-pollution Codex App & Claude Desktop GUI launchers + session journal restore, and non-destructive `config` dry-run/sync/uninstall), **Models Catalog** (live `/v1/models` explorer, context limits, one-click default & session title model switching, and harness launch), **Antigravity (`agy`) & Proxy** (`agy` SHA-512 install/update/reinstall, `agy acp --login`, idle auto-update toggle, arbitrary `agy` command runner, and proxy configuration + latency probe), and **Logs, Doctor & System** (live `gateway.log` & `agy` stderr viewer, environment doctor with quick-fix actions, `lg` PATH alias installer, shell completions preview, and SHA-256-verified atomic self-upgrade).
+  - Bundled `liftgate-desktop` into macOS (Apple Silicon & Intel), Windows (x64 & ARM64), and Linux (`x86_64-unknown-linux-gnu`) release archives and `upgrade` workflows.
+
 ### Changed
-- Codex and Claude Code title requests default to `gemini-4-hydrogen-low`. Select a model and press `t` in the Models tab of `lg tui` to change it for subsequent titles. Automatic fast-model selection skips Gemini 3.8 Flash.
+- Codex and Claude Code title requests default to `gemini-4-hydrogen-low`. Select a model and press `t` in the Models tab of `lg tui` (or click **Set Title** in `liftgate-desktop`) to change it for subsequent titles. Automatic fast-model selection skips Gemini 3.8 Flash.
 - `lg cx` and `lg cc` now allow 30 minutes of stream inactivity by default. Claude Code also waits up to 30 minutes for response headers. The gateway's default per-turn deadline is now 30 minutes.
+- Extracted all shared control-plane logic (`agy_manager`, `cli`, `client`, `config_sync`, `daemon`, `desktop`, `error`, `format`, `harness`, `serve`, `state`, `terminal`, `upgrade`, and embedded `web/dist` asset bundling) into a dedicated `liftgate-core` library crate shared by `liftgate`, `lg`, and `liftgate-desktop`.
 
 ### Fixed
 - **Isolated `CODEX_HOME` and auth routing in `lg codex-app` (`lg cxa`)**:
