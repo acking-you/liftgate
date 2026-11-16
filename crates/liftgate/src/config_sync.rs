@@ -91,7 +91,7 @@ pub struct HarnessSyncParams {
     pub discovered_models: Vec<DiscoveredModel>,
 }
 
-/// Resolves the optimal fast/subagent model (`gemini-*-flash-low`) from the discovered live
+/// Resolves the fast/subagent model from the discovered live
 /// catalog unless an explicit `--fast-model` override was supplied.
 #[must_use]
 pub fn resolve_fast_model(
@@ -106,9 +106,7 @@ pub fn resolve_fast_model(
         .iter()
         .map(DiscoveredModel::to_available_model)
         .collect();
-    let fallback = ModelId::try_new(primary_model)
-        .or_else(|_| ModelId::try_new("gemini-3.8-flash-low"))
-        .expect("compile-time fallback model id is non-empty");
+    let fallback = ModelId::try_new(primary_model).unwrap_or_else(|_| ModelId::fallback_fast());
     select_fastest_gemini_model(&available, &fallback)
         .as_str()
         .to_owned()

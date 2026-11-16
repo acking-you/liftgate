@@ -172,7 +172,7 @@ pub fn select_fastest_gemini_model(available: &[AvailableModel], fallback: &Mode
     for candidate in available {
         let id = candidate.model_id.trim();
         let lower = id.to_ascii_lowercase();
-        if !lower.starts_with("gemini-") {
+        if !lower.starts_with("gemini-") || lower.starts_with("gemini-3.8-flash") {
             continue;
         }
 
@@ -180,6 +180,8 @@ pub fn select_fastest_gemini_model(available: &[AvailableModel], fallback: &Mode
             5
         } else if lower.contains("flash") {
             4
+        } else if lower.contains("hydrogen") {
+            3
         } else if lower.contains("argon") {
             2
         } else if lower.contains("carbon") {
@@ -217,7 +219,16 @@ pub fn select_fastest_gemini_model(available: &[AvailableModel], fallback: &Mode
         return model_id;
     }
 
-    ModelId::try_new("gemini-3.8-flash-low").unwrap_or_else(|_| fallback.clone())
+    if available.is_empty()
+        || fallback
+            .as_str()
+            .to_ascii_lowercase()
+            .starts_with("gemini-3.8-flash")
+    {
+        ModelId::fallback_fast()
+    } else {
+        fallback.clone()
+    }
 }
 
 fn parse_gemini_version(lower_id: &str) -> (u32, u32) {
@@ -505,6 +516,10 @@ mod tests {
     fn sample_catalog() -> Vec<AvailableModel> {
         vec![
             AvailableModel {
+                model_id: "gemini-4-hydrogen-low".to_owned(),
+                name: "Gemini 4 Hydrogen (Low)".to_owned(),
+            },
+            AvailableModel {
                 model_id: "gemini-4-carbon-medium".to_owned(),
                 name: "Gemini 4 Carbon (Medium)".to_owned(),
             },
@@ -542,7 +557,7 @@ mod tests {
         );
         assert_eq!(
             resolve_model_id(Some("claude-3-5-haiku-20241022"), None, &catalog, &default).as_str(),
-            "gemini-3.8-flash-low"
+            "gemini-4-hydrogen-low"
         );
         assert_eq!(
             resolve_model_id(
@@ -607,12 +622,12 @@ mod tests {
     }
 
     #[test]
-    fn selects_newest_fastest_gemini_flash_low() {
+    fn skips_gemini_3_8_flash_when_selecting_a_fast_model() {
         let mut catalog = sample_catalog();
         let default = ModelId::try_new("gemini-4-carbon-high").expect("non-empty model");
         assert_eq!(
             select_fastest_gemini_model(&catalog, &default).as_str(),
-            "gemini-3.8-flash-low"
+            "gemini-4-hydrogen-low"
         );
 
         catalog.push(AvailableModel {

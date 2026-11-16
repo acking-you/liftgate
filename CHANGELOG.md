@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Codex and Claude Code title requests default to `gemini-4-hydrogen-low`. Select a model and press `t` in the Models tab of `lg tui` to change it for subsequent titles. Automatic fast-model selection skips Gemini 3.8 Flash.
+- `lg cx` and `lg cc` now allow 30 minutes of stream inactivity by default. Claude Code also waits up to 30 minutes for response headers. The gateway's default per-turn deadline is now 30 minutes.
+
 ### Fixed
 - **Isolated `CODEX_HOME` and auth routing in `lg codex-app` (`lg cxa`)**:
   - Fixed Windows MSIX activation (`OpenAI.Codex` via `Invoke-CommandInDesktopPackage`) dropping `CODEX_HOME`, `AGY_GATEWAY_API_KEY`, `NO_PROXY`, and `CODEX_CLI_PATH` across the out-of-process `IDesktopAppXActivator` COM boundary by launching through a headless in-container helper (`conhost.exe --headless <liftgate> __desktop-msix-launch` with `-PreventBreakaway`) that records the exact spawned GUI PID and preserves all environment variables without flashing a console window.

@@ -59,7 +59,7 @@ it cleanly afterward.
 
 The default mode sends one ACP prompt per client step, with a `176,000`-byte
 text budget below the observed upstream single-turn truncation boundary. It
-does not insert Flash seed turns. Oversized tool outputs or single-turn inputs
+does not insert seed turns. Oversized tool outputs or single-turn inputs
 are automatically middle-truncated across line boundaries using water-filling
 Head+Tail preservation (~55% head, ~45% tail, with an explicit omitted-lines
 marker) while leaving smaller sibling tool results untouched and keeping the
@@ -81,8 +81,8 @@ several gateway models take the smallest limit. These settings aim to trigger
 client compaction before the upstream compaction observed around `300k–320k`;
 they do not change that upstream policy.
 
-Only explicit `--long-context` enables Flash hydration and Gemini's experimental
-`1M / 850k` metadata. Histories are split across bounded Flash seed turns in the
+Only explicit `--long-context` enables hydration and Gemini's experimental
+`1M / 850k` metadata. Histories are split across bounded seed turns on the fast model in the
 same ACP session before switching to the requested model. This introduces
 synthetic acknowledgements and extra calls, and cannot preserve more history
 than upstream compaction permits. Inputs beyond the bounded chunk capacity
@@ -104,10 +104,10 @@ text.
   an upstream `429 RESOURCE_EXHAUSTED` or quota error, Liftgate aborts `agy`'s
   retry wait at once and returns HTTP `429` (`rate_limit_error`) / SSE failure
   directly on the exact model you requested, never silently switching models.
-- **Fast lanes.** Auxiliary requests (Claude Code Auto Mode classifiers, web
-  search sub-requests, title and topic generation, away recaps) go to the
-  fastest available `gemini-*-flash-low` model on short-lived sessions, so they
-  never evict or change your cached main session.
+- **Background requests.** Titles and topics use `gemini-4-hydrogen-low` by default.
+  In `lg tui`, press `3` for Models, highlight a model, and press `t` to use it
+  for subsequent titles. Classifiers, web search sub-requests, and away recaps
+  use the fast model selector, which skips Gemini 3.8 Flash. All run in short-lived sessions.
 - **Defaults.** An unknown or generic model name maps to `--default-model`.
 
 ## Process supervision

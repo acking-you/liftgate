@@ -16,7 +16,7 @@ RUNTIME_DIR="${SCRIPT_DIR}/.agy-runtime"
 mkdir -p "${RUNTIME_DIR}" "${SCRIPT_DIR}/.claude"
 
 MODEL="${AGY_MODEL:-gemini-4-carbon-high}"
-FAST_MODEL="${AGY_FAST_MODEL:-gemini-3.8-flash-low}"
+FAST_MODEL="${AGY_FAST_MODEL:-gemini-4-hydrogen-low}"
 EXPLICIT_FAST_MODEL=0
 if [[ -n "${AGY_FAST_MODEL:-}" ]]; then
   EXPLICIT_FAST_MODEL=1
@@ -300,7 +300,7 @@ sync_claude_settings() {
     if (process.env.EXPLICIT_FAST_MODEL !== "1") {
       const flash = data
         .map((m) => String(m.id))
-        .filter((id) => /^gemini-.*flash.*-low$/.test(id))
+        .filter((id) => /^gemini-(?!3\.8-flash).*flash.*-low$/.test(id))
         .sort()
         .reverse();
       if (flash.length > 0) {
@@ -399,7 +399,7 @@ if os.environ.get("CHECK_COUNT_ONLY") == "1":
 fast_model = os.environ["FAST_MODEL"]
 if os.environ.get("EXPLICIT_FAST_MODEL") != "1":
     flash = sorted(
-        (str(m.get("id", "")) for m in data if re.match(r"^gemini-.*flash.*-low$", str(m.get("id", "")))),
+        (str(m.get("id", "")) for m in data if re.match(r"^gemini-(?!3\.8-flash).*flash.*-low$", str(m.get("id", "")))),
         reverse=True,
     )
     if flash:

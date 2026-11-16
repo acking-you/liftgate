@@ -4,6 +4,7 @@ use std::process::Stdio;
 use liftgate_server::platform::{
     canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
 };
+use liftgate_types::config::DEFAULT_TURN_TIMEOUT_SECS;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::task::JoinSet;
@@ -20,6 +21,9 @@ use crate::config_sync::{
 use crate::daemon::ensure_gateway_ready;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths, user_home_dir};
+
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = DEFAULT_TURN_TIMEOUT_SECS * 1_000;
+const CODEX_STREAM_IDLE_TIMEOUT_KEY: &str = "model_providers.agy.stream_idle_timeout_ms";
 
 #[derive(Clone, Debug)]
 pub struct ResolvedCommand {
@@ -377,6 +381,11 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         .arg("model_providers.agy.wire_api='responses'")
         .arg("-c")
         .arg("model_providers.agy.requires_openai_auth=false");
+    if !has_explicit_codex_config_key(&args.passthrough_args, CODEX_STREAM_IDLE_TIMEOUT_KEY) {
+        cmd.arg("-c").arg(format!(
+            "{CODEX_STREAM_IDLE_TIMEOUT_KEY}={DEFAULT_REQUEST_TIMEOUT_MS}"
+        ));
+    }
     if args.no_code_mode {
         cmd.arg("-c")
             .arg("features.code_mode=false")
@@ -412,6 +421,11 @@ fn apply_claude_gateway_env(
     no_code_mode: bool,
     no_proxy: &str,
 ) {
+    for key in ["API_TIMEOUT_MS", "CLAUDE_STREAM_IDLE_TIMEOUT_MS"] {
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, DEFAULT_REQUEST_TIMEOUT_MS.to_string());
+        }
+    }
     cmd.env_remove("ANTHROPIC_API_KEY")
         .env_remove("AGY_API_KEY")
         .env("ANTHROPIC_BASE_URL", base_url)

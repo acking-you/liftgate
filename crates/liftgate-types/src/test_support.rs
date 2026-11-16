@@ -5,6 +5,10 @@ use crate::acp::{AcpUsage, AvailableModel};
 pub fn mock_available_models() -> Vec<AvailableModel> {
     vec![
         AvailableModel {
+            model_id: "gemini-4-hydrogen-low".to_owned(),
+            name: "Gemini 4 Hydrogen (Low)".to_owned(),
+        },
+        AvailableModel {
             model_id: "gemini-4-hydrogen-xhigh".to_owned(),
             name: "Gemini 4 Hydrogen (XHigh)".to_owned(),
         },

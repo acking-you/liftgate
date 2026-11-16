@@ -49,6 +49,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn title_model_file(&self) -> PathBuf {
+        self.root.join("title-model")
+    }
+
+    #[must_use]
     pub fn log_file(&self) -> PathBuf {
         self.root.join("gateway.log")
     }

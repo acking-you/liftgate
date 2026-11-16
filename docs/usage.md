@@ -54,6 +54,8 @@ lg completions zsh              # generate shell completions (bash, zsh, fish, p
 liftgate serve                  # run in the foreground
 ```
 
+In `lg tui`, press `3` to open Models, select a model, and press `t` to save it for future titles. The default is `gemini-4-hydrogen-low`.
+
 ## Antigravity CLI (`lg agy`) & Proxy Management (`lg proxy`)
 
 Liftgate manages the official `agy` CLI lifecycle, outbound proxy injection,
@@ -113,7 +115,7 @@ liftgate codex --code-mode-only             # strict Code Mode (`exec` + `wait` 
 liftgate codex --no-code-mode               # disable Code Mode (`tool_mode = "direct"`) for this session
 liftgate claude                             # interactive Claude Code (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` by default)
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
-liftgate claude --model gemini-3.8-flash-low -p "summarize recent commits"
+liftgate claude --model gemini-4-hydrogen-low -p "summarize recent commits"
 
 # Native session browsing, resumption, forking, worktrees & background agents
 lg cx resume                                # interactive Codex session picker (`--all` across projects; alias: `lg cx -r`)
@@ -358,7 +360,7 @@ conservative 110k auto-compact window for every model. Set the variables for one
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local-agy"
 export ANTHROPIC_MODEL="gemini-4-carbon-high"
-export ANTHROPIC_SMALL_FAST_MODEL="gemini-3.8-flash-low"
+export ANTHROPIC_SMALL_FAST_MODEL="gemini-4-hydrogen-low"
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="110000"
 export NO_PROXY="127.0.0.1,localhost,::1"
 claude
@@ -368,7 +370,7 @@ claude
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 $env:ANTHROPIC_AUTH_TOKEN = "local-agy"
 $env:ANTHROPIC_MODEL = "gemini-4-carbon-high"
-$env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-3.8-flash-low"
+$env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-4-hydrogen-low"
 $env:CLAUDE_CODE_AUTO_COMPACT_WINDOW = "110000"
 $env:NO_PROXY = "127.0.0.1,localhost,::1"
 claude
@@ -384,7 +386,7 @@ Or keep them in `~/.claude/settings.json` (or a project's
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_AUTH_TOKEN": "local-agy",
     "ANTHROPIC_MODEL": "gemini-4-carbon-high",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gemini-3.8-flash-low",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gemini-4-hydrogen-low",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
     "NO_PROXY": "127.0.0.1,localhost,::1"
   }
@@ -436,7 +438,7 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--ui-dir` | `AGY_UI_DIR` | embedded `web/dist` bundle |
 | `--max-idle-sessions` | | `64` |
 | `--max-stored-responses` | | `256` |
-| `--turn-timeout-secs` | | `600` |
+| `--turn-timeout-secs` | Overall gateway deadline per turn, in seconds | `1800` |
 | `--max-body-bytes` | | 12 MiB |
 | `--max-line-bytes` (one ACP JSON-RPC line) | | 16 MiB |
 | `--channel-capacity` (per stream) | | `256` |

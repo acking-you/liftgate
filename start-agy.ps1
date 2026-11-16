@@ -33,7 +33,7 @@ $ProgressPreference = "SilentlyContinue"
 $IsWin = ($IsWindows -or $env:OS -eq "Windows_NT")
 
 $GatewayModel = if (-not [string]::IsNullOrWhiteSpace($env:AGY_MODEL)) { $env:AGY_MODEL } else { "gemini-4-carbon-high" }
-$FastModel = if (-not [string]::IsNullOrWhiteSpace($env:AGY_FAST_MODEL)) { $env:AGY_FAST_MODEL } else { "gemini-3.8-flash-low" }
+$FastModel = if (-not [string]::IsNullOrWhiteSpace($env:AGY_FAST_MODEL)) { $env:AGY_FAST_MODEL } else { "gemini-4-hydrogen-low" }
 $ExplicitFastModel = (-not [string]::IsNullOrWhiteSpace($env:AGY_FAST_MODEL))
 $ListenHost = if (-not [string]::IsNullOrWhiteSpace($env:AGY_HOST)) { $env:AGY_HOST } else { "127.0.0.1" }
 $ListenPort = if (-not [string]::IsNullOrWhiteSpace($env:AGY_PORT)) { [int]$env:AGY_PORT } else { 8787 }
@@ -822,7 +822,7 @@ try {
         $flashCandidates = @(
             $modelsResp.data |
                 ForEach-Object { [string]$_.id } |
-                Where-Object { $_ -match '^gemini-.*flash.*-low$' } |
+                Where-Object { $_ -match '^gemini-(?!3\.8-flash).*flash.*-low$' } |
                 Sort-Object -Descending
         )
         if ($flashCandidates.Count -gt 0) {
