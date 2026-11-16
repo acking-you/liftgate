@@ -1,46 +1,32 @@
-#[path = "agy_manager.rs"]
-pub(crate) mod agy_manager;
-#[path = "cli.rs"]
-pub(crate) mod cli;
-#[path = "client.rs"]
-pub(crate) mod client;
-#[path = "config_sync.rs"]
-pub(crate) mod config_sync;
-#[path = "daemon.rs"]
-pub(crate) mod daemon;
-#[path = "desktop.rs"]
-pub(crate) mod desktop;
-#[path = "error.rs"]
-pub(crate) mod error;
-#[path = "harness.rs"]
-pub(crate) mod harness;
-#[path = "serve.rs"]
-pub(crate) mod serve;
-#[path = "state.rs"]
-pub(crate) mod state;
+#[path = "render.rs"]
+pub(crate) mod render;
 #[path = "tui.rs"]
 pub(crate) mod tui;
 #[path = "ui.rs"]
 pub(crate) mod ui;
-#[path = "upgrade.rs"]
-pub(crate) mod upgrade;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, stdin, stdout};
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, FromArgMatches as _};
+use liftgate_core::{
+    agy_manager,
+    cli::{
+        AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs,
+        ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs, DoctorArgs,
+        ModelsArgs, RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs,
+        invoked_bin_name, normalize_harness_args,
+    },
+    daemon, desktop,
+    error::CliError,
+    serve::{self, ServeReadyInfo},
+    state::{StatePaths, resolve_effective_agy_bin},
+    upgrade,
+};
 use liftgate_server::job::install_panic_cleanup_hook;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{
-    AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs,
-    ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs, DoctorArgs, ModelsArgs,
-    RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs, invoked_bin_name,
-    normalize_harness_args,
-};
-use crate::error::CliError;
-use crate::state::{StatePaths, resolve_effective_agy_bin};
 use crate::tui::CockpitAction;
 
 pub async fn entry() -> ExitCode {
@@ -118,7 +104,7 @@ async fn dispatch(
             dispatch_cockpit_action(&state_paths, action).await
         }
         None => {
-            serve::run_serve(&state_paths, cli.serve).await?;
+            run_foreground_serve(&state_paths, cli.serve).await?;
             Ok(0)
         }
         Some(Commands::Top(args)) => {
@@ -126,66 +112,66 @@ async fn dispatch(
             Ok(0)
         }
         Some(Commands::Serve(args)) => {
-            serve::run_serve(&state_paths, args).await?;
+            run_foreground_serve(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Start(args)) => {
-            daemon::run_start(&state_paths, args).await?;
+            render::run_start(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Stop) => {
-            let _ = daemon::stop_daemon(&state_paths, false).await?;
+            render::run_stop(&state_paths).await?;
             Ok(0)
         }
         Some(Commands::Restart(args)) => {
-            daemon::run_restart(&state_paths, args).await?;
+            render::run_restart(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Status(args)) => {
-            daemon::run_status(&state_paths, args).await?;
+            render::run_status(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Logs(args)) => {
-            daemon::run_logs(&state_paths, args).await?;
+            render::run_logs(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Ui(args)) => {
-            daemon::run_ui(&state_paths, args).await?;
+            render::run_ui(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Models(args)) => {
-            daemon::run_models(&state_paths, args).await?;
+            render::run_models(&state_paths, args).await?;
             Ok(0)
         }
-        Some(Commands::Claude(args)) => harness::run_claude(&state_paths, args).await,
+        Some(Commands::Claude(args)) => render::run_claude_cli(&state_paths, args).await,
         Some(Commands::ClaudeDesktop(args)) => {
-            desktop::run_claude_desktop(&state_paths, args).await
+            render::run_claude_desktop_cli(&state_paths, args).await
         }
-        Some(Commands::Codex(args)) => harness::run_codex(&state_paths, args).await,
-        Some(Commands::CodexApp(args)) => desktop::run_codex_app(&state_paths, args).await,
+        Some(Commands::Codex(args)) => render::run_codex_cli(&state_paths, args).await,
+        Some(Commands::CodexApp(args)) => render::run_codex_app_cli(&state_paths, args).await,
         Some(Commands::InternalDesktopWatch(args)) => {
             desktop::run_desktop_watch(args).await?;
             Ok(0)
         }
         Some(Commands::Config(args)) => {
-            config_sync::run_config(&state_paths, args).await?;
+            render::run_config(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Doctor(args)) => {
-            daemon::run_doctor(&state_paths, args).await?;
+            render::run_doctor(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Upgrade(args)) => {
-            upgrade::run_upgrade(&state_paths, args).await?;
+            render::run_upgrade(&state_paths, args).await?;
             Ok(0)
         }
-        Some(Commands::Agy(args)) => agy_manager::run_agy(&state_paths, args).await,
+        Some(Commands::Agy(args)) => render::run_agy(&state_paths, args).await,
         Some(Commands::Proxy(args)) => {
-            agy_manager::run_proxy(&state_paths, args).await?;
+            render::run_proxy(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Alias(args)) => {
-            daemon::run_alias(args)?;
+            render::run_alias(args)?;
             Ok(0)
         }
         Some(Commands::Completions(args)) => {
@@ -197,22 +183,39 @@ async fn dispatch(
     }
 }
 
+async fn run_foreground_serve(state_paths: &StatePaths, args: ServeArgs) -> Result<(), CliError> {
+    let banner_cb = |info: &ServeReadyInfo| {
+        ui::print_serve_ready_banner(
+            &info.listen_url,
+            &info.dashboard_url,
+            &info.default_model,
+            &info.acp_mode,
+            info.auth_enabled,
+            info.full_ui_embedded,
+            info.agy_proxy_display.as_deref(),
+            info.agy_auto_update,
+        );
+    };
+    serve::run_serve_with_hook(state_paths, args, Some(&banner_cb)).await
+}
+
 async fn dispatch_cockpit_action(
     state_paths: &StatePaths,
     action: CockpitAction,
 ) -> Result<i32, CliError> {
     match action {
         CockpitAction::LaunchCodex => {
-            harness::run_codex(state_paths, CodexArgs::default_interactive()).await
+            render::run_codex_cli(state_paths, CodexArgs::default_interactive()).await
         }
         CockpitAction::LaunchClaude => {
-            harness::run_claude(state_paths, ClaudeArgs::default_interactive()).await
+            render::run_claude_cli(state_paths, ClaudeArgs::default_interactive()).await
         }
         CockpitAction::LaunchCodexApp => {
-            desktop::run_codex_app(state_paths, CodexAppArgs::default_interactive()).await
+            render::run_codex_app_cli(state_paths, CodexAppArgs::default_interactive()).await
         }
         CockpitAction::LaunchClaudeDesktop => {
-            desktop::run_claude_desktop(state_paths, ClaudeDesktopArgs::default_interactive()).await
+            render::run_claude_desktop_cli(state_paths, ClaudeDesktopArgs::default_interactive())
+                .await
         }
         CockpitAction::OpenTop => {
             tui::run_top(
@@ -228,7 +231,7 @@ async fn dispatch_cockpit_action(
             Ok(0)
         }
         CockpitAction::PickModel => {
-            daemon::run_models(
+            render::run_models(
                 state_paths,
                 ModelsArgs {
                     listen: None,
@@ -242,7 +245,7 @@ async fn dispatch_cockpit_action(
             Ok(0)
         }
         CockpitAction::OpenWebUi => {
-            daemon::run_ui(
+            render::run_ui(
                 state_paths,
                 UiArgs {
                     listen: None,
@@ -259,9 +262,9 @@ async fn dispatch_cockpit_action(
                 .read_daemon()?
                 .is_some_and(|d| daemon::is_pid_alive(d.pid));
             if managed_running {
-                daemon::run_restart(state_paths, RestartArgs::default()).await?;
+                render::run_restart(state_paths, RestartArgs::default()).await?;
             } else {
-                daemon::run_start(
+                render::run_start(
                     state_paths,
                     StartArgs {
                         serve: ServeArgs::default(),
@@ -276,11 +279,11 @@ async fn dispatch_cockpit_action(
         CockpitAction::AgyManage => {
             let settings = state_paths.read_settings()?;
             if resolve_effective_agy_bin(None, &settings).is_none() {
-                let _ = agy_manager::run_agy_install(state_paths, AgyInstallArgs::default(), false)
-                    .await?;
+                let _ =
+                    render::run_agy_install(state_paths, AgyInstallArgs::default(), false).await?;
                 Ok(0)
             } else {
-                agy_manager::run_agy(
+                render::run_agy(
                     state_paths,
                     AgyArgs {
                         agy_bin: None,
@@ -292,7 +295,7 @@ async fn dispatch_cockpit_action(
             }
         }
         CockpitAction::AgyLogin => {
-            agy_manager::run_agy_login(
+            render::run_agy_login(
                 state_paths,
                 None,
                 AgyLoginArgs {
@@ -304,11 +307,11 @@ async fn dispatch_cockpit_action(
             .await
         }
         CockpitAction::SyncConfig => {
-            config_sync::run_config(state_paths, ConfigArgs::default_local()).await?;
+            render::run_config(state_paths, ConfigArgs::default_local()).await?;
             Ok(0)
         }
         CockpitAction::Doctor => {
-            daemon::run_doctor(
+            render::run_doctor(
                 state_paths,
                 DoctorArgs {
                     agy_bin: None,
@@ -321,7 +324,7 @@ async fn dispatch_cockpit_action(
             Ok(0)
         }
         CockpitAction::Upgrade => {
-            upgrade::run_upgrade(
+            render::run_upgrade(
                 state_paths,
                 UpgradeArgs {
                     repo: "acking-you/liftgate".to_owned(),
@@ -332,7 +335,7 @@ async fn dispatch_cockpit_action(
             Ok(0)
         }
         CockpitAction::StopGateway => {
-            let _ = daemon::stop_daemon(state_paths, false).await?;
+            render::run_stop(state_paths).await?;
             Ok(0)
         }
     }

@@ -44,6 +44,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **拒绝静默降级与 Flash 快车道**：上游 `429` 限流立即返回，绝不暗中偷换模型；标题、摘要与 Auto Mode 分类走独立的 Flash 会话，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
 - **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
+- **原生 GPUI 独立桌面端（`liftgate-desktop`）**：基于最新 `gpui-kit` 构建的跨平台独立桌面控制中心，采用 Warm Editorial（`ackingliu.top`）暖调亮/暗双色主题与中英双语实时切换，内置网关无头守护模式，100% 覆盖网关启停、SSE 实时遥测与会话驱逐、Claude/Codex 终端与桌面应用零污染启动、持久化配置同步、模型热切换、`agy` 与代理管理、环境诊断及原子自升级。
 
 ## 工作原理
 
@@ -60,6 +61,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ```bash
 cargo install --path crates/liftgate --locked  # 同时安装 `lg` 与 `liftgate`（装有 Bun 时自动内嵌 Web 面板）
+cargo install --path crates/liftgate-desktop --locked  # 可选：安装独立原生 GPUI 桌面端（`liftgate-desktop`）
 
 lg agy install                          # 若本机尚未安装 `agy`，跨平台下载官方包并做 SHA-512 校验安装
 lg proxy 7890                           # 可选：为 `agy` 强制指定代理（默认不设任何代理，`lg proxy off` 关闭）

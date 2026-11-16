@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use liftgate_server::routes::ADMIN_SHUTDOWN_HEADER;
 use liftgate_types::{acp::AvailableModel, telemetry::GatewayTelemetrySnapshot};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
@@ -14,9 +14,10 @@ use crate::error::CliError;
 use crate::state::format_connect_url;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SSE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiscoveredModel {
     pub id: String,
     #[serde(default)]
@@ -241,6 +242,93 @@ impl GatewayClient {
         Ok(())
     }
 
+    /// Subscribes to `/api/telemetry/events` over loopback SSE, streaming parsed
+    /// [`GatewayTelemetrySnapshot`] frames into `tx` until `cancel` triggers or the connection closes.
+    pub async fn subscribe_telemetry_events(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<GatewayTelemetrySnapshot>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), CliError> {
+        let path = "/api/telemetry/events";
+        let full_url = format!("{}{path}", self.base_url);
+        let mut req_buf = String::with_capacity(256);
+        let _ = write!(
+            req_buf,
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n",
+            self.host_header
+        );
+        if let Some(key) = &self.api_key {
+            let clean_key: String = key.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let _ = write!(req_buf, "Authorization: Bearer {clean_key}\r\n");
+        }
+        req_buf.push_str("\r\n");
+
+        let connect_deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream =
+            match timeout_at(connect_deadline, TcpStream::connect(self.connect_addr)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(source)) => {
+                    return Err(CliError::GatewayUnreachable {
+                        url: full_url,
+                        source,
+                    });
+                }
+                Err(_) => {
+                    return Err(CliError::GatewayUnreachable {
+                        url: full_url,
+                        source: io::Error::new(io::ErrorKind::TimedOut, "SSE connect timed out"),
+                    });
+                }
+            };
+        stream
+            .write_all(req_buf.as_bytes())
+            .await
+            .map_err(|source| CliError::GatewayUnreachable {
+                url: full_url.clone(),
+                source,
+            })?;
+
+        let mut decoder = IncrementalSseDecoder::new();
+        let mut read_buf = [0u8; 16_384];
+        loop {
+            if *cancel.borrow() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.wait_for(|&stopped| stopped) => break,
+                read_res = stream.read(&mut read_buf) => {
+                    let n = read_res.map_err(|source| CliError::GatewayUnreachable {
+                        url: full_url.clone(),
+                        source,
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    let Some(bytes) = read_buf.get(..n) else {
+                        continue;
+                    };
+                    match decoder.push_bytes(bytes, &full_url)? {
+                        SseFeedOutcome::Continue(snapshots) => {
+                            for snap in snapshots {
+                                if tx.send(snap).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        SseFeedOutcome::EndOfStream(snapshots) => {
+                            for snap in snapshots {
+                                let _ = tx.send(snap);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn authed_get(
         &self,
         path_and_query: &str,
@@ -394,6 +482,182 @@ fn decode_chunked_body(mut rest: &[u8]) -> io::Result<Vec<u8>> {
         rest = rest.get(chunk_len + 2..).unwrap_or_default();
     }
     Ok(out)
+}
+
+enum SseFeedOutcome {
+    Continue(Vec<GatewayTelemetrySnapshot>),
+    EndOfStream(Vec<GatewayTelemetrySnapshot>),
+}
+
+struct IncrementalSseDecoder {
+    headers_parsed: bool,
+    is_chunked: bool,
+    raw_buf: Vec<u8>,
+    sse_buf: Vec<u8>,
+}
+
+impl IncrementalSseDecoder {
+    fn new() -> Self {
+        Self {
+            headers_parsed: false,
+            is_chunked: false,
+            raw_buf: Vec::with_capacity(8192),
+            sse_buf: Vec::with_capacity(8192),
+        }
+    }
+
+    fn push_bytes(&mut self, incoming: &[u8], url: &str) -> Result<SseFeedOutcome, CliError> {
+        if self.raw_buf.len().saturating_add(incoming.len()) > MAX_SSE_BUFFER_BYTES {
+            return Err(CliError::GatewayUnreachable {
+                url: url.to_owned(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "SSE raw buffer exceeded 4 MiB"),
+            });
+        }
+        self.raw_buf.extend_from_slice(incoming);
+
+        if !self.headers_parsed {
+            let Some(hdr_end) = find_double_crlf(&self.raw_buf) else {
+                return Ok(SseFeedOutcome::Continue(Vec::new()));
+            };
+            let header_bytes = self.raw_buf.get(..hdr_end).unwrap_or_default();
+            let header_str =
+                std::str::from_utf8(header_bytes).map_err(|_| CliError::GatewayUnreachable {
+                    url: url.to_owned(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 SSE headers"),
+                })?;
+            let mut lines = header_str.split("\r\n");
+            let status = lines
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            self.is_chunked = lines.any(|line| {
+                line.split_once(':').is_some_and(|(k, v)| {
+                    k.trim().eq_ignore_ascii_case("transfer-encoding")
+                        && v.to_ascii_lowercase().contains("chunked")
+                })
+            });
+            self.raw_buf.drain(..hdr_end + 4);
+            self.headers_parsed = true;
+            if !(200..300).contains(&status) {
+                return Err(CliError::GatewayHttpStatus {
+                    url: url.to_owned(),
+                    status,
+                    body: String::from_utf8_lossy(&self.raw_buf).into_owned(),
+                });
+            }
+        }
+
+        let mut reached_eof = false;
+        if self.is_chunked {
+            while let Some(crlf) = self.raw_buf.windows(2).position(|w| w == b"\r\n") {
+                let size_str = std::str::from_utf8(self.raw_buf.get(..crlf).unwrap_or_default())
+                    .map_err(|_| CliError::GatewayUnreachable {
+                        url: url.to_owned(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid SSE chunk header",
+                        ),
+                    })?;
+                let hex_part = size_str.split(';').next().unwrap_or_default().trim();
+                let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|_| {
+                    CliError::GatewayUnreachable {
+                        url: url.to_owned(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid SSE chunk length",
+                        ),
+                    }
+                })?;
+                if chunk_len == 0 {
+                    reached_eof = true;
+                    self.raw_buf.clear();
+                    break;
+                }
+                let needed = crlf
+                    .saturating_add(2)
+                    .saturating_add(chunk_len)
+                    .saturating_add(2);
+                if self.raw_buf.len() < needed {
+                    break;
+                }
+                if self.sse_buf.len().saturating_add(chunk_len) > MAX_SSE_BUFFER_BYTES {
+                    return Err(CliError::GatewayUnreachable {
+                        url: url.to_owned(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SSE payload exceeded 4 MiB",
+                        ),
+                    });
+                }
+                if let Some(payload) = self.raw_buf.get(crlf + 2..crlf + 2 + chunk_len) {
+                    self.sse_buf.extend_from_slice(payload);
+                }
+                self.raw_buf.drain(..needed);
+            }
+        } else {
+            if self.sse_buf.len().saturating_add(self.raw_buf.len()) > MAX_SSE_BUFFER_BYTES {
+                return Err(CliError::GatewayUnreachable {
+                    url: url.to_owned(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SSE payload exceeded 4 MiB",
+                    ),
+                });
+            }
+            self.sse_buf.append(&mut self.raw_buf);
+        }
+
+        let mut out = Vec::new();
+        while let Some((frame_end, delim_len)) = find_sse_event_boundary(&self.sse_buf) {
+            let frame_bytes = self.sse_buf.get(..frame_end).unwrap_or_default();
+            if let Ok(frame_str) = std::str::from_utf8(frame_bytes)
+                && let Some(snap) = parse_sse_snapshot_event(frame_str)
+            {
+                out.push(snap);
+            }
+            self.sse_buf.drain(..frame_end + delim_len);
+        }
+
+        if reached_eof {
+            Ok(SseFeedOutcome::EndOfStream(out))
+        } else {
+            Ok(SseFeedOutcome::Continue(out))
+        }
+    }
+}
+
+fn find_sse_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    for (idx, win) in buf.windows(2).enumerate() {
+        if win == b"\n\n" {
+            return Some((idx, 2));
+        }
+        if win == b"\r\n" && buf.get(idx + 2..idx + 4) == Some(b"\r\n") {
+            return Some((idx, 4));
+        }
+    }
+    None
+}
+
+fn parse_sse_snapshot_event(frame: &str) -> Option<GatewayTelemetrySnapshot> {
+    let mut event_type = "message";
+    let mut data_lines: Vec<&str> = Vec::new();
+    for raw_line in frame.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with(':') || line.is_empty() {
+            continue;
+        }
+        if let Some(ev) = line.strip_prefix("event:") {
+            event_type = ev.trim();
+        } else if let Some(d) = line.strip_prefix("data:") {
+            data_lines.push(d.strip_prefix(' ').unwrap_or(d));
+        }
+    }
+    if event_type != "snapshot" || data_lines.is_empty() {
+        return None;
+    }
+    let joined = data_lines.join("\n");
+    serde_json::from_str(&joined).ok()
 }
 
 #[cfg(test)]

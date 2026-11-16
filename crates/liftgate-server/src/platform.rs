@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use liftgate_types::config::ProxyUrl;
 
-const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
+pub const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -19,7 +19,7 @@ const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
     "AGY_GATEWAY_API_KEY",
 ];
 
-const OUTBOUND_PROXY_ENV_KEYS: &[&str] = &[
+pub const OUTBOUND_PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",

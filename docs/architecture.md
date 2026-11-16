@@ -123,9 +123,11 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | --- | --- |
 | `crates/liftgate-types` | protocol, wire and config types: no async runtime, HTTP or I/O |
 | `crates/liftgate-server` | HTTP/SSE routes, ACP transport, `SessionPool`, process supervision, `web_fetch`, telemetry |
-| `crates/liftgate` | the `liftgate` CLI binary: global daemon lifecycle (`start`/`stop`/`restart`/`status`/`logs`/`ui`/`models`/`doctor`), embedded `web/dist` assets, non-destructive `config` sync, and zero-side-effect `claude` / `codex` launchers |
-| `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release `liftgate` builds via `crates/liftgate/build.rs` |
+| `crates/liftgate-core` | shared control-plane library: daemon lifecycle, embedded `web/dist` assets, HTTP/SSE client, `agy` & proxy manager, zero-side-effect CLI/GUI launchers, system terminal spawner, non-destructive `config` sync, and verified self-upgrade |
+| `crates/liftgate` | the `liftgate` / `lg` CLI and interactive `ratatui` TUI binaries |
+| `crates/liftgate-desktop` | standalone native GPUI desktop control center (`gpui-kit`) with Warm Editorial Light/Dark themes, `中文`/`EN` switch, 100% CLI capability parity, and built-in headless `serve` / `__desktop-watch` daemon modes |
+| `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release builds via `crates/liftgate-core/build.rs` |
 | `run-gateway.{sh,ps1,cmd}` | build and run the gateway |
 | `start-agy.{sh,ps1,cmd}` | launch Claude Code or Codex through the gateway |
 
-Dependencies point one way: `liftgate` → `liftgate-server` → `liftgate-types`.
+Dependencies point one way: `{liftgate, liftgate-desktop}` → `liftgate-core` → `liftgate-server` → `liftgate-types`.

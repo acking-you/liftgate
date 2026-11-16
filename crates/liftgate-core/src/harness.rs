@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -20,6 +21,7 @@ use crate::config_sync::{
 use crate::daemon::ensure_gateway_ready;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths, user_home_dir};
+use crate::terminal::TerminalLaunchSpec;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedCommand {
@@ -56,7 +58,7 @@ enum CodexInvocationKind {
 
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
     if args.desktop {
-        return crate::desktop::run_claude_desktop(
+        let _ = crate::desktop::launch_claude_desktop(
             state_paths,
             ClaudeDesktopArgs {
                 listen: args.listen,
@@ -69,8 +71,37 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
                 passthrough_args: args.passthrough_args,
             },
         )
-        .await;
+        .await?;
+        return Ok(0);
     }
+    let (spec, ephemeral_guard) = build_claude_invocation(state_paths, &args, None, false).await?;
+    let cmd = command_from_terminal_spec(&spec);
+    let exit_code = spawn_and_wait_interactive("claude", &spec.program, cmd).await?;
+    drop(ephemeral_guard);
+    Ok(exit_code)
+}
+
+/// Prepares an isolated [`TerminalLaunchSpec`] for launching Claude Code CLI in a native terminal
+/// window with zero global config side effects.
+pub async fn prepare_claude_terminal_spec(
+    state_paths: &StatePaths,
+    args: &ClaudeArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
+    let (mut spec, guard) = build_claude_invocation(state_paths, args, cwd, hold_open).await?;
+    if let Some(g) = guard {
+        spec.cleanup_files.push(g.disarm());
+    }
+    Ok(spec)
+}
+
+async fn build_claude_invocation(
+    state_paths: &StatePaths,
+    args: &ClaudeArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<(TerminalLaunchSpec, Option<EphemeralFileGuard>), CliError> {
     let resolved_cmd = resolve_claude_command(args.claude_bin.as_deref())?;
     let invocation = classify_claude_invocation(&args.passthrough_args);
 
@@ -82,11 +113,28 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
     );
 
     if invocation == ClaudeInvocationKind::DirectPassthrough {
-        let mut cmd = build_base_child_command(&resolved_cmd);
-        cmd.args(&args.passthrough_args)
-            .env("NO_PROXY", &no_proxy)
-            .env("no_proxy", &no_proxy);
-        return spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await;
+        let mut full_args: Vec<OsString> = resolved_cmd
+            .prefix_args
+            .iter()
+            .map(OsString::from)
+            .collect();
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+        return Ok((
+            TerminalLaunchSpec {
+                title: "Liftgate · Claude Code".to_owned(),
+                program: resolved_cmd.program,
+                args: full_args,
+                cwd,
+                env_set: vec![
+                    ("NO_PROXY".to_owned(), no_proxy.clone()),
+                    ("no_proxy".to_owned(), no_proxy),
+                ],
+                env_remove: Vec::new(),
+                cleanup_files: Vec::new(),
+                hold_open_on_exit: hold_open,
+            },
+            None,
+        ));
     }
 
     let explicit_passthrough_model = extract_explicit_model_arg(&args.passthrough_args);
@@ -114,20 +162,35 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
     let long_context = infer_live_long_context(&discovered, target.managed_long_context);
 
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
+    let (env_set, env_remove) = build_claude_gateway_env_pairs(
+        target.client.base_url(),
+        &auth_token,
+        &primary_model,
+        &fast_model,
+        args.no_code_mode,
+        &no_proxy,
+    );
 
     if matches!(invocation, ClaudeInvocationKind::GatewayEnvSubcommand) {
-        let mut cmd = build_base_child_command(&resolved_cmd);
-        cmd.args(&args.passthrough_args);
-        apply_claude_gateway_env(
-            &mut cmd,
-            target.client.base_url(),
-            &auth_token,
-            &primary_model,
-            &fast_model,
-            args.no_code_mode,
-            &no_proxy,
-        );
-        return spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await;
+        let mut full_args: Vec<OsString> = resolved_cmd
+            .prefix_args
+            .iter()
+            .map(OsString::from)
+            .collect();
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+        return Ok((
+            TerminalLaunchSpec {
+                title: format!("Liftgate · Claude Code ({primary_model})"),
+                program: resolved_cmd.program,
+                args: full_args,
+                cwd,
+                env_set,
+                env_remove,
+                cleanup_files: Vec::new(),
+                hold_open_on_exit: hold_open,
+            },
+            None,
+        ));
     }
 
     let sync_params = HarnessSyncParams {
@@ -178,52 +241,60 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
         ) || a.starts_with("--permission-mode=")
     });
 
-    let mut cmd = build_base_child_command(&resolved_cmd);
+    let mut full_args: Vec<OsString> = resolved_cmd
+        .prefix_args
+        .iter()
+        .map(OsString::from)
+        .collect();
     match invocation {
         ClaudeInvocationKind::AgentsView => {
-            cmd.arg("agents");
+            full_args.push(OsString::from("agents"));
             if !args.no_bypass && !has_explicit_perm {
-                cmd.arg("--dangerously-skip-permissions");
+                full_args.push(OsString::from("--dangerously-skip-permissions"));
             }
-            cmd.arg("--settings").arg(ephemeral_settings.path());
+            full_args.push(OsString::from("--settings"));
+            full_args.push(ephemeral_settings.path().as_os_str().to_os_string());
             if !has_explicit_model {
-                cmd.arg("--model").arg(&primary_model);
+                full_args.push(OsString::from("--model"));
+                full_args.push(OsString::from(&primary_model));
             }
             if let Some(rest) = args.passthrough_args.get(1..) {
-                cmd.args(rest);
+                full_args.extend(rest.iter().map(OsString::from));
             }
         }
         ClaudeInvocationKind::AgentSession => {
             if !args.no_bypass && !has_explicit_perm {
-                cmd.arg("--dangerously-skip-permissions");
+                full_args.push(OsString::from("--dangerously-skip-permissions"));
             }
-            cmd.arg("--settings").arg(ephemeral_settings.path());
+            full_args.push(OsString::from("--settings"));
+            full_args.push(ephemeral_settings.path().as_os_str().to_os_string());
             if !has_explicit_model {
-                cmd.arg("--model").arg(&primary_model);
+                full_args.push(OsString::from("--model"));
+                full_args.push(OsString::from(&primary_model));
             }
-            cmd.args(&args.passthrough_args);
+            full_args.extend(args.passthrough_args.iter().map(OsString::from));
         }
         ClaudeInvocationKind::DirectPassthrough | ClaudeInvocationKind::GatewayEnvSubcommand => {}
     }
 
-    apply_claude_gateway_env(
-        &mut cmd,
-        target.client.base_url(),
-        &auth_token,
-        &primary_model,
-        &fast_model,
-        args.no_code_mode,
-        &no_proxy,
-    );
-
-    let exit_code = spawn_and_wait_interactive("claude", &resolved_cmd.program, cmd).await?;
-    drop(ephemeral_settings);
-    Ok(exit_code)
+    Ok((
+        TerminalLaunchSpec {
+            title: format!("Liftgate · Claude Code ({primary_model})"),
+            program: resolved_cmd.program,
+            args: full_args,
+            cwd,
+            env_set,
+            env_remove,
+            cleanup_files: Vec::new(),
+            hold_open_on_exit: hold_open,
+        },
+        Some(ephemeral_settings),
+    ))
 }
 
 pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32, CliError> {
     if args.app {
-        return crate::desktop::run_codex_app(
+        let _ = crate::desktop::launch_codex_app(
             state_paths,
             CodexAppArgs {
                 listen: args.listen,
@@ -241,8 +312,37 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
                 passthrough_args: args.passthrough_args,
             },
         )
-        .await;
+        .await?;
+        return Ok(0);
     }
+    let (spec, ephemeral_guard) = build_codex_invocation(state_paths, &args, None, false).await?;
+    let cmd = command_from_terminal_spec(&spec);
+    let exit_code = spawn_and_wait_interactive("codex", &spec.program, cmd).await?;
+    drop(ephemeral_guard);
+    Ok(exit_code)
+}
+
+/// Prepares an isolated [`TerminalLaunchSpec`] for launching Codex CLI in a native terminal
+/// window with zero global config side effects.
+pub async fn prepare_codex_terminal_spec(
+    state_paths: &StatePaths,
+    args: &CodexArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
+    let (mut spec, guard) = build_codex_invocation(state_paths, args, cwd, hold_open).await?;
+    if let Some(g) = guard {
+        spec.cleanup_files.push(g.disarm());
+    }
+    Ok(spec)
+}
+
+async fn build_codex_invocation(
+    state_paths: &StatePaths,
+    args: &CodexArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<(TerminalLaunchSpec, Option<EphemeralFileGuard>), CliError> {
     let resolved_cmd = resolve_codex_command(args.codex_bin.as_deref())?;
     let invocation = classify_codex_invocation(&args.passthrough_args);
 
@@ -254,11 +354,28 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     );
 
     if invocation == CodexInvocationKind::DirectPassthrough {
-        let mut cmd = build_base_child_command(&resolved_cmd);
-        cmd.args(&args.passthrough_args)
-            .env("NO_PROXY", &no_proxy)
-            .env("no_proxy", &no_proxy);
-        return spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await;
+        let mut full_args: Vec<OsString> = resolved_cmd
+            .prefix_args
+            .iter()
+            .map(OsString::from)
+            .collect();
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+        return Ok((
+            TerminalLaunchSpec {
+                title: "Liftgate · Codex CLI".to_owned(),
+                program: resolved_cmd.program,
+                args: full_args,
+                cwd,
+                env_set: vec![
+                    ("NO_PROXY".to_owned(), no_proxy.clone()),
+                    ("no_proxy".to_owned(), no_proxy),
+                ],
+                env_remove: Vec::new(),
+                cleanup_files: Vec::new(),
+                hold_open_on_exit: hold_open,
+            },
+            None,
+        ));
     }
 
     let explicit_passthrough_model = extract_explicit_model_arg(&args.passthrough_args);
@@ -337,19 +454,28 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
         }) || has_explicit_codex_config_key(&args.passthrough_args, "approval_policy")
             || has_explicit_codex_config_key(&args.passthrough_args, "sandbox_mode");
 
-    let mut cmd = build_base_child_command(&resolved_cmd);
+    let mut full_args: Vec<OsString> = resolved_cmd
+        .prefix_args
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let push_cfg = |out: &mut Vec<OsString>, expr: String| {
+        out.push(OsString::from("-c"));
+        out.push(OsString::from(expr));
+    };
     match invocation {
         CodexInvocationKind::AgentSession => {
             if !args.no_bypass && !has_explicit_approval {
-                cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                full_args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
             }
         }
         CodexInvocationKind::GatewayConfigOnly => {
             if !args.no_bypass && !has_explicit_approval {
-                cmd.arg("-c")
-                    .arg("approval_policy='never'")
-                    .arg("-c")
-                    .arg("sandbox_mode='danger-full-access'");
+                push_cfg(&mut full_args, "approval_policy='never'".to_owned());
+                push_cfg(
+                    &mut full_args,
+                    "sandbox_mode='danger-full-access'".to_owned(),
+                );
             }
         }
         CodexInvocationKind::DirectPassthrough => {}
@@ -357,78 +483,126 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     let toml_primary = toml_inline_string(&primary_model);
     let toml_catalog = toml_inline_string(&catalog_slash);
     let toml_base_v1 = toml_inline_string(&format!("{}/v1", target.client.base_url()));
-    cmd.arg("-c").arg("model_provider='agy'");
+    push_cfg(&mut full_args, "model_provider='agy'".to_owned());
     if !has_explicit_model {
-        cmd.arg("-c").arg(format!("model={toml_primary}"));
+        push_cfg(&mut full_args, format!("model={toml_primary}"));
     }
-    cmd.arg("-c")
-        .arg(format!("model_catalog_json={toml_catalog}"))
-        .arg("-c")
-        .arg("web_search='live'")
-        .arg("-c")
-        .arg("model_providers.agy.name='Liftgate'")
-        .arg("-c")
-        .arg(format!("model_providers.agy.base_url={toml_base_v1}"));
+    push_cfg(&mut full_args, format!("model_catalog_json={toml_catalog}"));
+    push_cfg(&mut full_args, "web_search='live'".to_owned());
+    push_cfg(
+        &mut full_args,
+        "model_providers.agy.name='Liftgate'".to_owned(),
+    );
+    push_cfg(
+        &mut full_args,
+        format!("model_providers.agy.base_url={toml_base_v1}"),
+    );
     if require_env_key {
-        cmd.arg("-c")
-            .arg("model_providers.agy.env_key='AGY_GATEWAY_API_KEY'");
+        push_cfg(
+            &mut full_args,
+            "model_providers.agy.env_key='AGY_GATEWAY_API_KEY'".to_owned(),
+        );
     }
-    cmd.arg("-c")
-        .arg("model_providers.agy.wire_api='responses'");
+    push_cfg(
+        &mut full_args,
+        "model_providers.agy.wire_api='responses'".to_owned(),
+    );
     if args.no_code_mode {
-        cmd.arg("-c")
-            .arg("features.code_mode=false")
-            .arg("-c")
-            .arg("features.code_mode_only=false");
+        push_cfg(&mut full_args, "features.code_mode=false".to_owned());
+        push_cfg(&mut full_args, "features.code_mode_only=false".to_owned());
     } else {
-        cmd.arg("-c")
-            .arg("suppress_unstable_features_warning=true")
-            .arg("-c")
-            .arg("features.code_mode=true");
+        push_cfg(
+            &mut full_args,
+            "suppress_unstable_features_warning=true".to_owned(),
+        );
+        push_cfg(&mut full_args, "features.code_mode=true".to_owned());
         if args.code_mode_only {
-            cmd.arg("-c").arg("features.code_mode_only=true");
+            push_cfg(&mut full_args, "features.code_mode_only=true".to_owned());
         }
     }
-    cmd.args(&args.passthrough_args);
+    full_args.extend(args.passthrough_args.iter().map(OsString::from));
 
-    cmd.env_remove("AGY_API_KEY")
-        .env("AGY_GATEWAY_API_KEY", &auth_token)
-        .env("NO_PROXY", &no_proxy)
-        .env("no_proxy", &no_proxy);
-
-    let exit_code = spawn_and_wait_interactive("codex", &resolved_cmd.program, cmd).await?;
-    drop(ephemeral_catalog);
-    Ok(exit_code)
+    Ok((
+        TerminalLaunchSpec {
+            title: format!("Liftgate · Codex CLI ({primary_model})"),
+            program: resolved_cmd.program,
+            args: full_args,
+            cwd,
+            env_set: vec![
+                ("AGY_GATEWAY_API_KEY".to_owned(), auth_token),
+                ("NO_PROXY".to_owned(), no_proxy.clone()),
+                ("no_proxy".to_owned(), no_proxy),
+            ],
+            env_remove: vec!["AGY_API_KEY".to_owned()],
+            cleanup_files: Vec::new(),
+            hold_open_on_exit: hold_open,
+        },
+        Some(ephemeral_catalog),
+    ))
 }
 
-fn apply_claude_gateway_env(
-    cmd: &mut Command,
+fn build_claude_gateway_env_pairs(
     base_url: &str,
     auth_token: &str,
     primary_model: &str,
     fast_model: &str,
     no_code_mode: bool,
     no_proxy: &str,
-) {
-    cmd.env_remove("ANTHROPIC_API_KEY")
-        .env_remove("AGY_API_KEY")
-        .env("ANTHROPIC_BASE_URL", base_url)
-        .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-        .env("ANTHROPIC_MODEL", primary_model)
-        .env("ANTHROPIC_DEFAULT_OPUS_MODEL", primary_model)
-        .env("ANTHROPIC_DEFAULT_SONNET_MODEL", primary_model)
-        .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", fast_model)
-        .env("ANTHROPIC_SMALL_FAST_MODEL", fast_model)
-        .env_remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-        .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env("CLAUDE_CODE_AUTO_MODE_SERVER", "0")
-        .env(
-            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
-            if no_code_mode { "0" } else { "1" },
-        )
-        .env("NO_PROXY", no_proxy)
-        .env("no_proxy", no_proxy);
+) -> (Vec<(String, String)>, Vec<String>) {
+    let env_set = vec![
+        ("ANTHROPIC_BASE_URL".to_owned(), base_url.to_owned()),
+        ("ANTHROPIC_AUTH_TOKEN".to_owned(), auth_token.to_owned()),
+        ("ANTHROPIC_MODEL".to_owned(), primary_model.to_owned()),
+        (
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".to_owned(),
+            primary_model.to_owned(),
+        ),
+        (
+            "ANTHROPIC_DEFAULT_SONNET_MODEL".to_owned(),
+            primary_model.to_owned(),
+        ),
+        (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_owned(),
+            fast_model.to_owned(),
+        ),
+        (
+            "ANTHROPIC_SMALL_FAST_MODEL".to_owned(),
+            fast_model.to_owned(),
+        ),
+        (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_owned(),
+            "1".to_owned(),
+        ),
+        ("CLAUDE_CODE_AUTO_MODE_SERVER".to_owned(), "0".to_owned()),
+        (
+            "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE".to_owned(),
+            if no_code_mode { "0" } else { "1" }.to_owned(),
+        ),
+        ("NO_PROXY".to_owned(), no_proxy.to_owned()),
+        ("no_proxy".to_owned(), no_proxy.to_owned()),
+    ];
+    let env_remove = vec![
+        "ANTHROPIC_API_KEY".to_owned(),
+        "AGY_API_KEY".to_owned(),
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_owned(),
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_owned(),
+    ];
+    (env_set, env_remove)
+}
+
+fn command_from_terminal_spec(spec: &TerminalLaunchSpec) -> Command {
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args);
+    for k in &spec.env_remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &spec.env_set {
+        cmd.env(k, v);
+    }
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd
 }
 
 fn classify_claude_invocation(passthrough_args: &[String]) -> ClaudeInvocationKind {
@@ -657,14 +831,6 @@ fn toml_inline_string(val: &str) -> String {
     } else {
         serde_json::to_string(val).unwrap_or_else(|_| format!("{val:?}"))
     }
-}
-
-fn build_base_child_command(resolved: &ResolvedCommand) -> Command {
-    let mut cmd = Command::new(&resolved.program);
-    for prefix in &resolved.prefix_args {
-        cmd.arg(prefix);
-    }
-    cmd
 }
 
 async fn spawn_and_wait_interactive(

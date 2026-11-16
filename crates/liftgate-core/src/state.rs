@@ -49,6 +49,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn desktop_prefs_file(&self) -> PathBuf {
+        self.root.join("desktop-ui.json")
+    }
+
+    #[must_use]
     pub fn log_file(&self) -> PathBuf {
         self.root.join("gateway.log")
     }
@@ -174,6 +179,94 @@ impl StatePaths {
         json.push(b'\n');
         write_file_atomic(&path, &json, true)
     }
+
+    pub fn read_desktop_prefs(&self) -> Result<DesktopUiPrefs, CliError> {
+        let path = self.desktop_prefs_file();
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DesktopUiPrefs::default());
+            }
+            Err(source) => return Err(CliError::StateIo { path, source }),
+        };
+        let parsed = serde_json::from_slice(&bytes)
+            .map_err(|source| CliError::StateJson { path, source })?;
+        Ok(parsed)
+    }
+
+    pub fn write_desktop_prefs(&self, prefs: &DesktopUiPrefs) -> Result<(), CliError> {
+        self.ensure_root_dir()?;
+        let path = self.desktop_prefs_file();
+        let mut json = serde_json::to_vec_pretty(prefs).map_err(|source| CliError::StateJson {
+            path: path.clone(),
+            source,
+        })?;
+        json.push(b'\n');
+        write_file_atomic(&path, &json, false)
+    }
+}
+
+/// Color appearance mode for `liftgate-desktop` (styled after `ackingliu.top`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopThemeMode {
+    #[default]
+    Light,
+    Dark,
+    #[serde(other)]
+    Unknown,
+}
+
+impl DesktopThemeMode {
+    #[must_use]
+    pub const fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        if self.is_dark() {
+            Self::Light
+        } else {
+            Self::Dark
+        }
+    }
+}
+
+/// Interface language for `liftgate-desktop`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopLang {
+    #[default]
+    Zh,
+    En,
+    #[serde(other)]
+    Unknown,
+}
+
+impl DesktopLang {
+    #[must_use]
+    pub const fn is_en(self) -> bool {
+        matches!(self, Self::En)
+    }
+
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        if self.is_en() { Self::Zh } else { Self::En }
+    }
+}
+
+/// Persistent UI preferences for `liftgate-desktop` (`~/.liftgate/desktop-ui.json`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DesktopUiPrefs {
+    #[serde(default)]
+    pub theme: DesktopThemeMode,
+    #[serde(default)]
+    pub lang: DesktopLang,
+    #[serde(default)]
+    pub project_dir: Option<PathBuf>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Persistent user-level preferences stored at `~/.liftgate/settings.json`.
@@ -425,6 +518,7 @@ pub fn write_file_atomic(target: &Path, bytes: &[u8], secret_mode: bool) -> Resu
 #[derive(Debug)]
 pub struct EphemeralFileGuard {
     path: PathBuf,
+    armed: bool,
 }
 
 impl EphemeralFileGuard {
@@ -443,18 +537,28 @@ impl EphemeralFileGuard {
         );
         let path = dir.join(filename);
         write_file_atomic(&path, contents, true)?;
-        Ok(Self { path })
+        Ok(Self { path, armed: true })
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Transfers cleanup responsibility to a detached terminal wrapper (with crash fallback via
+    /// `sweep_dead_ephemeral_files` once this process exits).
+    #[must_use]
+    pub fn disarm(mut self) -> PathBuf {
+        self.armed = false;
+        self.path.clone()
+    }
 }
 
 impl Drop for EphemeralFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 

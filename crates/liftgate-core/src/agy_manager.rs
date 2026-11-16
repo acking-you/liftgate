@@ -12,26 +12,26 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal as _, Read as _, Write as _, stdin, stdout};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use comfy_table::Cell;
 use flate2::read::GzDecoder;
 use liftgate_server::{
     acp_client::{BinarySwapGuard, LiveAcpClient},
     platform::{
-        canonicalize_clean, configure_acp_child_env, detect_system_proxy_url,
+        CLIENT_ENV_VARS_TO_STRIP, OUTBOUND_PROXY_ENV_KEYS, canonicalize_clean,
+        configure_acp_child_env, detect_system_proxy_url, merge_loopback_no_proxy,
         split_expanded_path_var,
     },
     session_pool::SessionPool,
     telemetry::TelemetryHub,
 };
 use liftgate_types::config::{ProxyUrl, is_proxy_disable_keyword};
+use liftgate_types::telemetry::GatewayTelemetrySnapshot;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest as _, Sha512};
 use tar::Archive;
 use tokio::io::AsyncReadExt as _;
@@ -42,8 +42,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::cli::{
-    AgyArgs, AgyAutoUpdateArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs,
-    AgyUpdateArgs, AutoUpdateToggle, ProxyArgs, RestartArgs, invoked_bin_name,
+    AgyAutoUpdateArgs, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs,
+    AutoUpdateToggle, ProxyArgs, RestartArgs,
 };
 use crate::client::GatewayClient;
 use crate::daemon;
@@ -51,7 +51,7 @@ use crate::error::CliError;
 use crate::state::{
     StatePaths, now_unix_ms, resolve_effective_agy_bin, resolve_effective_agy_proxy, user_home_dir,
 };
-use crate::ui::{self, Spinner, Tone};
+use crate::terminal::{TerminalLaunchSpec, spawn_in_system_terminal};
 use crate::upgrade::{SemVer, download_url_with_policy, fetch_bytes_with_policy};
 
 pub const DEFAULT_AGY_MANIFEST_BASE_URL: &str =
@@ -79,7 +79,8 @@ pub struct AgyManifest {
 }
 
 /// Authentication & reachability state of `agy` determined via official CLI/gateway probes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum AgyAuthStatus {
     SignedIn {
         model_count: usize,
@@ -429,6 +430,7 @@ async fn run_command_bounded(
         res
     } else {
         let _ = child.kill().await;
+        let _ = child.wait().await;
         Err(format!("command timed out after {}s", max_wait.as_secs()))
     }
 }
@@ -717,7 +719,35 @@ fn map_install_io_error(target: &Path, source: io::Error) -> CliError {
 // `lg proxy` & `lg agy proxy`
 // ============================================================================
 
-pub async fn run_proxy(state_paths: &StatePaths, args: ProxyArgs) -> Result<(), CliError> {
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxyConnectivityProbe {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub latest_agy_version: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxyOutcome {
+    pub updated: bool,
+    pub configured_proxy: Option<ProxyUrl>,
+    pub env_override: Option<String>,
+    pub effective_proxy: Option<ProxyUrl>,
+    pub ambient_system_proxy: Option<String>,
+    pub settings_file: PathBuf,
+    pub daemon_restarted: bool,
+    pub connectivity_probe: Option<ProxyConnectivityProbe>,
+}
+
+#[must_use]
+pub fn detect_ambient_system_proxy() -> Option<String> {
+    detect_system_proxy_url()
+}
+
+pub async fn execute_proxy(
+    state_paths: &StatePaths,
+    args: &ProxyArgs,
+) -> Result<ProxyOutcome, CliError> {
     let mut settings = state_paths.read_settings()?;
     let previous_proxy = settings.agy_proxy.clone();
     let mut mutated = false;
@@ -765,199 +795,71 @@ pub async fn run_proxy(state_paths: &StatePaths, args: ProxyArgs) -> Result<(), 
         && let Some(d) = state_paths.read_daemon()?
         && daemon::is_pid_alive(d.pid)
     {
-        daemon::run_restart(state_paths, RestartArgs::default()).await?;
+        let _ = daemon::restart_daemon(state_paths, RestartArgs::default()).await?;
         daemon_restarted = true;
     }
 
     let connectivity_probe = if args.test {
         let slug = detect_agy_platform_slug().unwrap_or("windows_amd64");
         let started = Instant::now();
-        let sp = (!args.json).then(|| {
-            Spinner::start(format!(
-                "Testing Antigravity upstream connectivity ({})…",
-                effective_proxy.as_ref().map_or_else(
-                    || "direct connection".to_owned(),
-                    |p| p.redacted_display().into_owned()
-                )
-            ))
-        });
         let res = fetch_agy_manifest(None, slug, effective_proxy.as_ref()).await;
-        if let Some(s) = sp {
-            s.finish_and_clear().await;
-        }
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Some((res, elapsed_ms))
+        Some(match res {
+            Ok(m) => ProxyConnectivityProbe {
+                ok: true,
+                latency_ms: elapsed_ms,
+                latest_agy_version: Some(m.version),
+                error: None,
+            },
+            Err(err) => ProxyConnectivityProbe {
+                ok: false,
+                latency_ms: elapsed_ms,
+                latest_agy_version: None,
+                error: Some(err.to_string()),
+            },
+        })
     } else {
         None
     };
 
-    if args.json {
-        let probe_json = connectivity_probe.as_ref().map(|(res, ms)| match res {
-            Ok(m) => json!({ "ok": true, "latency_ms": ms, "latest_agy_version": m.version }),
-            Err(e) => json!({ "ok": false, "latency_ms": ms, "error": e.to_string() }),
-        });
-        let payload = json!({
-            "updated": mutated,
-            "configured_proxy": settings.agy_proxy.as_ref().map(|p| p.redacted_display()),
-            "env_override": env_override_raw,
-            "effective_proxy": effective_proxy.as_ref().map(|p| p.redacted_display()),
-            "default_mode": effective_proxy.is_none(),
-            "daemon_restarted": daemon_restarted,
-            "connectivity_test": probe_json,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-        );
-        if let Some((Err(err), _)) = connectivity_probe {
-            return Err(err);
-        }
-        return Ok(());
-    }
-
-    let bin = invoked_bin_name();
-    if mutated {
-        match &settings.agy_proxy {
-            Some(p) => ui::headline(
-                Tone::Ok,
-                &format!("Configured forced `agy` proxy -> {}", p.redacted_display()),
-            ),
-            None => ui::headline(
-                Tone::Ok,
-                "Cleared `agy` proxy (restored default: direct connection, no proxy injected)",
-            ),
-        }
-    } else {
-        let badge = if effective_proxy.is_some() {
-            (Tone::Info, "FORCED PROXY")
-        } else {
-            (Tone::Muted, "DIRECT · NO PROXY")
-        };
-        ui::banner("Antigravity Proxy Policy", Some(badge), None);
-    }
-
-    ui::kv_accent(
-        "Saved Setting",
-        &settings.agy_proxy.as_ref().map_or_else(
-            || "none (default · no proxy injected into `agy`)".to_owned(),
-            |p| p.redacted_display().into_owned(),
-        ),
-    );
-    if let Some(env_val) = &env_override_raw {
-        ui::kv("AGY_PROXY Env", env_val);
-    }
-    ui::kv(
-        "Settings File",
-        &state_paths.settings_file().display().to_string(),
-    );
-
-    if let Some((res, ms)) = connectivity_probe {
-        match res {
-            Ok(m) => ui::headline(
-                Tone::Ok,
-                &format!(
-                    "Upstream reachable in {} (latest `agy` v{})",
-                    ui::format_latency_ms(ms),
-                    m.version
-                ),
-            ),
-            Err(err) => return Err(err),
-        }
-    }
-
-    if !mutated {
-        println!();
-        ui::cmd_hint("Set local port shorthand", &format!("{bin} proxy 7890"));
-        ui::cmd_hint(
-            "Set explicit HTTP/SOCKS5 proxy",
-            &format!("{bin} proxy socks5://127.0.0.1:1080"),
-        );
-        ui::cmd_hint("Disable proxy (default)", &format!("{bin} proxy off"));
-    }
-    Ok(())
+    Ok(ProxyOutcome {
+        updated: mutated,
+        configured_proxy: settings.agy_proxy,
+        env_override: env_override_raw,
+        effective_proxy,
+        ambient_system_proxy: detect_system_proxy_url(),
+        settings_file: state_paths.settings_file(),
+        daemon_restarted,
+        connectivity_probe,
+    })
 }
 
 // ============================================================================
-// `lg agy` Dispatcher & Subcommands
+// `lg agy` Structured Headless Control Plane
 // ============================================================================
 
-pub async fn run_agy(state_paths: &StatePaths, args: AgyArgs) -> Result<i32, CliError> {
-    match args.action {
-        None => {
-            run_agy_status(
-                state_paths,
-                args.agy_bin,
-                AgyStatusArgs::default(),
-                args.json,
-            )
-            .await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Status(st_args)) => {
-            run_agy_status(state_paths, args.agy_bin, st_args, args.json).await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Install(inst_args)) => {
-            run_agy_install(state_paths, inst_args, args.json).await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Update(upd_args)) => {
-            run_agy_update(state_paths, args.agy_bin, upd_args, args.json).await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Login(login_args)) => {
-            run_agy_login(state_paths, args.agy_bin, login_args).await
-        }
-        Some(AgyCommand::AutoUpdate(auto_args)) => {
-            run_agy_auto_update(state_paths, auto_args, args.json).await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Proxy(mut proxy_args)) => {
-            if args.json {
-                proxy_args.json = true;
-            }
-            run_proxy(state_paths, proxy_args).await?;
-            Ok(0)
-        }
-        Some(AgyCommand::Models) => {
-            run_agy_passthrough(state_paths, args.agy_bin, &[OsString::from("models")]).await
-        }
-        Some(AgyCommand::Mcp(fwd)) => {
-            let mut argv = Vec::with_capacity(fwd.args.len() + 1);
-            argv.push(OsString::from("mcp"));
-            argv.extend(fwd.args);
-            run_agy_passthrough(state_paths, args.agy_bin, &argv).await
-        }
-        Some(AgyCommand::Plugin(fwd)) => {
-            let mut argv = Vec::with_capacity(fwd.args.len() + 1);
-            argv.push(OsString::from("plugin"));
-            argv.extend(fwd.args);
-            run_agy_passthrough(state_paths, args.agy_bin, &argv).await
-        }
-        Some(AgyCommand::Changelog) => {
-            run_agy_passthrough(state_paths, args.agy_bin, &[OsString::from("changelog")]).await
-        }
-        Some(AgyCommand::Run(fwd)) => {
-            run_agy_passthrough(state_paths, args.agy_bin, &fwd.args).await
-        }
-        Some(AgyCommand::External(ext)) => {
-            run_agy_passthrough(state_paths, args.agy_bin, &ext).await
-        }
-    }
+#[derive(Clone, Debug, Serialize)]
+pub struct AgyStatusReport {
+    pub installed: bool,
+    pub binary_path: Option<PathBuf>,
+    pub version: Option<String>,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub auth_status: AgyAuthStatus,
+    pub effective_proxy: Option<ProxyUrl>,
+    pub auto_update_enabled: bool,
+    pub live_telemetry: Option<GatewayTelemetrySnapshot>,
 }
 
-async fn run_agy_status(
+pub async fn inspect_agy_status(
     state_paths: &StatePaths,
     explicit_agy_bin: Option<PathBuf>,
-    args: AgyStatusArgs,
-    json_out: bool,
-) -> Result<(), CliError> {
+    args: &AgyStatusArgs,
+) -> Result<AgyStatusReport, CliError> {
     let settings = state_paths.read_settings()?;
     let env_proxy = std::env::var("AGY_PROXY").ok();
     let effective_proxy = resolve_effective_agy_proxy(env_proxy.as_deref(), &settings)?;
     let resolved_bin = resolve_effective_agy_bin(explicit_agy_bin, &settings);
-
-    let sp = (!json_out).then(|| Spinner::start("Inspecting Antigravity CLI (`agy`) environment…"));
 
     let installed_version = match &resolved_bin {
         Some(bin_path) => probe_agy_version(bin_path, effective_proxy.as_ref()).await,
@@ -996,10 +898,6 @@ async fn run_agy_status(
         None
     };
 
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
-
     let update_available = match (&installed_version, &latest_manifest) {
         (Some(cur), Some(m)) => match (SemVer::parse(cur), SemVer::parse(&m.version)) {
             (Some(c), Some(l)) => l > c,
@@ -1008,213 +906,46 @@ async fn run_agy_status(
         _ => false,
     };
 
-    if json_out {
-        let auth_detail = match &auth_status {
-            AgyAuthStatus::SignedIn {
-                model_count,
-                source,
-            } => json!({ "signed_in": true, "model_count": model_count, "source": source }),
-            AgyAuthStatus::NotSignedIn { detail } => {
-                json!({ "signed_in": false, "detail": detail })
-            }
-            AgyAuthStatus::NetworkError { detail } => {
-                json!({ "signed_in": false, "network_error": true, "detail": detail })
-            }
-            AgyAuthStatus::NotInstalled => json!({ "signed_in": false }),
-            AgyAuthStatus::Skipped => json!({ "skipped": true }),
-        };
-        let payload = json!({
-            "installed": resolved_bin.is_some(),
-            "binary_path": resolved_bin,
-            "version": installed_version,
-            "latest_version": latest_manifest.as_ref().map(|m| &m.version),
-            "update_available": update_available,
-            "auth_status": auth_status.status_slug(),
-            "auth": auth_detail,
-            "proxy": effective_proxy.as_ref().map(|p| p.redacted_display()),
-            "auto_update_enabled": settings.agy_auto_update,
-            "daemon_auto_update": live_telemetry.as_ref().map(|t| {
-                json!({
-                    "enabled": t.acp_process.auto_update_enabled,
-                    "last_check_unix_ms": t.acp_process.last_update_check_unix_ms,
-                    "last_auto_update_unix_ms": t.acp_process.last_auto_update_unix_ms,
-                    "last_auto_updated_from": t.acp_process.last_auto_updated_from,
-                    "note": t.acp_process.auto_update_note,
-                })
-            }),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-        );
-        return Ok(());
-    }
-
-    let bin = invoked_bin_name();
-    let pill = match (&resolved_bin, &auth_status) {
-        (None, _) => (Tone::Err, "NOT INSTALLED"),
-        (Some(_), AgyAuthStatus::SignedIn { .. }) => (Tone::Ok, "READY · SIGNED IN"),
-        (Some(_), AgyAuthStatus::NotSignedIn { .. }) => (Tone::Warn, "LOGIN REQUIRED"),
-        (Some(_), AgyAuthStatus::NetworkError { .. }) => (Tone::Warn, "NETWORK / PROXY ISSUE"),
-        (Some(_), AgyAuthStatus::NotInstalled | AgyAuthStatus::Skipped) => {
-            (Tone::Info, "INSTALLED")
-        }
-    };
-    let subtitle = installed_version.as_deref().map(|v| format!("agy v{v}"));
-    ui::banner("Antigravity CLI (`agy`)", Some(pill), subtitle.as_deref());
-    println!();
-
-    let mut table = ui::new_table(&["Item", "Status", "Details"]);
-
-    match &resolved_bin {
-        Some(path) => table.add_row(vec![
-            ui::accent_cell("Executable"),
-            ui::status_cell("installed", Tone::Ok),
-            Cell::new(path.display().to_string()),
-        ]),
-        None => table.add_row(vec![
-            ui::accent_cell("Executable"),
-            ui::status_cell("missing", Tone::Err),
-            Cell::new(format!(
-                "not found in PATH — run `{bin} agy install` to install automatically"
-            )),
-        ]),
-    };
-
-    let (ver_status, ver_tone, ver_detail) = match (&installed_version, &latest_manifest) {
-        (Some(cur), Some(m)) if update_available => (
-            "outdated",
-            Tone::Warn,
-            format!(
-                "v{cur} -> v{} available (run `{bin} agy update`)",
-                m.version
-            ),
-        ),
-        (Some(cur), Some(_)) => (
-            "up to date",
-            Tone::Ok,
-            format!("v{cur} (latest official build)"),
-        ),
-        (Some(cur), None) => ("installed", Tone::Ok, format!("v{cur}")),
-        (None, Some(m)) => (
-            "not installed",
-            Tone::Warn,
-            format!("latest upstream build is v{}", m.version),
-        ),
-        (None, None) => ("unknown", Tone::Muted, "—".to_owned()),
-    };
-    table.add_row(vec![
-        ui::accent_cell("CLI Version"),
-        ui::status_cell(ver_status, ver_tone),
-        Cell::new(ver_detail),
-    ]);
-
-    let (auth_label, auth_tone, auth_detail) = match &auth_status {
-        AgyAuthStatus::SignedIn {
-            model_count,
-            source,
-        } => (
-            "signed in",
-            Tone::Ok,
-            format!("{model_count} account models unlocked (verified via {source})"),
-        ),
-        AgyAuthStatus::NotSignedIn { detail } => (
-            "login needed",
-            Tone::Warn,
-            format!("{detail} — run `{bin} agy login`"),
-        ),
-        AgyAuthStatus::NetworkError { detail } => (
-            "unreachable",
-            Tone::Err,
-            format!("{detail} — check `{bin} proxy`"),
-        ),
-        AgyAuthStatus::NotInstalled => {
-            ("unavailable", Tone::Muted, "install `agy` first".to_owned())
-        }
-        AgyAuthStatus::Skipped => ("skipped", Tone::Muted, "--no-auth-check".to_owned()),
-    };
-    table.add_row(vec![
-        ui::accent_cell("Google Account"),
-        ui::status_cell(auth_label, auth_tone),
-        Cell::new(auth_detail),
-    ]);
-
-    match &effective_proxy {
-        Some(proxy) => table.add_row(vec![
-            ui::accent_cell("Forced Proxy"),
-            ui::status_cell("active", Tone::Info),
-            Cell::new(format!(
-                "{}  (disable with `{bin} proxy off`)",
-                proxy.redacted_display()
-            )),
-        ]),
-        None => table.add_row(vec![
-            ui::accent_cell("Forced Proxy"),
-            ui::status_cell("none", Tone::Ok),
-            Cell::new(format!(
-                "direct connection by default (set with `{bin} proxy 7890`)"
-            )),
-        ]),
-    };
-
-    let mut auto_detail = if settings.agy_auto_update {
-        format!(
-            "checks & updates `agy` automatically while gateway is idle (`{bin} agy auto-update off` to disable)"
-        )
-    } else {
-        format!("disabled (`{bin} agy auto-update on` to re-enable)")
-    };
-    if let Some(snap) = &live_telemetry
-        && let Some(prev) = &snap.acp_process.last_auto_updated_from
-    {
-        let cur = snap
-            .acp_process
-            .agent_version
-            .as_deref()
-            .unwrap_or("latest");
-        auto_detail = format!("{auto_detail} · last updated v{prev} -> v{cur}");
-    }
-    table.add_row(vec![
-        ui::accent_cell("Idle Auto-Update"),
-        ui::status_cell(
-            if settings.agy_auto_update {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            if settings.agy_auto_update {
-                Tone::Ok
-            } else {
-                Tone::Muted
-            },
-        ),
-        Cell::new(auto_detail),
-    ]);
-
-    println!("{table}");
-    println!();
-
-    if resolved_bin.is_none() {
-        ui::cmd_hint(
-            "Download & install `agy` now",
-            &format!("{bin} agy install"),
-        );
-    } else if !auth_status.is_signed_in() && !matches!(auth_status, AgyAuthStatus::Skipped) {
-        ui::cmd_hint("Sign in with Google account", &format!("{bin} agy login"));
-    } else if update_available {
-        ui::cmd_hint(
-            "Update `agy` to latest version",
-            &format!("{bin} agy update"),
-        );
-    }
-    Ok(())
+    Ok(AgyStatusReport {
+        installed: resolved_bin.is_some(),
+        binary_path: resolved_bin,
+        version: installed_version,
+        latest_version: latest_manifest.map(|m| m.version),
+        update_available,
+        auth_status,
+        effective_proxy,
+        auto_update_enabled: settings.agy_auto_update,
+        live_telemetry,
+    })
 }
 
-pub async fn run_agy_install(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgyInstallStatus {
+    Checked,
+    AlreadyInstalled,
+    Installed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgyInstallOutcome {
+    pub status: AgyInstallStatus,
+    pub platform: String,
+    pub installed: bool,
+    pub previous_version: Option<String>,
+    pub version: String,
+    pub sha512: String,
+    pub binary_path: PathBuf,
+    pub target_path: PathBuf,
+    pub up_to_date: bool,
+    pub dir_in_path: bool,
+    pub daemon_restarted: bool,
+}
+
+pub async fn execute_agy_install(
     state_paths: &StatePaths,
-    args: AgyInstallArgs,
-    json_out: bool,
-) -> Result<PathBuf, CliError> {
+    args: &AgyInstallArgs,
+) -> Result<AgyInstallOutcome, CliError> {
     let mut settings = state_paths.read_settings()?;
     let cli_proxy = args
         .proxy
@@ -1238,20 +969,12 @@ pub async fn run_agy_install(
         None => None,
     };
 
-    let sp = (!json_out).then(|| {
-        Spinner::start(format!(
-            "Querying official Antigravity CLI manifest ({platform_slug})…"
-        ))
-    });
     let manifest = fetch_agy_manifest(
         args.manifest_base_url.as_deref(),
         platform_slug,
         effective_proxy.as_ref(),
     )
     .await?;
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
 
     let already_up_to_date = args.dir.is_none()
         && existing_bin.is_some()
@@ -1263,93 +986,68 @@ pub async fn run_agy_install(
         });
 
     if args.check {
-        if json_out {
-            let payload = json!({
-                "platform": platform_slug,
-                "installed": existing_bin.is_some(),
-                "binary_path": existing_bin,
-                "current_version": current_ver,
-                "latest_version": manifest.version,
-                "sha512": manifest.sha512,
-                "up_to_date": already_up_to_date,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-            );
-        } else {
-            ui::headline(
-                Tone::Info,
-                &format!(
-                    "Latest official Antigravity CLI for `{platform_slug}`: v{}",
-                    manifest.version
-                ),
-            );
-            if let Some(cur) = &current_ver {
-                ui::kv("Installed Version", &format!("v{cur}"));
-            }
-            ui::kv("Target Path", &target_bin.display().to_string());
-        }
-        return Ok(existing_bin.unwrap_or(target_bin));
+        let installed = existing_bin.is_some();
+        let binary_path = existing_bin.unwrap_or_else(|| target_bin.clone());
+        let dir_in_path = binary_path.parent().is_some_and(|dir| {
+            split_expanded_path_var()
+                .into_iter()
+                .any(|p| canonicalize_clean(&p) == canonicalize_clean(dir))
+        });
+        return Ok(AgyInstallOutcome {
+            status: AgyInstallStatus::Checked,
+            platform: platform_slug.to_owned(),
+            installed,
+            previous_version: current_ver,
+            version: manifest.version,
+            sha512: manifest.sha512,
+            binary_path,
+            target_path: target_bin,
+            up_to_date: already_up_to_date,
+            dir_in_path,
+            daemon_restarted: false,
+        });
     }
 
     if already_up_to_date
         && !args.force
         && let Some(existing_path) = existing_bin
     {
-        if json_out {
-            let payload = json!({
-                "status": "already_installed",
-                "version": current_ver.unwrap_or(manifest.version),
-                "binary_path": existing_path,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-            );
-        } else {
-            let bin = invoked_bin_name();
-            ui::headline(
-                Tone::Ok,
-                &format!(
-                    "Antigravity CLI v{} is already installed and up to date",
-                    current_ver.as_deref().unwrap_or(&manifest.version)
-                ),
-            );
-            ui::kv_accent("Executable", &existing_path.display().to_string());
-            ui::cmd_hint("Sign in with Google account", &format!("{bin} agy login"));
-            ui::cmd_hint(
-                "Force fresh reinstallation",
-                &format!("{bin} agy install --force"),
-            );
-        }
-        return Ok(existing_path);
+        let dir_in_path = existing_path.parent().is_some_and(|dir| {
+            split_expanded_path_var()
+                .into_iter()
+                .any(|p| canonicalize_clean(&p) == canonicalize_clean(dir))
+        });
+        let version = current_ver.clone().unwrap_or(manifest.version);
+        return Ok(AgyInstallOutcome {
+            status: AgyInstallStatus::AlreadyInstalled,
+            platform: platform_slug.to_owned(),
+            installed: true,
+            previous_version: current_ver,
+            version,
+            sha512: manifest.sha512,
+            binary_path: existing_path,
+            target_path: target_bin,
+            up_to_date: true,
+            dir_in_path,
+            daemon_restarted: false,
+        });
     }
 
     let install_dest = if args.dir.is_some() {
-        target_bin
+        target_bin.clone()
     } else {
-        existing_bin.unwrap_or(target_bin)
+        existing_bin.unwrap_or_else(|| target_bin.clone())
     };
 
     let stage = StageDirGuard::create(state_paths, "agy-install-stage")?;
-    let dl_sp = (!json_out).then(|| {
-        Spinner::start(format!(
-            "Downloading & SHA-512 verifying Antigravity CLI v{} ({platform_slug})…",
-            manifest.version
-        ))
-    });
     let staged_bin =
         download_and_verify_agy_staged(&manifest, &stage.path, effective_proxy.as_ref()).await?;
-    if let Some(s) = dl_sp {
-        s.finish_and_clear().await;
-    }
 
     // If a managed background daemon is running on the binary we're replacing, stop it cleanly first.
     let was_daemon_running = if let Some(d) = state_paths.read_daemon()?
         && daemon::is_pid_alive(d.pid)
     {
-        let _ = daemon::stop_daemon(state_paths, json_out).await?;
+        let _ = daemon::stop_daemon(state_paths).await?;
         true
     } else {
         false
@@ -1381,65 +1079,54 @@ pub async fn run_agy_install(
     state_paths.write_settings(&settings)?;
 
     if was_daemon_running {
-        daemon::run_restart(state_paths, RestartArgs::default()).await?;
+        let _ = daemon::restart_daemon(state_paths, RestartArgs::default()).await?;
     }
 
-    if json_out {
-        let payload = json!({
-            "status": "installed",
-            "platform": platform_slug,
-            "previous_version": current_ver,
-            "version": manifest.version,
-            "sha512": manifest.sha512,
-            "binary_path": clean_installed,
-            "daemon_restarted": was_daemon_running,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-        );
-        return Ok(clean_installed);
-    }
-
-    let bin = invoked_bin_name();
-    ui::headline(
-        Tone::Ok,
-        &format!(
-            "Installed Antigravity CLI v{} ({platform_slug})",
-            manifest.version
-        ),
-    );
-    ui::kv_accent("Executable", &clean_installed.display().to_string());
-    ui::kv(
-        "SHA-512",
-        &format!("{}…", manifest.sha512.get(..24).unwrap_or(&manifest.sha512)),
-    );
-    if let Some(dir) = clean_installed.parent() {
-        let in_path = split_expanded_path_var()
+    let dir_in_path = clean_installed.parent().is_some_and(|dir| {
+        split_expanded_path_var()
             .into_iter()
-            .any(|p| canonicalize_clean(&p) == canonicalize_clean(dir));
-        if !in_path {
-            ui::note(
-                Tone::Info,
-                &format!(
-                    "Saved `{}` in Liftgate settings (`lg` can use it right away; open a new shell for bare `agy`).",
-                    clean_installed.display()
-                ),
-            );
-        }
-    }
-    println!();
-    ui::cmd_hint("Sign in with Google account", &format!("{bin} agy login"));
-    ui::cmd_hint("Verify full readiness", &format!("{bin} agy"));
-    Ok(clean_installed)
+            .any(|p| canonicalize_clean(&p) == canonicalize_clean(dir))
+    });
+    Ok(AgyInstallOutcome {
+        status: AgyInstallStatus::Installed,
+        platform: platform_slug.to_owned(),
+        installed: true,
+        previous_version: current_ver,
+        version: manifest.version,
+        sha512: manifest.sha512,
+        binary_path: clean_installed,
+        target_path: target_bin,
+        up_to_date: true,
+        dir_in_path,
+        daemon_restarted: was_daemon_running,
+    })
 }
 
-pub async fn run_agy_update(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgyUpdateStatus {
+    UpdateAvailable,
+    UpToDate,
+    Updated,
+    InstalledFresh,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgyUpdateOutcome {
+    pub status: AgyUpdateStatus,
+    pub previous_version: Option<String>,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub sha512: String,
+    pub binary_path: PathBuf,
+    pub daemon_restarted: bool,
+}
+
+pub async fn execute_agy_update(
     state_paths: &StatePaths,
     explicit_agy_bin: Option<PathBuf>,
-    args: AgyUpdateArgs,
-    json_out: bool,
-) -> Result<(), CliError> {
+    args: &AgyUpdateArgs,
+) -> Result<AgyUpdateOutcome, CliError> {
     let mut settings = state_paths.read_settings()?;
     let cli_proxy = args
         .proxy
@@ -1451,35 +1138,37 @@ pub async fn run_agy_update(
         if args.check {
             return Err(CliError::AgyBinaryNotFound);
         }
-        let _ = run_agy_install(
+        let inst = execute_agy_install(
             state_paths,
-            AgyInstallArgs {
+            &AgyInstallArgs {
                 check: false,
                 force: args.force,
                 dir: None,
-                proxy: args.proxy,
+                proxy: args.proxy.clone(),
                 skip_path: false,
-                manifest_base_url: args.manifest_base_url,
+                manifest_base_url: args.manifest_base_url.clone(),
             },
-            json_out,
         )
         .await?;
-        return Ok(());
+        return Ok(AgyUpdateOutcome {
+            status: AgyUpdateStatus::InstalledFresh,
+            previous_version: inst.previous_version,
+            latest_version: inst.version,
+            update_available: false,
+            sha512: inst.sha512,
+            binary_path: inst.binary_path,
+            daemon_restarted: inst.daemon_restarted,
+        });
     };
 
     let platform_slug = detect_agy_platform_slug()?;
     let current_ver = probe_agy_version(&target_bin, effective_proxy.as_ref()).await;
-    let sp =
-        (!json_out).then(|| Spinner::start("Checking official Antigravity CLI release manifest…"));
     let manifest = fetch_agy_manifest(
         args.manifest_base_url.as_deref(),
         platform_slug,
         effective_proxy.as_ref(),
     )
     .await?;
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
 
     let update_available = match &current_ver {
         Some(cur) => match (SemVer::parse(cur), SemVer::parse(&manifest.version)) {
@@ -1490,61 +1179,31 @@ pub async fn run_agy_update(
     };
 
     if args.check || (!update_available && !args.force) {
-        if json_out {
-            let payload = json!({
-                "status": if update_available { "update_available" } else { "up_to_date" },
-                "current_version": current_ver,
-                "latest_version": manifest.version,
-                "update_available": update_available,
-                "binary_path": target_bin,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-            );
-        } else if update_available {
-            let bin = invoked_bin_name();
-            ui::headline(
-                Tone::Warn,
-                &format!(
-                    "Antigravity CLI update available: v{} -> v{}",
-                    current_ver.as_deref().unwrap_or("unknown"),
-                    manifest.version
-                ),
-            );
-            ui::cmd_hint("Apply update now", &format!("{bin} agy update"));
-        } else {
-            ui::headline(
-                Tone::Ok,
-                &format!(
-                    "Antigravity CLI v{} is already up to date",
-                    current_ver.as_deref().unwrap_or(&manifest.version)
-                ),
-            );
-            ui::kv_accent("Executable", &target_bin.display().to_string());
-        }
-        return Ok(());
+        return Ok(AgyUpdateOutcome {
+            status: if update_available {
+                AgyUpdateStatus::UpdateAvailable
+            } else {
+                AgyUpdateStatus::UpToDate
+            },
+            previous_version: current_ver,
+            latest_version: manifest.version,
+            update_available,
+            sha512: manifest.sha512,
+            binary_path: target_bin,
+            daemon_restarted: false,
+        });
     }
 
     let stage = StageDirGuard::create(state_paths, "agy-update-stage")?;
-    let dl_sp = (!json_out).then(|| {
-        Spinner::start(format!(
-            "Downloading & verifying Antigravity CLI v{}…",
-            manifest.version
-        ))
-    });
     let staged_bin =
         download_and_verify_agy_staged(&manifest, &stage.path, effective_proxy.as_ref()).await?;
-    if let Some(s) = dl_sp {
-        s.finish_and_clear().await;
-    }
 
     let should_restart_daemon = !args.no_restart
         && state_paths
             .read_daemon()?
             .is_some_and(|d| daemon::is_pid_alive(d.pid));
     if should_restart_daemon {
-        let _ = daemon::stop_daemon(state_paths, json_out).await?;
+        let _ = daemon::stop_daemon(state_paths).await?;
     }
 
     let swap_guard = install_staged_agy_binary(&staged_bin, &target_bin)
@@ -1555,128 +1214,162 @@ pub async fn run_agy_update(
     state_paths.write_settings(&settings)?;
 
     if should_restart_daemon {
-        daemon::run_restart(state_paths, RestartArgs::default()).await?;
+        let _ = daemon::restart_daemon(state_paths, RestartArgs::default()).await?;
     }
 
-    if json_out {
-        let payload = json!({
-            "status": "updated",
-            "previous_version": current_ver,
-            "version": manifest.version,
-            "sha512": manifest.sha512,
-            "binary_path": target_bin,
-            "daemon_restarted": should_restart_daemon,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-        );
-        return Ok(());
-    }
-
-    ui::headline(
-        Tone::Ok,
-        &format!(
-            "Updated Antigravity CLI (`agy`): v{} -> v{}",
-            current_ver.as_deref().unwrap_or("previous"),
-            manifest.version
-        ),
-    );
-    ui::kv_accent("Executable", &target_bin.display().to_string());
-    Ok(())
+    Ok(AgyUpdateOutcome {
+        status: AgyUpdateStatus::Updated,
+        previous_version: current_ver,
+        latest_version: manifest.version,
+        update_available: false,
+        sha512: manifest.sha512,
+        binary_path: target_bin,
+        daemon_restarted: should_restart_daemon,
+    })
 }
 
-pub async fn run_agy_login(
+pub fn prepare_agy_terminal_spec(
     state_paths: &StatePaths,
     explicit_agy_bin: Option<PathBuf>,
-    args: AgyLoginArgs,
-) -> Result<i32, CliError> {
+    argv: &[OsString],
+    proxy_override: Option<&str>,
+    hold_open_on_exit: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
     let settings = state_paths.read_settings()?;
-    let cli_proxy = args
-        .proxy
-        .clone()
-        .or_else(|| std::env::var("AGY_PROXY").ok());
-    let effective_proxy = resolve_effective_agy_proxy(cli_proxy.as_deref(), &settings)?;
+    let env_proxy = std::env::var("AGY_PROXY").ok();
+    let effective_proxy =
+        resolve_effective_agy_proxy(proxy_override.or(env_proxy.as_deref()), &settings)?;
+    let agy_bin = resolve_effective_agy_bin(explicit_agy_bin, &settings)
+        .ok_or(CliError::AgyBinaryNotFound)?;
 
+    let mut env_remove: Vec<String> = CLIENT_ENV_VARS_TO_STRIP
+        .iter()
+        .map(|&k| k.to_owned())
+        .collect();
+    let merged_no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+    let mut env_set = vec![
+        ("NO_PROXY".to_owned(), merged_no_proxy.clone()),
+        ("no_proxy".to_owned(), merged_no_proxy),
+    ];
+    if let Some(px) = &effective_proxy {
+        for &k in OUTBOUND_PROXY_ENV_KEYS {
+            env_set.push((k.to_owned(), px.as_str().to_owned()));
+        }
+    } else {
+        for &k in OUTBOUND_PROXY_ENV_KEYS {
+            env_remove.push(k.to_owned());
+        }
+    }
+
+    Ok(TerminalLaunchSpec {
+        title: "Liftgate · Antigravity CLI".to_owned(),
+        program: agy_bin,
+        args: argv.to_vec(),
+        cwd: std::env::current_dir().ok(),
+        env_set,
+        env_remove,
+        cleanup_files: Vec::new(),
+        hold_open_on_exit,
+    })
+}
+
+pub async fn launch_agy_login_in_terminal(
+    state_paths: &StatePaths,
+    explicit_agy_bin: Option<PathBuf>,
+    args: &AgyLoginArgs,
+) -> Result<PathBuf, CliError> {
+    let settings = state_paths.read_settings()?;
     let agy_bin = match resolve_effective_agy_bin(explicit_agy_bin, &settings) {
         Some(found) => found,
-        None => {
-            if args.install || prompt_install_missing_agy()? {
-                run_agy_install(
-                    state_paths,
-                    AgyInstallArgs {
-                        proxy: args.proxy.clone(),
-                        ..AgyInstallArgs::default()
-                    },
-                    false,
-                )
-                .await?
-            } else {
-                return Err(CliError::AgyBinaryNotFound);
-            }
+        None if args.install => {
+            execute_agy_install(
+                state_paths,
+                &AgyInstallArgs {
+                    proxy: args.proxy.clone(),
+                    ..AgyInstallArgs::default()
+                },
+            )
+            .await?
+            .binary_path
         }
+        None => return Err(CliError::AgyBinaryNotFound),
     };
 
-    ui::headline(
-        Tone::Action,
-        "Launching official Antigravity Google Sign-In (`agy acp --login`)…",
-    );
-    if let Some(p) = &effective_proxy {
-        ui::kv("Forced Proxy", &p.redacted_display());
-    }
-
-    let exit_code = spawn_interactive_agy(
-        &agy_bin,
+    let spec = prepare_agy_terminal_spec(
+        state_paths,
+        Some(agy_bin.clone()),
         &[OsString::from("acp"), OsString::from("--login")],
-        effective_proxy.as_ref(),
-    )
-    .await?;
-
-    if exit_code == 0 {
-        let auth = probe_agy_auth(state_paths, &agy_bin, effective_proxy.as_ref()).await;
-        if let AgyAuthStatus::SignedIn { model_count, .. } = auth {
-            ui::headline(
-                Tone::Ok,
-                &format!("Signed in to Antigravity ({model_count} models unlocked)"),
-            );
-        }
-        if !args.no_restart
-            && let Some(d) = state_paths.read_daemon()?
-            && daemon::is_pid_alive(d.pid)
-        {
-            ui::headline(
-                Tone::Action,
-                "Refreshing running Liftgate background gateway to load account models…",
-            );
-            daemon::run_restart(state_paths, RestartArgs::default()).await?;
-        }
-    }
-
-    Ok(exit_code)
+        args.proxy.as_deref(),
+        true,
+    )?;
+    spawn_in_system_terminal(state_paths, &spec)?;
+    Ok(agy_bin)
 }
 
-fn prompt_install_missing_agy() -> Result<bool, CliError> {
-    if !stdin().is_terminal() || !stdout().is_terminal() {
-        return Ok(false);
-    }
-    print!("  ? Antigravity CLI (`agy`) is not installed yet. Download & install it now? [Y/n]: ");
-    let _ = stdout().flush();
-    let mut input = String::new();
-    stdin()
-        .read_line(&mut input)
-        .map_err(|source| CliError::StateIo {
-            path: PathBuf::from("stdin"),
-            source,
-        })?;
-    let answer = input.trim().to_ascii_lowercase();
-    Ok(answer.is_empty() || matches!(answer.as_str(), "y" | "yes"))
+#[derive(Clone, Debug, Serialize)]
+pub struct AgyCapturedOutput {
+    pub exit_ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub binary_path: PathBuf,
 }
 
-pub async fn run_agy_auto_update(
+pub async fn run_agy_captured(
     state_paths: &StatePaths,
-    args: AgyAutoUpdateArgs,
-    json_out: bool,
-) -> Result<(), CliError> {
+    explicit_agy_bin: Option<PathBuf>,
+    argv: &[OsString],
+    max_wait: Duration,
+) -> Result<AgyCapturedOutput, CliError> {
+    let settings = state_paths.read_settings()?;
+    let env_proxy = std::env::var("AGY_PROXY").ok();
+    let effective_proxy = resolve_effective_agy_proxy(env_proxy.as_deref(), &settings)?;
+    let agy_bin = resolve_effective_agy_bin(explicit_agy_bin, &settings)
+        .ok_or(CliError::AgyBinaryNotFound)?;
+
+    let mut cmd = Command::new(&agy_bin);
+    cmd.args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.current_dir(cwd);
+    }
+    configure_acp_child_env(&mut cmd, effective_proxy.as_ref());
+    suppress_windows_console(&mut cmd);
+
+    match run_command_bounded(&mut cmd, max_wait).await {
+        Ok((exit_ok, stdout, stderr)) => Ok(AgyCapturedOutput {
+            exit_ok,
+            stdout,
+            stderr,
+            binary_path: agy_bin,
+        }),
+        Err(detail) => Ok(AgyCapturedOutput {
+            exit_ok: false,
+            stdout: String::new(),
+            stderr: detail,
+            binary_path: agy_bin,
+        }),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgyAutoUpdateOutcome {
+    pub updated: bool,
+    pub agy_auto_update: bool,
+    pub daemon_restarted: bool,
+    pub settings_file: PathBuf,
+}
+
+pub async fn execute_agy_auto_update(
+    state_paths: &StatePaths,
+    args: &AgyAutoUpdateArgs,
+) -> Result<AgyAutoUpdateOutcome, CliError> {
     let mut settings = state_paths.read_settings()?;
     let previous = settings.agy_auto_update;
     let mutated = match args.mode {
@@ -1702,73 +1395,19 @@ pub async fn run_agy_auto_update(
         && let Some(d) = state_paths.read_daemon()?
         && daemon::is_pid_alive(d.pid)
     {
-        daemon::run_restart(state_paths, RestartArgs::default()).await?;
+        let _ = daemon::restart_daemon(state_paths, RestartArgs::default()).await?;
         daemon_restarted = true;
     }
 
-    if json_out {
-        let payload = json!({
-            "updated": mutated,
-            "agy_auto_update": settings.agy_auto_update,
-            "daemon_restarted": daemon_restarted,
-            "settings_file": state_paths.settings_file(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-        );
-        return Ok(());
-    }
-
-    let bin = invoked_bin_name();
-    if mutated {
-        ui::headline(
-            Tone::Ok,
-            if settings.agy_auto_update {
-                "Enabled background idle `agy` auto-update (default)"
-            } else {
-                "Disabled background idle `agy` auto-update"
-            },
-        );
-    } else {
-        let pill = if settings.agy_auto_update {
-            (Tone::Ok, "ENABLED · IDLE AUTO-UPDATE")
-        } else {
-            (Tone::Muted, "DISABLED")
-        };
-        ui::banner("Antigravity Idle Auto-Update", Some(pill), None);
-    }
-
-    ui::kv(
-        "Policy",
-        if settings.agy_auto_update {
-            "checks official manifest & hot-updates `agy` when gateway has 0 active turns"
-        } else {
-            "manual updates only (`lg agy update`)"
-        },
-    );
-    ui::kv(
-        "Settings File",
-        &state_paths.settings_file().display().to_string(),
-    );
-    if !mutated {
-        println!();
-        if settings.agy_auto_update {
-            ui::cmd_hint(
-                "Disable idle auto-update",
-                &format!("{bin} agy auto-update off"),
-            );
-        } else {
-            ui::cmd_hint(
-                "Enable idle auto-update",
-                &format!("{bin} agy auto-update on"),
-            );
-        }
-    }
-    Ok(())
+    Ok(AgyAutoUpdateOutcome {
+        updated: mutated,
+        agy_auto_update: settings.agy_auto_update,
+        daemon_restarted,
+        settings_file: state_paths.settings_file(),
+    })
 }
 
-async fn run_agy_passthrough(
+pub async fn run_agy_passthrough(
     state_paths: &StatePaths,
     explicit_agy_bin: Option<PathBuf>,
     argv: &[OsString],
@@ -1781,7 +1420,7 @@ async fn run_agy_passthrough(
     spawn_interactive_agy(&agy_bin, argv, effective_proxy.as_ref()).await
 }
 
-async fn spawn_interactive_agy(
+pub async fn spawn_interactive_agy(
     agy_bin: &Path,
     argv: &[OsString],
     proxy: Option<&ProxyUrl>,
@@ -2162,6 +1801,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use serde_json::json;
     use tar::{Builder, Header};
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -2287,9 +1927,9 @@ mod tests {
             }
         });
 
-        let err = run_agy_install(
+        let err = execute_agy_install(
             &state_paths,
-            AgyInstallArgs {
+            &AgyInstallArgs {
                 check: false,
                 force: true,
                 dir: Some(install_dir.clone()),
@@ -2297,7 +1937,6 @@ mod tests {
                 skip_path: true,
                 manifest_base_url: Some(format!("http://{addr}")),
             },
-            true,
         )
         .await
         .unwrap_err();

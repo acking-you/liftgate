@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Standalone native GPUI desktop application (`liftgate-desktop`)**:
+  - Built on `gpui-kit 0.9` with a Warm Editorial / StaticFlow (`ackingliu.top`) Light & Dark design palette (`#faf9f5` warm paper / `#141413` ink / `#c96442` terracotta accent / `.sf-term` `#111110` terminal panels) and persistent `中文` / `EN` language + theme switches (`~/.liftgate/desktop-ui.json`).
+  - Runs completely standalone with zero external `liftgate` / `lg` CLI binary dependency via built-in headless `serve` and `__desktop-watch` subcommands.
+  - Covers 100% of CLI capabilities across six dedicated workspaces: **Overview & Gateway** (`ServeArgs` configuration, managed daemon lifecycle, embedded Web dashboard launcher), **Live Telemetry & Sessions** (auto-reconnecting `/api/telemetry/events` SSE stream, warm `SessionPool` eviction, searchable protocol-filtered turn inspector), **AI Launchers & Config Sync** (zero-side-effect Claude Code & Codex CLI system-terminal launchers with Code Mode toggles, zero-pollution Codex App & Claude Desktop GUI launchers + session journal restore, and non-destructive `config` dry-run/sync/uninstall), **Models Catalog** (live `/v1/models` explorer, context limits, one-click default model switching & harness launch), **Antigravity (`agy`) & Proxy** (`agy` SHA-512 install/update/reinstall, `agy acp --login`, idle auto-update toggle, arbitrary `agy` command runner, and proxy configuration + latency probe), and **Logs, Doctor & System** (live `gateway.log` & `agy` stderr viewer, environment doctor with quick-fix actions, `lg` PATH alias installer, shell completions preview, and SHA-256-verified atomic self-upgrade).
+  - Bundled `liftgate-desktop` into macOS (Apple Silicon & Intel), Windows (x64 & ARM64), and Linux (`x86_64-unknown-linux-gnu`) release archives and `upgrade` workflows.
+
+### Changed
+- Extracted all shared control-plane logic (`agy_manager`, `cli`, `client`, `config_sync`, `daemon`, `desktop`, `error`, `format`, `harness`, `serve`, `state`, `terminal`, `upgrade`, and embedded `web/dist` asset bundling) into a dedicated `liftgate-core` library crate shared by `liftgate`, `lg`, and `liftgate-desktop`.
+
 ## [0.1.8] - 2026-11-16
 
 ### Added

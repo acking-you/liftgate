@@ -77,6 +77,18 @@ impl ModelId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Default high-capability model identifier used when no explicit model is supplied.
+    #[must_use]
+    pub fn fallback_primary() -> Self {
+        Self(Arc::from("gemini-4-carbon-high"))
+    }
+
+    /// Default low-latency flash model identifier used for auxiliary tasks.
+    #[must_use]
+    pub fn fallback_fast() -> Self {
+        Self(Arc::from("gemini-3.8-flash-low"))
+    }
 }
 
 impl fmt::Display for ModelId {

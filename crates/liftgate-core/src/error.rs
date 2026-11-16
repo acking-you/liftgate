@@ -207,3 +207,50 @@ pub enum CliError {
         source: std::io::Error,
     },
 }
+
+/// Returns an actionable recovery hint for `err` using `bin` as the CLI command name.
+#[must_use]
+pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
+    match err {
+        CliError::AgyBinaryNotFound => Some(format!(
+            "Run `{bin} agy install` to download & install Antigravity CLI automatically, then `{bin} agy login` to sign in."
+        )),
+        CliError::NoSystemProxyDetected => Some(format!(
+            "Set an explicit proxy with `{bin} proxy 7890` (or `{bin} proxy socks5://127.0.0.1:1080`), or clear with `{bin} proxy off`."
+        )),
+        CliError::AgyInstallFailed { .. } => Some(format!(
+            "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
+        )),
+        CliError::GatewayUnreachable { .. } => Some(format!(
+            "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
+        )),
+        CliError::PortOccupiedUnmanaged { .. } => Some(format!(
+            "Run `{bin} status` to inspect the active listener, or bind another port with `--listen 127.0.0.1:8788`."
+        )),
+        CliError::DaemonExitedEarly { .. } | CliError::DaemonHealthTimeout { .. } => Some(format!(
+            "Inspect `{bin} logs -n 80` and `{bin} doctor` for startup diagnostics."
+        )),
+        CliError::GatewayHttpStatus { status: 401, .. } => Some(format!(
+            "Pass `--api-key <key>` or export `AGY_GATEWAY_API_KEY` matching the running gateway (`{bin} status`)."
+        )),
+        CliError::UpgradeNetwork { .. } => Some(format!(
+            "Check network connectivity, pass `--proxy <url>` (or set `HTTPS_PROXY`), or set `GITHUB_TOKEN` if rate-limited (`{bin} upgrade --check`)."
+        )),
+        CliError::UpgradePermissionDenied { .. } => Some(
+            "Re-run with elevated permissions (e.g. `sudo lg upgrade`) or install into a user-writable directory such as `~/.cargo/bin`."
+                .to_owned(),
+        ),
+        CliError::UpgradeUnsupportedTarget { .. } => Some(
+            "Install from source with `cargo install --git https://github.com/acking-you/liftgate liftgate` or specify `--target <triple>`."
+                .to_owned(),
+        ),
+        CliError::DesktopAppAlreadyRunning { .. } => Some(
+            "Close the running desktop app window first, or re-run with `--restart-app` to restart it automatically with Liftgate configuration."
+                .to_owned(),
+        ),
+        CliError::DesktopAppNotFound { .. } => Some(format!(
+            "Run `{bin} doctor` to inspect detected desktop installations, or specify an explicit path via `--codex-app-bin` / `--claude-desktop-bin`."
+        )),
+        _ => None,
+    }
+}

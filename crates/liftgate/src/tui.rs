@@ -33,18 +33,18 @@ use ratatui::{
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::cli::{RestartArgs, ServeArgs, TopArgs};
-use crate::client::{DiscoveredModel, GatewayClient, infer_live_long_context};
-use crate::config_sync::resolve_fast_model;
-use crate::daemon::{
-    build_authenticated_dashboard_url, ensure_gateway_ready, is_pid_alive, open_browser,
-    resolve_client_api_key, start_daemon_inner, stop_daemon, tail_file_lines,
-};
-use crate::error::CliError;
-use crate::state::{StatePaths, format_connect_url, now_unix_ms};
 use crate::ui::{
     format_duration_secs, format_latency_ms, format_relative_ms, format_tokens, format_utc_hms,
 };
+use liftgate_core::cli::{RestartArgs, ServeArgs, TopArgs};
+use liftgate_core::client::{DiscoveredModel, GatewayClient, infer_live_long_context};
+use liftgate_core::config_sync::resolve_fast_model;
+use liftgate_core::daemon::{
+    build_authenticated_dashboard_url, ensure_gateway_ready, is_pid_alive, open_browser,
+    read_log_tail, resolve_client_api_key, restart_daemon, start_daemon, stop_daemon,
+};
+use liftgate_core::error::CliError;
+use liftgate_core::state::{StatePaths, format_connect_url, now_unix_ms};
 
 static TUI_RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TUI_PANIC_HOOK_ONCE: Once = Once::new();
@@ -250,7 +250,7 @@ struct CockpitSummary {
 }
 
 async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
-    let local_agy = crate::agy_manager::quick_local_agy_summary(state_paths, None).await;
+    let local_agy = liftgate_core::agy_manager::quick_local_agy_summary(state_paths, None).await;
     let daemon = state_paths.read_daemon().ok().flatten();
     let default_serve = ServeArgs::default();
     let listen = daemon.as_ref().map_or(default_serve.listen, |d| d.listen);
@@ -1093,7 +1093,7 @@ async fn poll_gateway_snapshot(
 
     let log_file = state_paths.log_file();
     let service_log_lines = if log_file.is_file() {
-        tail_file_lines(&log_file, 120)
+        read_log_tail(&log_file, 120)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
@@ -1183,8 +1183,8 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         api_key: worker_key.clone(),
                         ..RestartArgs::default()
                     };
-                    match restart_daemon_quiet(&worker_paths, restart_args).await {
-                        Ok(()) => Ok(format!("Switched default model to {model_id}")),
+                    match restart_daemon(&worker_paths, restart_args).await {
+                        Ok(_) => Ok(format!("Switched default model to {model_id}")),
                         Err(e) => Err(e.to_string()),
                     }
                 }
@@ -1192,7 +1192,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                     let daemon = worker_paths.read_daemon().ok().flatten();
                     let running = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
                     let res = if running {
-                        restart_daemon_quiet(
+                        restart_daemon(
                             &worker_paths,
                             RestartArgs {
                                 listen: worker_listen,
@@ -1201,7 +1201,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                             },
                         )
                         .await
-                        .map(|()| "Restarted background gateway".to_owned())
+                        .map(|_| "Restarted background gateway".to_owned())
                     } else {
                         let mut serve = ServeArgs::default();
                         if let Some(addr) = worker_listen {
@@ -1210,21 +1210,21 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         if let Some(k) = worker_key.clone() {
                             serve.api_key = Some(k);
                         }
-                        start_daemon_inner(&worker_paths, serve, false, true)
-                            .await
-                            .map(|d| {
-                                format!(
-                                    "Started gateway (PID {}) on {}",
-                                    d.pid,
-                                    format_connect_url(d.listen)
-                                )
-                            })
+                        start_daemon(&worker_paths, serve, false).await.map(|out| {
+                            format!(
+                                "Started gateway (PID {}) on {}",
+                                out.daemon.pid,
+                                format_connect_url(out.daemon.listen)
+                            )
+                        })
                     };
                     res.map_err(|e| e.to_string())
                 }
-                TuiCommand::StopDaemon => match stop_daemon(&worker_paths, true).await {
-                    Ok(true) => Ok("Stopped background gateway".to_owned()),
-                    Ok(false) => Err("No managed background gateway is running".to_owned()),
+                TuiCommand::StopDaemon => match stop_daemon(&worker_paths).await {
+                    Ok(out) if out.stopped_pid.is_some() => {
+                        Ok("Stopped background gateway".to_owned())
+                    }
+                    Ok(_) => Err("No managed background gateway is running".to_owned()),
                     Err(e) => Err(e.to_string()),
                 },
                 TuiCommand::OpenBrowser => {
@@ -1280,38 +1280,6 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     drop(session);
-    Ok(())
-}
-
-async fn restart_daemon_quiet(state_paths: &StatePaths, args: RestartArgs) -> Result<(), CliError> {
-    let prev = state_paths.read_daemon()?;
-    let _ = stop_daemon(state_paths, true).await?;
-
-    let mut serve = ServeArgs::default();
-    if let Some(old) = prev {
-        serve.listen = old.listen;
-        serve.ui_listen = old.ui_listen;
-        if !old.default_model.is_empty() {
-            serve.default_model = old.default_model;
-        }
-        if !old.acp_mode.is_empty() {
-            serve.acp_mode = old.acp_mode;
-        }
-        serve.api_key = old.api_key;
-        serve.agy_bin = old.agy_bin;
-        serve.acp_cwd = old.acp_cwd;
-        serve.ui_dir = old.ui_dir;
-    }
-    if let Some(listen) = args.listen {
-        serve.listen = listen;
-    }
-    if let Some(model) = args.default_model {
-        serve.default_model = model;
-    }
-    if let Some(key) = args.api_key {
-        serve.api_key = Some(key);
-    }
-    let _ = start_daemon_inner(state_paths, serve, false, true).await?;
     Ok(())
 }
 
