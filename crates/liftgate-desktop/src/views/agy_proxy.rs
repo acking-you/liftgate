@@ -28,18 +28,26 @@ impl DesktopApp {
                 model_count,
                 source,
             }) => (
-                "GOOGLE ACCOUNT SIGNED IN",
+                tr(lang, "已登录 GOOGLE 账号", "GOOGLE ACCOUNT SIGNED IN"),
                 BadgeTone::Ok,
-                format!("{model_count} models verified via {source}"),
+                if lang.is_en() {
+                    format!("{model_count} models verified via {source}")
+                } else {
+                    format!("已验证 {model_count} 个可用模型（来源: {source}）")
+                },
             ),
-            Some(AgyAuthStatus::NotSignedIn { detail }) => {
-                ("SIGN-IN REQUIRED", BadgeTone::Warn, detail.clone())
-            }
-            Some(AgyAuthStatus::NetworkError { detail }) => {
-                ("AUTH PROBE NETWORK ERROR", BadgeTone::Err, detail.clone())
-            }
+            Some(AgyAuthStatus::NotSignedIn { detail }) => (
+                tr(lang, "需要登录授权", "SIGN-IN REQUIRED"),
+                BadgeTone::Warn,
+                detail.clone(),
+            ),
+            Some(AgyAuthStatus::NetworkError { detail }) => (
+                tr(lang, "鉴权探测网络异常", "AUTH PROBE NETWORK ERROR"),
+                BadgeTone::Err,
+                detail.clone(),
+            ),
             Some(AgyAuthStatus::NotInstalled) => (
-                "AGY NOT INSTALLED",
+                tr(lang, "尚未安装 AGY", "AGY NOT INSTALLED"),
                 BadgeTone::Err,
                 tr(
                     lang,
@@ -49,12 +57,12 @@ impl DesktopApp {
                 .to_owned(),
             ),
             _ => (
-                "UNVERIFIED",
+                tr(lang, "尚未校验", "UNVERIFIED"),
                 BadgeTone::Neutral,
                 tr(
                     lang,
-                    "点击「校验登录与更新」执行实况探测",
-                    "Click 'Verify Auth & Update' to probe live status",
+                    "点击「校验登录与版本」执行实况探测",
+                    "Click 'Verify Auth & Version' to probe live status",
                 )
                 .to_owned(),
             ),
@@ -83,7 +91,7 @@ impl DesktopApp {
                     .gap_2()
                     .child(section_header(
                         p,
-                        "OFFICIAL ANTIGRAVITY ACP ENGINE",
+                        tr(lang, "官方 ANTIGRAVITY ACP 引擎", "OFFICIAL ANTIGRAVITY ACP ENGINE"),
                         tr(lang, "Antigravity (`agy`) 安装、升级与账号认证", "Antigravity (`agy`) Lifecycle & Google OAuth"),
                         Some(tr(
                             lang,
@@ -98,7 +106,15 @@ impl DesktopApp {
                             .gap_2()
                             .child(pill_badge(p, auth_tone, auth_badge_lbl))
                             .children(agy.is_some_and(|r| r.update_available).then(|| {
-                                pill_badge(p, BadgeTone::Brand, format!("UPDATE AVAILABLE -> {latest_str}"))
+                                pill_badge(
+                                    p,
+                                    BadgeTone::Brand,
+                                    if lang.is_en() {
+                                        format!("UPDATE AVAILABLE -> {latest_str}")
+                                    } else {
+                                        format!("发现新版本 -> {latest_str}")
+                                    },
+                                )
                             })),
                     ),
             )
@@ -112,7 +128,7 @@ impl DesktopApp {
                     .border_color(p.border)
                     .flex()
                     .flex_col()
-                    .child(kv_row(p, "Binary Path", bin_str))
+                    .child(kv_row(p, tr(lang, "二进制路径", "Binary Path"), bin_str))
                     .child(kv_row(p, tr(lang, "当前已安装版本", "Installed Version"), ver_str))
                     .child(kv_row(p, tr(lang, "上游最新稳定版", "Latest Upstream"), latest_str))
                     .child(kv_row(p, tr(lang, "账号鉴权详情", "Auth Status"), auth_detail)),
@@ -201,11 +217,13 @@ impl DesktopApp {
         let px_out = self.proxy_outcome.as_ref();
         let configured_px = px_out
             .and_then(|o| o.configured_proxy.as_ref().map(|u| u.as_str().to_owned()))
-            .unwrap_or_else(|| "direct (none saved)".to_owned());
+            .unwrap_or_else(|| {
+                tr(lang, "直连（未保存强制代理）", "direct (none saved)").to_owned()
+            });
         let effective_px = px_out
             .and_then(|o| o.effective_proxy.as_ref().map(|u| u.as_str().to_owned()))
             .or_else(|| agy.and_then(|r| r.effective_proxy.as_ref().map(|u| u.as_str().to_owned())))
-            .unwrap_or_else(|| "direct (off)".to_owned());
+            .unwrap_or_else(|| tr(lang, "直连（未启用代理）", "direct (off)").to_owned());
         let ambient_px = px_out
             .and_then(|o| o.ambient_system_proxy.clone())
             .or_else(agy_manager::detect_ambient_system_proxy)
@@ -219,16 +237,22 @@ impl DesktopApp {
             });
 
         let probe_summary = match px_out.and_then(|o| o.connectivity_probe.as_ref()) {
-            Some(pr) if pr.ok => format!(
-                "OK · {} ms (upstream manifest v{})",
-                pr.latency_ms,
-                pr.latest_agy_version.as_deref().unwrap_or("unknown")
-            ),
-            Some(pr) => format!(
-                "FAILED ({} ms): {}",
-                pr.latency_ms,
-                pr.error.as_deref().unwrap_or("unreachable")
-            ),
+            Some(pr) if pr.ok => {
+                let latest_v = pr.latest_agy_version.as_deref().unwrap_or("unknown");
+                if lang.is_en() {
+                    format!("OK · {} ms (upstream manifest v{latest_v})", pr.latency_ms)
+                } else {
+                    format!("正常 · {} ms（上游清单 v{latest_v}）", pr.latency_ms)
+                }
+            }
+            Some(pr) => {
+                let err_s = pr.error.as_deref().unwrap_or("unreachable");
+                if lang.is_en() {
+                    format!("FAILED ({} ms): {err_s}", pr.latency_ms)
+                } else {
+                    format!("失败（{} ms）：{err_s}", pr.latency_ms)
+                }
+            }
             None => tr(
                 lang,
                 "点击「连通性测速」验证上游可达性与延迟",
@@ -240,7 +264,7 @@ impl DesktopApp {
         let proxy_card = editorial_card(p)
             .child(section_header(
                 p,
-                "UPSTREAM HTTP / SOCKS5 PROXY",
+                tr(lang, "上游 HTTP / SOCKS5 代理", "UPSTREAM HTTP / SOCKS5 PROXY"),
                 tr(lang, "上游网络代理管理 (`lg proxy`)", "Upstream Proxy Configuration (`lg proxy`)"),
                 Some(tr(
                     lang,
@@ -329,7 +353,7 @@ impl DesktopApp {
         let runner_card = editorial_card(p)
             .child(section_header(
                 p,
-                "PASSTHROUGH AGY RUNNER",
+                tr(lang, "原生 AGY 命令运行器", "PASSTHROUGH AGY RUNNER"),
                 tr(lang, "原生 `agy` 命令运行器 (`lg agy <args>`)", "Direct `agy` Command Runner (`lg agy <args>`)"),
                 Some(tr(
                     lang,

@@ -29,7 +29,7 @@ use crate::harness::{resolve_claude_command, resolve_codex_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
-    resolve_effective_agy_bin, resolve_effective_agy_proxy,
+    resolve_effective_agy_bin, resolve_effective_agy_proxy, write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -744,8 +744,21 @@ pub struct ModelsReport {
     pub gateway_url: String,
     pub default_model: String,
     pub fast_model: String,
+    pub title_model: String,
     pub long_context: bool,
     pub models: Vec<DiscoveredModel>,
+}
+
+/// Validates and atomically persists the session title generation model (`~/.liftgate/title-model`),
+/// taking effect on the very next title request without restarting active sessions.
+pub fn set_title_model(state_paths: &StatePaths, model_id: &str) -> Result<ModelId, CliError> {
+    let validated = ModelId::try_new(model_id)?;
+    write_file_atomic(
+        &state_paths.title_model_file(),
+        validated.as_str().as_bytes(),
+        false,
+    )?;
+    Ok(validated)
 }
 
 pub async fn inspect_models(
@@ -762,11 +775,17 @@ pub async fn inspect_models(
     .await?;
     let models: Vec<DiscoveredModel> = target.client.fetch_models().await?;
     let fast_model = resolve_fast_model(None, &target.default_model, &models);
+    let title_model =
+        liftgate_server::title_model::title_model(Some(&state_paths.title_model_file()))
+            .await
+            .as_str()
+            .to_owned();
     let long_context = infer_live_long_context(&models, target.managed_long_context);
     Ok(ModelsReport {
         gateway_url: target.client.base_url().to_owned(),
         default_model: target.default_model,
         fast_model,
+        title_model,
         long_context,
         models,
     })

@@ -499,6 +499,7 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
         let payload = json!({
             "default_model": report.default_model,
             "fast_model": report.fast_model,
+            "title_model": report.title_model,
             "long_context": report.long_context,
             "count": report.models.len(),
             "models": report.models.iter().map(|m| {

@@ -65,6 +65,12 @@ impl From<SessionId> for String {
 pub struct ModelId(Arc<str>);
 
 impl ModelId {
+    /// Default low-effort Hydrogen model for short background requests.
+    #[must_use]
+    pub fn fallback_fast() -> Self {
+        Self(Arc::from("gemini-4-hydrogen-low"))
+    }
+
     pub fn try_new(raw: impl AsRef<str>) -> Result<Self, ValidationError> {
         let trimmed = raw.as_ref().trim();
         if trimmed.is_empty() {
@@ -82,12 +88,6 @@ impl ModelId {
     #[must_use]
     pub fn fallback_primary() -> Self {
         Self(Arc::from("gemini-4-carbon-high"))
-    }
-
-    /// Default low-effort Hydrogen model for short background requests.
-    #[must_use]
-    pub fn fallback_fast() -> Self {
-        Self(Arc::from("gemini-4-hydrogen-low"))
     }
 }
 

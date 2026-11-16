@@ -90,14 +90,16 @@ impl DesktopApp {
                         ))
                         .child(pill_badge(p, BadgeTone::Neutral, pid_text))
                         .child(pill_badge(p, BadgeTone::Info, format!("agy {agy_ver}")))
-                        .children(
-                            self.cfg_long_context
-                                .then(|| pill_badge(p, BadgeTone::Warn, "1M LONG CONTEXT")),
-                        )
-                        .children(
-                            self.sse_connected
-                                .then(|| pill_badge(p, BadgeTone::Ok, "SSE LIVE")),
-                        ),
+                        .children(self.cfg_long_context.then(|| {
+                            pill_badge(
+                                p,
+                                BadgeTone::Warn,
+                                tr(lang, "1M 长上下文", "1M LONG CONTEXT"),
+                            )
+                        }))
+                        .children(self.sse_connected.then(|| {
+                            pill_badge(p, BadgeTone::Ok, tr(lang, "SSE 实时连接", "SSE LIVE"))
+                        })),
                 )
                 .child(
                     div()
@@ -152,7 +154,11 @@ impl DesktopApp {
                                 .icon(IconName::Copy)
                                 .label(tr(lang, "复制地址", "Copy URL"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_text("Gateway URL", url_for_copy.clone(), cx);
+                                    this.copy_text(
+                                        tr(this.lang, "网关地址", "Gateway URL"),
+                                        url_for_copy.clone(),
+                                        cx,
+                                    );
                                 })),
                         )
                         .child(
@@ -162,7 +168,11 @@ impl DesktopApp {
                                 .icon(IconName::SquareTerminal)
                                 .label(tr(lang, "复制环境变量", "Copy Env"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_text("Gateway Env", env_snippet.clone(), cx);
+                                    this.copy_text(
+                                        tr(this.lang, "环境变量片段", "Gateway Env"),
+                                        env_snippet.clone(),
+                                        cx,
+                                    );
                                 })),
                         ),
                 ),
@@ -187,10 +197,17 @@ impl DesktopApp {
                     sp.active_leased_sessions + sp.idle_cached_sessions,
                     sp.max_idle_sessions
                 ),
-                format!(
-                    "{} active · {} idle · {hit_pct}% warm hit",
-                    sp.active_leased_sessions, sp.idle_cached_sessions
-                ),
+                if lang.is_en() {
+                    format!(
+                        "{} active · {} idle · {hit_pct}% warm hit",
+                        sp.active_leased_sessions, sp.idle_cached_sessions
+                    )
+                } else {
+                    format!(
+                        "运行 {} · 空闲 {} · 命中率 {hit_pct}%",
+                        sp.active_leased_sessions, sp.idle_cached_sessions
+                    )
+                },
             )
         } else {
             (
@@ -202,10 +219,17 @@ impl DesktopApp {
         let (req_val, req_sub) = if let Some(tp) = snap.map(|s| &s.metrics) {
             (
                 tp.total_requests.to_string(),
-                format!(
-                    "OA {} · Anth {} · Err {}",
-                    tp.openai_requests, tp.anthropic_requests, tp.failed_requests
-                ),
+                if lang.is_en() {
+                    format!(
+                        "OA {} · Anth {} · Err {}",
+                        tp.openai_requests, tp.anthropic_requests, tp.failed_requests
+                    )
+                } else {
+                    format!(
+                        "OpenAI {} · Anthropic {} · 失败 {}",
+                        tp.openai_requests, tp.anthropic_requests, tp.failed_requests
+                    )
+                },
             )
         } else {
             (
@@ -219,12 +243,21 @@ impl DesktopApp {
                 tp.total_input_tokens + tp.total_output_tokens + tp.total_thought_tokens;
             (
                 format_tokens(total_tok),
-                format!(
-                    "In {} · Out {} · Cache {}",
-                    format_tokens(tp.total_input_tokens),
-                    format_tokens(tp.total_output_tokens),
-                    format_tokens(tp.total_cached_tokens)
-                ),
+                if lang.is_en() {
+                    format!(
+                        "In {} · Out {} · Cache {}",
+                        format_tokens(tp.total_input_tokens),
+                        format_tokens(tp.total_output_tokens),
+                        format_tokens(tp.total_cached_tokens)
+                    )
+                } else {
+                    format!(
+                        "输入 {} · 输出 {} · 缓存 {}",
+                        format_tokens(tp.total_input_tokens),
+                        format_tokens(tp.total_output_tokens),
+                        format_tokens(tp.total_cached_tokens)
+                    )
+                },
             )
         } else {
             (
@@ -273,7 +306,7 @@ impl DesktopApp {
             .flex_1()
             .child(section_header(
                 p,
-                "DAEMON PARAMETERS",
+                tr(lang, "守护进程参数", "DAEMON PARAMETERS"),
                 tr(lang, "网关守护进程参数", "Gateway Daemon Configuration"),
                 Some(tr(
                     lang,
@@ -433,7 +466,7 @@ impl DesktopApp {
             });
         let proxy_str = report
             .and_then(|r| r.agy_proxy_display.clone())
-            .unwrap_or_else(|| "direct (off)".to_owned());
+            .unwrap_or_else(|| tr(lang, "直连（未启用代理）", "direct (off)").to_owned());
 
         let right_col = div()
             .flex_1()
@@ -444,7 +477,7 @@ impl DesktopApp {
                 editorial_card(p)
                     .child(section_header(
                         p,
-                        "ZERO-POLLUTION LAUNCHERS",
+                        tr(lang, "零污染启动器", "ZERO-POLLUTION LAUNCHERS"),
                         tr(lang, "一键启动 AI 编码客户端", "One-Click AI Harness Launchers"),
                         Some(tr(
                             lang,
@@ -524,7 +557,7 @@ impl DesktopApp {
                             .justify_between()
                             .child(section_header(
                                 p,
-                                "RUNTIME TOPOLOGY",
+                                tr(lang, "运行态路径", "RUNTIME TOPOLOGY"),
                                 tr(lang, "本地运行态路径摘要", "Local Runtime Topology"),
                                 None,
                             ))
@@ -545,7 +578,7 @@ impl DesktopApp {
                             .flex()
                             .flex_col()
                             .child(kv_row(p, tr(lang, "Web 面板", "Dashboard"), dashboard_url))
-                            .child(kv_row(p, "agy Binary", agy_bin_str))
+                            .child(kv_row(p, tr(lang, "agy 路径", "agy Binary"), agy_bin_str))
                             .child(kv_row(p, tr(lang, "上游代理", "Upstream Proxy"), proxy_str))
                             .child(kv_row(p, tr(lang, "状态目录", "State Dir"), state_dir_str))
                             .child(kv_row(p, tr(lang, "日志文件", "Gateway Log"), log_path_str)),
@@ -611,7 +644,11 @@ impl DesktopApp {
                     .child(sf_terminal_box(
                         p,
                         "overview-log-tail",
-                        "gateway.log (latest 12 lines)",
+                        tr(
+                            lang,
+                            "gateway.log（最近 12 行）",
+                            "gateway.log (latest 12 lines)",
+                        ),
                         &log_preview_text,
                         px(180.0),
                     )),

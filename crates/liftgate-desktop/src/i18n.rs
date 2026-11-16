@@ -8,8 +8,18 @@ use liftgate_core::state::DesktopLang;
 pub const fn tr(lang: DesktopLang, zh: &'static str, en: &'static str) -> &'static str {
     match lang {
         DesktopLang::En => en,
-        DesktopLang::Zh | DesktopLang::Unknown => zh,
+        DesktopLang::Zh => zh,
     }
+}
+
+/// Localized main native window title.
+#[must_use]
+pub const fn window_title(lang: DesktopLang) -> &'static str {
+    tr(
+        lang,
+        "Liftgate · Antigravity 桌面控制中心",
+        "Liftgate · Antigravity Desktop Control Center",
+    )
 }
 
 /// Primary sidebar tabs covering 100% of Liftgate CLI capabilities.
@@ -106,14 +116,34 @@ impl NavTab {
     }
 
     #[must_use]
-    pub const fn eyebrow(self) -> &'static str {
+    pub const fn eyebrow(self, lang: DesktopLang) -> &'static str {
         match self {
-            Self::Overview => "01 · GATEWAY CONTROL",
-            Self::Telemetry => "02 · LIVE TELEMETRY & SESSIONS",
-            Self::Launchers => "03 · AI WORKBENCH & CONFIG SYNC",
-            Self::Models => "04 · ANTIGRAVITY MODEL CATALOG",
-            Self::AgyProxy => "05 · AGY LIFECYCLE & NETWORK PROXY",
-            Self::System => "06 · LOGS · DOCTOR · SYSTEM",
+            Self::Overview => tr(lang, "01 · 网关控制中心", "01 · GATEWAY CONTROL"),
+            Self::Telemetry => tr(
+                lang,
+                "02 · 实时遥测与热会话池",
+                "02 · LIVE TELEMETRY & SESSIONS",
+            ),
+            Self::Launchers => tr(
+                lang,
+                "03 · AI 启动台与配置同步",
+                "03 · AI WORKBENCH & CONFIG SYNC",
+            ),
+            Self::Models => tr(
+                lang,
+                "04 · 上游模型目录与路由",
+                "04 · ANTIGRAVITY MODEL CATALOG",
+            ),
+            Self::AgyProxy => tr(
+                lang,
+                "05 · AGY 引擎与网络代理",
+                "05 · AGY LIFECYCLE & NETWORK PROXY",
+            ),
+            Self::System => tr(
+                lang,
+                "06 · 日志 · 诊断 · 系统工具",
+                "06 · LOGS · DOCTOR · SYSTEM",
+            ),
         }
     }
 }

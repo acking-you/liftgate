@@ -211,15 +211,45 @@ impl StatePaths {
     }
 }
 
-/// Color appearance mode for `liftgate-desktop` (styled after `ackingliu.top`).
+/// Color appearance preference for `liftgate-desktop` (`system` follows OS light/dark mode).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DesktopThemeMode {
+pub enum DesktopThemePref {
     #[default]
+    System,
     Light,
     Dark,
     #[serde(other)]
     Unknown,
+}
+
+impl DesktopThemePref {
+    #[must_use]
+    pub const fn is_system(self) -> bool {
+        matches!(self, Self::System | Self::Unknown)
+    }
+
+    #[must_use]
+    pub const fn resolve(self, system_is_dark: bool) -> DesktopThemeMode {
+        match self {
+            Self::Light => DesktopThemeMode::Light,
+            Self::Dark => DesktopThemeMode::Dark,
+            Self::System | Self::Unknown => {
+                if system_is_dark {
+                    DesktopThemeMode::Dark
+                } else {
+                    DesktopThemeMode::Light
+                }
+            }
+        }
+    }
+}
+
+/// Resolved active appearance mode (`Light` or `Dark`) for `liftgate-desktop`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopThemeMode {
+    Light,
+    Dark,
 }
 
 impl DesktopThemeMode {
@@ -227,26 +257,48 @@ impl DesktopThemeMode {
     pub const fn is_dark(self) -> bool {
         matches!(self, Self::Dark)
     }
-
-    #[must_use]
-    pub const fn toggled(self) -> Self {
-        if self.is_dark() {
-            Self::Light
-        } else {
-            Self::Dark
-        }
-    }
 }
 
-/// Interface language for `liftgate-desktop`.
+/// Interface language preference for `liftgate-desktop` (`system` follows the OS locale).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DesktopLang {
+pub enum DesktopLangPref {
     #[default]
+    System,
+    #[serde(alias = "zh-cn", alias = "zh_cn")]
     Zh,
+    #[serde(alias = "en-us", alias = "en_us")]
     En,
     #[serde(other)]
     Unknown,
+}
+
+impl DesktopLangPref {
+    #[must_use]
+    pub const fn is_system(self) -> bool {
+        matches!(self, Self::System | Self::Unknown)
+    }
+
+    #[must_use]
+    pub const fn resolve(self, system_lang: DesktopLang) -> DesktopLang {
+        match self {
+            Self::Zh => DesktopLang::Zh,
+            Self::En => DesktopLang::En,
+            Self::System | Self::Unknown => system_lang,
+        }
+    }
+
+    #[must_use]
+    pub fn resolve_current(self) -> DesktopLang {
+        self.resolve(detect_system_language())
+    }
+}
+
+/// Resolved active interface language (`中文` or `English`) for `liftgate-desktop`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopLang {
+    Zh,
+    En,
 }
 
 impl DesktopLang {
@@ -259,15 +311,66 @@ impl DesktopLang {
     pub const fn toggled(self) -> Self {
         if self.is_en() { Self::Zh } else { Self::En }
     }
+
+    /// Locale tag recognized by `gpui-component` (`zh-CN` or `en`).
+    #[must_use]
+    pub const fn gpui_locale(self) -> &'static str {
+        match self {
+            Self::Zh => "zh-CN",
+            Self::En => "en",
+        }
+    }
+}
+
+/// Parses a POSIX / BCP-47 locale tag (such as `zh-CN`, `zh_TW.UTF-8`, `zh-Hans-CN`, or `en-US`)
+/// into a supported [`DesktopLang`], returning `None` for neutral tags (`C`, `POSIX`, empty).
+#[must_use]
+pub fn parse_locale_tag(raw: &str) -> Option<DesktopLang> {
+    let first = raw.split(':').next().unwrap_or("").trim();
+    let without_mod = first.split('@').next().unwrap_or("");
+    let without_enc = without_mod.split('.').next().unwrap_or("").trim();
+    if without_enc.is_empty() {
+        return None;
+    }
+    let lower = without_enc.to_ascii_lowercase();
+    if matches!(lower.as_str(), "c" | "posix") {
+        return None;
+    }
+    if lower == "zh"
+        || lower.starts_with("zh-")
+        || lower.starts_with("zh_")
+        || lower.starts_with("chinese")
+    {
+        Some(DesktopLang::Zh)
+    } else {
+        Some(DesktopLang::En)
+    }
+}
+
+/// Detects the current operating system / environment UI language (`中文` for `zh*` locales,
+/// `English` otherwise).
+#[must_use]
+pub fn detect_system_language() -> DesktopLang {
+    for env_key in ["LIFTGATE_LANG", "LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
+        if let Ok(val) = std::env::var(env_key)
+            && let Some(lang) = parse_locale_tag(&val)
+        {
+            return lang;
+        }
+    }
+    sys_locale::get_locale()
+        .as_deref()
+        .and_then(parse_locale_tag)
+        .unwrap_or(DesktopLang::En)
 }
 
 /// Persistent UI preferences for `liftgate-desktop` (`~/.liftgate/desktop-ui.json`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DesktopUiPrefs {
     #[serde(default)]
-    pub theme: DesktopThemeMode,
+    pub theme: DesktopThemePref,
     #[serde(default)]
-    pub lang: DesktopLang,
+    pub lang: DesktopLangPref,
     #[serde(default)]
     pub project_dir: Option<PathBuf>,
     #[serde(flatten)]
@@ -675,5 +778,32 @@ mod tests {
         );
         assert!(!reloaded.agy_auto_update);
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn desktop_prefs_default_to_system_and_parse_locales() {
+        assert_eq!(parse_locale_tag("zh-CN"), Some(DesktopLang::Zh));
+        assert_eq!(parse_locale_tag("zh_TW.UTF-8"), Some(DesktopLang::Zh));
+        assert_eq!(parse_locale_tag("zh-Hans-CN"), Some(DesktopLang::Zh));
+        assert_eq!(parse_locale_tag("zh_CN:en_US"), Some(DesktopLang::Zh));
+        assert_eq!(parse_locale_tag("en-US"), Some(DesktopLang::En));
+        assert_eq!(parse_locale_tag("en_GB.UTF-8"), Some(DesktopLang::En));
+        assert_eq!(parse_locale_tag("C.UTF-8"), None);
+        assert_eq!(parse_locale_tag("POSIX"), None);
+
+        let empty_prefs: DesktopUiPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty_prefs.theme, DesktopThemePref::System);
+        assert_eq!(empty_prefs.lang, DesktopLangPref::System);
+        assert!(empty_prefs.theme.resolve(true).is_dark());
+        assert!(!empty_prefs.theme.resolve(false).is_dark());
+        assert_eq!(empty_prefs.lang.resolve(DesktopLang::Zh), DesktopLang::Zh);
+        assert_eq!(empty_prefs.lang.resolve(DesktopLang::En), DesktopLang::En);
+
+        let explicit: DesktopUiPrefs =
+            serde_json::from_str(r#"{"theme":"dark","lang":"en"}"#).unwrap();
+        assert_eq!(explicit.theme, DesktopThemePref::Dark);
+        assert_eq!(explicit.lang, DesktopLangPref::En);
+        assert!(explicit.theme.resolve(false).is_dark());
+        assert_eq!(explicit.lang.resolve(DesktopLang::Zh), DesktopLang::En);
     }
 }

@@ -30,14 +30,17 @@ use liftgate_core::daemon::{
 use liftgate_core::desktop::{self, DesktopAppsStatus};
 use liftgate_core::format::format_tokens;
 use liftgate_core::harness;
-use liftgate_core::state::{DesktopLang, DesktopThemeMode, DesktopUiPrefs, StatePaths};
+use liftgate_core::state::{
+    DesktopLang, DesktopLangPref, DesktopThemePref, DesktopUiPrefs, StatePaths,
+    detect_system_language,
+};
 use liftgate_core::terminal::spawn_in_system_terminal;
 use liftgate_core::upgrade::{self, UpgradeOutcome};
 use liftgate_types::telemetry::{GatewayTelemetrySnapshot, TaskProtocol};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::i18n::{NavTab, tr};
-use crate::theme::{BadgeTone, Palette, apply_staticflow_theme, pill_badge};
+use crate::i18n::{NavTab, tr, window_title};
+use crate::theme::{BadgeTone, Palette, apply_staticflow_theme, is_appearance_dark, pill_badge};
 
 /// Tool-bridge mode selector for Claude Code and Codex CLI launchers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,8 +148,11 @@ pub struct DesktopApp {
     pub(crate) rt: tokio::runtime::Handle,
     pub(crate) state_paths: StatePaths,
     pub(crate) current_exe: PathBuf,
+    pub(crate) lang_pref: DesktopLangPref,
+    pub(crate) theme_pref: DesktopThemePref,
     pub(crate) lang: DesktopLang,
     pub(crate) dark_mode: bool,
+    _appearance_sub: Subscription,
     pub(crate) active_tab: NavTab,
     pub(crate) banner: Option<StatusBanner>,
 
@@ -323,7 +329,7 @@ impl DesktopApp {
         });
         let in_turn_timeout_secs = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("900")
+                .placeholder("1800")
                 .default_value(defaults.turn_timeout_secs.to_string())
         });
 
@@ -397,12 +403,31 @@ impl DesktopApp {
         let alias_report = daemon::inspect_alias_status("lg", None).ok();
         let config_inspection = config_sync::inspect_config_sync(true, None).ok();
 
+        let resolved_lang = prefs.lang.resolve_current();
+        let sys_dark = is_appearance_dark(window.appearance());
+        let resolved_dark = prefs.theme.resolve(sys_dark).is_dark();
+        apply_staticflow_theme(resolved_dark, cx);
+
+        let appearance_sub = cx.observe_window_appearance(window, |this, window, cx| {
+            if this.theme_pref.is_system() {
+                let now_dark = is_appearance_dark(window.appearance());
+                if this.dark_mode != now_dark {
+                    this.dark_mode = now_dark;
+                    apply_staticflow_theme(now_dark, cx);
+                    cx.notify();
+                }
+            }
+        });
+
         let mut app = Self {
             rt,
             state_paths,
             current_exe,
-            lang: prefs.lang,
-            dark_mode: prefs.theme.is_dark(),
+            lang_pref: prefs.lang,
+            theme_pref: prefs.theme,
+            lang: resolved_lang,
+            dark_mode: resolved_dark,
+            _appearance_sub: appearance_sub,
             active_tab: NavTab::Overview,
             banner: None,
             busy_gateway: false,
@@ -473,6 +498,7 @@ impl DesktopApp {
             upgrade_force: false,
         };
 
+        app.sync_localized_ui(window, cx);
         app.refresh_gateway_status(Some(window), cx);
         app.action_apply_proxy(ProxyApplyMode::RefreshOnly, cx);
         app.start_background_poller(cx);
@@ -506,24 +532,117 @@ impl DesktopApp {
 
     pub(crate) fn persist_prefs(&self) {
         let mut prefs = self.state_paths.read_desktop_prefs().unwrap_or_default();
-        prefs.lang = self.lang;
-        prefs.theme = if self.dark_mode {
-            DesktopThemeMode::Dark
-        } else {
-            DesktopThemeMode::Light
-        };
+        prefs.lang = self.lang_pref;
+        prefs.theme = self.theme_pref;
         let _ = self.state_paths.write_desktop_prefs(&prefs);
     }
 
-    pub(crate) fn toggle_language(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_localized_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lang = self.lang;
+        gpui_kit::component::set_locale(lang.gpui_locale());
+        window.set_window_title(window_title(lang));
+
+        let ui_listen_ph = tr(
+            lang,
+            "可选，如 127.0.0.1:8788",
+            "optional, e.g. 127.0.0.1:8788",
+        );
+        self.in_ui_listen
+            .update(cx, |s, cx| s.set_placeholder(ui_listen_ph, window, cx));
+        let api_key_ph = tr(
+            lang,
+            "可选 Bearer / x-api-key（留空则免鉴权）",
+            "optional Bearer / x-api-key",
+        );
+        self.in_api_key
+            .update(cx, |s, cx| s.set_placeholder(api_key_ph, window, cx));
+        let task_ph = tr(
+            lang,
+            "搜索模型、会话 ID、Prompt 或工具名…",
+            "Search model, session, prompt or tool...",
+        );
+        self.in_task_filter
+            .update(cx, |s, cx| s.set_placeholder(task_ph, window, cx));
+        let dir_ph = tr(lang, "项目工作目录", "Project working directory");
+        self.in_launch_dir
+            .update(cx, |s, cx| s.set_placeholder(dir_ph, window, cx));
+        let launch_mdl_ph = tr(
+            lang,
+            "可选模型覆盖（留空则使用网关默认模型）",
+            "Optional model override (leave blank for gateway default)",
+        );
+        self.in_launch_model
+            .update(cx, |s, cx| s.set_placeholder(launch_mdl_ph, window, cx));
+        let claude_ph = tr(
+            lang,
+            "可选 Claude 参数，如 --continue 或 -p \"review diff\"",
+            "Optional claude args, e.g. --continue or -p \"review diff\"",
+        );
+        self.in_claude_extra
+            .update(cx, |s, cx| s.set_placeholder(claude_ph, window, cx));
+        let codex_ph = tr(
+            lang,
+            "可选 Codex 参数，如 resume --last 或 exec \"cargo test\"",
+            "Optional codex args, e.g. resume --last or exec \"cargo test\"",
+        );
+        self.in_codex_extra
+            .update(cx, |s, cx| s.set_placeholder(codex_ph, window, cx));
+        let fast_ph = tr(
+            lang,
+            "可选 Claude 子智能体快速模型覆盖",
+            "Optional Claude fast/subagent model override",
+        );
+        self.in_config_fast_model
+            .update(cx, |s, cx| s.set_placeholder(fast_ph, window, cx));
+        let mdl_search_ph = tr(
+            lang,
+            "按模型 ID 或展示名称筛选…",
+            "Filter by model ID or display name...",
+        );
+        self.in_model_search
+            .update(cx, |s, cx| s.set_placeholder(mdl_search_ph, window, cx));
+        let log_ph = tr(lang, "按关键词过滤日志行…", "Filter log lines...");
+        self.in_log_filter
+            .update(cx, |s, cx| s.set_placeholder(log_ph, window, cx));
+        let upg_ph = tr(
+            lang,
+            "可选版本标签（如 v0.1.8）；留空自动拉取最新正式版",
+            "Optional tag (e.g. v0.1.8); empty = latest release",
+        );
+        self.in_upgrade_version
+            .update(cx, |s, cx| s.set_placeholder(upg_ph, window, cx));
+    }
+
+    pub(crate) fn toggle_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.lang = self.lang.toggled();
+        self.lang_pref = match self.lang {
+            DesktopLang::Zh => DesktopLangPref::Zh,
+            DesktopLang::En => DesktopLangPref::En,
+        };
+        self.sync_localized_ui(window, cx);
         self.persist_prefs();
         cx.notify();
     }
 
     pub(crate) fn toggle_dark_mode(&mut self, cx: &mut Context<Self>) {
         self.dark_mode = !self.dark_mode;
+        self.theme_pref = if self.dark_mode {
+            DesktopThemePref::Dark
+        } else {
+            DesktopThemePref::Light
+        };
         apply_staticflow_theme(self.dark_mode, cx);
+        self.persist_prefs();
+        cx.notify();
+    }
+
+    pub(crate) fn reset_prefs_to_system(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.lang_pref = DesktopLangPref::System;
+        self.theme_pref = DesktopThemePref::System;
+        self.lang = detect_system_language();
+        self.dark_mode = is_appearance_dark(window.appearance());
+        apply_staticflow_theme(self.dark_mode, cx);
+        self.sync_localized_ui(window, cx);
         self.persist_prefs();
         cx.notify();
     }
@@ -685,10 +804,17 @@ impl DesktopApp {
                 })
                 .unwrap_or_else(|| "gemini-4-carbon-high".to_owned());
             let fast = config_sync::resolve_fast_model(None, &def_model, models);
+            let title_mdl = std::fs::read_to_string(self.state_paths.title_model_file())
+                .ok()
+                .and_then(|s| liftgate_types::config::ModelId::try_new(s).ok())
+                .unwrap_or_else(liftgate_types::config::ModelId::fallback_fast)
+                .as_str()
+                .to_owned();
             self.models_report = Some(ModelsReport {
                 gateway_url: report.gateway_url.clone(),
                 default_model: def_model,
                 fast_model: fast,
+                title_model: title_mdl,
                 long_context: report.long_context,
                 models: models.clone(),
             });
@@ -924,12 +1050,21 @@ impl DesktopApp {
                             app.set_banner(
                                 BadgeTone::Ok,
                                 headline,
-                                format!(
-                                    "PID {} · {} · {} models",
-                                    outcome.daemon.pid,
-                                    outcome.daemon.connect_base_url(),
-                                    outcome.live_model_count
-                                ),
+                                if app.lang.is_en() {
+                                    format!(
+                                        "PID {} · {} · {} models",
+                                        outcome.daemon.pid,
+                                        outcome.daemon.connect_base_url(),
+                                        outcome.live_model_count
+                                    )
+                                } else {
+                                    format!(
+                                        "PID {} · {} · {} 个模型",
+                                        outcome.daemon.pid,
+                                        outcome.daemon.connect_base_url(),
+                                        outcome.live_model_count
+                                    )
+                                },
                             );
                         }
                         Err(err) => {
@@ -977,7 +1112,13 @@ impl DesktopApp {
                     match stop_res {
                         Ok(outcome) => {
                             let detail = match outcome.stopped_pid {
-                                Some(pid) => format!("Stopped PID {pid}"),
+                                Some(pid) => {
+                                    if app.lang.is_en() {
+                                        format!("Stopped PID {pid}")
+                                    } else {
+                                        format!("已终止守护进程 PID {pid}")
+                                    }
+                                }
                                 None => tr(
                                     app.lang,
                                     "当前没有托管中的网关进程",
@@ -1138,6 +1279,42 @@ impl DesktopApp {
         .detach();
     }
 
+    pub(crate) fn action_set_title_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        let clean = model_id.trim().to_owned();
+        if clean.is_empty() {
+            return;
+        }
+        match daemon::set_title_model(&self.state_paths, &clean) {
+            Ok(validated) => {
+                let next_id = validated.as_str().to_owned();
+                if let Some(rep) = &mut self.models_report {
+                    rep.title_model.clone_from(&next_id);
+                }
+                self.set_banner(
+                    BadgeTone::Ok,
+                    tr(
+                        self.lang,
+                        "会话标题生成模型已更新（实时生效）",
+                        "Session Title Model Updated",
+                    ),
+                    next_id,
+                );
+            }
+            Err(err) => {
+                self.set_banner(
+                    BadgeTone::Err,
+                    tr(
+                        self.lang,
+                        "设置会话标题模型失败",
+                        "Failed to Set Title Model",
+                    ),
+                    err.to_string(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn action_evict_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(report) = &self.gateway_report else {
             return;
@@ -1288,7 +1465,11 @@ impl DesktopApp {
                         Ok(cmd_line) => {
                             app.last_launcher_output = format!("$ {cmd_line}");
                             if preview_only {
-                                app.copy_text("claude command", cmd_line, cx);
+                                app.copy_text(
+                                    tr(app.lang, "Claude 启动命令", "Claude command"),
+                                    cmd_line,
+                                    cx,
+                                );
                             } else {
                                 app.set_banner(
                                     BadgeTone::Ok,
@@ -1365,7 +1546,11 @@ impl DesktopApp {
                         Ok(cmd_line) => {
                             app.last_launcher_output = format!("$ {cmd_line}");
                             if preview_only {
-                                app.copy_text("codex command", cmd_line, cx);
+                                app.copy_text(
+                                    tr(app.lang, "Codex 启动命令", "Codex command"),
+                                    cmd_line,
+                                    cx,
+                                );
                             } else {
                                 app.set_banner(
                                     BadgeTone::Ok,
@@ -1646,7 +1831,11 @@ impl DesktopApp {
                             app.set_banner(
                                 BadgeTone::Ok,
                                 title,
-                                format!("{} target(s) processed", outcome.results.len()),
+                                if app.lang.is_en() {
+                                    format!("{} target(s) processed", outcome.results.len())
+                                } else {
+                                    format!("已处理 {} 项配置目标", outcome.results.len())
+                                },
                             );
                         }
                         Err(err) => {
@@ -1709,7 +1898,11 @@ impl DesktopApp {
                                 app.set_banner(
                                     BadgeTone::Ok,
                                     tr(app.lang, "模型目录已刷新", "Models Catalog Refreshed"),
-                                    format!("{count} models available"),
+                                    if app.lang.is_en() {
+                                        format!("{count} models available")
+                                    } else {
+                                        format!("共发现 {count} 个可用模型")
+                                    },
                                 );
                                 app.refresh_gateway_status(None, cx);
                             }
@@ -1775,7 +1968,11 @@ impl DesktopApp {
                                         "AGY 与认证状态已校验",
                                         "AGY & Auth Status Verified",
                                     ),
-                                    "Antigravity probe completed",
+                                    tr(
+                                        app.lang,
+                                        "已完成 Antigravity 在线状态探测",
+                                        "Antigravity probe completed",
+                                    ),
                                 );
                             }
                         }
@@ -2166,18 +2363,34 @@ impl DesktopApp {
                         Ok(outcome) => {
                             if mode != ProxyApplyMode::RefreshOnly {
                                 let summary = match &outcome.connectivity_probe {
-                                    Some(p) if p.ok => format!(
-                                        "Latency {}ms · latest agy {}",
-                                        p.latency_ms,
-                                        p.latest_agy_version.as_deref().unwrap_or("unknown")
-                                    ),
-                                    Some(p) => format!(
-                                        "Probe failed ({}ms): {}",
-                                        p.latency_ms,
-                                        p.error.as_deref().unwrap_or("error")
-                                    ),
+                                    Some(p) if p.ok => {
+                                        let latest_v =
+                                            p.latest_agy_version.as_deref().unwrap_or("unknown");
+                                        if app.lang.is_en() {
+                                            format!(
+                                                "Latency {}ms · latest agy {latest_v}",
+                                                p.latency_ms
+                                            )
+                                        } else {
+                                            format!(
+                                                "连通延迟 {}ms · 最新 agy {latest_v}",
+                                                p.latency_ms
+                                            )
+                                        }
+                                    }
+                                    Some(p) => {
+                                        let err_s = p.error.as_deref().unwrap_or("error");
+                                        if app.lang.is_en() {
+                                            format!("Probe failed ({}ms): {err_s}", p.latency_ms)
+                                        } else {
+                                            format!("连通性探测失败（{}ms）：{err_s}", p.latency_ms)
+                                        }
+                                    }
                                     None => outcome.effective_proxy.as_ref().map_or_else(
-                                        || "direct (no proxy)".to_owned(),
+                                        || {
+                                            tr(app.lang, "直连（未启用代理）", "direct (no proxy)")
+                                                .to_owned()
+                                        },
                                         |p| p.redacted_display().into_owned(),
                                     ),
                                 };
@@ -2439,10 +2652,34 @@ impl DesktopApp {
         };
 
         let sse_badge = if self.sse_connected {
-            pill_badge(p, BadgeTone::Primary, "SSE LIVE")
+            pill_badge(p, BadgeTone::Primary, tr(lang, "SSE 实时流", "SSE LIVE"))
         } else {
-            pill_badge(p, BadgeTone::Neutral, "SSE IDLE")
+            pill_badge(p, BadgeTone::Neutral, tr(lang, "SSE 待命", "SSE IDLE"))
         };
+
+        let lang_btn_label = if self.lang_pref.is_system() {
+            match lang {
+                DesktopLang::Zh => "中文 · 自动",
+                DesktopLang::En => "EN · Auto",
+            }
+        } else {
+            match lang {
+                DesktopLang::Zh => "中文 / EN",
+                DesktopLang::En => "EN / 中文",
+            }
+        };
+        let theme_btn_label = if self.theme_pref.is_system() {
+            if self.dark_mode {
+                tr(lang, "深色 · 自动", "Dark · Auto")
+            } else {
+                tr(lang, "浅色 · 自动", "Light · Auto")
+            }
+        } else if self.dark_mode {
+            tr(lang, "深色墨韵", "Warm Dark")
+        } else {
+            tr(lang, "浅色暖纸", "Warm Light")
+        };
+        let has_manual_override = !self.lang_pref.is_system() || !self.theme_pref.is_system();
 
         let listen_url = self.gateway_report.as_ref().map_or_else(
             || "http://127.0.0.1:8787".to_owned(),
@@ -2522,7 +2759,11 @@ impl DesktopApp {
                             .icon(IconName::Copy)
                             .label(listen_url)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_text("Gateway URL", url_copy.clone(), cx);
+                                this.copy_text(
+                                    tr(this.lang, "网关地址", "Gateway URL"),
+                                    url_copy.clone(),
+                                    cx,
+                                );
                             }))
                     })
                     .child(
@@ -2530,12 +2771,9 @@ impl DesktopApp {
                             .small()
                             .outline()
                             .icon(IconName::Globe)
-                            .label(match lang {
-                                DesktopLang::En => "EN / 中文",
-                                DesktopLang::Zh | DesktopLang::Unknown => "中文 / EN",
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_language(cx);
+                            .label(lang_btn_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_language(window, cx);
                             })),
                     )
                     .child(
@@ -2547,15 +2785,21 @@ impl DesktopApp {
                             } else {
                                 IconName::Moon
                             })
-                            .label(if self.dark_mode {
-                                tr(lang, "浅色暖纸", "Warm Light")
-                            } else {
-                                tr(lang, "深色墨韵", "Warm Dark")
-                            })
+                            .label(theme_btn_label)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_dark_mode(cx);
                             })),
-                    ),
+                    )
+                    .children(has_manual_override.then(|| {
+                        Button::new("hdr-follow-os")
+                            .small()
+                            .ghost()
+                            .icon(IconName::RefreshCw)
+                            .label(tr(lang, "跟随系统", "Follow OS"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_prefs_to_system(window, cx);
+                            }))
+                    })),
             )
     }
 
@@ -2597,7 +2841,7 @@ impl DesktopApp {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.faint)
-                            .child(tr(lang, "工作台导航 · NAVIGATION", "NAVIGATION")),
+                            .child(tr(lang, "工作台导航", "NAVIGATION")),
                     )
                     .children(NavTab::ALL.into_iter().map(|tab| {
                         let selected = self.active_tab == tab;
@@ -2668,7 +2912,7 @@ impl DesktopApp {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.primary)
-                            .child("LIVE PULSE"),
+                            .child(tr(lang, "实时脉搏", "LIVE PULSE")),
                     )
                     .child(
                         div()
@@ -2793,7 +3037,7 @@ impl Render for DesktopApp {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.primary)
-                            .child(tab.eyebrow()),
+                            .child(tab.eyebrow(lang)),
                     )
                     .child(
                         div()

@@ -28,7 +28,7 @@ impl DesktopApp {
                 .items_start()
                 .child(section_header(
                     p,
-                    "TELEMETRY OFFLINE",
+                    tr(lang, "遥测离线", "TELEMETRY OFFLINE"),
                     tr(lang, "实时遥测尚未连接", "Live Telemetry Not Connected"),
                     Some(tr(
                         lang,
@@ -70,34 +70,65 @@ impl DesktopApp {
                         .items_center()
                         .gap_2()
                         .child(if self.sse_connected {
-                            pill_badge(p, BadgeTone::Ok, "SSE STREAM CONNECTED")
+                            pill_badge(
+                                p,
+                                BadgeTone::Ok,
+                                tr(lang, "SSE 实时流已连接", "SSE STREAM CONNECTED"),
+                            )
                         } else {
-                            pill_badge(p, BadgeTone::Warn, "SNAPSHOT POLLING")
+                            pill_badge(
+                                p,
+                                BadgeTone::Warn,
+                                tr(lang, "快照轮询中", "SNAPSHOT POLLING"),
+                            )
                         })
                         .child(if acp.connected {
-                            pill_badge(p, BadgeTone::Ok, "ACP CONNECTED")
+                            pill_badge(p, BadgeTone::Ok, tr(lang, "ACP 已连接", "ACP CONNECTED"))
                         } else {
-                            pill_badge(p, BadgeTone::Neutral, "ACP IDLE / LAZY")
+                            pill_badge(
+                                p,
+                                BadgeTone::Neutral,
+                                tr(lang, "ACP 空闲按需加载", "ACP IDLE / LAZY"),
+                            )
                         })
                         .child(pill_badge(
                             p,
                             BadgeTone::Brand,
-                            format!("Default: {}", acp.default_model),
+                            if lang.is_en() {
+                                format!("Default: {}", acp.default_model)
+                            } else {
+                                format!("默认模型: {}", acp.default_model)
+                            },
                         ))
                         .child(pill_badge(
                             p,
                             BadgeTone::Neutral,
-                            format!("Mode: {}", acp.acp_mode),
+                            if lang.is_en() {
+                                format!("Mode: {}", acp.acp_mode)
+                            } else {
+                                format!("模式: {}", acp.acp_mode)
+                            },
                         )),
                 )
-                .child(div().text_xs().text_color(p.muted).child(format!(
-                    "JSON-RPC req {} · resp {} · notif {} · pending {} · active streams {}",
-                    acp.rpc_requests_sent,
-                    acp.rpc_responses_received,
-                    acp.rpc_notifications_received,
-                    acp.rpc_pending_in_flight,
-                    acp.active_prompt_streams
-                ))),
+                .child(div().text_xs().text_color(p.muted).child(if lang.is_en() {
+                    format!(
+                        "JSON-RPC req {} · resp {} · notif {} · pending {} · active streams {}",
+                        acp.rpc_requests_sent,
+                        acp.rpc_responses_received,
+                        acp.rpc_notifications_received,
+                        acp.rpc_pending_in_flight,
+                        acp.active_prompt_streams
+                    )
+                } else {
+                    format!(
+                        "JSON-RPC 请求 {} · 响应 {} · 通知 {} · 在途 {} · 活跃流 {}",
+                        acp.rpc_requests_sent,
+                        acp.rpc_responses_received,
+                        acp.rpc_notifications_received,
+                        acp.rpc_pending_in_flight,
+                        acp.active_prompt_streams
+                    )
+                })),
         );
 
         // --- Token Breakdown Row ---
@@ -111,16 +142,27 @@ impl DesktopApp {
                 p,
                 tr(lang, "输入 Tokens", "INPUT TOKENS"),
                 format_tokens(tp.total_input_tokens),
-                format!("Completed turns: {}", tp.completed_requests),
+                if lang.is_en() {
+                    format!("Completed turns: {}", tp.completed_requests)
+                } else {
+                    format!("已完成轮次: {}", tp.completed_requests)
+                },
             ))
             .child(kpi_card(
                 p,
                 tr(lang, "输出 Tokens", "OUTPUT TOKENS"),
                 format_tokens(tp.total_output_tokens),
-                format!(
-                    "Cancelled: {} · Failed: {}",
-                    tp.cancelled_requests, tp.failed_requests
-                ),
+                if lang.is_en() {
+                    format!(
+                        "Cancelled: {} · Failed: {}",
+                        tp.cancelled_requests, tp.failed_requests
+                    )
+                } else {
+                    format!(
+                        "已取消: {} · 失败: {}",
+                        tp.cancelled_requests, tp.failed_requests
+                    )
+                },
             ))
             .child(kpi_card(
                 p,
@@ -136,7 +178,11 @@ impl DesktopApp {
                 p,
                 tr(lang, "深度思考 Tokens", "THOUGHT TOKENS"),
                 format_tokens(tp.total_thought_tokens),
-                format!("Total: {}", format_tokens(total_tok)),
+                if lang.is_en() {
+                    format!("Total: {}", format_tokens(total_tok))
+                } else {
+                    format!("合计: {}", format_tokens(total_tok))
+                },
             ));
 
         // --- Warm Session Pool Card ---
@@ -151,7 +197,7 @@ impl DesktopApp {
                     .gap_2()
                     .child(section_header(
                         p,
-                        "BOUNDED LRU SESSION POOL",
+                        tr(lang, "有界 LRU 热会话池", "BOUNDED LRU SESSION POOL"),
                         tr(lang, "驻留热会话池管理", "Warm ACP Session Pool"),
                         None,
                     ))
@@ -163,22 +209,39 @@ impl DesktopApp {
                             .child(pill_badge(
                                 p,
                                 BadgeTone::Ok,
-                                format!("Active {}", sp.active_leased_sessions),
+                                if lang.is_en() {
+                                    format!("Active {}", sp.active_leased_sessions)
+                                } else {
+                                    format!("运行中 {}", sp.active_leased_sessions)
+                                },
                             ))
                             .child(pill_badge(
                                 p,
                                 BadgeTone::Info,
-                                format!("Idle {} / {}", sp.idle_cached_sessions, sp.max_idle_sessions),
+                                if lang.is_en() {
+                                    format!("Idle {} / {}", sp.idle_cached_sessions, sp.max_idle_sessions)
+                                } else {
+                                    format!("空闲 {} / {}", sp.idle_cached_sessions, sp.max_idle_sessions)
+                                },
                             ))
                             .child(pill_badge(
                                 p,
                                 BadgeTone::Neutral,
-                                format!(
-                                    "Created {} · Reused {} · Evicted {}",
-                                    sp.total_sessions_created,
-                                    sp.total_sessions_reused,
-                                    sp.total_sessions_closed_or_evicted
-                                ),
+                                if lang.is_en() {
+                                    format!(
+                                        "Created {} · Reused {} · Evicted {}",
+                                        sp.total_sessions_created,
+                                        sp.total_sessions_reused,
+                                        sp.total_sessions_closed_or_evicted
+                                    )
+                                } else {
+                                    format!(
+                                        "新建 {} · 复用 {} · 驱逐 {}",
+                                        sp.total_sessions_created,
+                                        sp.total_sessions_reused,
+                                        sp.total_sessions_closed_or_evicted
+                                    )
+                                },
                             )),
                     ),
             )
@@ -222,9 +285,9 @@ impl DesktopApp {
                                     .items_center()
                                     .gap_2()
                                     .child(if is_running {
-                                        pill_badge(p, BadgeTone::Brand, "RUNNING")
+                                        pill_badge(p, BadgeTone::Brand, tr(lang, "执行中", "RUNNING"))
                                     } else {
-                                        pill_badge(p, BadgeTone::Ok, "IDLE · WARM")
+                                        pill_badge(p, BadgeTone::Ok, tr(lang, "空闲 · 热驻留", "IDLE · WARM"))
                                     })
                                     .child(
                                         div()
@@ -243,12 +306,21 @@ impl DesktopApp {
                                         div()
                                             .text_xs()
                                             .text_color(p.text_2)
-                                            .child(format!(
-                                                "{} turns · {} msgs · active {}",
-                                                sess.turn_count,
-                                                sess.message_count,
-                                                format_relative_ms(sess.last_active_unix_ms, now_ms)
-                                            )),
+                                            .child(if lang.is_en() {
+                                                format!(
+                                                    "{} turns · {} msgs · active {}",
+                                                    sess.turn_count,
+                                                    sess.message_count,
+                                                    format_relative_ms(sess.last_active_unix_ms, now_ms)
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{} 轮 · {} 条消息 · 活跃于 {}",
+                                                    sess.turn_count,
+                                                    sess.message_count,
+                                                    format_relative_ms(sess.last_active_unix_ms, now_ms)
+                                                )
+                                            }),
                                     ),
                             )
                             .child(
@@ -263,7 +335,7 @@ impl DesktopApp {
                                             .icon(IconName::Copy)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.copy_text(
-                                                    "Session ID",
+                                                    tr(this.lang, "会话 ID", "Session ID"),
                                                     sid_copy.clone(),
                                                     cx,
                                                 );
@@ -372,7 +444,7 @@ impl DesktopApp {
                     .map(|(idx, (task, is_live))| {
                         let is_sel = selected_task.is_some_and(|s| s.task_id == task.task_id);
                         let tid = task.task_id.clone();
-                        let (phase_lbl, phase_tone) = phase_badge_meta(task.phase);
+                        let (phase_lbl, phase_tone) = phase_badge_meta(task.phase, lang);
                         let row_bg = if is_sel {
                             p.primary_soft
                         } else if *is_live {
@@ -410,10 +482,13 @@ impl DesktopApp {
                                             .items_center()
                                             .gap_1p5()
                                             .child(pill_badge(p, phase_tone, phase_lbl))
-                                            .children(
-                                                task.session_reused
-                                                    .then(|| pill_badge(p, BadgeTone::Ok, "WARM")),
-                                            ),
+                                            .children(task.session_reused.then(|| {
+                                                pill_badge(
+                                                    p,
+                                                    BadgeTone::Ok,
+                                                    tr(lang, "热复用", "WARM"),
+                                                )
+                                            })),
                                     )
                                     .child(
                                         div()
@@ -429,12 +504,11 @@ impl DesktopApp {
                                     .text_color(p.text)
                                     .child(task.resolved_model.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(p.text_2)
-                                    .child(truncate_preview(&task.prompt_preview, 68)),
-                            )
+                            .child(div().text_xs().text_color(p.text_2).child(truncate_preview(
+                                &task.prompt_preview,
+                                68,
+                                lang,
+                            )))
                             .into_any_element()
                     })
                     .collect::<Vec<AnyElement>>()
@@ -442,7 +516,7 @@ impl DesktopApp {
             .overflow_y_scrollbar();
 
         let detail_pane = if let Some(t) = selected_task {
-            let (phase_lbl, phase_tone) = phase_badge_meta(t.phase);
+            let (phase_lbl, phase_tone) = phase_badge_meta(t.phase, lang);
             let proto_name = match t.protocol {
                 TaskProtocol::OpenaiResponses => "OpenAI /v1/responses",
                 TaskProtocol::AnthropicMessages => "Anthropic /v1/messages",
@@ -483,9 +557,17 @@ impl DesktopApp {
                                 .child(pill_badge(p, phase_tone, phase_lbl))
                                 .child(pill_badge(p, BadgeTone::Info, proto_name))
                                 .child(if t.session_reused {
-                                    pill_badge(p, BadgeTone::Ok, "WARM SESSION REUSED")
+                                    pill_badge(
+                                        p,
+                                        BadgeTone::Ok,
+                                        tr(lang, "热会话命中复用", "WARM SESSION REUSED"),
+                                    )
                                 } else {
-                                    pill_badge(p, BadgeTone::Neutral, "COLD NEW SESSION")
+                                    pill_badge(
+                                        p,
+                                        BadgeTone::Neutral,
+                                        tr(lang, "新建冷启动会话", "COLD NEW SESSION"),
+                                    )
                                 }),
                         )
                         .child(
@@ -495,7 +577,11 @@ impl DesktopApp {
                                 .icon(IconName::Copy)
                                 .label(tr(lang, "复制 Task ID", "Copy Task ID"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_text("Task ID", tid_copy.clone(), cx);
+                                    this.copy_text(
+                                        tr(this.lang, "任务 ID", "Task ID"),
+                                        tid_copy.clone(),
+                                        cx,
+                                    );
                                 })),
                         ),
                 )
@@ -509,7 +595,7 @@ impl DesktopApp {
                         .border_color(p.err.opacity(0.45))
                         .text_xs()
                         .text_color(p.err)
-                        .child(format!("Error: {err_msg}"))
+                        .child(format!("{}: {err_msg}", tr(lang, "错误", "Error")))
                 }))
                 .child(
                     div()
@@ -528,7 +614,7 @@ impl DesktopApp {
                         ))
                         .child(kv_row(
                             p,
-                            "Session ID",
+                            tr(lang, "会话 ID", "Session ID"),
                             t.session_id.clone().unwrap_or_else(|| "—".to_owned()),
                         ))
                         .child(kv_row(
@@ -559,7 +645,11 @@ impl DesktopApp {
                                 t.native_web_fetches
                             ),
                         ))
-                        .child(kv_row(p, "Token Usage", usage_line)),
+                        .child(kv_row(
+                            p,
+                            tr(lang, "Token 用量明细", "Token Usage"),
+                            usage_line,
+                        )),
                 )
                 .child(
                     div()
@@ -581,7 +671,11 @@ impl DesktopApp {
                                 .icon(IconName::Copy)
                                 .label(tr(lang, "复制", "Copy"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_text("Prompt Preview", prompt_copy.clone(), cx);
+                                    this.copy_text(
+                                        tr(this.lang, "Prompt 预览", "Prompt Preview"),
+                                        prompt_copy.clone(),
+                                        cx,
+                                    );
                                 })),
                         ),
                 )
@@ -590,7 +684,7 @@ impl DesktopApp {
                     "task-prompt-box",
                     "prompt_preview",
                     if t.prompt_preview.is_empty() {
-                        "(empty)"
+                        tr(lang, "（空）", "(empty)")
                     } else {
                         &t.prompt_preview
                     },
@@ -607,12 +701,17 @@ impl DesktopApp {
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.text_2)
-                                .child(format!(
-                                    "{} (thought {} chars · output {} chars)",
-                                    tr(lang, "输出响应预览", "Output Preview"),
-                                    t.thought_chars,
-                                    t.output_chars
-                                )),
+                                .child(if lang.is_en() {
+                                    format!(
+                                        "Output Preview (thought {} chars · output {} chars)",
+                                        t.thought_chars, t.output_chars
+                                    )
+                                } else {
+                                    format!(
+                                        "输出响应预览（思考 {} 字符 · 正文 {} 字符）",
+                                        t.thought_chars, t.output_chars
+                                    )
+                                }),
                         )
                         .child(
                             Button::new("copy-out-prev")
@@ -621,7 +720,11 @@ impl DesktopApp {
                                 .icon(IconName::Copy)
                                 .label(tr(lang, "复制", "Copy"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_text("Output Preview", out_copy.clone(), cx);
+                                    this.copy_text(
+                                        tr(this.lang, "输出响应预览", "Output Preview"),
+                                        out_copy.clone(),
+                                        cx,
+                                    );
                                 })),
                         ),
                 )
@@ -630,7 +733,7 @@ impl DesktopApp {
                     "task-output-box",
                     "output_preview",
                     if t.output_preview.is_empty() {
-                        "(streaming or empty)"
+                        tr(lang, "（流式生成中或为空）", "(streaming or empty)")
                     } else {
                         &t.output_preview
                     },
@@ -654,7 +757,11 @@ impl DesktopApp {
         let inspector_card = editorial_card(p)
             .child(section_header(
                 p,
-                "LIVE & HISTORICAL TURN INSPECTOR",
+                tr(
+                    lang,
+                    "实时与历史请求检视器",
+                    "LIVE & HISTORICAL TURN INSPECTOR",
+                ),
                 tr(
                     lang,
                     "API 请求追踪与深度检视",
@@ -686,17 +793,20 @@ impl DesktopApp {
     }
 }
 
-const fn phase_badge_meta(phase: TaskPhase) -> (&'static str, BadgeTone) {
+const fn phase_badge_meta(
+    phase: TaskPhase,
+    lang: liftgate_core::state::DesktopLang,
+) -> (&'static str, BadgeTone) {
     match phase {
-        TaskPhase::InitializingSession => ("INIT SESSION", BadgeTone::Info),
-        TaskPhase::Thinking => ("THINKING", BadgeTone::Warn),
-        TaskPhase::SearchingWeb => ("WEB SEARCH", BadgeTone::Brand),
-        TaskPhase::FetchingWeb => ("WEB FETCH", BadgeTone::Brand),
-        TaskPhase::StreamingText => ("STREAMING", BadgeTone::Brand),
-        TaskPhase::CallingClientTool => ("CLIENT TOOL", BadgeTone::Info),
-        TaskPhase::Completed => ("COMPLETED", BadgeTone::Ok),
-        TaskPhase::Failed => ("FAILED", BadgeTone::Err),
-        TaskPhase::Cancelled => ("CANCELLED", BadgeTone::Neutral),
+        TaskPhase::InitializingSession => (tr(lang, "初始化会话", "INIT SESSION"), BadgeTone::Info),
+        TaskPhase::Thinking => (tr(lang, "深度思考", "THINKING"), BadgeTone::Warn),
+        TaskPhase::SearchingWeb => (tr(lang, "联网搜索", "WEB SEARCH"), BadgeTone::Brand),
+        TaskPhase::FetchingWeb => (tr(lang, "网页抓取", "WEB FETCH"), BadgeTone::Brand),
+        TaskPhase::StreamingText => (tr(lang, "流式输出", "STREAMING"), BadgeTone::Brand),
+        TaskPhase::CallingClientTool => (tr(lang, "客户端工具", "CLIENT TOOL"), BadgeTone::Info),
+        TaskPhase::Completed => (tr(lang, "已完成", "COMPLETED"), BadgeTone::Ok),
+        TaskPhase::Failed => (tr(lang, "失败", "FAILED"), BadgeTone::Err),
+        TaskPhase::Cancelled => (tr(lang, "已取消", "CANCELLED"), BadgeTone::Neutral),
     }
 }
 
@@ -715,10 +825,14 @@ fn task_matches_query(task: &TaskSnapshot, query: &str) -> bool {
         || task.output_preview.to_ascii_lowercase().contains(query)
 }
 
-fn truncate_preview(text: &str, max_chars: usize) -> String {
+fn truncate_preview(
+    text: &str,
+    max_chars: usize,
+    lang: liftgate_core::state::DesktopLang,
+) -> String {
     let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if single_line.is_empty() {
-        return "(empty prompt)".to_owned();
+        return tr(lang, "（空 Prompt）", "(empty prompt)").to_owned();
     }
     let mut out = String::new();
     for (idx, ch) in single_line.chars().enumerate() {

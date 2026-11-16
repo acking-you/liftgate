@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use gpui_kit::*;
 use liftgate_core::{
     agy_manager,
-    cli::{DesktopWatchArgs, ServeArgs, clap_styles},
+    cli::{DesktopMsixLaunchArgs, DesktopWatchArgs, ServeArgs, clap_styles},
     desktop, serve,
     state::StatePaths,
     upgrade,
@@ -48,6 +48,10 @@ enum DesktopCommand {
     /// Internal detached rollback watcher for Codex App / Claude Desktop sessions.
     #[command(name = "__desktop-watch", hide = true)]
     InternalDesktopWatch(DesktopWatchArgs),
+
+    /// Internal Windows MSIX in-container launcher that preserves scoped environment variables.
+    #[command(name = "__desktop-msix-launch", hide = true)]
+    InternalDesktopMsixLaunch(DesktopMsixLaunchArgs),
 }
 
 fn main() -> ExitCode {
@@ -81,8 +85,21 @@ fn main() -> ExitCode {
         }
     };
     agy_manager::sweep_stale_agy_backups(&state_paths);
-    if !matches!(cli.command, Some(DesktopCommand::InternalDesktopWatch(_))) {
+    if !matches!(
+        cli.command,
+        Some(
+            DesktopCommand::InternalDesktopWatch(_) | DesktopCommand::InternalDesktopMsixLaunch(_)
+        )
+    ) {
         desktop::sweep_stale_desktop_sessions(&state_paths);
+    }
+
+    if let Some(DesktopCommand::InternalDesktopMsixLaunch(args)) = cli.command {
+        if let Err(err) = desktop::run_desktop_msix_launch(args) {
+            tracing::error!(error = %err, "desktop MSIX launcher exited with error");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -114,27 +131,31 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        Some(DesktopCommand::InternalDesktopMsixLaunch(_)) => {
+            return ExitCode::SUCCESS;
+        }
         None => {}
     }
 
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("liftgate-desktop"));
     let prefs = state_paths.read_desktop_prefs().unwrap_or_default();
-    let init_dark = prefs.theme.is_dark();
+    let init_lang = prefs.lang.resolve_current();
     let rt_handle = runtime.handle().clone();
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            gpui_kit::component::set_locale(init_lang.gpui_locale());
+            let sys_dark = theme::is_appearance_dark(cx.window_appearance());
+            let init_dark = prefs.theme.resolve(sys_dark).is_dark();
             theme::apply_staticflow_theme(init_dark, cx);
 
             let bounds = Bounds::centered(None, size(px(1320.0), px(860.0)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from(
-                        "Liftgate · Antigravity Desktop Control Center",
-                    )),
+                    title: Some(SharedString::from(i18n::window_title(init_lang))),
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(1020.0), px(680.0))),

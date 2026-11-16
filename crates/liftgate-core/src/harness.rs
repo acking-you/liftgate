@@ -511,6 +511,10 @@ async fn build_codex_invocation(
         &mut full_args,
         "model_providers.agy.wire_api='responses'".to_owned(),
     );
+    push_cfg(
+        &mut full_args,
+        "model_providers.agy.requires_openai_auth=false".to_owned(),
+    );
     if !has_explicit_codex_config_key(&args.passthrough_args, CODEX_STREAM_IDLE_TIMEOUT_KEY) {
         push_cfg(
             &mut full_args,

@@ -21,7 +21,7 @@ impl DesktopApp {
         let scope_card = editorial_card(p)
             .child(section_header(
                 p,
-                "SESSION WORKSPACE & OVERRIDES",
+                tr(lang, "会话工作区与覆盖参数", "SESSION WORKSPACE & OVERRIDES"),
                 tr(lang, "启动工作目录与模型覆盖", "Target Workspace & Model Override"),
                 Some(tr(
                     lang,
@@ -99,7 +99,11 @@ impl DesktopApp {
                     .justify_between()
                     .child(section_header(
                         p,
-                        "TERMINAL HARNESS · ANTHROPIC",
+                        tr(
+                            lang,
+                            "终端客户端 · ANTHROPIC 协议",
+                            "TERMINAL HARNESS · ANTHROPIC",
+                        ),
                         "Claude Code CLI (`lg claude`)",
                         Some(tr(
                             lang,
@@ -167,7 +171,11 @@ impl DesktopApp {
                     .justify_between()
                     .child(section_header(
                         p,
-                        "TERMINAL HARNESS · OPENAI RESPONSES",
+                        tr(
+                            lang,
+                            "终端客户端 · OPENAI RESPONSES",
+                            "TERMINAL HARNESS · OPENAI RESPONSES",
+                        ),
                         "Codex CLI (`lg codex`)",
                         Some(tr(
                             lang,
@@ -241,7 +249,7 @@ impl DesktopApp {
                     .gap_3()
                     .child(section_header(
                         p,
-                        "ISOLATED DESKTOP GUI LAUNCHERS",
+                        tr(lang, "隔离桌面客户端启动器", "ISOLATED DESKTOP GUI LAUNCHERS"),
                         tr(lang, "桌面客户端无痕接管（退出自动回滚）", "Desktop GUI Launchers (Auto-Rollback)"),
                         Some(tr(
                             lang,
@@ -261,7 +269,11 @@ impl DesktopApp {
                                 } else {
                                     BadgeTone::Neutral
                                 },
-                                format!("Active Watchers: {journals}"),
+                                if lang.is_en() {
+                                    format!("Active Watchers: {journals}")
+                                } else {
+                                    format!("活跃回滚守护: {journals}")
+                                },
                             ))
                             .child(
                                 Switch::new("ln-sw-restart-app")
@@ -323,13 +335,15 @@ impl DesktopApp {
                                                 BadgeTone::Brand
                                             },
                                             if codex_app_info.running_pids.is_empty() {
-                                                "INSTALLED".to_owned()
-                                            } else {
+                                                tr(lang, "已安装", "INSTALLED").to_owned()
+                                            } else if lang.is_en() {
                                                 format!("RUNNING ({} PID)", codex_app_info.running_pids.len())
+                                            } else {
+                                                format!("运行中 ({} PID)", codex_app_info.running_pids.len())
                                             },
                                         )
                                     } else {
-                                        pill_badge(p, BadgeTone::Neutral, "NOT DETECTED")
+                                        pill_badge(p, BadgeTone::Neutral, tr(lang, "未检测到", "NOT DETECTED"))
                                     }),
                             )
                             .child(
@@ -396,13 +410,15 @@ impl DesktopApp {
                                                 BadgeTone::Brand
                                             },
                                             if claude_app_info.running_pids.is_empty() {
-                                                "INSTALLED".to_owned()
-                                            } else {
+                                                tr(lang, "已安装", "INSTALLED").to_owned()
+                                            } else if lang.is_en() {
                                                 format!("RUNNING ({} PID)", claude_app_info.running_pids.len())
+                                            } else {
+                                                format!("运行中 ({} PID)", claude_app_info.running_pids.len())
                                             },
                                         )
                                     } else {
-                                        pill_badge(p, BadgeTone::Neutral, "NOT DETECTED")
+                                        pill_badge(p, BadgeTone::Neutral, tr(lang, "未检测到", "NOT DETECTED"))
                                     }),
                             )
                             .child(
@@ -455,7 +471,7 @@ impl DesktopApp {
         let config_card = editorial_card(p)
             .child(section_header(
                 p,
-                "PERSISTENT HARNESS CONFIG SYNC",
+                tr(lang, "持久化配置同步", "PERSISTENT HARNESS CONFIG SYNC"),
                 tr(lang, "持久化配置文件同步 (`lg config`)", "Persistent Config Sync (`lg config`)"),
                 Some(tr(
                     lang,
@@ -556,31 +572,31 @@ impl DesktopApp {
                     .flex_col()
                     .child(kv_row(
                         p,
-                        "Claude Settings",
+                        tr(lang, "Claude 配置文件", "Claude Settings"),
                         format!(
                             "{} [{}]",
                             ci.claude_path.display(),
                             if ci.claude_managed {
-                                "MANAGED BY LIFTGATE"
+                                tr(lang, "由 Liftgate 托管", "MANAGED BY LIFTGATE")
                             } else if ci.claude_exists {
-                                "EXISTING USER FILE"
+                                tr(lang, "用户已有文件", "EXISTING USER FILE")
                             } else {
-                                "NOT CREATED"
+                                tr(lang, "尚未创建", "NOT CREATED")
                             }
                         ),
                     ))
                     .child(kv_row(
                         p,
-                        "Codex Config",
+                        tr(lang, "Codex 配置文件", "Codex Config"),
                         format!(
                             "{} [{}]",
                             ci.codex_path.display(),
                             if ci.codex_managed {
-                                "MANAGED BY LIFTGATE"
+                                tr(lang, "由 Liftgate 托管", "MANAGED BY LIFTGATE")
                             } else if ci.codex_exists {
-                                "EXISTING USER FILE"
+                                tr(lang, "用户已有文件", "EXISTING USER FILE")
                             } else {
-                                "NOT CREATED"
+                                tr(lang, "尚未创建", "NOT CREATED")
                             }
                         ),
                     ))
@@ -630,7 +646,11 @@ impl DesktopApp {
                 sf_terminal_box(
                     p,
                     "config-sync-preview-box",
-                    "lg config preview / summary",
+                    tr(
+                        lang,
+                        "lg config 配置预览 / 变更摘要",
+                        "lg config preview / summary",
+                    ),
                     &self.config_preview_output,
                     px(220.0),
                 )
@@ -679,14 +699,18 @@ impl DesktopApp {
                                     .icon(IconName::Copy)
                                     .label(tr(lang, "复制", "Copy"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.copy_text("Launch Command", copy_cmd.clone(), cx);
+                                        this.copy_text(
+                                            tr(this.lang, "启动命令", "Launch Command"),
+                                            copy_cmd.clone(),
+                                            cx,
+                                        );
                                     })),
                             ),
                     )
                     .child(sf_terminal_box(
                         p,
                         "launcher-cmd-preview",
-                        "terminal launch spec",
+                        tr(lang, "终端启动参数摘要", "terminal launch spec"),
                         &self.last_launcher_output,
                         px(150.0),
                     ))

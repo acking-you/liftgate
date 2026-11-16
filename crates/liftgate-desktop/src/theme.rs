@@ -187,6 +187,16 @@ pub fn apply_staticflow_theme(dark: bool, cx: &mut App) {
 }
 
 /// Semantic tone for StaticFlow status pills and callouts.
+/// Returns `true` when GPUI reports a dark OS window appearance (`Dark` or `VibrantDark`).
+#[must_use]
+pub const fn is_appearance_dark(appearance: WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
+}
+
+/// Semantic tone for StaticFlow status pills and callouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeTone {
     Primary,
@@ -374,6 +384,13 @@ pub fn sf_terminal_box(
         content.lines().map(str::to_owned).collect()
     };
     let line_count = lines.len();
+    let is_zh = gpui_kit::component::locale().starts_with("zh");
+    let empty_text = if is_zh { "（空）" } else { "(empty)" };
+    let count_text = if is_zh {
+        format!("{line_count} 行")
+    } else {
+        format!("{line_count} lines")
+    };
 
     let body = div()
         .id(scroll_id.into())
@@ -384,7 +401,7 @@ pub fn sf_terminal_box(
         .flex_col()
         .gap_0p5()
         .when(lines.is_empty(), |el| {
-            el.child(div().text_xs().text_color(p.term_muted).child("(empty)"))
+            el.child(div().text_xs().text_color(p.term_muted).child(empty_text))
         })
         .children(lines.into_iter().map(|line| {
             let color = if line.contains("ERROR") || line.contains("error:") {
@@ -438,12 +455,7 @@ pub fn sf_terminal_box(
                                 .child(title.into()),
                         ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(p.term_muted)
-                        .child(format!("{line_count} lines")),
-                ),
+                .child(div().text_xs().text_color(p.term_muted).child(count_text)),
         )
         .child(body)
 }

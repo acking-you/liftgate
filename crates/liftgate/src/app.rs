@@ -92,7 +92,10 @@ async fn dispatch(
 ) -> Result<i32, CliError> {
     let state_paths = StatePaths::resolve(cli.state_dir)?;
     agy_manager::sweep_stale_agy_backups(&state_paths);
-    if !matches!(cli.command, Some(Commands::InternalDesktopWatch(_))) {
+    if !matches!(
+        cli.command,
+        Some(Commands::InternalDesktopWatch(_) | Commands::InternalDesktopMsixLaunch(_))
+    ) {
         desktop::sweep_stale_desktop_sessions(&state_paths);
     }
 
@@ -151,6 +154,10 @@ async fn dispatch(
         Some(Commands::CodexApp(args)) => render::run_codex_app_cli(&state_paths, args).await,
         Some(Commands::InternalDesktopWatch(args)) => {
             desktop::run_desktop_watch(args).await?;
+            Ok(0)
+        }
+        Some(Commands::InternalDesktopMsixLaunch(args)) => {
+            desktop::run_desktop_msix_launch(args)?;
             Ok(0)
         }
         Some(Commands::Config(args)) => {

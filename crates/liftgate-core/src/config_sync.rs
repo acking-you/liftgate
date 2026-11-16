@@ -89,6 +89,32 @@ const MANAGED_CODEX_ROOT_KEYS: &[&str] = &[
     "model_auto_compact_token_limit",
 ];
 
+/// Additional top-level keys stripped when synthesizing an isolated Codex App `CODEX_HOME` so an
+/// existing ChatGPT subscription login, OS keyring credential store, startup update check, or named
+/// profile in `~/.codex/config.toml` cannot override Liftgate's local provider routing or mutate
+/// shared MSIX runtime state.
+const ISOLATED_CODEX_APP_EXTRA_ROOT_KEYS: &[&str] = &[
+    "cli_auth_credentials_store",
+    "forced_login_method",
+    "forced_chatgpt_workspace_id",
+    "check_for_update_on_startup",
+    "openai_base_url",
+    "chatgpt_base_url",
+    "profile",
+    "review_model",
+];
+
+/// `[features]` toggles forced to `false` inside an isolated `lg cxa` session so Codex App never
+/// initiates ChatGPT OAuth remote-control tunnels, downloads 500MB+ unauthenticated primary
+/// runtime MSIX updates over an existing signed-in runtime, or stalls startup for 30–43s waiting
+/// on ChatGPT-authenticated remote plugin catalogs.
+const ISOLATED_DESKTOP_DISABLED_FEATURES: &[&str] = &[
+    "remote_control",
+    "in_app_updates",
+    "remote_plugin",
+    "recommended_plugins",
+];
+
 #[derive(Clone, Debug)]
 pub struct HarnessSyncParams {
     pub gateway_base_url: String,
@@ -642,7 +668,7 @@ pub fn merge_codex_config_toml_with_mode(
         out.push_str("suppress_unstable_features_warning = true\n");
     }
 
-    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only);
+    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only, false);
     let trimmed_tables = merged_tables.trim();
     if !trimmed_tables.is_empty() {
         out.push('\n');
@@ -658,6 +684,83 @@ pub fn merge_codex_config_toml_with_mode(
         out.push_str("env_key = \"AGY_GATEWAY_API_KEY\"\n");
     }
     out.push_str("wire_api = \"responses\"\n");
+    out.push_str("requires_openai_auth = false\n");
+    out
+}
+
+/// Synthesizes an isolated `config.toml` for **Codex App** (`lg cxa`) from a read-only copy of
+/// `~/.codex/config.toml`, forcing file-only API-key credentials (`cli_auth_credentials_store = "file"`,
+/// `forced_login_method = "api"`), disabling ChatGPT cloud `remote_control`, and embedding
+/// `requires_openai_auth = false` + `experimental_bearer_token` under `[model_providers.agy]` so
+/// the desktop `app-server` never falls back to the user's ChatGPT OAuth session or OS keyring.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "isolated desktop config synthesis accepts explicit session parameters directly"
+)]
+#[must_use]
+pub fn merge_isolated_codex_app_config_toml(
+    existing: &str,
+    gateway_base_url: &str,
+    primary_model: &str,
+    catalog_path: &Path,
+    auth_token: &str,
+    no_bypass: bool,
+    no_code_mode: bool,
+    code_mode_only: bool,
+) -> String {
+    let catalog_slash = catalog_path.to_string_lossy().replace('\\', "/");
+    let (root_part, tables_part) = split_toml_root_and_tables(existing);
+
+    let mut kept_root_lines: Vec<&str> = Vec::new();
+    for line in root_part.lines() {
+        if let Some(key) = parse_toml_assignment_key(line)
+            && (MANAGED_CODEX_ROOT_KEYS.contains(&key)
+                || ISOLATED_CODEX_APP_EXTRA_ROOT_KEYS.contains(&key))
+        {
+            continue;
+        }
+        kept_root_lines.push(line);
+    }
+    while kept_root_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        kept_root_lines.pop();
+    }
+
+    let mut out = String::new();
+    if !kept_root_lines.is_empty() {
+        out.push_str(&kept_root_lines.join("\n"));
+        out.push('\n');
+    }
+
+    out.push_str(&format!("model = {primary_model:?}\n"));
+    out.push_str("model_provider = \"agy\"\n");
+    out.push_str(&format!("model_catalog_json = {catalog_slash:?}\n"));
+    out.push_str("cli_auth_credentials_store = \"file\"\n");
+    out.push_str("forced_login_method = \"api\"\n");
+    out.push_str("check_for_update_on_startup = false\n");
+    if !no_bypass {
+        out.push_str("approval_policy = \"never\"\n");
+        out.push_str("sandbox_mode = \"danger-full-access\"\n");
+    }
+    out.push_str("web_search = \"live\"\n");
+    if !no_code_mode {
+        out.push_str("suppress_unstable_features_warning = true\n");
+    }
+
+    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only, true);
+    let trimmed_tables = merged_tables.trim();
+    if !trimmed_tables.is_empty() {
+        out.push('\n');
+        out.push_str(trimmed_tables);
+        out.push('\n');
+    }
+
+    let base_v1 = format!("{}/v1", gateway_base_url.trim_end_matches('/'));
+    out.push_str("\n[model_providers.agy]\n");
+    out.push_str("name = \"Liftgate\"\n");
+    out.push_str(&format!("base_url = {base_v1:?}\n"));
+    out.push_str("wire_api = \"responses\"\n");
+    out.push_str("requires_openai_auth = false\n");
+    out.push_str(&format!("experimental_bearer_token = {auth_token:?}\n"));
     out
 }
 
@@ -679,7 +782,7 @@ pub fn strip_codex_config_toml(existing: &str) -> String {
         kept_root.pop();
     }
 
-    let stripped_tables = rewrite_codex_tables(tables_part, false, false);
+    let stripped_tables = rewrite_codex_tables(tables_part, false, false, false);
     let trimmed_tables = stripped_tables.trim();
 
     let mut out = String::new();
@@ -1126,10 +1229,25 @@ fn parse_toml_assignment_key(line: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
+fn is_ephemeral_bundled_marketplace_table(sec_name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "marketplaces.openai-bundled",
+        "marketplaces.\"openai-bundled\"",
+        "marketplaces.'openai-bundled'",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        sec_name == *prefix
+            || sec_name
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
 fn rewrite_codex_tables(
     tables_part: &str,
     enable_code_mode: bool,
     enable_code_mode_only: bool,
+    isolate_desktop_features: bool,
 ) -> String {
     let mut sections: Vec<(String, String, Vec<&str>)> = Vec::new();
     for line in tables_part.split_inclusive('\n') {
@@ -1144,7 +1262,14 @@ fn rewrite_codex_tables(
     let mut saw_features = false;
 
     for (sec_name, header, body) in sections {
-        if sec_name == "model_providers.agy" {
+        if sec_name == "model_providers.agy" || sec_name.starts_with("model_providers.agy.") {
+            continue;
+        }
+        // `~/.codex/config.toml` records `[marketplaces.openai-bundled]` pointing into
+        // `~/.codex/.tmp/bundled-marketplaces/openai-bundled`; copying that path into an
+        // ephemeral `CODEX_HOME` makes Codex App reject its own ephemeral bundled marketplace
+        // (`marketplace 'openai-bundled' is already added from a different source`).
+        if isolate_desktop_features && is_ephemeral_bundled_marketplace_table(&sec_name) {
             continue;
         }
         if sec_name == "features" {
@@ -1152,36 +1277,43 @@ fn rewrite_codex_tables(
             let mut kept: Vec<&str> = body
                 .into_iter()
                 .filter(|l| {
-                    !matches!(
-                        parse_toml_assignment_key(l),
-                        Some("code_mode" | "code_mode_only")
-                    )
+                    let key = parse_toml_assignment_key(l);
+                    !matches!(key, Some("code_mode" | "code_mode_only"))
+                        && !(isolate_desktop_features
+                            && key.is_some_and(|k| ISOLATED_DESKTOP_DISABLED_FEATURES.contains(&k)))
                 })
                 .collect();
             while kept.last().is_some_and(|l| l.trim().is_empty()) {
                 kept.pop();
             }
+            let mut managed_feature_lines: Vec<String> = Vec::new();
             if enable_code_mode {
+                managed_feature_lines.push("code_mode = true".to_owned());
+                if enable_code_mode_only {
+                    managed_feature_lines.push("code_mode_only = true".to_owned());
+                }
+            } else if isolate_desktop_features {
+                managed_feature_lines.push("code_mode = false".to_owned());
+                managed_feature_lines.push("code_mode_only = false".to_owned());
+            }
+            if isolate_desktop_features {
+                for feat in ISOLATED_DESKTOP_DISABLED_FEATURES {
+                    managed_feature_lines.push(format!("{feat} = false"));
+                }
+            }
+
+            if !managed_feature_lines.is_empty() || kept.iter().any(|l| !l.trim().is_empty()) {
                 let mut block = String::new();
                 block.push_str(&header);
-                block.push('\n');
-                block.push_str("code_mode = true");
-                if enable_code_mode_only {
-                    block.push_str("\ncode_mode_only = true");
+                for fl in &managed_feature_lines {
+                    block.push('\n');
+                    block.push_str(fl);
                 }
                 if !kept.is_empty() {
                     block.push('\n');
                     for l in kept {
                         block.push_str(l);
                     }
-                }
-                rendered_sections.push(block.trim_end().to_owned());
-            } else if kept.iter().any(|l| !l.trim().is_empty()) {
-                let mut block = String::new();
-                block.push_str(&header);
-                block.push('\n');
-                for l in kept {
-                    block.push_str(l);
                 }
                 rendered_sections.push(block.trim_end().to_owned());
             }
@@ -1197,13 +1329,22 @@ fn rewrite_codex_tables(
         rendered_sections.push(block.trim_end().to_owned());
     }
 
-    if enable_code_mode && !saw_features {
-        if enable_code_mode_only {
-            rendered_sections
-                .push("[features]\ncode_mode = true\ncode_mode_only = true".to_owned());
-        } else {
-            rendered_sections.push("[features]\ncode_mode = true".to_owned());
+    if !saw_features && (enable_code_mode || isolate_desktop_features) {
+        let mut block = String::from("[features]");
+        if enable_code_mode {
+            block.push_str("\ncode_mode = true");
+            if enable_code_mode_only {
+                block.push_str("\ncode_mode_only = true");
+            }
+        } else if isolate_desktop_features {
+            block.push_str("\ncode_mode = false\ncode_mode_only = false");
         }
+        if isolate_desktop_features {
+            for feat in ISOLATED_DESKTOP_DISABLED_FEATURES {
+                block.push_str(&format!("\n{feat} = false"));
+            }
+        }
+        rendered_sections.push(block);
     }
 
     rendered_sections.join("\n\n")
@@ -1488,5 +1629,83 @@ mod tests {
     fn relative_project_dir_resolves_to_absolute_codex_catalog_path() {
         let (_, catalog) = resolve_codex_paths(false, Some(Path::new("."))).unwrap();
         assert!(catalog.is_absolute());
+    }
+
+    #[test]
+    fn isolated_codex_app_toml_forces_file_apikey_auth_and_strips_conflicting_user_auth_keys() {
+        let user_toml = "\
+# User settings
+custom_flag = true
+cli_auth_credentials_store = \"keyring\"
+forced_login_method = \"chatgpt\"
+forced_chatgpt_workspace_id = \"ws-123\"
+check_for_update_on_startup = true
+openai_base_url = \"https://example.invalid/v1\"
+profile = \"work\"
+
+[features]
+remote_control = true
+in_app_updates = true
+remote_plugin = true
+recommended_plugins = true
+fast_mode = true
+
+[marketplaces.openai-bundled]
+source = \"C:\\\\Users\\\\alice\\\\.codex\\\\.tmp\\\\bundled-marketplaces\\\\openai-bundled\"
+
+[marketplaces.openai-primary-runtime]
+source = \"C:\\\\Users\\\\alice\\\\.cache\\\\codex-runtimes\\\\codex-primary-runtime\"
+
+[model_providers.agy.auth]
+command = \"echo bad\"
+
+[mcp_servers.demo]
+command = \"npx\"
+";
+        let catalog = Path::new(r"C:\Users\alice\.liftgate\desktop\sessions\s1\agy-models.json");
+        let rendered = merge_isolated_codex_app_config_toml(
+            user_toml,
+            "http://127.0.0.1:8787",
+            "gemini-4-carbon-high",
+            catalog,
+            "local-agy",
+            false,
+            false,
+            false,
+        );
+        let rendered_again = merge_isolated_codex_app_config_toml(
+            &rendered,
+            "http://127.0.0.1:8787",
+            "gemini-4-carbon-high",
+            catalog,
+            "local-agy",
+            false,
+            false,
+            false,
+        );
+        assert_eq!(rendered, rendered_again);
+        assert!(rendered.contains("cli_auth_credentials_store = \"file\""));
+        assert!(rendered.contains("forced_login_method = \"api\""));
+        assert!(rendered.contains("check_for_update_on_startup = false"));
+        assert!(rendered.contains("requires_openai_auth = false"));
+        assert!(rendered.contains("experimental_bearer_token = \"local-agy\""));
+        assert!(rendered.contains("remote_control = false"));
+        assert!(rendered.contains("in_app_updates = false"));
+        assert!(rendered.contains("remote_plugin = false"));
+        assert!(rendered.contains("recommended_plugins = false"));
+        assert!(rendered.contains("fast_mode = true"));
+        assert!(rendered.contains("[marketplaces.openai-primary-runtime]"));
+        assert!(rendered.contains("[mcp_servers.demo]"));
+        assert!(!rendered.contains("keyring"));
+        assert!(!rendered.contains("forced_chatgpt_workspace_id"));
+        assert!(!rendered.contains("check_for_update_on_startup = true"));
+        assert!(!rendered.contains("openai_base_url"));
+        assert!(!rendered.contains("profile ="));
+        assert!(!rendered.contains("[marketplaces.openai-bundled]"));
+        assert!(!rendered.contains("[model_providers.agy.auth]"));
+        assert!(!rendered.contains("remote_control = true"));
+        assert!(!rendered.contains("in_app_updates = true"));
+        assert!(!rendered.contains("remote_plugin = true"));
+        assert!(!rendered.contains("recommended_plugins = true"));
     }
 }

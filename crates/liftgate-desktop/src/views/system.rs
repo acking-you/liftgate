@@ -83,7 +83,7 @@ impl DesktopApp {
                     .gap_2()
                     .child(section_header(
                         p,
-                        "DAEMON LOGS & ACP STDERR",
+                        tr(lang, "守护进程日志与 ACP 诊断", "DAEMON LOGS & ACP STDERR"),
                         tr(
                             lang,
                             "网关实时日志查看器 (`lg logs`)",
@@ -155,7 +155,11 @@ impl DesktopApp {
                                     .icon(IconName::Copy)
                                     .label(tr(lang, "复制", "Copy"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.copy_text("Gateway Logs", log_for_copy.clone(), cx);
+                                        this.copy_text(
+                                            tr(this.lang, "网关日志", "Gateway Logs"),
+                                            log_for_copy.clone(),
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
@@ -191,7 +195,11 @@ impl DesktopApp {
                 sf_terminal_box(
                     p,
                     "system-acp-stderr-box",
-                    "agy acp recent_stderr ring buffer",
+                    tr(
+                        lang,
+                        "agy acp 最近标准错误输出 (recent_stderr)",
+                        "agy acp recent_stderr ring buffer",
+                    ),
                     &stderr_txt,
                     px(150.0),
                 )
@@ -210,7 +218,7 @@ impl DesktopApp {
                     .gap_2()
                     .child(section_header(
                         p,
-                        "ENVIRONMENT DIAGNOSTICS",
+                        tr(lang, "全链路环境诊断", "ENVIRONMENT DIAGNOSTICS"),
                         tr(lang, "全链路环境健康检查 (`lg doctor`)", "End-to-End Environment Doctor (`lg doctor`)"),
                         Some(tr(
                             lang,
@@ -226,11 +234,23 @@ impl DesktopApp {
                             .gap_2()
                             .children(doc.map(|d| {
                                 if d.ok && !d.warnings {
-                                    pill_badge(p, BadgeTone::Ok, "ALL CHECKS PASSED")
+                                    pill_badge(
+                                        p,
+                                        BadgeTone::Ok,
+                                        tr(lang, "全部检查通过", "ALL CHECKS PASSED"),
+                                    )
                                 } else if d.ok {
-                                    pill_badge(p, BadgeTone::Warn, "PASSED WITH WARNINGS")
+                                    pill_badge(
+                                        p,
+                                        BadgeTone::Warn,
+                                        tr(lang, "通过（含提示）", "PASSED WITH WARNINGS"),
+                                    )
                                 } else {
-                                    pill_badge(p, BadgeTone::Err, "ACTION REQUIRED")
+                                    pill_badge(
+                                        p,
+                                        BadgeTone::Err,
+                                        tr(lang, "存在待修复项", "ACTION REQUIRED"),
+                                    )
                                 }
                             }))
                             .children(doc.filter(|d| d.agy_missing).map(|_| {
@@ -291,13 +311,13 @@ impl DesktopApp {
                                     .flex()
                                     .items_center()
                                     .gap_2p5()
-                                    .child(pill_badge(p, tone, chk.status))
+                                    .child(pill_badge(p, tone, doctor_status_label(chk.status, lang)))
                                     .child(
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(p.text)
-                                            .child(chk.name),
+                                            .child(doctor_check_name(chk.name, lang)),
                                     ),
                             )
                             .child(
@@ -329,7 +349,11 @@ impl DesktopApp {
             .flex_1()
             .child(section_header(
                 p,
-                "CLI ALIAS & SHELL COMPLETIONS",
+                tr(
+                    lang,
+                    "命令行别名与自动补全",
+                    "CLI ALIAS & SHELL COMPLETIONS",
+                ),
                 tr(
                     lang,
                     "快捷别名 (`lg alias`) 与补全脚本",
@@ -349,13 +373,29 @@ impl DesktopApp {
                     .flex_col()
                     .child(kv_row(
                         p,
-                        "Target Alias Path",
+                        tr(lang, "目标别名路径", "Target Alias Path"),
                         ar.target_path.display().to_string(),
                     ))
                     .child(kv_row(
                         p,
-                        "Status",
-                        format!("installed={} · in_path={}", ar.installed, ar.dir_in_path),
+                        tr(lang, "当前状态", "Status"),
+                        if lang.is_en() {
+                            format!("installed={} · in_path={}", ar.installed, ar.dir_in_path)
+                        } else {
+                            format!(
+                                "{} · {}",
+                                if ar.installed {
+                                    "已安装"
+                                } else {
+                                    "未安装"
+                                },
+                                if ar.dir_in_path {
+                                    "目录已在 PATH"
+                                } else {
+                                    "目录未在 PATH"
+                                }
+                            )
+                        },
                     ))
             }))
             .child(
@@ -419,8 +459,12 @@ impl DesktopApp {
                                 let styled = if sel { b.primary() } else { b.outline() };
                                 styled.on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_shell = sh;
+                                    let bin_name =
+                                        this.in_alias_name.read(cx).value().trim().to_owned();
+                                    let target_bin =
+                                        if bin_name.is_empty() { "lg" } else { &bin_name };
                                     this.completions_preview =
-                                        render_completions_text(sh, "liftgate");
+                                        render_completions_text(sh, target_bin);
                                     cx.notify();
                                 }))
                             }),
@@ -433,7 +477,11 @@ impl DesktopApp {
                             .icon(IconName::Copy)
                             .label(tr(lang, "复制补全脚本", "Copy Script"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_text("Completions Script", comp_for_copy.clone(), cx);
+                                this.copy_text(
+                                    tr(this.lang, "补全脚本", "Completions Script"),
+                                    comp_for_copy.clone(),
+                                    cx,
+                                );
                             })),
                     ),
             )
@@ -451,7 +499,7 @@ impl DesktopApp {
             .flex_1()
             .child(section_header(
                 p,
-                "ATOMIC VERIFIED SELF-UPGRADE",
+                tr(lang, "校验原子自升级", "ATOMIC VERIFIED SELF-UPGRADE"),
                 tr(lang, "GitHub Release 自升级 (`lg upgrade`)", "Verified Release Self-Upgrade (`lg upgrade`)"),
                 Some(tr(
                     lang,
@@ -474,7 +522,7 @@ impl DesktopApp {
                         tr(lang, "当前版本", "Current Version"),
                         format!("v{}", env!("CARGO_PKG_VERSION")),
                     ))
-                    .child(kv_row(p, "Target Triple", BUILD_TARGET))
+                    .child(kv_row(p, tr(lang, "编译目标平台", "Target Triple"), BUILD_TARGET))
                     .children(upg.map(|u| {
                         kv_row(
                             p,
@@ -557,5 +605,48 @@ impl DesktopApp {
                     .child(alias_comp_card)
                     .child(upgrade_card),
             )
+    }
+}
+
+fn doctor_check_name(raw: &str, lang: liftgate_core::state::DesktopLang) -> &str {
+    if lang.is_en() {
+        return raw;
+    }
+    match raw {
+        "State Directory" => "运行态目录",
+        "Antigravity CLI" => "Antigravity CLI",
+        "AGY Proxy" => "AGY 网络代理",
+        "AGY Auto-Update" => "AGY 自动更新",
+        "Embedded Web UI" => "内嵌 Web 面板",
+        "Claude Code CLI" => "Claude Code CLI",
+        "Codex CLI" => "Codex CLI",
+        "Claude Desktop" => "Claude Desktop",
+        "Codex App" => "Codex App",
+        "Gateway Service" => "本地网关服务",
+        "ACP Auth/Models" => "ACP 鉴权与模型",
+        other => other,
+    }
+}
+
+fn doctor_status_label(raw: &str, lang: liftgate_core::state::DesktopLang) -> &str {
+    if lang.is_en() {
+        return raw;
+    }
+    match raw {
+        "ready" => "就绪",
+        "found" => "已安装",
+        "missing" => "未安装",
+        "forced" => "强制代理",
+        "direct" => "直连",
+        "enabled" => "已启用",
+        "disabled" => "已关闭",
+        "bundled" => "完整内嵌",
+        "fallback" => "精简面板",
+        "optional" => "可选未装",
+        "online" => "在线",
+        "offline" => "离线",
+        "login needed" => "需登录",
+        "error" => "异常",
+        other => other,
     }
 }

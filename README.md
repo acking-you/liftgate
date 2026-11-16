@@ -72,8 +72,9 @@ Any other harness that speaks either API connects the same way
   ([dashboard](docs/usage.md#dashboard)).
 - **Native GPUI desktop app (`liftgate-desktop`)** — standalone cross-platform
   desktop control center built on `gpui-kit` with Warm Editorial Light/Dark
-  themes, bilingual `中文` / `EN` UI, live SSE telemetry, one-click CLI/GUI
-  launchers, config sync, model switcher, `agy`/proxy manager, environment
+  themes and bilingual `中文` / `EN` UI (automatically following OS appearance and
+  system locale by default), live SSE telemetry, one-click CLI/GUI
+  launchers, config sync, default & title model switcher, `agy`/proxy manager, environment
   doctor and self-upgrade — zero external CLI binary required.
 
 ## How it works

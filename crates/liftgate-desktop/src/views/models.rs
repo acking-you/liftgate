@@ -32,7 +32,7 @@ impl DesktopApp {
                 .items_start()
                 .child(section_header(
                     p,
-                    "MODEL CATALOG",
+                    tr(lang, "上游模型目录", "MODEL CATALOG"),
                     tr(lang, "尚未加载上游模型目录", "Model Catalog Not Loaded Yet"),
                     Some(tr(
                         lang,
@@ -73,7 +73,19 @@ impl DesktopApp {
                 p,
                 tr(lang, "可用模型总数", "DISCOVERED MODELS"),
                 format!("{} / {}", filtered.len(), report.models.len()),
-                format!("Endpoint: {}/v1/models", report.gateway_url),
+                if report.long_context {
+                    format!(
+                        "{}/v1/models · {}",
+                        report.gateway_url,
+                        tr(lang, "1M 长上下文", "1M Extended")
+                    )
+                } else {
+                    format!(
+                        "{}/v1/models · {}",
+                        report.gateway_url,
+                        tr(lang, "280k 标准窗口", "280k Standard")
+                    )
+                },
             ))
             .child(kpi_card(
                 p,
@@ -87,26 +99,22 @@ impl DesktopApp {
             ))
             .child(kpi_card(
                 p,
+                tr(lang, "会话标题模型", "SESSION TITLE MODEL"),
+                report.title_model.clone(),
+                tr(
+                    lang,
+                    "生成 Codex / Claude 会话标题（实时生效）",
+                    "Generates Codex & Claude session titles",
+                ),
+            ))
+            .child(kpi_card(
+                p,
                 tr(lang, "轻量辅助模型", "FAST / AUXILIARY MODEL"),
                 report.fast_model.clone(),
                 tr(
                     lang,
                     "处理分类与其他轻量辅助请求",
                     "Handles classification and other lightweight requests",
-                ),
-            ))
-            .child(kpi_card(
-                p,
-                tr(lang, "上下文窗口策略", "CONTEXT POLICY"),
-                if report.long_context {
-                    "1M Extended".to_owned()
-                } else {
-                    "280k Standard".to_owned()
-                },
-                tr(
-                    lang,
-                    "含自动压缩水位阈值 (auto-compact)",
-                    "Includes deterministic auto-compact limit",
                 ),
             ));
 
@@ -158,7 +166,7 @@ impl DesktopApp {
         let list_card = editorial_card(p)
             .child(section_header(
                 p,
-                "UPSTREAM ANTIGRAVITY MODELS",
+                tr(lang, "上游 ANTIGRAVITY 模型", "UPSTREAM ANTIGRAVITY MODELS"),
                 tr(
                     lang,
                     "模型列表与一键切换 / 启动",
@@ -177,9 +185,11 @@ impl DesktopApp {
                     filtered.into_iter().enumerate().map(|(idx, m)| {
                         let is_default = m.id == report.default_model;
                         let is_fast = m.id == report.fast_model;
+                        let is_title = m.id == report.title_model;
                         let (ctx_win, compact_lim) = m.context_limits(report.long_context);
                         let id_copy = m.id.clone();
                         let id_def = m.id.clone();
+                        let id_title = m.id.clone();
                         let id_claude = m.id.clone();
                         let id_codex = m.id.clone();
                         let display_title = if m.display_name.trim().is_empty() {
@@ -223,19 +233,42 @@ impl DesktopApp {
                                                     .child(display_title),
                                             )
                                             .children(is_default.then(|| {
-                                                pill_badge(p, BadgeTone::Brand, "DEFAULT")
+                                                pill_badge(
+                                                    p,
+                                                    BadgeTone::Brand,
+                                                    tr(lang, "默认主模型", "DEFAULT"),
+                                                )
+                                            }))
+                                            .children(is_title.then(|| {
+                                                pill_badge(
+                                                    p,
+                                                    BadgeTone::Info,
+                                                    tr(lang, "会话标题", "TITLE"),
+                                                )
                                             }))
                                             .children(is_fast.then(|| {
-                                                pill_badge(p, BadgeTone::Ok, "FAST / AUX")
+                                                pill_badge(
+                                                    p,
+                                                    BadgeTone::Ok,
+                                                    tr(lang, "轻量辅助", "FAST / AUX"),
+                                                )
                                             }))
                                             .child(pill_badge(
                                                 p,
                                                 BadgeTone::Neutral,
-                                                format!(
-                                                    "ctx {} · compact {}",
-                                                    format_tokens(ctx_win),
-                                                    format_tokens(compact_lim)
-                                                ),
+                                                if lang.is_en() {
+                                                    format!(
+                                                        "ctx {} · compact {}",
+                                                        format_tokens(ctx_win),
+                                                        format_tokens(compact_lim)
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "上下文 {} · 压缩阈值 {}",
+                                                        format_tokens(ctx_win),
+                                                        format_tokens(compact_lim)
+                                                    )
+                                                },
                                             )),
                                     )
                                     .child(
@@ -258,7 +291,11 @@ impl DesktopApp {
                                             .icon(IconName::Copy)
                                             .label(tr(lang, "复制 ID", "Copy ID"))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.copy_text("Model ID", id_copy.clone(), cx);
+                                                this.copy_text(
+                                                    tr(this.lang, "模型 ID", "Model ID"),
+                                                    id_copy.clone(),
+                                                    cx,
+                                                );
                                             })),
                                     )
                                     .child(
@@ -274,6 +311,17 @@ impl DesktopApp {
                                                     window,
                                                     cx,
                                                 );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("mdl-ttl-{idx}")))
+                                            .xsmall()
+                                            .secondary()
+                                            .disabled(is_title)
+                                            .icon(IconName::Star)
+                                            .label(tr(lang, "设为标题模型", "Set Title"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.action_set_title_model(id_title.clone(), cx);
                                             })),
                                     )
                                     .child(
