@@ -166,7 +166,7 @@ export function App(): React.JSX.Element {
   // Live probe modal state
   const [probeOpen, setProbeOpen] = useState(false);
   const [probeProtocol, setProbeProtocol] = useState<TaskProtocol>("openai_responses");
-  const [probeModel, setProbeModel] = useState("gemini-3.8-flash-low");
+  const [probeModel, setProbeModel] = useState("gemini-4-hydrogen-low");
   const [probePrompt, setProbePrompt] = useState(
     "请用一句话介绍 Rust 2024 Edition 的优势。",
   );

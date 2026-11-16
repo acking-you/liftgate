@@ -39,6 +39,8 @@ lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh�
 liftgate serve                  # 前台运行网关
 ```
 
+在 `lg tui` 中按 `3` 进入 Models，选中模型后按 `t` 保存。从下一次生成标题开始生效，默认使用 `gemini-4-hydrogen-low`。
+
 ## Antigravity CLI 管理（`lg agy`）与代理配置（`lg proxy`）
 
 无需手动查找安装包、拼环境变量或单独维护更新，直接通过 `lg` 即可完成 `agy` 的全生命周期管理：
@@ -84,7 +86,7 @@ liftgate codex --code-mode-only             # 启动纯 Code Mode（仅暴露 `e
 liftgate codex --no-code-mode               # 当前会话关闭 Code Mode，恢复直连工具模式（`direct`）
 liftgate claude                             # 在当前目录启动交互式 Claude Code（默认注入 `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`）
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
-liftgate claude --model gemini-3.8-flash-low -p "总结最近一次提交"
+liftgate claude --model gemini-4-hydrogen-low -p "总结最近一次提交"
 
 # 原生会话查看、恢复、分叉、Git Worktree 与后台任务管理
 lg cx resume                                # 打开 Codex 交互式会话列表（加 `--all` 跨目录查看；兼容别名 `lg cx -r`）
@@ -244,7 +246,7 @@ wire_api = "responses"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local-agy"
 export ANTHROPIC_MODEL="gemini-4-carbon-high"
-export ANTHROPIC_SMALL_FAST_MODEL="gemini-3.8-flash-low"
+export ANTHROPIC_SMALL_FAST_MODEL="gemini-4-hydrogen-low"
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="110000"
 export NO_PROXY="127.0.0.1,localhost,::1"
 claude
@@ -254,7 +256,7 @@ claude
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 $env:ANTHROPIC_AUTH_TOKEN = "local-agy"
 $env:ANTHROPIC_MODEL = "gemini-4-carbon-high"
-$env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-3.8-flash-low"
+$env:ANTHROPIC_SMALL_FAST_MODEL = "gemini-4-hydrogen-low"
 $env:CLAUDE_CODE_AUTO_COMPACT_WINDOW = "110000"
 $env:NO_PROXY = "127.0.0.1,localhost,::1"
 claude
@@ -269,7 +271,7 @@ claude
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_AUTH_TOKEN": "local-agy",
     "ANTHROPIC_MODEL": "gemini-4-carbon-high",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gemini-3.8-flash-low",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gemini-4-hydrogen-low",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
     "NO_PROXY": "127.0.0.1,localhost,::1"
   }
@@ -306,7 +308,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--ui-dir` | `AGY_UI_DIR` | 编译期内嵌的 `web/dist` |
 | `--max-idle-sessions` | | `64` |
 | `--max-stored-responses` | | `256` |
-| `--turn-timeout-secs` | | `600` |
+| `--turn-timeout-secs` | 网关单轮请求的总时限，单位为秒 | `1800` |
 | `--max-body-bytes` | | 12 MiB |
 | `--max-line-bytes`（单行 ACP JSON-RPC） | | 16 MiB |
 | `--channel-capacity`（每个流） | | `256` |

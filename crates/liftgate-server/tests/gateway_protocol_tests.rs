@@ -442,15 +442,25 @@ fn test_app_with_context(
     api_key: Option<&str>,
     long_context: bool,
 ) -> axum::Router {
+    build_router(test_state(backend, timeout_secs, api_key, long_context))
+}
+
+fn test_state(
+    backend: Arc<MockAcpBackend>,
+    timeout_secs: u64,
+    api_key: Option<&str>,
+    long_context: bool,
+) -> AppState<MockAcpBackend> {
     let limits =
         GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, timeout_secs)
             .unwrap();
 
-    build_router(AppState {
+    AppState {
         backend,
         pool: Arc::new(SessionPool::new(limits)),
         telemetry: Arc::new(TelemetryHub::new()),
         config: GatewayRuntimeConfig {
+            title_model_file: None,
             long_context,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
@@ -460,11 +470,64 @@ fn test_app_with_context(
         ui_dist_dir: None,
         embedded_ui: &[],
         admin_shutdown: None,
-    })
+    }
 }
 
 fn test_app(backend: Arc<MockAcpBackend>, timeout_secs: u64) -> axum::Router {
     test_app_with_key(backend, timeout_secs, None)
+}
+
+#[tokio::test]
+async fn title_model_change_applies_to_the_next_request_on_the_same_gateway() {
+    let backend = Arc::new(MockAcpBackend::new(
+        (0..2)
+            .map(|_| MockScript::Immediate {
+                thoughts: vec![],
+                chunks_template: vec!["Compile report".to_owned()],
+            })
+            .collect(),
+    ));
+    let path = std::env::temp_dir().join(format!("liftgate-title-{}", uuid::Uuid::new_v4()));
+    let mut state = test_state(Arc::clone(&backend), 30, None, false);
+    state.config.title_model_file = Some(path.clone());
+    let app = build_router(state);
+    for (uri, request) in [
+        (
+            "/v1/responses",
+            json!({
+                "model": "gemini-4-carbon-high",
+                "input": "Generate a concise, single-line task title for compiling a report."
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": "gemini-4-carbon-high", "max_tokens": 32,
+                "system": "Return isNewTopic and a short title.",
+                "messages": [{"role": "user", "content": "Compile a report."}]
+            }),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if uri == "/v1/responses" {
+            std::fs::write(&path, "gemini-4-carbon-medium").unwrap();
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        backend.recorded_models.lock().unwrap().as_slice(),
+        ["gemini-4-hydrogen-low", "gemini-4-carbon-medium"]
+    );
 }
 
 #[tokio::test]
@@ -1861,7 +1924,7 @@ async fn auto_mode_classifier_and_away_recap_route_to_flash_without_stealing_ses
         serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let toolu_id = b1["content"][0]["id"].as_str().unwrap().to_owned();
 
-    // 2. Auto Mode Stage 1 classifier requesting heavy `gemini-4-carbon-high` -> must override to `gemini-3.8-flash-low`!
+    // 2. Auto Mode Stage 1 classifier requesting heavy `gemini-4-carbon-high` -> must override to `gemini-4-hydrogen-low`!
     let auto_req = json!({
         "model": "gemini-4-carbon-high",
         "stream": false,
@@ -1945,8 +2008,8 @@ async fn auto_mode_classifier_and_away_recap_route_to_flash_without_stealing_ses
         models,
         vec![
             "gemini-4-hydrogen-xhigh".to_owned(),
-            "gemini-3.8-flash-low".to_owned(),
-            "gemini-3.8-flash-low".to_owned(),
+            "gemini-4-hydrogen-low".to_owned(),
+            "gemini-4-hydrogen-low".to_owned(),
         ]
     );
     let prompts = backend.recorded_prompts.lock().unwrap();
@@ -2174,7 +2237,7 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_no_silent_
                 "<agy_tool_call_{NONCE}>{\"name\":\"multi_agent_v1.spawn_agent\",\"arguments\":{\"task\":\"audit workspace\"}}</agy_tool_call_{NONCE}>".to_owned(),
             ],
         },
-        // 4. Concurrent Codex TUI task-title generator -> routed to `gemini-3.8-flash-low` (`sess_4`)
+        // 4. Concurrent Codex TUI task-title generator -> routed to `gemini-4-hydrogen-low` (`sess_4`)
         MockScript::Immediate {
             thoughts: vec![],
             chunks_template: vec!["Audit workspace codebase".to_owned()],
@@ -2414,7 +2477,7 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_no_silent_
     );
 
     // 2) Exact `-high` model was NOT mutated to `-xhigh`, NEVER silently failed over to
-    //    `claude-sonnet-5-5-high` on 429, title call routed to `gemini-3.8-flash-low`, and Turn 2
+    //    `claude-sonnet-5-5-high` on 429, title call routed to `gemini-4-hydrogen-low`, and Turn 2
     //    reused warm `sess_3` on `gemini-4-carbon-high`!
     let models = backend.recorded_models.lock().unwrap().clone();
     assert_eq!(
@@ -2423,7 +2486,7 @@ async fn codex_0_166_massive_developer_prompt_namespace_tools_and_429_no_silent_
             "gemini-4-carbon-high".to_owned(),
             "gemini-4-carbon-high".to_owned(),
             "gemini-4-carbon-high".to_owned(),
-            "gemini-3.8-flash-low".to_owned(),
+            "gemini-4-hydrogen-low".to_owned(),
         ]
     );
 
@@ -2809,6 +2872,7 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
         pool: Arc::new(SessionPool::new(limits)),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
+            title_model_file: None,
             long_context: false,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
@@ -3312,12 +3376,12 @@ async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_res
     // NOT the sum of intermediate Flash hydration turns (which would trigger premature /compact)!
     assert_eq!(body["usage"]["input_tokens"], 228);
 
-    // Session started on `gemini-3.8-flash-low` for seed turns, then switched to `gemini-4-carbon-high`!
+    // Session started on `gemini-4-hydrogen-low` for seed turns, then switched to `gemini-4-carbon-high`!
     let models = backend.recorded_models.lock().unwrap().clone();
     assert_eq!(
         models,
         vec![
-            "gemini-3.8-flash-low".to_owned(),
+            "gemini-4-hydrogen-low".to_owned(),
             "gemini-4-carbon-high".to_owned(),
         ]
     );
@@ -4003,7 +4067,7 @@ async fn codex_code_mode_multi_turn_sse_guardian_classifier_and_effort_update() 
         models.as_slice(),
         &[
             "gemini-4-carbon-high",
-            "gemini-3.8-flash-low",
+            "gemini-4-hydrogen-low",
             "gemini-4-carbon-medium"
         ]
     );

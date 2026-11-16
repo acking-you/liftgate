@@ -44,7 +44,9 @@ use liftgate_core::daemon::{
     read_log_tail, resolve_client_api_key, restart_daemon, start_daemon, stop_daemon,
 };
 use liftgate_core::error::CliError;
-use liftgate_core::state::{StatePaths, format_connect_url, now_unix_ms};
+use liftgate_core::state::{StatePaths, format_connect_url, now_unix_ms, write_file_atomic};
+use liftgate_server::title_model::title_model;
+use liftgate_types::config::ModelId;
 
 static TUI_RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TUI_PANIC_HOOK_ONCE: Once = Once::new();
@@ -952,6 +954,7 @@ struct PolledData {
     dashboard_url: String,
     default_model: String,
     fast_model: String,
+    title_model: Option<ModelId>,
     telemetry: Option<GatewayTelemetrySnapshot>,
     models: Vec<DiscoveredModel>,
     service_log_lines: Vec<String>,
@@ -961,6 +964,7 @@ struct PolledData {
 enum TuiCommand {
     CloseSession(String),
     SwitchDefaultModel(String),
+    SetTitleModel(String),
     StartOrRestartDaemon,
     StopDaemon,
     OpenBrowser,
@@ -1059,7 +1063,9 @@ async fn poll_gateway_snapshot(
         .unwrap_or(default_serve.listen);
     let api_key = resolve_client_api_key(explicit_key, daemon.as_ref(), listen);
     let client = GatewayClient::new(listen, api_key.clone());
-    let managed_alive = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
+    let managed_alive = daemon
+        .as_ref()
+        .is_some_and(|d| d.listen == listen && is_pid_alive(d.pid));
     let healthy = client.check_health(Duration::from_millis(600)).await;
 
     let telemetry = if healthy {
@@ -1084,6 +1090,11 @@ async fn poll_gateway_snapshot(
         })
         .unwrap_or(default_serve.default_model);
     let fast_model = resolve_fast_model(None, &default_model, &models);
+    let title_model = if healthy && managed_alive {
+        Some(title_model(Some(&state_paths.title_model_file())).await)
+    } else {
+        None
+    };
 
     let dashboard_base = daemon
         .as_ref()
@@ -1110,6 +1121,7 @@ async fn poll_gateway_snapshot(
         dashboard_url,
         default_model,
         fast_model,
+        title_model,
         telemetry,
         models,
         service_log_lines,
@@ -1187,6 +1199,11 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         Ok(_) => Ok(format!("Switched default model to {model_id}")),
                         Err(e) => Err(e.to_string()),
                     }
+                }
+                TuiCommand::SetTitleModel(model_id) => {
+                    write_file_atomic(&worker_paths.title_model_file(), model_id.as_bytes(), false)
+                        .map(|()| format!("Title model set to {model_id}"))
+                        .map_err(|e| e.to_string())
                 }
                 TuiCommand::StartOrRestartDaemon => {
                     let daemon = worker_paths.read_daemon().ok().flatten();
@@ -1401,6 +1418,20 @@ fn handle_top_key(
                 } else {
                     app.set_toast("Cannot evict an actively leased session", false);
                 }
+            }
+        }
+        KeyCode::Char('t') if app.tab_idx == 2 => {
+            if !app.data.managed {
+                app.set_toast(
+                    "Select the local managed gateway to change its title model",
+                    false,
+                );
+            } else if let Some(model) = app.data.models.get(app.model_idx)
+                && cmd_tx
+                    .try_send(TuiCommand::SetTitleModel(model.id.clone()))
+                    .is_err()
+            {
+                app.set_toast("Gateway controls are busy; try again", false);
             }
         }
         KeyCode::Enter if app.tab_idx == 2 => {
@@ -2114,12 +2145,20 @@ fn draw_models_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
             let is_def = m.id == app.data.default_model;
             let is_fast = m.id == app.data.fast_model;
-            let role = match (is_def, is_fast) {
-                (true, true) => "★ default · ⚡ fast",
-                (true, false) => "★ default",
-                (false, true) => "⚡ fast",
-                (false, false) => "",
-            };
+            let is_title = app
+                .data
+                .title_model
+                .as_ref()
+                .is_some_and(|id| id.as_str() == m.id);
+            let role = [
+                (is_title, "title"),
+                (is_def, "★ default"),
+                (is_fast, "⚡ fast"),
+            ]
+            .into_iter()
+            .filter_map(|(active, label)| active.then_some(label))
+            .collect::<Vec<_>>()
+            .join(" · ");
             Row::new(vec![
                 Cell::from(m.id.clone()).style(
                     Style::default()
@@ -2168,7 +2207,7 @@ fn draw_models_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " Live Antigravity Models  (press [Enter] to set managed gateway default model) ",
+                " Live Antigravity Models  [Enter] set primary  [t] set title model ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -2310,13 +2349,13 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         }
         2 => {
             chips.push(Span::styled(
-                "Enter ",
+                "Enter / t ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
             chips.push(Span::styled(
-                "Set Default  ",
+                "Set Primary / Title  ",
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -2410,7 +2449,7 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Switch default model (Models tab)"),
+            Span::raw("Switch primary model (Models tab); t sets the title model"),
         ]),
         Line::from(vec![
             Span::styled(

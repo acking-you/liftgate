@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   - Bundled `liftgate-desktop` into macOS (Apple Silicon & Intel), Windows (x64 & ARM64), and Linux (`x86_64-unknown-linux-gnu`) release archives and `upgrade` workflows.
 
 ### Changed
+- Codex and Claude Code title requests default to `gemini-4-hydrogen-low`. Select a model and press `t` in the Models tab of `lg tui` to change it for subsequent titles. Automatic fast-model selection skips Gemini 3.8 Flash.
+- `lg cx` and `lg cc` now allow 30 minutes of stream inactivity by default. Claude Code also waits up to 30 minutes for response headers. The gateway's default per-turn deadline is now 30 minutes.
 - Extracted all shared control-plane logic (`agy_manager`, `cli`, `client`, `config_sync`, `daemon`, `desktop`, `error`, `format`, `harness`, `serve`, `state`, `terminal`, `upgrade`, and embedded `web/dist` asset bundling) into a dedicated `liftgate-core` library crate shared by `liftgate`, `lg`, and `liftgate-desktop`.
 
 ## [0.1.8] - 2026-11-16

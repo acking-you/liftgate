@@ -215,6 +215,7 @@ pub async fn run_serve_with_hook(
         pool: Arc::clone(&pool),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
+            title_model_file: Some(state_paths.title_model_file()),
             long_context: args.long_context.unwrap_or(settings.long_context),
             default_model,
             acp_mode,

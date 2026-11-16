@@ -5,6 +5,7 @@ use std::process::Stdio;
 use liftgate_server::platform::{
     canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
 };
+use liftgate_types::config::DEFAULT_TURN_TIMEOUT_SECS;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::task::JoinSet;
@@ -22,6 +23,9 @@ use crate::daemon::ensure_gateway_ready;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths, user_home_dir};
 use crate::terminal::TerminalLaunchSpec;
+
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = DEFAULT_TURN_TIMEOUT_SECS * 1_000;
+const CODEX_STREAM_IDLE_TIMEOUT_KEY: &str = "model_providers.agy.stream_idle_timeout_ms";
 
 #[derive(Clone, Debug)]
 pub struct ResolvedCommand {
@@ -507,6 +511,12 @@ async fn build_codex_invocation(
         &mut full_args,
         "model_providers.agy.wire_api='responses'".to_owned(),
     );
+    if !has_explicit_codex_config_key(&args.passthrough_args, CODEX_STREAM_IDLE_TIMEOUT_KEY) {
+        push_cfg(
+            &mut full_args,
+            format!("{CODEX_STREAM_IDLE_TIMEOUT_KEY}={DEFAULT_REQUEST_TIMEOUT_MS}"),
+        );
+    }
     if args.no_code_mode {
         push_cfg(&mut full_args, "features.code_mode=false".to_owned());
         push_cfg(&mut full_args, "features.code_mode_only=false".to_owned());
@@ -549,7 +559,7 @@ fn build_claude_gateway_env_pairs(
     no_code_mode: bool,
     no_proxy: &str,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let env_set = vec![
+    let mut env_set = vec![
         ("ANTHROPIC_BASE_URL".to_owned(), base_url.to_owned()),
         ("ANTHROPIC_AUTH_TOKEN".to_owned(), auth_token.to_owned()),
         ("ANTHROPIC_MODEL".to_owned(), primary_model.to_owned()),
@@ -581,6 +591,11 @@ fn build_claude_gateway_env_pairs(
         ("NO_PROXY".to_owned(), no_proxy.to_owned()),
         ("no_proxy".to_owned(), no_proxy.to_owned()),
     ];
+    for key in ["API_TIMEOUT_MS", "CLAUDE_STREAM_IDLE_TIMEOUT_MS"] {
+        if std::env::var_os(key).is_none() {
+            env_set.push((key.to_owned(), DEFAULT_REQUEST_TIMEOUT_MS.to_string()));
+        }
+    }
     let env_remove = vec![
         "ANTHROPIC_API_KEY".to_owned(),
         "AGY_API_KEY".to_owned(),

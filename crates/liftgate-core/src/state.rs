@@ -49,6 +49,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn title_model_file(&self) -> PathBuf {
+        self.root.join("title-model")
+    }
+
+    #[must_use]
     pub fn desktop_prefs_file(&self) -> PathBuf {
         self.root.join("desktop-ui.json")
     }

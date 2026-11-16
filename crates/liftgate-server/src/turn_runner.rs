@@ -108,6 +108,7 @@ impl Drop for ActiveTurnStream {
 /// Shared gateway runtime configuration.
 #[derive(Clone, Debug)]
 pub struct GatewayRuntimeConfig {
+    pub title_model_file: Option<std::path::PathBuf>,
     pub long_context: bool,
     pub default_model: ModelId,
     pub acp_mode: AcpModeId,
@@ -152,22 +153,21 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     let available = backend.refresh_models_if_empty().await;
-    let resolved_model = if let Some(aux_kind) = req.auxiliary_task {
-        let fast_model = select_fastest_gemini_model(&available, &cfg.default_model);
-        tracing::debug!(
-            auxiliary_task = ?aux_kind,
-            resolved_model = %fast_model,
-            "routing harness auxiliary/classifier sub-request to fastest low-cost Gemini model"
-        );
-        fast_model
-    } else {
-        resolve_model_id(
+    let resolved_model = match req.auxiliary_task {
+        Some(AuxiliaryTaskKind::SessionTitleOrTopic) => {
+            crate::title_model::title_model(cfg.title_model_file.as_deref()).await
+        }
+        Some(_) => select_fastest_gemini_model(&available, &cfg.default_model),
+        None => resolve_model_id(
             req.requested_model.as_deref(),
             req.reasoning_effort,
             &available,
             &cfg.default_model,
-        )
+        ),
     };
+    if let Some(kind) = req.auxiliary_task {
+        tracing::debug!(auxiliary_task = ?kind, %resolved_model, "routing harness auxiliary request");
+    }
     let hydration_seed_model = select_fastest_gemini_model(&available, &resolved_model);
 
     let web_cfg = WebToolBridgeConfig {
@@ -632,7 +632,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
             seed_chunks = seed_chunks.len(),
             seed_model = %current_rpc_model,
             target_model = %active_model,
-            "hydrating multi-chunk conversation context on fast Flash model before target turn"
+            "hydrating multi-chunk conversation context on fast model before target turn"
         );
         for chunk_blocks in seed_chunks {
             if let Err(err) = run_hydration_seed_step(

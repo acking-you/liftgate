@@ -12,7 +12,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 pub const DEFAULT_MAX_IDLE_SESSIONS: usize = 64;
 pub const DEFAULT_MAX_STORED_RESPONSES: usize = 256;
-pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 
 const _: () = assert!(
     DEFAULT_MAX_LINE_BYTES > DEFAULT_MAX_BODY_BYTES,
@@ -84,10 +84,10 @@ impl ModelId {
         Self(Arc::from("gemini-4-carbon-high"))
     }
 
-    /// Default low-latency flash model identifier used for auxiliary tasks.
+    /// Default low-effort Hydrogen model for short background requests.
     #[must_use]
     pub fn fallback_fast() -> Self {
-        Self(Arc::from("gemini-3.8-flash-low"))
+        Self(Arc::from("gemini-4-hydrogen-low"))
     }
 }
 

@@ -101,7 +101,7 @@ pub struct HarnessSyncParams {
     pub discovered_models: Vec<DiscoveredModel>,
 }
 
-/// Resolves the optimal fast/subagent model (`gemini-*-flash-low`) from the discovered live
+/// Resolves the fast/subagent model from the discovered live
 /// catalog unless an explicit `--fast-model` override was supplied.
 #[must_use]
 pub fn resolve_fast_model(

@@ -50,7 +50,7 @@ impl ReasoningEffort {
 
 /// Identifies lightweight harness background/classifier sub-requests (e.g. Claude Code Auto Mode
 /// safety classifier, background away-recap, session title generator, or internal web-tool helpers)
-/// so the gateway routes them to the fastest low-cost Gemini Flash model and closes their one-shot
+/// so the gateway can select a model by task and close its one-shot
 /// ACP session immediately without stealing or evicting interactive sessions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,7 +184,7 @@ pub fn detect_auxiliary_task(
 
     // 1. Claude Code Auto Mode safety classifier (Stage 1 & Stage 2), startup recon,
     //    & permission classifiers. Checked unconditionally before tool checks so Stage 1,
-    //    Stage 2, and startup recon always use fast Gemini Flash.
+    //    Stage 2, and startup recon use the fast auxiliary model.
     if is_auto_mode_classifier_prompt(sys, trimmed_user) {
         return Some(AuxiliaryTaskKind::AutoModeClassifier);
     }

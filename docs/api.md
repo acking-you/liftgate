@@ -66,8 +66,8 @@ print(reply.content[0].text)
 - Extended thinking, parallel `tool_use` / `tool_result` and image input.
 - Built in: `web_search_20250305` and `web_fetch_20250910`; fetches refuse
   private and loopback addresses.
-- Claude Code's background requests (Auto Mode classifiers, titles, recaps)
-  go to the fastest Flash model ([model routing](architecture.md#model-routing)).
+- Claude Code titles use the configured title model. Classifiers and recaps use
+  the fast model selector ([model routing](architecture.md#model-routing)).
 
 ## Models
 

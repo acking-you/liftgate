@@ -91,8 +91,8 @@ impl DesktopApp {
                 report.fast_model.clone(),
                 tr(
                     lang,
-                    "自动承接标题生成与分类等辅助请求",
-                    "Handles title-gen & auxiliary recon turns",
+                    "处理分类与其他轻量辅助请求",
+                    "Handles classification and other lightweight requests",
                 ),
             ))
             .child(kpi_card(
