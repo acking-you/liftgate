@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Isolated `CODEX_HOME` and auth routing in `lg codex-app` (`lg cxa`)**:
+  - Fixed Windows MSIX activation (`OpenAI.Codex` via `Invoke-CommandInDesktopPackage`) dropping `CODEX_HOME`, `AGY_GATEWAY_API_KEY`, `NO_PROXY`, and `CODEX_CLI_PATH` across the out-of-process `IDesktopAppXActivator` COM boundary by launching through a headless in-container helper (`conhost.exe --headless <liftgate> __desktop-msix-launch` with `-PreventBreakaway`) that records the exact spawned GUI PID and preserves all environment variables without flashing a console window.
+  - Stopped copying `~/.codex/auth.json` (user ChatGPT OAuth tokens) into the ephemeral `CODEX_HOME`; `lg cxa` now always synthesizes a dedicated API-key `auth.json` (`0o600`) paired with `cli_auth_credentials_store = "file"`, `forced_login_method = "api"`, `check_for_update_on_startup = false`, `features.{remote_control,in_app_updates,remote_plugin,recommended_plugins} = false`, and inline `requires_openai_auth = false` + `experimental_bearer_token` under `[model_providers.agy]` (stripping conflicting user `profile` / `openai_base_url` / `forced_chatgpt_workspace_id` overrides and host-scoped `[marketplaces.openai-bundled]` entries) so Codex App never signs into the user's ChatGPT account, queries the OS keyring, downloads unauthenticated MSIX runtime updates, or stalls startup on ChatGPT-only remote plugin catalogs.
+  - Migrated the persistent isolated `--user-data-dir` profile from `desktop/codex-app` to `desktop/codex-app-isolated` and automatically retired/cleaned up stale v0.1.8 `desktop/codex-app` sessions whose Chromium storage had cached ChatGPT login cookies.
+
 ## [0.1.8] - 2026-11-16
 
 ### Added

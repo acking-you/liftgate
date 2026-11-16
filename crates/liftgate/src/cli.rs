@@ -185,6 +185,11 @@ pub enum Commands {
     /// Internal detached reaper that cleans up or restores desktop session state once the GUI app exits.
     #[command(name = "__desktop-watch", hide = true)]
     InternalDesktopWatch(DesktopWatchArgs),
+
+    /// Internal Windows MSIX in-container launcher that injects environment variables across the
+    /// out-of-process `IDesktopAppXActivator` COM boundary.
+    #[command(name = "__desktop-msix-launch", hide = true)]
+    InternalDesktopMsixLaunch(DesktopMsixLaunchArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -192,6 +197,13 @@ pub struct DesktopWatchArgs {
     /// Path to the desktop session journal file.
     #[arg(long)]
     pub journal: PathBuf,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DesktopMsixLaunchArgs {
+    /// Path to the ephemeral owner-only MSIX launch specification JSON file.
+    #[arg(long)]
+    pub spec: PathBuf,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -959,7 +971,7 @@ pub struct CodexArgs {
     #[arg(long)]
     pub restart_app: bool,
 
-    /// Use a disposable Electron `--user-data-dir` deleted on exit instead of `~/.liftgate/desktop/codex-app` (used with `--app`).
+    /// Use a disposable Electron `--user-data-dir` deleted on exit instead of `~/.liftgate/desktop/codex-app-isolated` (used with `--app`).
     #[arg(long)]
     pub ephemeral: bool,
 
@@ -1040,7 +1052,7 @@ pub struct CodexAppArgs {
     #[arg(long)]
     pub restart_app: bool,
 
-    /// Use a disposable Electron `--user-data-dir` wiped on exit instead of `~/.liftgate/desktop/codex-app`.
+    /// Use a disposable Electron `--user-data-dir` wiped on exit instead of `~/.liftgate/desktop/codex-app-isolated`.
     #[arg(long)]
     pub ephemeral: bool,
 

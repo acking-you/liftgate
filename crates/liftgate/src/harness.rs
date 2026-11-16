@@ -374,7 +374,9 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
             .arg("model_providers.agy.env_key='AGY_GATEWAY_API_KEY'");
     }
     cmd.arg("-c")
-        .arg("model_providers.agy.wire_api='responses'");
+        .arg("model_providers.agy.wire_api='responses'")
+        .arg("-c")
+        .arg("model_providers.agy.requires_openai_auth=false");
     if args.no_code_mode {
         cmd.arg("-c")
             .arg("features.code_mode=false")

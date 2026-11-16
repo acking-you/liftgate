@@ -140,12 +140,14 @@ lg claude-desktop --restore                 # manually replay rollback journals 
 - Scoped environment variables and temporary settings/catalog files (under
   `~/.liftgate/ephemeral/`) apply **only** to the spawned child process and are
   deleted immediately when the CLI exits.
-- **Codex App (`lg cxa`)** synthesizes a physical session `CODEX_HOME` (reading
-  `~/.codex/config.toml` and `auth.json` read-only without ever modifying
-  `~/.codex`) and passes `--user-data-dir` under `~/.liftgate/desktop/codex-app`
-  (activating MSIX packages on Windows via `Invoke-CommandInDesktopPackage` while
-  preserving `HOME` / `USERPROFILE` / `APPDATA` for child `git`, `cargo`, and
-  `ssh` shells).
+- **Codex App (`lg cxa`)** synthesizes a physical session `CODEX_HOME` (merging
+  `~/.codex/config.toml` read-only with `cli_auth_credentials_store = "file"`,
+  `forced_login_method = "api"`, and a dedicated API-key `auth.json` so ChatGPT
+  OAuth tokens never leak, without ever modifying `~/.codex`) and passes
+  `--user-data-dir` under `~/.liftgate/desktop/codex-app-isolated` (activating
+  MSIX packages on Windows via headless in-container `Invoke-CommandInDesktopPackage`
+  so `CODEX_HOME` survives the COM boundary while preserving `HOME` /
+  `USERPROFILE` / `APPDATA` for child `git`, `cargo`, and `ssh` shells).
 - **Claude Desktop (`lg cd`)** snapshots existing `Claude` / `Claude-3p` state
   into an atomic rollback journal (`~/.liftgate/desktop-journals/`), activates a
   scoped Third-Party Inference (`deploymentMode: "3p"`) profile pointed at
