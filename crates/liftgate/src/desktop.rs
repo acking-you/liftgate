@@ -4,11 +4,16 @@
 //!
 //! - **Codex App** (`Codex.app` / `OpenAI.Codex` MSIX / `codex-desktop`):
 //!   - Synthesizes an isolated physical `CODEX_HOME` under `~/.liftgate/desktop/sessions/`
-//!     containing `config.toml` (non-destructively merged from `~/.codex/config.toml` read-only),
-//!     `agy-models.json`, and `auth.json` (`0o600`), never mutating `~/.codex`.
-//!   - Launches with `--user-data-dir` scoped under `~/.liftgate/desktop/codex-app` (or a
+//!     containing `config.toml` (merged read-only from `~/.codex/config.toml` with
+//!     `cli_auth_credentials_store = "file"`, `forced_login_method = "api"`, and inline
+//!     `[model_providers.agy]` bearer routing), `agy-models.json`, and a dedicated API-key
+//!     `auth.json` (`0o600`), never copying ChatGPT OAuth tokens or mutating `~/.codex`.
+//!   - Launches with `--user-data-dir` scoped under `~/.liftgate/desktop/codex-app-isolated` (or a
 //!     disposable session directory with `--ephemeral`) so native `%APPDATA%\Codex`,
 //!     `~/Library/Application Support/Codex`, and `~/.config/Codex` remain untouched.
+//!   - On Windows MSIX (`OpenAI.Codex`), invokes `conhost.exe --headless <liftgate> __desktop-msix-launch`
+//!     inside `Invoke-CommandInDesktopPackage -PreventBreakaway` so `CODEX_HOME` and gateway env
+//!     vars survive the out-of-process `IDesktopAppXActivator` COM boundary without console flashes.
 //!   - Never alters `HOME`, `USERPROFILE`, `APPDATA`, or `LOCALAPPDATA`, keeping child developer
 //!     shells (`git`, `cargo`, `ssh`, `npm`, `gh`) working identically to native terminals.
 //!
@@ -39,12 +44,12 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::cli::{
-    ClaudeDesktopArgs, CodexAppArgs, DesktopWatchArgs, PLACEHOLDER_API_KEY,
+    ClaudeDesktopArgs, CodexAppArgs, DesktopMsixLaunchArgs, DesktopWatchArgs, PLACEHOLDER_API_KEY,
     normalize_optional_api_key,
 };
 use crate::client::{DiscoveredModel, infer_live_long_context};
 use crate::config_sync::{
-    build_offline_codex_catalog_bytes_with_mode, merge_codex_config_toml_with_mode,
+    build_offline_codex_catalog_bytes_with_mode, merge_isolated_codex_app_config_toml,
 };
 use crate::daemon::{configure_detached_command, ensure_gateway_ready, is_pid_alive};
 use crate::error::CliError;
@@ -57,6 +62,8 @@ pub const LIFTGATE_CLAUDE_3P_PROFILE_ID: &str = "00000000-0000-4000-8000-0000008
 /// Human-readable profile name shown in Claude Desktop while the Liftgate session is active.
 pub const LIFTGATE_CLAUDE_3P_PROFILE_NAME: &str = "Liftgate (Antigravity ACP)";
 
+const CODEX_APP_ISOLATED_PROFILE_DIR: &str = "codex-app-isolated";
+const LEGACY_V1_CODEX_APP_PROFILE_DIR: &str = "codex-app";
 const CLAUDE_DESKTOP_CONFIG_FILENAME: &str = "claude_desktop_config.json";
 const CLAUDE_CONFIG_LIBRARY_DIR: &str = "configLibrary";
 const CLAUDE_META_FILENAME: &str = "_meta.json";
@@ -227,32 +234,78 @@ impl Drop for ForegroundJournalGuard {
 /// or power loss once both the watcher and the target GUI application are no longer running.
 pub fn sweep_stale_desktop_sessions(state_paths: &StatePaths) {
     let dir = state_paths.desktop_journals_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(journal) = read_journal_file(&path) else {
+                continue;
+            };
+            let watcher_alive = journal.watcher_pid.is_some_and(is_pid_alive);
+            let launcher_alive = is_pid_alive(journal.launcher_pid);
+            if watcher_alive || launcher_alive {
+                continue;
+            }
+            if is_journal_session_still_running(&journal) {
+                continue;
+            }
+            cleanup_session_journal(&path, &journal);
         }
-        let Ok(journal) = read_journal_file(&path) else {
-            continue;
-        };
-        let watcher_alive = journal.watcher_pid.is_some_and(is_pid_alive);
-        let launcher_alive = is_pid_alive(journal.launcher_pid);
-        if watcher_alive || launcher_alive {
-            continue;
+    }
+
+    let legacy_codex_profile = state_paths
+        .desktop_dir()
+        .join(LEGACY_V1_CODEX_APP_PROFILE_DIR);
+    if legacy_codex_profile.exists() && !is_electron_profile_locked(&legacy_codex_profile) {
+        remove_dir_all_best_effort(&legacy_codex_profile);
+    }
+}
+
+/// Retires any lingering Liftgate v0.1.8 Codex App session tied to the legacy `desktop/codex-app`
+/// profile directory (which previously cached ChatGPT login cookies when `IDesktopAppXActivator`
+/// dropped `CODEX_HOME`), never touching native `%APPDATA%\Codex` windows.
+async fn retire_legacy_v1_codex_app_sessions(state_paths: &StatePaths) {
+    let legacy_raw = state_paths
+        .desktop_dir()
+        .join(LEGACY_V1_CODEX_APP_PROFILE_DIR);
+    let legacy_norm = normalize_match_path(&canonicalize_clean(&legacy_raw));
+
+    if let Ok(entries) = fs::read_dir(state_paths.desktop_journals_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(journal) = read_journal_file(&path) else {
+                continue;
+            };
+            let DesktopSessionPayload::CodexApp { user_data_dir, .. } = &journal.payload else {
+                continue;
+            };
+            let journal_profile_norm = normalize_match_path(&canonicalize_clean(user_data_dir));
+            if journal_profile_norm != legacy_norm {
+                continue;
+            }
+            let mut pids_to_stop = journal.tracked_pids.clone();
+            if let Some(watcher) = journal.watcher_pid {
+                pids_to_stop.push(watcher);
+            }
+            terminate_specific_pids(&pids_to_stop).await;
+            cleanup_session_journal(&path, &journal);
         }
-        if is_journal_session_still_running(&journal) {
-            continue;
-        }
-        cleanup_session_journal(&path, &journal);
+    }
+
+    if legacy_raw.exists() && !is_electron_profile_locked(&legacy_raw) {
+        remove_dir_all_best_effort(&legacy_raw);
     }
 }
 
 /// Launches **Codex App** routed through Liftgate with an isolated ephemeral `CODEX_HOME`.
 pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Result<i32, CliError> {
     sweep_stale_desktop_sessions(state_paths);
+    retire_legacy_v1_codex_app_sessions(state_paths).await;
 
     let app_bin = resolve_codex_app(args.codex_app_bin.as_deref())?;
     let explicit_codex_cli = match args.codex_bin.as_deref() {
@@ -262,6 +315,7 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
 
     if args.restart_app {
         stop_running_desktop_app(DesktopKind::CodexApp, args.codex_app_bin.as_deref()).await;
+        sweep_stale_desktop_sessions(state_paths);
     }
 
     let target = ensure_gateway_ready(
@@ -281,7 +335,6 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
         .unwrap_or(&target.default_model)
         .to_owned();
     let normalized_key = normalize_optional_api_key(target.api_key.as_deref());
-    let require_env_key = normalized_key.is_some();
     let auth_token = normalized_key.unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let tool_mode = if args.no_code_mode {
@@ -327,14 +380,15 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
         target.client.base_url(),
         &primary_model,
         &auth_token,
-        require_env_key,
         &catalog_bytes,
         args.no_bypass,
         args.no_code_mode,
         args.code_mode_only,
     )?;
 
-    let persistent_user_data = state_paths.desktop_dir().join("codex-app");
+    let persistent_user_data = state_paths
+        .desktop_dir()
+        .join(CODEX_APP_ISOLATED_PROFILE_DIR);
     let use_ephemeral_profile = args.ephemeral || is_electron_profile_locked(&persistent_user_data);
     let user_data_dir = if use_ephemeral_profile {
         session_dir.join("user-data")
@@ -393,6 +447,7 @@ pub async fn run_codex_app(state_paths: &StatePaths, args: CodexAppArgs) -> Resu
     }
 
     let tracked_pids = spawn_desktop_application(
+        state_paths,
         DesktopKind::CodexApp,
         &app_bin,
         args.codex_app_bin.as_deref(),
@@ -543,6 +598,7 @@ pub async fn run_claude_desktop(
     ];
 
     let tracked_pids = spawn_desktop_application(
+        state_paths,
         DesktopKind::ClaudeDesktop,
         &app_bin,
         args.claude_desktop_bin.as_deref(),
@@ -584,6 +640,80 @@ pub async fn run_desktop_watch(args: DesktopWatchArgs) -> Result<(), CliError> {
     wait_for_desktop_session_exit(&journal, false).await;
     cleanup_session_journal(&args.journal, &journal);
     Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MsixLaunchSpec {
+    executable: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    result_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MsixLaunchResult {
+    pid: Option<u32>,
+    error: Option<String>,
+}
+
+/// Internal in-container launcher (`lg __desktop-msix-launch --spec <path>`) executed inside a
+/// Windows MSIX package context (`Invoke-CommandInDesktopPackage -PreventBreakaway`).
+///
+/// Because Windows's out-of-process `IDesktopAppXActivator` COM server spawns packaged processes
+/// from the session logon token rather than inheriting the calling process's environment block,
+/// running `liftgate` itself inside the MSIX bubble allows `CreateProcessW` to pass `CODEX_HOME`,
+/// `AGY_GATEWAY_API_KEY`, `NO_PROXY`, and `CODEX_CLI_PATH` losslessly to the target GUI binary.
+pub fn run_desktop_msix_launch(args: DesktopMsixLaunchArgs) -> Result<(), CliError> {
+    let spec_bytes = read_bounded_bytes(&args.spec, MAX_DESKTOP_CONFIG_BYTES)?;
+    let _ = fs::remove_file(&args.spec);
+    let spec: MsixLaunchSpec =
+        serde_json::from_slice(&spec_bytes).map_err(|source| CliError::StateJson {
+            path: args.spec.clone(),
+            source,
+        })?;
+
+    let mut cmd = std::process::Command::new(&spec.executable);
+    cmd.args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(unix)]
+    configure_detached_command(&mut cmd);
+
+    #[cfg(windows)]
+    let _inherit_guard = crate::daemon::StdioInheritGuard::suspend_current();
+
+    let outcome = match cmd.spawn() {
+        Ok(child) => MsixLaunchResult {
+            pid: Some(child.id()),
+            error: None,
+        },
+        Err(err) => MsixLaunchResult {
+            pid: None,
+            error: Some(format!("{}: {err}", spec.executable.display())),
+        },
+    };
+    #[cfg(windows)]
+    drop(_inherit_guard);
+
+    let mut result_bytes = serde_json::to_vec(&outcome).map_err(|source| CliError::StateJson {
+        path: spec.result_path.clone(),
+        source,
+    })?;
+    result_bytes.push(b'\n');
+    write_file_atomic(&spec.result_path, &result_bytes, true)
 }
 
 async fn finalize_or_watch_session(
@@ -735,7 +865,6 @@ pub fn seed_ephemeral_codex_home(
     gateway_base_url: &str,
     primary_model: &str,
     auth_token: &str,
-    require_env_key: bool,
     catalog_bytes: &[u8],
     no_bypass: bool,
     no_code_mode: bool,
@@ -753,12 +882,12 @@ pub fn seed_ephemeral_codex_home(
         .map(|d| d.join("config.toml"))
         .and_then(|p| read_bounded_utf8(&p, MAX_DESKTOP_CONFIG_BYTES).ok())
         .unwrap_or_default();
-    let merged_toml = merge_codex_config_toml_with_mode(
+    let merged_toml = merge_isolated_codex_app_config_toml(
         &existing_toml,
         gateway_base_url,
         primary_model,
         &catalog_path,
-        require_env_key,
+        auth_token,
         no_bypass,
         no_code_mode,
         code_mode_only,
@@ -769,27 +898,22 @@ pub fn seed_ephemeral_codex_home(
         true,
     )?;
 
-    // Codex App requires `auth.json` to unlock custom model selection in its GUI picker.
-    // If the user already signed in to Codex CLI (`~/.codex/auth.json`), copy it read-only
-    // (`0o600`) without modifying `~/.codex`; `[model_providers.agy]` still routes all
-    // requests to Liftgate using `AGY_GATEWAY_API_KEY`. Otherwise synthesize an API-key entry.
+    // Always synthesize a clean API-key `auth.json` (`0o600`) paired with
+    // `cli_auth_credentials_store = "file"` and `forced_login_method = "api"` in `config.toml`.
+    // Copying `~/.codex/auth.json` would leak the user's ChatGPT OAuth session into `app-server`,
+    // causing Codex App to sign into their ChatGPT account and spawn remote cloud executors
+    // instead of routing through Liftgate.
     let auth_target = ephemeral_codex_home.join("auth.json");
-    let copied_existing_auth = source_codex_dir
-        .map(|d| d.join("auth.json"))
-        .and_then(|src| read_bounded_bytes(&src, MAX_DESKTOP_CONFIG_BYTES).ok())
-        .filter(|bytes| !bytes.is_empty());
-    if let Some(raw_auth) = copied_existing_auth {
-        write_file_atomic(&auth_target, &raw_auth, true)?;
-    } else {
-        let synthetic_auth = serde_json::to_vec_pretty(&json!({
-            "OPENAI_API_KEY": auth_token,
-        }))
-        .map_err(|source| CliError::StateJson {
-            path: auth_target.clone(),
-            source,
-        })?;
-        write_file_atomic(&auth_target, &synthetic_auth, true)?;
-    }
+    let mut synthetic_auth = serde_json::to_vec_pretty(&json!({
+        "auth_mode": "apikey",
+        "OPENAI_API_KEY": auth_token,
+    }))
+    .map_err(|source| CliError::StateJson {
+        path: auth_target.clone(),
+        source,
+    })?;
+    synthetic_auth.push(b'\n');
+    write_file_atomic(&auth_target, &synthetic_auth, true)?;
 
     if let Some(src_dir) = source_codex_dir {
         for doc_name in ["AGENTS.md", "instructions.md"] {
@@ -1987,11 +2111,40 @@ fn windows_powershell_exe() -> PathBuf {
     PathBuf::from("powershell.exe")
 }
 
+#[cfg(windows)]
+fn windows_conhost_exe() -> Option<PathBuf> {
+    let sys_root = std::env::var_os("SystemRoot").filter(|s| !s.is_empty())?;
+    let candidate = PathBuf::from(sys_root).join("System32").join("conhost.exe");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(windows)]
+struct MsixTempFilesGuard {
+    spec_path: PathBuf,
+    result_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for MsixTempFilesGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.spec_path);
+        let _ = fs::remove_file(&self.result_path);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Process Spawning, Enumeration & Graceful Restart
 // ---------------------------------------------------------------------------
 
 async fn spawn_desktop_application(
+    #[cfg_attr(
+        not(windows),
+        expect(
+            unused_variables,
+            reason = "ephemeral launch spec directory is only used for Windows MSIX packages"
+        )
+    )]
+    state_paths: &StatePaths,
     kind: DesktopKind,
     app_bin: &DesktopAppBinary,
     explicit_bin: Option<&Path>,
@@ -2036,6 +2189,7 @@ async fn spawn_desktop_application(
             ..
         } => {
             spawn_windows_msix_package(
+                state_paths,
                 kind.display_name(),
                 package_family_name,
                 app_id,
@@ -2044,8 +2198,7 @@ async fn spawn_desktop_application(
                 launch_args,
                 extra_env,
             )
-            .await?;
-            None
+            .await?
         }
     };
 
@@ -2077,7 +2230,12 @@ async fn spawn_desktop_application(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MSIX in-container launcher receives resolved package descriptor and env directly"
+)]
 async fn spawn_windows_msix_package(
+    state_paths: &StatePaths,
     app_display_name: &'static str,
     package_family_name: &str,
     app_id: &str,
@@ -2085,42 +2243,82 @@ async fn spawn_windows_msix_package(
     executable_full: &Path,
     launch_args: &[String],
     extra_env: &[(String, String)],
-) -> Result<(), CliError> {
+) -> Result<Option<u32>, CliError> {
     use tokio::process::Command;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-    let ps_exe = windows_powershell_exe();
-    let joined_args = join_windows_command_line_args(launch_args);
-    let exe_arg = if executable_full.is_file() {
-        executable_full.display().to_string()
-    } else {
-        executable_rel.to_owned()
+    let current_exe =
+        std::env::current_exe().map_err(|source| CliError::DesktopAppLaunchFailed {
+            app: app_display_name,
+            detail: format!("failed to locate current liftgate binary: {source}"),
+        })?;
+    let ephemeral_dir = state_paths.ensure_ephemeral_dir()?;
+    let nonce = Uuid::new_v4().simple();
+    let spec_path = ephemeral_dir.join(format!("msix-spec-{nonce}.json"));
+    let result_path = ephemeral_dir.join(format!("msix-result-{nonce}.json"));
+    let _cleanup_guard = MsixTempFilesGuard {
+        spec_path: spec_path.clone(),
+        result_path: result_path.clone(),
     };
 
+    let target_exe = if executable_full.is_file() || executable_full.is_absolute() {
+        executable_full.to_path_buf()
+    } else {
+        PathBuf::from(executable_rel)
+    };
+    let spec = MsixLaunchSpec {
+        executable: target_exe,
+        args: launch_args.to_vec(),
+        env: extra_env.to_vec(),
+        result_path: result_path.clone(),
+    };
+    let mut spec_bytes = serde_json::to_vec(&spec).map_err(|source| CliError::StateJson {
+        path: spec_path.clone(),
+        source,
+    })?;
+    spec_bytes.push(b'\n');
+    write_file_atomic(&spec_path, &spec_bytes, true)?;
+
+    // Wrap the console-subsystem `liftgate.exe __desktop-msix-launch` helper inside
+    // `conhost.exe --headless` so `IDesktopAppXActivator` (`svchost.exe`) never flashes a
+    // visible console window, while `-PreventBreakaway` keeps the spawned GUI process inside the
+    // MSIX package identity (`OpenAI.Codex` / `Claude`) with all environment variables intact.
+    let (activator_cmd, activator_args) = if let Some(conhost) = windows_conhost_exe() {
+        let joined = join_windows_command_line_args(&[
+            "--headless".to_owned(),
+            current_exe.display().to_string(),
+            "__desktop-msix-launch".to_owned(),
+            "--spec".to_owned(),
+            spec_path.display().to_string(),
+        ]);
+        (conhost.display().to_string(), joined)
+    } else {
+        let joined = join_windows_command_line_args(&[
+            "__desktop-msix-launch".to_owned(),
+            "--spec".to_owned(),
+            spec_path.display().to_string(),
+        ]);
+        (current_exe.display().to_string(), joined)
+    };
+
+    let ps_exe = windows_powershell_exe();
     let ps_script = "$ErrorActionPreference = 'Stop'; \
         $pfn = $env:__LG_MSIX_PFN; \
         $app = $env:__LG_MSIX_APP_ID; \
-        $exe = $env:__LG_MSIX_EXE; \
+        $cmdExe = $env:__LG_MSIX_CMD; \
         $argStr = $env:__LG_MSIX_ARGS; \
-        Remove-Item Env:__LG_MSIX_PFN, Env:__LG_MSIX_APP_ID, Env:__LG_MSIX_EXE, Env:__LG_MSIX_ARGS -ErrorAction SilentlyContinue; \
-        if ([string]::IsNullOrEmpty($argStr)) { \
-            Invoke-CommandInDesktopPackage -PackageFamilyName $pfn -AppId $app -Command $exe | Out-Null \
-        } else { \
-            Invoke-CommandInDesktopPackage -PackageFamilyName $pfn -AppId $app -Command $exe -Args $argStr | Out-Null \
-        }";
+        Remove-Item Env:__LG_MSIX_PFN, Env:__LG_MSIX_APP_ID, Env:__LG_MSIX_CMD, Env:__LG_MSIX_ARGS -ErrorAction SilentlyContinue; \
+        Invoke-CommandInDesktopPackage -PackageFamilyName $pfn -AppId $app -Command $cmdExe -Args $argStr -PreventBreakaway | Out-Null";
 
     let mut cmd = Command::new(&ps_exe);
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
         .env("__LG_MSIX_PFN", package_family_name)
         .env("__LG_MSIX_APP_ID", app_id)
-        .env("__LG_MSIX_EXE", &exe_arg)
-        .env("__LG_MSIX_ARGS", &joined_args)
+        .env("__LG_MSIX_CMD", &activator_cmd)
+        .env("__LG_MSIX_ARGS", &activator_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
 
     let output = cmd
         .output()
@@ -2144,7 +2342,23 @@ async fn spawn_windows_msix_package(
             },
         });
     }
-    Ok(())
+
+    for _ in 0..45u8 {
+        if let Ok(raw) = read_bounded_bytes(&result_path, MAX_DESKTOP_CONFIG_BYTES)
+            && let Ok(parsed) = serde_json::from_slice::<MsixLaunchResult>(&raw)
+        {
+            if let Some(err_detail) = parsed.error {
+                return Err(CliError::DesktopAppLaunchFailed {
+                    app: app_display_name,
+                    detail: err_detail,
+                });
+            }
+            return Ok(parsed.pid);
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
+    Ok(None)
 }
 
 #[cfg(any(windows, test))]
@@ -2191,6 +2405,89 @@ fn quote_windows_arg(arg: &str) -> String {
     }
     out.push('"');
     out
+}
+
+async fn terminate_specific_pids(pids: &[u32]) {
+    let self_pid = std::process::id();
+    let live: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|&pid| pid != 0 && pid != self_pid && is_pid_alive(pid))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        for &pid in &live {
+            if let Ok(raw) = i32::try_from(pid)
+                && raw > 0
+            {
+                // SAFETY: Sends polite `SIGTERM` to a Liftgate-tracked session PID.
+                unsafe {
+                    let _ = libc::kill(raw, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        for &pid in &live {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    }
+
+    for _ in 0..12u8 {
+        if !live.iter().copied().any(is_pid_alive) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[cfg(unix)]
+    {
+        for &pid in &live {
+            if is_pid_alive(pid)
+                && let Ok(raw) = i32::try_from(pid)
+                && raw > 0
+            {
+                // SAFETY: Escalates to `SIGKILL` on unresponsive Liftgate-tracked session PID.
+                unsafe {
+                    let _ = libc::kill(raw, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        for &pid in &live {
+            if is_pid_alive(pid) {
+                let _ = std::process::Command::new("taskkill.exe")
+                    .args(["/F", "/PID", &pid.to_string(), "/T"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
 async fn stop_running_desktop_app(kind: DesktopKind, explicit_bin: Option<&Path>) {
@@ -2726,14 +3023,16 @@ mod tests {
     }
 
     #[test]
-    fn seed_ephemeral_codex_home_preserves_source_dir_untouched() {
+    fn seed_ephemeral_codex_home_preserves_source_dir_and_never_copies_chatgpt_oauth_tokens() {
         let tmp = std::env::temp_dir().join(format!("lg-codex-app-seed-{}", Uuid::new_v4()));
         let fake_user_codex = tmp.join("dot-codex");
         let ephemeral_home = tmp.join("ephemeral-home");
         fs::create_dir_all(&fake_user_codex).unwrap();
 
-        let original_config = "model = \"gpt-5\"\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
+        let original_config = "model = \"gpt-5\"\ncli_auth_credentials_store = \"keyring\"\nforced_login_method = \"chatgpt\"\n\n[mcp_servers.demo]\ncommand = \"npx\"\n";
+        let original_oauth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret-user-oauth","account_id":"acct_real"}}"#;
         fs::write(fake_user_codex.join("config.toml"), original_config).unwrap();
+        fs::write(fake_user_codex.join("auth.json"), original_oauth).unwrap();
         fs::write(fake_user_codex.join("AGENTS.md"), "# User rules\n").unwrap();
 
         seed_ephemeral_codex_home(
@@ -2742,7 +3041,6 @@ mod tests {
             "http://127.0.0.1:8787",
             "gemini-4-carbon-high",
             "agy-local",
-            false,
             b"{\"models\":[]}\n",
             false,
             false,
@@ -2755,18 +3053,106 @@ mod tests {
             fs::read_to_string(fake_user_codex.join("config.toml")).unwrap(),
             original_config
         );
+        assert_eq!(
+            fs::read_to_string(fake_user_codex.join("auth.json")).unwrap(),
+            original_oauth
+        );
         assert!(!fake_user_codex.join("agy-models.json").exists());
-        assert!(!fake_user_codex.join("auth.json").exists());
 
-        // Ephemeral CODEX_HOME gets merged config, catalog, synthetic auth.json, and AGENTS.md.
+        // Ephemeral CODEX_HOME gets isolated API-key config/auth and never leaks ChatGPT OAuth.
         let merged = fs::read_to_string(ephemeral_home.join("config.toml")).unwrap();
         assert!(merged.contains("model_provider = \"agy\""));
         assert!(merged.contains("model = \"gemini-4-carbon-high\""));
+        assert!(merged.contains("cli_auth_credentials_store = \"file\""));
+        assert!(merged.contains("forced_login_method = \"api\""));
+        assert!(merged.contains("requires_openai_auth = false"));
+        assert!(merged.contains("experimental_bearer_token = \"agy-local\""));
+        assert!(merged.contains("remote_control = false"));
         assert!(merged.contains("[mcp_servers.demo]"));
+        assert!(!merged.contains("keyring"));
+
+        let written_auth: Value =
+            serde_json::from_slice(&fs::read(ephemeral_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            written_auth,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "agy-local",
+            })
+        );
         assert!(ephemeral_home.join("agy-models.json").is_file());
-        assert!(ephemeral_home.join("auth.json").is_file());
         assert!(ephemeral_home.join("AGENTS.md").is_file());
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn msix_launch_helper_unlinks_spec_and_records_spawned_pid_with_injected_env() {
+        let tmp = std::env::temp_dir().join(format!("lg-msix-helper-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let spec_path = tmp.join("spec.json");
+        let result_path = tmp.join("result.json");
+        let probe_tmp = tmp.join("probe.tmp");
+        let probe_out = tmp.join("probe.txt");
+        let probe_src = tmp.join("probe_bin.rs");
+        let probe_bin = tmp.join(if cfg!(windows) {
+            "probe_bin.exe"
+        } else {
+            "probe_bin"
+        });
+
+        let code = r#"
+fn main() {
+    let mut args = std::env::args_os().skip(1);
+    let tmp_path = args.next().unwrap();
+    let out_path = args.next().unwrap();
+    let val = std::env::var("CODEX_HOME").unwrap_or_default();
+    std::fs::write(&tmp_path, val.as_bytes()).unwrap();
+    std::fs::rename(&tmp_path, &out_path).unwrap();
+}
+"#;
+        fs::write(&probe_src, code).unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compile_status = std::process::Command::new(rustc)
+            .arg(&probe_src)
+            .arg("-o")
+            .arg(&probe_bin)
+            .status()
+            .unwrap();
+        assert!(compile_status.success(), "rustc failed to build probe_bin");
+
+        let spec = MsixLaunchSpec {
+            executable: probe_bin,
+            args: vec![
+                probe_tmp.display().to_string(),
+                probe_out.display().to_string(),
+            ],
+            env: vec![("CODEX_HOME".to_owned(), "/isolated/codex-home".to_owned())],
+            result_path: result_path.clone(),
+        };
+        fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+
+        run_desktop_msix_launch(DesktopMsixLaunchArgs {
+            spec: spec_path.clone(),
+        })
+        .unwrap();
+
+        assert!(!spec_path.exists());
+        let res: MsixLaunchResult =
+            serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+        assert!(res.error.is_none());
+        assert!(res.pid.unwrap_or(0) > 0);
+
+        for _ in 0..100u8 {
+            if probe_out.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            fs::read_to_string(&probe_out).unwrap_or_default(),
+            "/isolated/codex-home"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
