@@ -211,8 +211,17 @@ impl Drop for BinarySwapGuard {
             && let Some(bak) = &self.backup_path
             && bak.exists()
         {
-            let _ = std::fs::remove_file(&self.target_path);
-            let _ = std::fs::rename(bak, &self.target_path);
+            for attempt in 0..15u8 {
+                if self.target_path.exists() {
+                    let _ = std::fs::remove_file(&self.target_path);
+                }
+                if std::fs::rename(bak, &self.target_path).is_ok() || !bak.exists() {
+                    break;
+                }
+                if attempt < 14 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         }
     }
 }
@@ -455,8 +464,10 @@ impl LiveAcpGeneration {
             _cancel_guard: cancel_guard,
         };
 
-        // Perform ACP `initialize` handshake
-        let init_res: InitializeResult = generation
+        // Perform ACP `initialize` handshake; on failure, explicitly await `shutdown()` so worker
+        // tasks and the OS Job Object release executable image locks before returning (critical
+        // for synchronous `BinarySwapGuard` rollback on Windows).
+        let init_res: InitializeResult = match generation
             .inner
             .call_rpc(
                 "initialize",
@@ -475,7 +486,14 @@ impl LiveAcpGeneration {
                     },
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                generation.shutdown().await;
+                return Err(err);
+            }
+        };
 
         tracing::info!(
             generation_id = id,

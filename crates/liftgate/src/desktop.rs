@@ -3092,33 +3092,41 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         let spec_path = tmp.join("spec.json");
         let result_path = tmp.join("result.json");
+        let probe_tmp = tmp.join("probe.tmp");
         let probe_out = tmp.join("probe.txt");
+        let probe_src = tmp.join("probe_bin.rs");
+        let probe_bin = tmp.join(if cfg!(windows) {
+            "probe_bin.exe"
+        } else {
+            "probe_bin"
+        });
 
-        #[cfg(windows)]
-        let (exe, args) = (
-            windows_powershell_exe(),
-            vec![
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                format!(
-                    "[IO.File]::WriteAllText('{}', $env:CODEX_HOME)",
-                    probe_out.display().to_string().replace('\'', "''")
-                ),
-            ],
-        );
-        #[cfg(not(windows))]
-        let (exe, args) = (
-            PathBuf::from("/bin/sh"),
-            vec![
-                "-c".to_owned(),
-                format!("printf '%s' \"$CODEX_HOME\" > '{}'", probe_out.display()),
-            ],
-        );
+        let code = r#"
+fn main() {
+    let mut args = std::env::args_os().skip(1);
+    let tmp_path = args.next().unwrap();
+    let out_path = args.next().unwrap();
+    let val = std::env::var("CODEX_HOME").unwrap_or_default();
+    std::fs::write(&tmp_path, val.as_bytes()).unwrap();
+    std::fs::rename(&tmp_path, &out_path).unwrap();
+}
+"#;
+        fs::write(&probe_src, code).unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compile_status = std::process::Command::new(rustc)
+            .arg(&probe_src)
+            .arg("-o")
+            .arg(&probe_bin)
+            .status()
+            .unwrap();
+        assert!(compile_status.success(), "rustc failed to build probe_bin");
 
         let spec = MsixLaunchSpec {
-            executable: exe,
-            args,
+            executable: probe_bin,
+            args: vec![
+                probe_tmp.display().to_string(),
+                probe_out.display().to_string(),
+            ],
             env: vec![("CODEX_HOME".to_owned(), "/isolated/codex-home".to_owned())],
             result_path: result_path.clone(),
         };
@@ -3135,7 +3143,7 @@ mod tests {
         assert!(res.error.is_none());
         assert!(res.pid.unwrap_or(0) > 0);
 
-        for _ in 0..40u8 {
+        for _ in 0..100u8 {
             if probe_out.is_file() {
                 break;
             }
