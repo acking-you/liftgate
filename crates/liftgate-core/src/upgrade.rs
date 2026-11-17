@@ -14,6 +14,7 @@
 //!   (with automatic rollback and Windows running-executable rename handling).
 
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _};
@@ -278,6 +279,76 @@ fn sweep_stale_backups_in_dir(dir: &Path) {
     }
 }
 
+/// Returns the packaged bundle description when `current_exe` is running from inside a
+/// read-only or code-signed desktop bundle (such as a Linux AppImage mount or macOS `.app`)
+/// where raw-binary in-place replacement would fail or corrupt the bundle.
+#[must_use]
+pub fn detect_packaged_bundle_kind(current_exe: &Path) -> Option<&'static str> {
+    detect_packaged_bundle_kind_with_env(
+        current_exe,
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+    )
+}
+
+fn detect_packaged_bundle_kind_with_env(
+    current_exe: &Path,
+    appimage: Option<&OsStr>,
+    appdir: Option<&OsStr>,
+) -> Option<&'static str> {
+    let normalized = current_exe.to_string_lossy().replace('\\', "/");
+    for segment in normalized.split('/') {
+        if segment.starts_with(".mount_") || segment.starts_with("appimage_extracted_") {
+            return Some("an AppImage runtime mount");
+        }
+    }
+
+    if let Some(raw_appdir) = appdir.filter(|v| !v.is_empty()) {
+        let appdir_path = Path::new(raw_appdir);
+        if current_exe.starts_with(appdir_path) {
+            return Some("an AppImage runtime mount");
+        }
+        if let (Ok(canon_exe), Ok(canon_dir)) =
+            (fs::canonicalize(current_exe), fs::canonicalize(appdir_path))
+            && canon_exe.starts_with(&canon_dir)
+        {
+            return Some("an AppImage runtime mount");
+        }
+    }
+
+    if let Some(raw_appimage) = appimage.filter(|v| !v.is_empty()) {
+        let outer = Path::new(raw_appimage);
+        if current_exe != outer && normalized.contains("/usr/bin/") {
+            return Some("an AppImage runtime mount");
+        }
+    }
+
+    if let Some(macos_dir) = current_exe.parent()
+        && macos_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("MacOS"))
+        && let Some(contents_dir) = macos_dir.parent()
+        && contents_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("Contents"))
+        && let Some(bundle_dir) = contents_dir.parent()
+        && bundle_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            })
+    {
+        return Some("a signed macOS .app bundle");
+    }
+
+    None
+}
+
 pub async fn execute_upgrade(
     state_paths: &StatePaths,
     args: &UpgradeArgs,
@@ -300,6 +371,23 @@ pub async fn execute_upgrade(
         .filter(|s| !s.is_empty())
         .unwrap_or(COMPILE_TARGET);
     validate_target_triple(desired_target)?;
+
+    if !args.check
+        && let Some(bundle_kind) = detect_packaged_bundle_kind(current_exe)
+    {
+        let release_url = match &requested_tag {
+            Some(tag) => format!(
+                "https://github.com/{}/releases/tag/{tag}-ui",
+                args.repo.trim()
+            ),
+            None => format!("https://github.com/{}/releases", args.repo.trim()),
+        };
+        return Err(CliError::UpgradePackagedBundle {
+            bundle_kind,
+            exe_path: current_exe.to_path_buf(),
+            release_url,
+        });
+    }
 
     let plan = resolve_release_plan(
         &args.repo,
@@ -479,6 +567,9 @@ pub async fn execute_upgrade(
 
     // Check if a managed background daemon is running so we unlock `liftgate.exe` on Windows
     // and bring the daemon back online running the newly installed version.
+    let install_targets = plan_install_targets(current_exe, &staged, &plan.target_triple);
+    verify_install_targets_writable(&install_targets)?;
+
     let active_daemon_before = state_paths
         .read_daemon()?
         .filter(|d| daemon::is_pid_alive(d.pid));
@@ -491,11 +582,23 @@ pub async fn execute_upgrade(
         let _ = daemon::stop_daemon(state_paths).await?;
     }
 
-    let install_targets = plan_install_targets(current_exe, &staged, &plan.target_triple);
     let mut installed_paths = Vec::with_capacity(install_targets.len());
+    let mut install_err: Option<CliError> = None;
     for (staged_src, dest_path) in &install_targets {
-        replace_executable_atomic(staged_src, dest_path)?;
-        installed_paths.push(dest_path.display().to_string());
+        match replace_executable_atomic(staged_src, dest_path) {
+            Ok(()) => installed_paths.push(dest_path.display().to_string()),
+            Err(err) => {
+                install_err = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = install_err {
+        if let Some(serve_cfg) = saved_daemon_serve {
+            let _ = daemon::start_daemon_with_exe(state_paths, Some(current_exe), serve_cfg, false)
+                .await;
+        }
+        return Err(err);
     }
 
     let mut daemon_restarted = false;
@@ -1766,8 +1869,39 @@ fn copy_executable_with_sync(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn verify_install_targets_writable(targets: &[(PathBuf, PathBuf)]) -> Result<(), CliError> {
+    let mut checked_dirs: Vec<PathBuf> = Vec::new();
+    for (_, dest_path) in targets {
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        if checked_dirs.iter().any(|d| same_file_path(d, parent)) {
+            continue;
+        }
+        let probe_path = parent.join(format!(
+            ".liftgate-upgrade-probe.{}.{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = fs::remove_file(&probe_path);
+            }
+            Err(source) => return Err(map_replace_io(dest_path, source)),
+        }
+        checked_dirs.push(parent.to_path_buf());
+    }
+    Ok(())
+}
+
 fn map_replace_io(target: &Path, source: io::Error) -> CliError {
-    if source.kind() == io::ErrorKind::PermissionDenied {
+    if matches!(
+        source.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    ) {
         CliError::UpgradePermissionDenied {
             path: target.to_path_buf(),
             source,
@@ -2131,6 +2265,109 @@ mod tests {
         let targets = plan_install_targets(&current_desktop, &staged, "x86_64-pc-windows-msvc");
         assert_eq!(targets.len(), 3);
         assert!(same_file_path(&targets[0].1, &current_desktop));
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn blocks_appimage_and_app_bundle_in_place_upgrade_while_allowing_check() {
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/tmp/.mount_liftgaAbCdEf/usr/bin/liftgate-desktop"),
+                None,
+                None,
+            ),
+            Some("an AppImage runtime mount")
+        );
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/tmp/appimage_extracted_1234/usr/bin/liftgate-desktop"),
+                None,
+                None,
+            ),
+            Some("an AppImage runtime mount")
+        );
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/opt/squash/usr/bin/liftgate-desktop"),
+                Some(OsStr::new("/home/dev/Apps/Liftgate.AppImage")),
+                Some(OsStr::new("/opt/squash")),
+            ),
+            Some("an AppImage runtime mount")
+        );
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/home/dev/.cargo/bin/lg"),
+                Some(OsStr::new("/home/dev/Apps/Liftgate.AppImage")),
+                Some(OsStr::new("/tmp/.mount_liftgaAbCdEf")),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/Applications/Liftgate.app/Contents/MacOS/liftgate-desktop"),
+                None,
+                None,
+            ),
+            Some("a signed macOS .app bundle")
+        );
+        assert_eq!(
+            detect_packaged_bundle_kind_with_env(
+                Path::new("/Users/dev/liftgate-aarch64-apple-darwin/liftgate-desktop"),
+                None,
+                None,
+            ),
+            None
+        );
+
+        let temp_root =
+            std::env::temp_dir().join(format!("lg-upgrade-appimage-{}", Uuid::new_v4()));
+        let state_paths = StatePaths::resolve(Some(temp_root.join("state"))).unwrap();
+        let appimage_exe = Path::new("/tmp/.mount_liftgaTest/usr/bin/liftgate-desktop");
+        let archive_name = if COMPILE_TARGET.contains("windows") {
+            format!("liftgate-{COMPILE_TARGET}.zip")
+        } else {
+            format!("liftgate-{COMPILE_TARGET}.tar.gz")
+        };
+        let mock_url = spawn_mock_release_server(
+            "v99.2.0",
+            &archive_name,
+            vec![1, 2, 3, 4],
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await;
+        let check_outcome = execute_upgrade(
+            &state_paths,
+            &UpgradeArgs {
+                check: true,
+                base_url: Some(mock_url),
+                ..UpgradeArgs::default()
+            },
+            appimage_exe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(check_outcome.status, "update_available");
+        assert!(!check_outcome.upgraded);
+
+        let err = execute_upgrade(
+            &state_paths,
+            &UpgradeArgs {
+                check: false,
+                version: Some("v0.2.0".to_owned()),
+                ..UpgradeArgs::default()
+            },
+            appimage_exe,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CliError::UpgradePackagedBundle {
+                ref release_url,
+                ..
+            } if release_url.ends_with("/releases/tag/v0.2.0-ui")
+        ));
 
         let _ = fs::remove_dir_all(&temp_root);
     }

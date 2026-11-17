@@ -6,3 +6,6 @@
 /claude-carbon.settings.json
 *.tsbuildinfo
 .DS_Store
+__pycache__/
+*.py[cod]
+/dist/

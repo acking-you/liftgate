@@ -91,10 +91,11 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 ## Get started
 
-Grab a prebuilt archive from
-[GitHub Releases](https://github.com/acking-you/liftgate/releases) (or
-`cargo binstall liftgate` / `cargo install`), then let **`lg`** (identical to
-`liftgate`) install `agy` if needed and sign you in:
+Grab a prebuilt CLI/portable archive or native **Liftgate Desktop** installer
+(`.dmg`, Windows `-setup.exe`, Linux `.AppImage` / `.deb`, published under
+`vX.Y.Z-ui`) from [GitHub Releases](https://github.com/acking-you/liftgate/releases)
+(or `cargo binstall liftgate` / `cargo install`), then let **`lg`** (identical
+to `liftgate`) or **`liftgate-desktop`** install `agy` if needed and sign you in:
 
 ```bash
 cargo install --path crates/liftgate --locked  # installs both `lg` and `liftgate` (embeds Web UI when Bun is present)

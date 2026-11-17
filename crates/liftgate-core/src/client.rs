@@ -243,10 +243,11 @@ impl GatewayClient {
     }
 
     /// Subscribes to `/api/telemetry/events` over loopback SSE, streaming parsed
-    /// [`GatewayTelemetrySnapshot`] frames into `tx` until `cancel` triggers or the connection closes.
+    /// latest [`GatewayTelemetrySnapshot`] frames into `tx` (coalescing bursts in O(1) memory)
+    /// until `cancel` triggers, all receivers drop, or the connection closes.
     pub async fn subscribe_telemetry_events(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<GatewayTelemetrySnapshot>,
+        tx: tokio::sync::watch::Sender<Option<GatewayTelemetrySnapshot>>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), CliError> {
         let path = "/api/telemetry/events";
@@ -291,12 +292,13 @@ impl GatewayClient {
         let mut decoder = IncrementalSseDecoder::new();
         let mut read_buf = [0u8; 16_384];
         loop {
-            if *cancel.borrow() {
+            if *cancel.borrow() || tx.is_closed() {
                 break;
             }
             tokio::select! {
                 biased;
                 _ = cancel.wait_for(|&stopped| stopped) => break,
+                () = tx.closed() => break,
                 read_res = stream.read(&mut read_buf) => {
                     let n = read_res.map_err(|source| CliError::GatewayUnreachable {
                         url: full_url.clone(),
@@ -310,15 +312,15 @@ impl GatewayClient {
                     };
                     match decoder.push_bytes(bytes, &full_url)? {
                         SseFeedOutcome::Continue(snapshots) => {
-                            for snap in snapshots {
-                                if tx.send(snap).is_err() {
-                                    return Ok(());
-                                }
+                            if let Some(latest) = snapshots.into_iter().last()
+                                && tx.send(Some(latest)).is_err()
+                            {
+                                return Ok(());
                             }
                         }
                         SseFeedOutcome::EndOfStream(snapshots) => {
-                            for snap in snapshots {
-                                let _ = tx.send(snap);
+                            if let Some(latest) = snapshots.into_iter().last() {
+                                let _ = tx.send(Some(latest));
                             }
                             break;
                         }

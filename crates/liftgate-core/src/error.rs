@@ -206,6 +206,16 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "in-place binary self-upgrade is not supported when running inside {bundle_kind} (`{}`); download the latest desktop package from `{release_url}` instead",
+        exe_path.display()
+    )]
+    UpgradePackagedBundle {
+        bundle_kind: &'static str,
+        exe_path: PathBuf,
+        release_url: String,
+    },
 }
 
 /// Returns an actionable recovery hint for `err` using `bin` as the CLI command name.
@@ -240,6 +250,9 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
             "Re-run with elevated permissions (e.g. `sudo lg upgrade`) or install into a user-writable directory such as `~/.cargo/bin`."
                 .to_owned(),
         ),
+        CliError::UpgradePackagedBundle { release_url, .. } => Some(format!(
+            "Open `{release_url}` to download the updated desktop package (`.AppImage`, `.dmg`, or `-setup.exe`); `--check` remains supported."
+        )),
         CliError::UpgradeUnsupportedTarget { .. } => Some(
             "Install from source with `cargo install --git https://github.com/acking-you/liftgate liftgate` or specify `--target <triple>`."
                 .to_owned(),

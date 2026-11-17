@@ -1,0 +1,508 @@
+name: Release Liftgate Desktop
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+      - "!*-ui"
+  workflow_dispatch:
+    inputs:
+      macos_verify_only:
+        description: "Build, sign and notarize both macOS architectures without publishing a release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare:
+    name: Prepare Web UI & Desktop Release Notes
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      ui_tag: ${{ steps.meta.outputs.ui_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(awk '
+            /^\[workspace.package\]$/ { in_workspace = 1; next }
+            in_workspace && /^version = / {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if [ "${tag}" != "v${package_version}" ]; then
+              echo "::error::Tag ${tag} does not match Cargo.toml version v${package_version}"
+              exit 1
+            fi
+          else
+            tag="v${package_version}"
+          fi
+          echo "version=${package_version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "ui_tag=${tag}-ui" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Build embedded React Web UI dist
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          test -f dist/index.html
+
+      - name: Upload compiled Web UI bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-web-dist
+          path: web/dist
+          if-no-files-found: error
+
+      - name: Generate desktop release notes
+        shell: bash
+        env:
+          REL_TAG: ${{ steps.meta.outputs.tag }}
+          REL_VER: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          changelog_section="$(awk -v ver="${REL_VER}" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "${changelog_section// /}" ]; then
+            changelog_section="$(awk '
+              /^## \[/ && !found { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md)"
+          fi
+
+          {
+            printf '%s\n' \
+              "# Liftgate Desktop ${REL_TAG}" \
+              '' \
+              'Standalone native GPUI desktop control center (`liftgate-desktop`) bundled with `liftgate` and `lg` CLIs and the embedded React observability dashboard.' \
+              '' \
+              "> Looking for the 17-target CLI & server archives or \`lg upgrade\` bundle? See [**Liftgate ${REL_TAG}**](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${REL_TAG})." \
+              '' \
+              '## Desktop Downloads' \
+              '' \
+              '| Platform | Architecture | Installer | Portable Bundle |' \
+              '|---|---|---|---|' \
+              '| **Windows** | x64 (MSVC) | `liftgate-desktop-windows-x86_64-setup.exe` | `liftgate-desktop-windows-x86_64.zip` |' \
+              '| **Windows** | ARM64 | `liftgate-desktop-windows-arm64-setup.exe` | `liftgate-desktop-windows-arm64.zip` |' \
+              '| **macOS** | Apple Silicon (M1–M4) | `liftgate-desktop-macos-arm64.dmg` | `liftgate-desktop-macos-arm64.zip` |' \
+              '| **macOS** | Intel (x86_64) | `liftgate-desktop-macos-x86_64.dmg` | `liftgate-desktop-macos-x86_64.zip` |' \
+              '| **Linux** | x86_64 (glibc 2.35+) | `liftgate-desktop-linux-x86_64.AppImage` / `liftgate-desktop-linux-amd64.deb` | `liftgate-desktop-linux-x86_64.tar.gz` |' \
+              '' \
+              '> Verify checksums against `SHA256SUMS` or `release-manifest.json` (`sha256sum -c SHA256SUMS --ignore-missing`). On macOS builds without Apple Developer ID notarization, run `xattr -cr /Applications/Liftgate.app` once after dragging `Liftgate.app` to `/Applications`.' \
+              '' \
+              '## Changelog'
+          } > ui_release_notes.md
+          printf '\n%s\n' "${changelog_section}" >> ui_release_notes.md
+          cat ui_release_notes.md
+
+      - name: Upload desktop release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-release-notes
+          path: ui_release_notes.md
+          if-no-files-found: error
+
+  build-windows:
+    name: Desktop Windows (${{ matrix.arch }})
+    if: ${{ !inputs.macos_verify_only }}
+    needs: prepare
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            iss_arch: x64compatible
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            iss_arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt Web UI bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-web-dist
+          path: web/dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Locate Windows SDK HLSL compiler (fxc.exe)
+        shell: pwsh
+        run: |
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          if (Test-Path -LiteralPath $kitsRoot) {
+            $fxc = Get-ChildItem -LiteralPath $kitsRoot -Filter fxc.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($fxc) {
+              "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              Write-Host "Using GPUI_FXC_PATH=$($fxc.FullName)"
+            }
+          }
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ui-win-${{ matrix.target }}
+
+      - name: Build Windows desktop and CLI binaries
+        shell: pwsh
+        env:
+          LIFTGATE_SKIP_WEB_BUILD: "1"
+          LIFTGATE_REQUIRE_EMBEDDED_WEB: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --target "${{ matrix.target }}" `
+            -p liftgate-desktop --bin liftgate-desktop `
+            -p liftgate --bin liftgate --bin lg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ("${{ matrix.arch }}" -eq "x86_64") {
+            & "target/${{ matrix.target }}/release/liftgate-desktop.exe" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Package Windows Setup (.exe) and Portable (.zip)
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          WIN_ARCH: ${{ matrix.arch }}
+          TARGET_TRIPLE: ${{ matrix.target }}
+          ISS_ARCH: ${{ matrix.iss_arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkgBase = "liftgate-desktop-windows-${env:WIN_ARCH}"
+          $stageDir = Join-Path $PWD "dist\${pkgBase}"
+          $outDir = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          foreach ($bin in @("liftgate-desktop.exe", "liftgate.exe", "lg.exe")) {
+            Copy-Item -LiteralPath "target\${env:TARGET_TRIPLE}\release\${bin}" -Destination $stageDir -Force
+          }
+          Copy-Item -LiteralPath "packaging\icons\app_icon.ico" -Destination $stageDir -Force
+          foreach ($doc in @("README.md", "README.zh-CN.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE")) {
+            Copy-Item -LiteralPath $doc -Destination $stageDir -Force
+          }
+
+          Push-Location $outDir
+          try {
+            & 7z a -tzip "${pkgBase}.zip" "${pkgBase}" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            $cmd = Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd) {
+              $iscc = $cmd.Source
+            } else {
+              choco install innosetup --no-progress -y
+              $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            }
+          }
+          $iconAbs = (Resolve-Path -LiteralPath "packaging\icons\app_icon.ico").Path
+          & $iscc `
+            "/DAppVersion=${env:APP_VERSION}" `
+            "/DArchMode=${env:ISS_ARCH}" `
+            "/DOutputBaseFilename=${pkgBase}-setup" `
+            "/DBuildDir=${stageDir}" `
+            "/DOutDir=${outDir}" `
+            "/DIconFile=${iconAbs}" `
+            "packaging\windows\liftgate-desktop.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          Remove-Item -LiteralPath $stageDir -Recurse -Force
+          Get-ChildItem -LiteralPath $outDir | Format-Table Name, Length -AutoSize
+
+      - name: Upload Windows desktop packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-pkg-windows-${{ matrix.arch }}
+          path: |
+            dist/liftgate-desktop-windows-${{ matrix.arch }}-setup.exe
+            dist/liftgate-desktop-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Desktop Linux (x86_64 AppImage / deb / tar.gz)
+    if: ${{ !inputs.macos_verify_only }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt Web UI bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-web-dist
+          path: web/dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Linux GUI & packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            libvulkan-dev \
+            desktop-file-utils \
+            fakeroot \
+            file \
+            squashfs-tools \
+            curl
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ui-linux-x86_64
+
+      - name: Build Linux desktop and CLI binaries
+        env:
+          LIFTGATE_SKIP_WEB_BUILD: "1"
+          LIFTGATE_REQUIRE_EMBEDDED_WEB: "1"
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
+            -p liftgate-desktop --bin liftgate-desktop \
+            -p liftgate --bin liftgate --bin lg
+          target/x86_64-unknown-linux-gnu/release/liftgate-desktop --version
+
+      - name: Package AppImage, Debian package, and portable tarball
+        run: |
+          bash scripts/release/package_linux_desktop.sh \
+            "${{ needs.prepare.outputs.version }}" \
+            "target/x86_64-unknown-linux-gnu/release" \
+            "dist"
+
+      - name: Upload Linux desktop packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-pkg-linux-x86_64
+          path: |
+            dist/liftgate-desktop-linux-x86_64.AppImage
+            dist/liftgate-desktop-linux-amd64.deb
+            dist/liftgate-desktop-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    name: Desktop macOS (${{ matrix.arch }})
+    needs: prepare
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt Web UI bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-web-dist
+          path: web/dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ui-macos-${{ matrix.target }}
+
+      - name: Build macOS desktop and CLI binaries
+        env:
+          LIFTGATE_SKIP_WEB_BUILD: "1"
+          LIFTGATE_REQUIRE_EMBEDDED_WEB: "1"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}" \
+            -p liftgate-desktop --bin liftgate-desktop \
+            -p liftgate --bin liftgate --bin lg
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            "target/${{ matrix.target }}/release/liftgate-desktop" --version
+          fi
+
+      - name: Assemble Liftgate.app bundle
+        run: |
+          python3 scripts/release/macos_package.py assemble \
+            --bin-dir "target/${{ matrix.target }}/release" \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --output "build/Liftgate.app"
+
+      - name: Audit, sign/notarize, and package macOS DMG & ZIP
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.macos_verify_only }}" = "true" ]; then
+            set -- --require-notarization
+          else
+            set --
+          fi
+          python3 scripts/release/macos_package.py package \
+            --app "build/Liftgate.app" \
+            --arch "${{ matrix.arch }}" \
+            --output "dist/liftgate-desktop-macos-${{ matrix.arch }}.dmg" \
+            --zip-output "dist/liftgate-desktop-macos-${{ matrix.arch }}.zip" \
+            "$@"
+
+      - name: Clean up temporary signing credentials
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil, subprocess
+          runner_temp = os.environ.get("RUNNER_TEMP")
+          if runner_temp:
+              for directory in pathlib.Path(runner_temp).glob("liftgate-signing-*"):
+                  keychain = directory / "signing.keychain-db"
+                  if keychain.exists():
+                      subprocess.run(["security", "delete-keychain", str(keychain)], check=False)
+                  shutil.rmtree(directory, ignore_errors=True)
+          PY
+
+      - name: Upload macOS verification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}-verification
+          path: dist/*-verification/
+          if-no-files-found: ignore
+
+      - name: Upload macOS desktop packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-pkg-macos-${{ matrix.arch }}
+          path: |
+            dist/liftgate-desktop-macos-${{ matrix.arch }}.dmg
+            dist/liftgate-desktop-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish Desktop Release & Manifest
+    if: ${{ !inputs.macos_verify_only }}
+    needs: [prepare, build-windows, build-linux, build-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download desktop release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-release-notes
+
+      - name: Download all desktop packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ui-pkg-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Build and optionally sign release-manifest.json & SHA256SUMS
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/ui_release_manifest.py build \
+            release-assets \
+            "${{ needs.prepare.outputs.tag }}" \
+            "${GITHUB_SHA}"
+          if [ -n "${UPDATE_SIGNING_KEY}" ]; then
+            key_file="$(mktemp)"
+            trap 'rm -f "${key_file}"' EXIT
+            printf '%s\n' "${UPDATE_SIGNING_KEY}" > "${key_file}"
+            python3 scripts/release/ui_release_manifest.py sign \
+              release-assets/release-manifest.json \
+              --key "${key_file}"
+            if [ -f scripts/release/update_signing_key.pub.pem ]; then
+              python3 scripts/release/ui_release_manifest.py verify \
+                release-assets/release-manifest.json \
+                --public-key scripts/release/update_signing_key.pub.pem
+            fi
+          fi
+          cat release-assets/SHA256SUMS
+          cat release-assets/release-manifest.json
+
+      - name: Publish GitHub Release (${{ needs.prepare.outputs.ui_tag }})
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.ui_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Liftgate Desktop ${{ needs.prepare.outputs.tag }}
+          body_path: ui_release_notes.md
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: release-assets/*

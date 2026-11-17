@@ -20,6 +20,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      release_scripts: ${{ steps.filter.outputs.release_scripts }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,6 +44,7 @@ jobs:
             echo "No usable base commit; checking everything."
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "web=true" >> "$GITHUB_OUTPUT"
+            echo "release_scripts=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -52,6 +54,7 @@ jobs:
 
           rust=false
           web=false
+          release_scripts=false
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
@@ -61,17 +64,23 @@ jobs:
               web/*)
                 web=true
                 ;;
+              scripts/release/*|packaging/*|.github/workflows/release*.yml)
+                release_scripts=true
+                ;;
               .github/workflows/syntax-check.yml)
                 rust=true
                 web=true
+                release_scripts=true
                 ;;
             esac
           done <<< "$changed"
 
           echo "rust=$rust"
           echo "web=$web"
+          echo "release_scripts=$release_scripts"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "web=$web" >> "$GITHUB_OUTPUT"
+          echo "release_scripts=$release_scripts" >> "$GITHUB_OUTPUT"
 
   rust-syntax-check:
     needs: changes
@@ -197,3 +206,36 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
+
+  release-scripts-check:
+    needs: changes
+    if: needs.changes.outputs.release_scripts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install desktop-file-utils and PyYAML
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils python3-yaml
+
+      - name: Validate workflow YAML, packaging assets, and shell syntax
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, plistlib, yaml
+          for wf in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
+              data = yaml.safe_load(wf.read_text(encoding='utf-8'))
+              assert isinstance(data, dict) and 'jobs' in data, f'Invalid workflow: {wf}'
+              print(f'Validated {wf}')
+          for plist in sorted(pathlib.Path('packaging/macos').glob('*')):
+              plistlib.loads(plist.read_bytes())
+              print(f'Validated {plist}')
+          PY
+          bash -n scripts/release/package_linux_desktop.sh
+          desktop-file-validate packaging/linux/liftgate-desktop.desktop
+
+      - name: Run release packaging unit tests
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v

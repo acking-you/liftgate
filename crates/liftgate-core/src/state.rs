@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
-use liftgate_types::config::{ProxyUrl, is_proxy_disable_keyword};
+use liftgate_types::config::{
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
+    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS, ProxyUrl,
+    is_proxy_disable_keyword,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,6 +19,30 @@ const MAX_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_max_line_bytes() -> usize {
+    DEFAULT_MAX_LINE_BYTES
+}
+
+const fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
+}
+
+const fn default_channel_capacity() -> usize {
+    DEFAULT_CHANNEL_CAPACITY
+}
+
+const fn default_max_idle_sessions() -> usize {
+    DEFAULT_MAX_IDLE_SESSIONS
+}
+
+const fn default_max_stored_responses() -> usize {
+    DEFAULT_MAX_STORED_RESPONSES
+}
+
+const fn default_turn_timeout_secs() -> u64 {
+    DEFAULT_TURN_TIMEOUT_SECS
 }
 
 /// Resolved filesystem locations for Liftgate's global management state (`~/.liftgate` by default).
@@ -74,6 +102,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn launchers_dir(&self) -> PathBuf {
+        self.root.join("launchers")
+    }
+
+    #[must_use]
     pub fn desktop_dir(&self) -> PathBuf {
         self.root.join("desktop")
     }
@@ -89,6 +122,12 @@ impl StatePaths {
 
     pub fn ensure_ephemeral_dir(&self) -> Result<PathBuf, CliError> {
         let dir = self.ephemeral_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_launchers_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.launchers_dir();
         ensure_private_dir(&dir)?;
         Ok(canonicalize_clean(&dir))
     }
@@ -483,6 +522,18 @@ pub struct DaemonState {
     /// Experimental multi-turn hydration; disabled unless explicitly selected.
     #[serde(default)]
     pub long_context: bool,
+    #[serde(default = "default_max_line_bytes")]
+    pub max_line_bytes: usize,
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+    #[serde(default = "default_max_idle_sessions")]
+    pub max_idle_sessions: usize,
+    #[serde(default = "default_max_stored_responses")]
+    pub max_stored_responses: usize,
+    #[serde(default = "default_turn_timeout_secs")]
+    pub turn_timeout_secs: u64,
     #[serde(default)]
     pub shutdown_token: String,
     #[serde(default)]
@@ -749,6 +800,12 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             long_context: false,
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            max_idle_sessions: DEFAULT_MAX_IDLE_SESSIONS,
+            max_stored_responses: DEFAULT_MAX_STORED_RESPONSES,
+            turn_timeout_secs: DEFAULT_TURN_TIMEOUT_SECS,
             shutdown_token: "tok-123".to_owned(),
             started_at_unix_ms: 1000,
             log_file: paths.log_file(),

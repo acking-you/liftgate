@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-core"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3779,7 +3779,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-desktop"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-server"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -3815,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-types"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

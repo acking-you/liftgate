@@ -34,10 +34,10 @@ use liftgate_core::state::{
     DesktopLang, DesktopLangPref, DesktopThemePref, DesktopUiPrefs, StatePaths,
     detect_system_language,
 };
-use liftgate_core::terminal::spawn_in_system_terminal;
+use liftgate_core::terminal::{prepare_reusable_launcher_command, spawn_in_system_terminal};
 use liftgate_core::upgrade::{self, UpgradeOutcome};
 use liftgate_types::telemetry::{GatewayTelemetrySnapshot, TaskProtocol};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 use crate::i18n::{NavTab, tr, window_title};
 use crate::theme::{BadgeTone, Palette, apply_staticflow_theme, is_appearance_dark, pill_badge};
@@ -283,6 +283,12 @@ impl DesktopApp {
         let init_auto_upd = saved_daemon
             .as_ref()
             .map_or(settings.agy_auto_update, |d| d.agy_auto_update);
+        let init_idle_sessions = saved_daemon
+            .as_ref()
+            .map_or(defaults.max_idle_sessions, |d| d.max_idle_sessions);
+        let init_turn_timeout = saved_daemon
+            .as_ref()
+            .map_or(defaults.turn_timeout_secs, |d| d.turn_timeout_secs);
 
         let default_dir = prefs
             .project_dir
@@ -325,12 +331,12 @@ impl DesktopApp {
         let in_max_idle_sessions = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("16")
-                .default_value(defaults.max_idle_sessions.to_string())
+                .default_value(init_idle_sessions.to_string())
         });
         let in_turn_timeout_secs = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("1800")
-                .default_value(defaults.turn_timeout_secs.to_string())
+                .default_value(init_turn_timeout.to_string())
         });
 
         let in_task_filter = cx.new(|cx| {
@@ -683,20 +689,24 @@ impl DesktopApp {
 
     fn start_background_poller(&mut self, cx: &mut Context<Self>) {
         let rt = self.rt.clone();
-        let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<()>();
+        let (tick_tx, mut tick_rx) = watch::channel::<u64>(0);
         rt.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
+            let mut seq = 0u64;
             loop {
                 interval.tick().await;
-                if tick_tx.send(()).is_err() {
+                seq = seq.wrapping_add(1);
+                if tick_tx.send(seq).is_err() {
                     break;
                 }
             }
         });
 
         cx.spawn(async move |this, cx| {
-            while tick_rx.recv().await.is_some() {
+            while tick_rx.changed().await.is_ok() {
+                let _ = *tick_rx.borrow_and_update();
                 let alive = this.update(cx, |app, cx| {
                     if !app.busy_gateway {
                         app.refresh_gateway_status(None, cx);
@@ -845,6 +855,8 @@ impl DesktopApp {
             let model_str = d.default_model.clone();
             let mode_str = d.acp_mode.clone();
             let key_str = d.api_key.clone().unwrap_or_default();
+            let idle_str = d.max_idle_sessions.to_string();
+            let timeout_str = d.turn_timeout_secs.to_string();
             self.in_ui_listen
                 .update(cx, |s, cx| s.set_value(ui_str, window, cx));
             if !model_str.is_empty() {
@@ -857,6 +869,10 @@ impl DesktopApp {
             }
             self.in_api_key
                 .update(cx, |s, cx| s.set_value(key_str, window, cx));
+            self.in_max_idle_sessions
+                .update(cx, |s, cx| s.set_value(idle_str, window, cx));
+            self.in_turn_timeout_secs
+                .update(cx, |s, cx| s.set_value(timeout_str, window, cx));
             self.cfg_long_context = d.long_context;
             self.cfg_agy_auto_update = d.agy_auto_update;
         } else {
@@ -881,7 +897,7 @@ impl DesktopApp {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.sse_cancel_tx = Some(cancel_tx);
-        let (snap_tx, mut snap_rx) = mpsc::unbounded_channel::<GatewayTelemetrySnapshot>();
+        let (snap_tx, mut snap_rx) = watch::channel::<Option<GatewayTelemetrySnapshot>>(None);
         let client = GatewayClient::new(listen, api_key);
         let rt = self.rt.clone();
 
@@ -890,7 +906,10 @@ impl DesktopApp {
         });
 
         cx.spawn(async move |this, cx| {
-            while let Some(snap) = snap_rx.recv().await {
+            while snap_rx.changed().await.is_ok() {
+                let Some(snap) = snap_rx.borrow_and_update().clone() else {
+                    continue;
+                };
                 let ok = this.update(cx, |app, cx| {
                     app.sse_connected = true;
                     if app.selected_task_id.is_none() {
@@ -934,9 +953,18 @@ impl DesktopApp {
     }
 
     pub(crate) fn build_serve_args_from_form(&self, cx: &App) -> Result<ServeArgs, String> {
-        let mut serve = ServeArgs::default();
+        let defaults = ServeArgs::default();
+        let mut serve = self
+            .state_paths
+            .read_daemon()
+            .ok()
+            .flatten()
+            .as_ref()
+            .map_or_else(ServeArgs::default, daemon::serve_args_from_daemon_state);
         let listen_raw = self.in_listen.read(cx).value().trim().to_owned();
-        if !listen_raw.is_empty() {
+        if listen_raw.is_empty() {
+            serve.listen = defaults.listen;
+        } else {
             serve.listen = listen_raw.parse::<SocketAddr>().map_err(|e| {
                 format!(
                     "{}: `{listen_raw}` ({e})",
@@ -944,21 +972,21 @@ impl DesktopApp {
                 )
             })?;
         }
-        if let Some(ui_raw) = self.read_optional_input(&self.in_ui_listen, cx) {
-            let ui_addr = ui_raw.parse::<SocketAddr>().map_err(|e| {
+        serve.ui_listen = match self.read_optional_input(&self.in_ui_listen, cx) {
+            Some(ui_raw) => Some(ui_raw.parse::<SocketAddr>().map_err(|e| {
                 format!(
                     "{}: `{ui_raw}` ({e})",
                     tr(self.lang, "面板监听地址无效", "Invalid UI listen address")
                 )
-            })?;
-            serve.ui_listen = Some(ui_addr);
-        }
-        if let Some(m) = self.read_optional_input(&self.in_default_model, cx) {
-            serve.default_model = m;
-        }
-        if let Some(mode) = self.read_optional_input(&self.in_acp_mode, cx) {
-            serve.acp_mode = mode;
-        }
+            })?),
+            None => None,
+        };
+        serve.default_model = self
+            .read_optional_input(&self.in_default_model, cx)
+            .unwrap_or(defaults.default_model);
+        serve.acp_mode = self
+            .read_optional_input(&self.in_acp_mode, cx)
+            .unwrap_or(defaults.acp_mode);
         serve.api_key =
             normalize_optional_api_key(self.read_optional_input(&self.in_api_key, cx).as_deref());
         if let Some(idle_raw) = self.read_optional_input(&self.in_max_idle_sessions, cx) {
@@ -968,6 +996,8 @@ impl DesktopApp {
                     tr(self.lang, "最大空闲会话数无效", "Invalid max idle sessions")
                 )
             })?;
+        } else {
+            serve.max_idle_sessions = defaults.max_idle_sessions;
         }
         if let Some(timeout_raw) = self.read_optional_input(&self.in_turn_timeout_secs, cx) {
             serve.turn_timeout_secs = timeout_raw.parse::<u64>().map_err(|e| {
@@ -980,6 +1010,8 @@ impl DesktopApp {
                     )
                 )
             })?;
+        } else {
+            serve.turn_timeout_secs = defaults.turn_timeout_secs;
         }
         serve.long_context = Some(self.cfg_long_context);
         serve.agy_auto_update = Some(self.cfg_agy_auto_update);
@@ -1444,15 +1476,13 @@ impl DesktopApp {
             let res = harness::prepare_claude_terminal_spec(&state_paths, &args, cwd, hold_open)
                 .await
                 .and_then(|spec| {
-                    let preview = spec.preview_command_line();
-                    if !preview_only {
-                        spawn_in_system_terminal(&state_paths, &spec)?;
+                    if preview_only {
+                        prepare_reusable_launcher_command(&state_paths, "claude", &spec)
                     } else {
-                        for f in &spec.cleanup_files {
-                            let _ = std::fs::remove_file(f);
-                        }
+                        let preview = spec.preview_command_line();
+                        spawn_in_system_terminal(&state_paths, &spec)?;
+                        Ok(preview)
                     }
-                    Ok(preview)
                 });
             let _ = tx.send(res);
         });
@@ -1525,15 +1555,13 @@ impl DesktopApp {
             let res = harness::prepare_codex_terminal_spec(&state_paths, &args, cwd, hold_open)
                 .await
                 .and_then(|spec| {
-                    let preview = spec.preview_command_line();
-                    if !preview_only {
-                        spawn_in_system_terminal(&state_paths, &spec)?;
+                    if preview_only {
+                        prepare_reusable_launcher_command(&state_paths, "codex", &spec)
                     } else {
-                        for f in &spec.cleanup_files {
-                            let _ = std::fs::remove_file(f);
-                        }
+                        let preview = spec.preview_command_line();
+                        spawn_in_system_terminal(&state_paths, &spec)?;
+                        Ok(preview)
                     }
-                    Ok(preview)
                 });
             let _ = tx.send(res);
         });
@@ -3109,39 +3137,108 @@ impl Render for DesktopApp {
 }
 
 /// Splits a CLI passthrough input string into shell-like tokens while honoring single and double quotes.
+///
+/// Preserves literal backslashes inside double quotes and unquoted Windows paths (only treating
+/// backslashes before `"` via standard `2n` / `2n + 1` rules, plus `\ ` and `\'` outside quotes)
+/// so paths like `-p "read C:\repo\src\main.rs"` reach target programs intact.
 #[must_use]
 pub fn parse_cli_tokens(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut has_token = false;
     let mut in_single = false;
     let mut in_double = false;
-    let mut escaped = false;
+    let mut chars = raw.chars().peekable();
 
-    for ch in raw.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
             continue;
         }
+
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '\\' => {
+                    let mut slashes = 1usize;
+                    while chars.next_if_eq(&'\\').is_some() {
+                        slashes += 1;
+                    }
+                    if chars.next_if_eq(&'"').is_some() {
+                        for _ in 0..(slashes / 2) {
+                            current.push('\\');
+                        }
+                        if slashes % 2 == 1 {
+                            current.push('"');
+                        } else {
+                            in_double = false;
+                        }
+                    } else {
+                        for _ in 0..slashes {
+                            current.push('\\');
+                        }
+                    }
+                }
+                other => current.push(other),
+            }
+            continue;
+        }
+
         match ch {
-            '\\' if !in_single => {
-                escaped = true;
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-            }
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
+            c if c.is_whitespace() => {
+                if has_token {
                     out.push(std::mem::take(&mut current));
+                    has_token = false;
                 }
             }
-            other => current.push(other),
+            '\'' => {
+                in_single = true;
+                has_token = true;
+            }
+            '"' => {
+                in_double = true;
+                has_token = true;
+            }
+            '\\' => {
+                has_token = true;
+                let mut slashes = 1usize;
+                while chars.next_if_eq(&'\\').is_some() {
+                    slashes += 1;
+                }
+                if chars.next_if_eq(&'"').is_some() {
+                    for _ in 0..(slashes / 2) {
+                        current.push('\\');
+                    }
+                    if slashes % 2 == 1 {
+                        current.push('"');
+                    } else {
+                        in_double = true;
+                    }
+                } else if slashes == 1
+                    && chars
+                        .peek()
+                        .is_some_and(|next| next.is_whitespace() || *next == '\'')
+                {
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                } else {
+                    for _ in 0..slashes {
+                        current.push('\\');
+                    }
+                }
+            }
+            other => {
+                current.push(other);
+                has_token = true;
+            }
         }
     }
-    if !current.is_empty() {
+    if has_token {
         out.push(current);
     }
     out
@@ -3166,6 +3263,22 @@ mod tests {
         assert_eq!(
             parsed,
             vec!["-p", "review auth diff", "--model", "gemini-4-carbon-high"]
+        );
+    }
+
+    #[test]
+    fn preserves_windows_backslashes_and_escaped_quotes() {
+        assert_eq!(
+            parse_cli_tokens(r#"-p "read C:\repo\src\main.rs""#),
+            vec!["-p", r"read C:\repo\src\main.rs"]
+        );
+        assert_eq!(
+            parse_cli_tokens(r#"-p "say \"hi\" in C:\new\temp\\""#),
+            vec!["-p", r#"say "hi" in C:\new\temp\"#]
+        );
+        assert_eq!(
+            parse_cli_tokens(r"-C C:\repo\src --dir /tmp/my\ folder -p ''"),
+            vec!["-C", r"C:\repo\src", "--dir", "/tmp/my folder", "-p", ""]
         );
     }
 }
