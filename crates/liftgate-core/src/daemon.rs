@@ -78,45 +78,6 @@ pub async fn start_daemon_with_exe(
         serve.no_agy_auto_update,
         &settings,
     );
-
-    if let Some(existing) = state_paths.read_daemon()? {
-        let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
-        if is_pid_alive(existing.pid)
-            && existing_client
-                .check_health(Duration::from_millis(800))
-                .await
-        {
-            if force_restart {
-                let _ = stop_daemon(state_paths).await?;
-            } else {
-                let requested_key = normalize_optional_api_key(serve.api_key.as_deref());
-                let config_matches = existing.listen == serve.listen
-                    && existing.ui_listen == serve.ui_listen
-                    && existing.default_model == serve.default_model
-                    && existing.acp_mode == serve.acp_mode
-                    && existing.api_key == requested_key
-                    && existing.agy_proxy.as_deref()
-                        == effective_proxy.as_ref().map(ProxyUrl::as_str)
-                    && existing.agy_auto_update == effective_auto_update
-                    && existing.long_context == long_context;
-                let live_model_count = existing_client.fetch_models().await.map_or(0, |m| m.len());
-                return Ok(DaemonStartOutcome {
-                    daemon: existing,
-                    already_running: true,
-                    config_matches,
-                    live_model_count,
-                });
-            }
-        } else {
-            state_paths.remove_daemon()?;
-        }
-    }
-
-    let probe = GatewayClient::new(serve.listen, serve.api_key.clone());
-    if probe.check_health(Duration::from_millis(400)).await {
-        return Err(CliError::PortOccupiedUnmanaged { addr: serve.listen });
-    }
-
     let _ = ModelId::try_new(&serve.default_model)?;
     let _ = AcpModeId::try_new(&serve.acp_mode)?;
     let _ = GatewayLimits::try_new(
@@ -129,6 +90,65 @@ pub async fn start_daemon_with_exe(
     )?;
     let resolved_agy = resolve_effective_agy_bin(serve.agy_bin.clone(), &settings)
         .ok_or(CliError::AgyBinaryNotFound)?;
+
+    let existing_daemon = state_paths.read_daemon()?;
+    let existing_owns_target_listen = existing_daemon
+        .as_ref()
+        .is_some_and(|d| is_pid_alive(d.pid) && d.listen == serve.listen);
+    if !existing_owns_target_listen {
+        let pre_probe = GatewayClient::new(serve.listen, serve.api_key.clone());
+        if pre_probe.check_health(Duration::from_millis(500)).await {
+            return Err(CliError::PortOccupiedUnmanaged { addr: serve.listen });
+        }
+    }
+
+    if let Some(existing) = existing_daemon {
+        let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
+        if is_pid_alive(existing.pid) {
+            if existing_client
+                .check_health(Duration::from_millis(800))
+                .await
+            {
+                if force_restart {
+                    let _ = stop_daemon(state_paths).await?;
+                } else {
+                    let requested_key = normalize_optional_api_key(serve.api_key.as_deref());
+                    let config_matches = existing.listen == serve.listen
+                        && existing.ui_listen == serve.ui_listen
+                        && existing.default_model == serve.default_model
+                        && existing.acp_mode == serve.acp_mode
+                        && existing.api_key == requested_key
+                        && existing.agy_proxy.as_deref()
+                            == effective_proxy.as_ref().map(ProxyUrl::as_str)
+                        && existing.agy_auto_update == effective_auto_update
+                        && existing.long_context == long_context
+                        && existing.max_line_bytes == serve.max_line_bytes
+                        && existing.max_body_bytes == serve.max_body_bytes
+                        && existing.channel_capacity == serve.channel_capacity
+                        && existing.max_idle_sessions == serve.max_idle_sessions
+                        && existing.max_stored_responses == serve.max_stored_responses
+                        && existing.turn_timeout_secs == serve.turn_timeout_secs;
+                    let live_model_count =
+                        existing_client.fetch_models().await.map_or(0, |m| m.len());
+                    return Ok(DaemonStartOutcome {
+                        daemon: existing,
+                        already_running: true,
+                        config_matches,
+                        live_model_count,
+                    });
+                }
+            } else {
+                let _ = stop_daemon(state_paths).await?;
+            }
+        } else {
+            state_paths.remove_daemon()?;
+        }
+    }
+
+    let probe = GatewayClient::new(serve.listen, serve.api_key.clone());
+    if probe.check_health(Duration::from_millis(400)).await {
+        return Err(CliError::PortOccupiedUnmanaged { addr: serve.listen });
+    }
 
     let log_out = state_paths.prepare_log_file_for_spawn()?;
     let log_err = log_out.try_clone().map_err(|source| CliError::StateIo {
@@ -246,6 +266,12 @@ pub async fn start_daemon_with_exe(
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
         agy_auto_update: effective_auto_update,
         long_context,
+        max_line_bytes: serve.max_line_bytes,
+        max_body_bytes: serve.max_body_bytes,
+        channel_capacity: serve.channel_capacity,
+        max_idle_sessions: serve.max_idle_sessions,
+        max_stored_responses: serve.max_stored_responses,
+        turn_timeout_secs: serve.turn_timeout_secs,
         shutdown_token,
         started_at_unix_ms: now_unix_ms(),
         log_file: state_paths.log_file(),
@@ -343,6 +369,12 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         agy_bin: old.agy_bin.clone(),
         acp_cwd: old.acp_cwd.clone(),
         ui_dir: old.ui_dir.clone(),
+        max_line_bytes: old.max_line_bytes,
+        max_body_bytes: old.max_body_bytes,
+        channel_capacity: old.channel_capacity,
+        max_idle_sessions: old.max_idle_sessions,
+        max_stored_responses: old.max_stored_responses,
+        turn_timeout_secs: old.turn_timeout_secs,
         ..defaults
     }
 }
@@ -352,8 +384,6 @@ pub async fn restart_daemon(
     args: RestartArgs,
 ) -> Result<DaemonStartOutcome, CliError> {
     let prev = state_paths.read_daemon()?;
-    let _ = stop_daemon(state_paths).await?;
-
     let mut serve = prev
         .as_ref()
         .map_or_else(ServeArgs::default, serve_args_from_daemon_state);
@@ -389,7 +419,7 @@ pub async fn restart_daemon(
         serve.no_agy_auto_update = true;
     }
 
-    let outcome = start_daemon(state_paths, serve, false).await?;
+    let outcome = start_daemon(state_paths, serve, true).await?;
     if args.open {
         let url = build_authenticated_dashboard_url(
             &outcome.daemon.dashboard_base_url(),
@@ -1786,6 +1816,12 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             long_context: false,
+            max_line_bytes: liftgate_types::config::DEFAULT_MAX_LINE_BYTES,
+            max_body_bytes: liftgate_types::config::DEFAULT_MAX_BODY_BYTES,
+            channel_capacity: liftgate_types::config::DEFAULT_CHANNEL_CAPACITY,
+            max_idle_sessions: liftgate_types::config::DEFAULT_MAX_IDLE_SESSIONS,
+            max_stored_responses: liftgate_types::config::DEFAULT_MAX_STORED_RESPONSES,
+            turn_timeout_secs: liftgate_types::config::DEFAULT_TURN_TIMEOUT_SECS,
             shutdown_token: "tok".to_owned(),
             started_at_unix_ms: 1,
             log_file: Path::new("gateway.log").to_path_buf(),
@@ -1802,6 +1838,41 @@ mod tests {
             resolve_client_api_key(Some("local-agy"), None, listen),
             None
         );
+    }
+
+    #[test]
+    fn serve_args_from_daemon_state_preserves_custom_paths_and_limits() {
+        let daemon = DaemonState {
+            pid: 99,
+            listen: "127.0.0.1:18790".parse().unwrap(),
+            ui_listen: Some("127.0.0.1:18791".parse().unwrap()),
+            default_model: "claude-opus-4-6-thinking".to_owned(),
+            acp_mode: "accept-edits".to_owned(),
+            api_key: Some("k".to_owned()),
+            agy_bin: Some(PathBuf::from("/opt/custom/agy")),
+            acp_cwd: Some(PathBuf::from("/tmp/acp-work")),
+            ui_dir: Some(PathBuf::from("/srv/ui")),
+            agy_proxy: None,
+            agy_auto_update: false,
+            long_context: true,
+            max_line_bytes: 67_108_864,
+            max_body_bytes: 33_554_432,
+            channel_capacity: 512,
+            max_idle_sessions: 32,
+            max_stored_responses: 128,
+            turn_timeout_secs: 3600,
+            shutdown_token: "tok".to_owned(),
+            started_at_unix_ms: 1,
+            log_file: PathBuf::from("gateway.log"),
+        };
+        let restored = serve_args_from_daemon_state(&daemon);
+        assert_eq!(restored.agy_bin, Some(PathBuf::from("/opt/custom/agy")));
+        assert_eq!(restored.acp_cwd, Some(PathBuf::from("/tmp/acp-work")));
+        assert_eq!(restored.ui_dir, Some(PathBuf::from("/srv/ui")));
+        assert_eq!(restored.max_line_bytes, 67_108_864);
+        assert_eq!(restored.max_idle_sessions, 32);
+        assert_eq!(restored.turn_timeout_secs, 3600);
+        assert_eq!(restored.long_context, Some(true));
     }
 
     #[test]

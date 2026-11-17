@@ -5,6 +5,7 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
+      - "!*-ui"
   workflow_dispatch:
 
 permissions:
@@ -91,6 +92,8 @@ jobs:
               '- `lg` — short daily-driver CLI alias (interactive cockpit, `lg top` TUI, `lg cx`, `lg cc`, `lg m -i`)' \
               '- `liftgate` — full canonical binary name' \
               '- `liftgate-desktop` — native GPUI desktop control center (included in macOS ARM64/Intel, Windows x64/ARM64, and Linux x86_64 glibc archives)' \
+              '' \
+              "> Looking for native OS desktop installers (\`.dmg\`, Windows \`-setup.exe\`, \`.AppImage\`, \`.deb\`)? Download [**Liftgate Desktop ${tag}**](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}-ui)." \
               '' \
               '### Quick Download Guide' \
               '' \
@@ -375,5 +378,6 @@ jobs:
           body_path: release_notes.md
           draft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: release-assets/*

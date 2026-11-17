@@ -19,7 +19,7 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
         ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, ConfigArgs, DoctorArgs, LogsArgs,
-        ModelsArgs, ProxyArgs, RestartArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs,
+        ModelsArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs,
         invoked_bin_name,
     },
     client::GatewayClient,
@@ -109,7 +109,6 @@ pub async fn run_stop(state_paths: &StatePaths) -> Result<(), CliError> {
 }
 
 pub async fn run_restart(state_paths: &StatePaths, args: RestartArgs) -> Result<(), CliError> {
-    let open_after = args.open;
     let sp = Spinner::start("Restarting Liftgate background daemon…");
     let out_res = restart_daemon(state_paths, args).await;
     sp.finish_and_clear().await;
@@ -122,15 +121,6 @@ pub async fn run_restart(state_paths: &StatePaths, args: RestartArgs) -> Result<
         ),
     );
     print_daemon_summary(&out.daemon, out.live_model_count);
-
-    if open_after {
-        let url = build_authenticated_dashboard_url(
-            &out.daemon.dashboard_base_url(),
-            &out.daemon.connect_base_url(),
-            out.daemon.api_key.as_deref(),
-        );
-        open_browser(&url)?;
-    }
     Ok(())
 }
 
@@ -417,22 +407,35 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
 
     if args.acp {
         let daemon = state_paths.read_daemon().ok().flatten();
-        if let Some(d) = daemon
-            && is_pid_alive(d.pid)
-        {
-            let key = resolve_client_api_key(None, Some(&d), d.listen);
-            let client = GatewayClient::new(d.listen, key);
-            if let Ok(snap) = client.fetch_telemetry().await
-                && !snap.acp_process.recent_stderr.is_empty()
-            {
-                ui::section("`agy acp` Recent Stderr");
-                for entry in &snap.acp_process.recent_stderr {
-                    println!(
-                        "  {}  {}",
-                        ui::format_utc_hms(entry.timestamp_unix_ms),
-                        entry.line
-                    );
+        let active_daemon = daemon.as_ref().filter(|d| is_pid_alive(d.pid));
+        let mut candidate_addrs = Vec::with_capacity(2);
+        if let Some(d) = active_daemon {
+            candidate_addrs.push(d.listen);
+        } else {
+            if let Some(d) = daemon.as_ref() {
+                candidate_addrs.push(d.listen);
+            }
+            let default_listen = ServeArgs::default().listen;
+            if !candidate_addrs.contains(&default_listen) {
+                candidate_addrs.push(default_listen);
+            }
+        }
+
+        for listen in candidate_addrs {
+            let key = resolve_client_api_key(None, active_daemon, listen);
+            let client = GatewayClient::new(listen, key);
+            if let Ok(snap) = client.fetch_telemetry().await {
+                if !snap.acp_process.recent_stderr.is_empty() {
+                    ui::section("`agy acp` Recent Stderr");
+                    for entry in &snap.acp_process.recent_stderr {
+                        ui::print_log_line(&format!(
+                            "{}  {}",
+                            ui::format_utc_hms(entry.timestamp_unix_ms),
+                            entry.line
+                        ));
+                    }
                 }
+                break;
             }
         }
     }

@@ -57,7 +57,7 @@ Liftgate 把 Google Antigravity 接到 OpenAI 与 Anthropic 的标准 API 后面
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包（或通过 `cargo binstall liftgate` / `cargo install` 安装），即可直接用短命令 **`lg`**（与 `liftgate` 完全等价）一键完成 `agy` 安装、可选代理设置与登录：
+从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台的 CLI 发行包，或下载 **Liftgate Desktop** 原生桌面安装包（`vX.Y.Z-ui`：macOS `.dmg`、Windows `-setup.exe`、Linux `.AppImage` / `.deb`，也可通过 `cargo binstall liftgate` / `cargo install` 安装），即可直接用 **`lg`**（与 `liftgate` 完全等价）或 **`liftgate-desktop`** 一键完成 `agy` 安装、可选代理设置与登录：
 
 ```bash
 cargo install --path crates/liftgate --locked  # 同时安装 `lg` 与 `liftgate`（装有 Bun 时自动内嵌 Web 面板）

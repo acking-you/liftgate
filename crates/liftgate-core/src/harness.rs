@@ -844,7 +844,7 @@ fn default_claude_effort_level(model_id: &str) -> Option<&'static str> {
     }
 }
 
-fn toml_inline_string(val: &str) -> String {
+pub(crate) fn toml_inline_string(val: &str) -> String {
     if !val.contains('\'') && !val.chars().any(char::is_control) {
         format!("'{val}'")
     } else {
