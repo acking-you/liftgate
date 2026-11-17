@@ -91,11 +91,51 @@ pub enum CanonicalPart {
     },
 }
 
+impl CanonicalPart {
+    /// Estimates heap bytes retained by this content part.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        match self {
+            Self::Text(s) | Self::Reasoning(s) => s.len(),
+            Self::ImageBase64 { media_type, data } => media_type.len().saturating_add(data.len()),
+            Self::ToolCall {
+                call_id,
+                name,
+                arguments,
+                is_custom: _,
+            } => call_id
+                .len()
+                .saturating_add(name.len())
+                .saturating_add(arguments.len()),
+            Self::ToolResult {
+                call_id,
+                output,
+                is_error: _,
+            } => call_id.len().saturating_add(output.len()),
+        }
+    }
+}
+
 /// Single normalized conversation turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalMessage {
     pub role: CanonicalRole,
     pub parts: Vec<CanonicalPart>,
+}
+
+impl CanonicalMessage {
+    /// Estimates structural plus heap bytes retained by this message.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Self>().saturating_add(
+            self.parts
+                .len()
+                .saturating_mul(std::mem::size_of::<CanonicalPart>()),
+        );
+        self.parts.iter().fold(base, |acc, part| {
+            acc.saturating_add(part.estimated_heap_bytes())
+        })
+    }
 }
 
 /// Kind of client-declared tool.
@@ -111,6 +151,21 @@ pub struct CanonicalToolSpec {
     pub name: String,
     pub description: Option<String>,
     pub kind: CanonicalToolKind,
+}
+
+impl CanonicalToolSpec {
+    /// Estimates structural plus heap bytes retained by this tool specification.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let kind_bytes = match &self.kind {
+            CanonicalToolKind::Function { parameters_json } => parameters_json.len(),
+            CanonicalToolKind::Custom { format_json } => format_json.as_deref().map_or(0, str::len),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(self.name.len())
+            .saturating_add(self.description.as_deref().map_or(0, str::len))
+            .saturating_add(kind_bytes)
+    }
 }
 
 /// Markdown hyperlink span extracted from grounded assistant text.
@@ -142,6 +197,7 @@ pub struct NormalizedTurnRequest {
     pub web_fetch_blocked_domains: Vec<String>,
     pub auxiliary_task: Option<AuxiliaryTaskKind>,
     pub previous_response_id: Option<String>,
+    pub retain_response_history: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub include_thinking: bool,
     pub omit_thinking_text: bool,
@@ -163,6 +219,30 @@ impl NormalizedTurnRequest {
                 &mut self.messages,
             );
         }
+    }
+
+    /// Estimates total in-memory bytes retained while this normalized turn is active.
+    #[must_use]
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let msg_bytes = self.messages.iter().fold(0usize, |acc, m| {
+            acc.saturating_add(m.estimated_heap_bytes())
+        });
+        let tool_bytes = self.client_tools.iter().fold(0usize, |acc, t| {
+            acc.saturating_add(t.estimated_heap_bytes())
+        });
+        let domain_bytes = self
+            .web_fetch_allowed_domains
+            .iter()
+            .chain(self.web_fetch_blocked_domains.iter())
+            .fold(0usize, |acc, d| acc.saturating_add(d.len()));
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.requested_model.as_deref().map_or(0, str::len))
+            .saturating_add(self.system_instructions.as_deref().map_or(0, str::len))
+            .saturating_add(self.previous_response_id.as_deref().map_or(0, str::len))
+            .saturating_add(msg_bytes)
+            .saturating_add(tool_bytes)
+            .saturating_add(domain_bytes)
     }
 }
 

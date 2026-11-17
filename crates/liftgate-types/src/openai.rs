@@ -628,6 +628,7 @@ pub fn normalize_responses_request(
         web_fetch_blocked_domains,
         auxiliary_task,
         previous_response_id: req.previous_response_id.clone(),
+        retain_response_history: req.store.unwrap_or(true),
         reasoning_effort,
         include_thinking,
         omit_thinking_text: false,
@@ -1051,6 +1052,30 @@ pub struct ResponseObject {
     pub truncation: Cow<'static, str>,
     pub usage: Option<ResponsesUsage>,
     pub metadata: BTreeMap<String, Value>,
+}
+
+impl ResponseObject {
+    /// Measures serialized JSON byte footprint without heap allocation so `SessionPool`
+    /// can enforce a global byte budget across cached `GET /v1/responses/{id}` objects.
+    #[must_use]
+    pub fn estimated_retained_bytes(&self) -> usize {
+        struct ByteCounter(usize);
+
+        impl std::io::Write for ByteCounter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(buf.len());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut counter = ByteCounter(std::mem::size_of::<Self>());
+        let _ = serde_json::to_writer(&mut counter, self);
+        counter.0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

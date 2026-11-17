@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
-    session_pool::{SessionLeaseGuard, SessionPool},
+    session_pool::{ActiveMemoryPermit, CommittedSessionTurn, SessionLeaseGuard, SessionPool},
     telemetry::{ActiveTaskGuard, TelemetryHub, unix_timestamp_ms},
     web_fetch::WebFetchOutcome,
 };
@@ -118,6 +118,10 @@ pub struct GatewayRuntimeConfig {
 
 /// Prepares an ACP session (reusing a matching multi-turn session when available, or creating
 /// a new isolated one) and starts streaming `TurnEvent`s.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit gateway dependencies and RAII active memory permit without wrapper churn"
+)]
 pub async fn execute_normalized_turn<B: AcpBackend>(
     backend: Arc<B>,
     pool: Arc<SessionPool>,
@@ -126,6 +130,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     protocol: TaskProtocol,
     mut req: NormalizedTurnRequest,
     response_id: String,
+    mut memory_permit: ActiveMemoryPermit,
 ) -> Result<ActiveTurnStream, GatewayError> {
     if let Some(aux_kind) = req.auxiliary_task {
         req.client_tools.clear();
@@ -185,13 +190,29 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         //    check out or cancel the user's active conversation session).
         if !is_ephemeral_aux {
             if let Some(prev_resp_id) = req.previous_response_id.as_deref()
-                && let Some(cached) = pool.checkout_by_response_id(prev_resp_id)
+                && let Some(mut cached) = pool.checkout_by_response_id(prev_resp_id)
             {
-                let mut combined = cached.accumulated_messages.clone();
-                combined.extend(req.messages.iter().cloned());
+                let cached_bytes = cached.estimated_retained_bytes();
+                let admission_timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(15));
+                if let Err(err) = memory_permit
+                    .grow_to_bytes(
+                        memory_permit.reserved_bytes().saturating_add(cached_bytes),
+                        admission_timeout,
+                    )
+                    .await
+                {
+                    pool.restore_idle_on_reject(cached, &*backend);
+                    return Err(err);
+                }
+                let combined_len = cached
+                    .accumulated_messages
+                    .len()
+                    .saturating_add(req.messages.len());
                 let mut guard = SessionLeaseGuard::from_cached(
                     &cached,
-                    combined.len(),
+                    combined_len,
                     Arc::clone(&pool),
                     Arc::clone(&backend),
                 );
@@ -225,6 +246,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 if guard.model_id() != &resolved_model {
                     guard.set_model_id(resolved_model.clone());
                 }
+                let mut combined = std::mem::take(&mut cached.accumulated_messages);
+                combined.extend(std::mem::take(&mut req.messages));
                 return Ok((
                     guard,
                     true,
@@ -290,7 +313,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     is_compaction_turn,
                     initial_rpc_model.clone(),
                     plan,
-                    req.messages.clone(),
+                    std::mem::take(&mut req.messages),
                 ));
             }
 
@@ -349,7 +372,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     true,
                     initial_rpc_model.clone(),
                     plan,
-                    req.messages.clone(),
+                    std::mem::take(&mut req.messages),
                 ));
             }
         }
@@ -415,7 +438,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             is_ephemeral_aux || is_compaction_turn,
             initial_rpc_model.clone(),
             plan,
-            req.messages.clone(),
+            std::mem::take(&mut req.messages),
         ))
     }
     .await;
@@ -450,6 +473,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         prompt_plan,
         base_messages,
         req,
+        memory_permit,
         web_cfg,
         active_model,
         initial_rpc_model,
@@ -587,6 +611,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     prompt_plan: AcpPromptPlan,
     mut full_messages: Vec<CanonicalMessage>,
     req: NormalizedTurnRequest,
+    _memory_permit: ActiveMemoryPermit,
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
     mut current_rpc_model: ModelId,
@@ -1166,19 +1191,26 @@ async fn run_turn_pipeline<B: AcpBackend>(
             let dialogue_hash =
                 hash_dialogue_with_reply(final_lease.model_id(), &full_messages, &assistant_msg);
             full_messages.push(assistant_msg);
+            let message_count = full_messages.len();
+            let retained_messages = if req.retain_response_history {
+                full_messages
+            } else {
+                Vec::new()
+            };
             let committed_context_used = if state.turn_peak_context_used > 0 {
                 state.latest_context_used
             } else {
                 context_usage.total_tokens
             };
-            final_lease.commit(
-                post_hash,
-                dialogue_hash,
-                req.client_tools,
-                committed_context_used,
-                Some(response_id),
-                full_messages,
-            );
+            final_lease.commit(CommittedSessionTurn {
+                post_turn_hash: post_hash,
+                post_turn_dialogue_hash: dialogue_hash,
+                declared_tools: req.client_tools,
+                last_context_used: committed_context_used,
+                message_count,
+                last_response_id: Some(response_id),
+                accumulated_messages: retained_messages,
+            });
         }
     }
 
@@ -1638,6 +1670,8 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId, long_context: bool)
             GatewayError::SharedAcp { source }
         }
         GatewayError::Unauthorized
+        | GatewayError::PayloadTooLarge { .. }
+        | GatewayError::RequestBudgetExhausted
         | GatewayError::NotFound { .. }
         | GatewayError::BadJson { .. }
         | GatewayError::Protocol { .. } => err,

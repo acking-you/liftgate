@@ -40,7 +40,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
-    session_pool::SessionPool,
+    session_pool::{ActiveMemoryPermit, SessionPool},
     telemetry::{TelemetryHub, unix_timestamp_ms},
     turn_runner::{
         ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
@@ -51,6 +51,11 @@ use crate::{
 
 /// Header name required by `POST /api/admin/shutdown` for managed daemon lifecycle control.
 pub const ADMIN_SHUTDOWN_HEADER: &str = "x-liftgate-shutdown-token";
+
+const CONTROL_ROUTE_BODY_LIMIT_BYTES: usize = 256 * 1024;
+const BODY_PERMIT_QUANTUM_BYTES: usize = 64 * 1024;
+const MAX_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Compile-time `(relative_slash_path, bytes)` entry for embedded companion web assets.
 pub type EmbeddedUiAsset = (&'static str, &'static [u8]);
@@ -120,19 +125,9 @@ impl<B: AcpBackend> Clone for AppState<B> {
 /// Anthropic `/v1/messages`, `/v1/models`, `/healthz`, real-time `/api/telemetry/*`,
 /// and optional companion web UI static hosting.
 pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
-    let max_body = state.config.limits.max_body_bytes().get();
-    Router::new()
-        .route("/healthz", get(handle_healthz))
-        .route("/v1/models", get(handle_list_models::<B>))
-        .route("/models", get(handle_list_models::<B>))
-        .route("/v1/codex-models", get(handle_codex_model_catalog::<B>))
-        .route("/codex-models", get(handle_codex_model_catalog::<B>))
-        .route("/v1/models/{model_id}", get(handle_get_model::<B>))
-        .route("/models/{model_id}", get(handle_get_model::<B>))
+    let turn_routes = Router::new()
         .route("/v1/responses", post(handle_create_response::<B>))
         .route("/responses", post(handle_create_response::<B>))
-        .route("/v1/responses/{response_id}", get(handle_get_response::<B>))
-        .route("/responses/{response_id}", get(handle_get_response::<B>))
         .route("/v1/messages", post(handle_anthropic_messages::<B>))
         .route("/messages", post(handle_anthropic_messages::<B>))
         .route(
@@ -142,22 +137,6 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
-        )
-        .route(
-            "/claude-desktop/v1/models",
-            get(handle_claude_desktop_models::<B>),
-        )
-        .route(
-            "/claude-desktop/models",
-            get(handle_claude_desktop_models::<B>),
-        )
-        .route(
-            "/claude-desktop/v1/models/{model_id}",
-            get(handle_get_model::<B>),
-        )
-        .route(
-            "/claude-desktop/models/{model_id}",
-            get(handle_get_model::<B>),
         )
         .route(
             "/claude-desktop/v1/messages",
@@ -174,6 +153,34 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/claude-desktop/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
+        )
+        .layer(DefaultBodyLimit::disable());
+
+    let control_routes = Router::new()
+        .route("/healthz", get(handle_healthz))
+        .route("/v1/models", get(handle_list_models::<B>))
+        .route("/models", get(handle_list_models::<B>))
+        .route("/v1/codex-models", get(handle_codex_model_catalog::<B>))
+        .route("/codex-models", get(handle_codex_model_catalog::<B>))
+        .route("/v1/models/{model_id}", get(handle_get_model::<B>))
+        .route("/models/{model_id}", get(handle_get_model::<B>))
+        .route("/v1/responses/{response_id}", get(handle_get_response::<B>))
+        .route("/responses/{response_id}", get(handle_get_response::<B>))
+        .route(
+            "/claude-desktop/v1/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/v1/models/{model_id}",
+            get(handle_get_model::<B>),
+        )
+        .route(
+            "/claude-desktop/models/{model_id}",
+            get(handle_get_model::<B>),
         )
         .route(
             "/claude-desktop/api/event_logging/batch",
@@ -196,7 +203,10 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
-        .layer(DefaultBodyLimit::max(max_body))
+        .layer(DefaultBodyLimit::max(CONTROL_ROUTE_BODY_LIMIT_BYTES));
+
+    control_routes
+        .merge(turn_routes)
         .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
 }
@@ -515,38 +525,83 @@ struct OpenAiRenderOptions {
 
 async fn handle_create_response<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_openai_response();
-    }
-
-    let req: CreateResponseRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_openai_response();
-        }
-    };
+    let (req, mut memory_permit): (CreateResponseRequest, ActiveMemoryPermit) =
+        match read_authenticated_json_body(&state, http_req).await {
+            Ok(pair) => pair,
+            Err(err) => return err.into_openai_response(),
+        };
 
     let normalized = match normalize_responses_request(&req) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_openai_response(),
     };
+    let CreateResponseRequest {
+        model,
+        input,
+        instructions,
+        previous_response_id,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning,
+        include,
+        stream: _,
+        max_output_tokens,
+        temperature,
+        top_p,
+        store,
+        metadata,
+    } = req;
+    drop((model, input, reasoning, include));
 
     let is_stream = normalized.stream;
     let render_opts = OpenAiRenderOptions {
         emit_web_search_items: normalized.enable_native_web_search,
         force_web_search: normalized.force_native_web_search,
         emit_web_fetch_items: normalized.enable_native_web_fetch,
-        emit_tool_search_items: req.tools.iter().any(|t| t.tool_type == "tool_search"),
+        emit_tool_search_items: tools.iter().any(|t| t.tool_type == "tool_search"),
         include_encrypted_reasoning: normalized.include_encrypted_reasoning,
         query_hint: extract_search_query_hint(&normalized.messages),
     };
     let resp_id = format!("resp_{}", generate_short_nonce());
+    let created_at = unix_timestamp_secs();
+    let mut base_resp = ResponseObject {
+        id: resp_id.clone(),
+        object: Cow::Borrowed("response"),
+        created_at,
+        status: Cow::Borrowed("in_progress"),
+        error: None,
+        incomplete_details: None,
+        instructions,
+        max_output_tokens,
+        model: String::new(),
+        output: Vec::new(),
+        parallel_tool_calls: parallel_tool_calls.unwrap_or(true),
+        previous_response_id,
+        store: store.unwrap_or(true),
+        temperature: temperature.unwrap_or(1.0),
+        text: ResponseTextFormatConfig::default(),
+        tool_choice: tool_choice.unwrap_or_else(|| json!("auto")),
+        tools,
+        top_p: top_p.unwrap_or(1.0),
+        truncation: Cow::Borrowed("disabled"),
+        usage: None,
+        metadata: metadata.unwrap_or_default(),
+    };
+
+    let active_retained = normalized
+        .estimated_retained_bytes()
+        .saturating_add(base_resp.estimated_retained_bytes());
+    let admission_timeout = Duration::from_secs(state.config.limits.turn_timeout_secs().get())
+        .min(MAX_ADMISSION_WAIT_TIMEOUT);
+    if let Err(err) = memory_permit
+        .adjust_to_bytes(active_retained, admission_timeout)
+        .await
+    {
+        return err.into_openai_response();
+    }
 
     let turn_stream = match execute_normalized_turn(
         Arc::clone(&state.backend),
@@ -555,38 +610,15 @@ async fn handle_create_response<B: AcpBackend>(
         &state.config,
         TaskProtocol::OpenaiResponses,
         normalized,
-        resp_id.clone(),
+        resp_id,
+        memory_permit,
     )
     .await
     {
         Ok(s) => s,
         Err(err) => return err.into_openai_response(),
     };
-
-    let created_at = unix_timestamp_secs();
-    let base_resp = ResponseObject {
-        id: resp_id,
-        object: Cow::Borrowed("response"),
-        created_at,
-        status: Cow::Borrowed("in_progress"),
-        error: None,
-        incomplete_details: None,
-        instructions: req.instructions,
-        max_output_tokens: req.max_output_tokens,
-        model: turn_stream.resolved_model.as_str().to_owned(),
-        output: Vec::new(),
-        parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: req.previous_response_id,
-        store: req.store.unwrap_or(true),
-        temperature: req.temperature.unwrap_or(1.0),
-        text: ResponseTextFormatConfig::default(),
-        tool_choice: req.tool_choice.unwrap_or_else(|| json!("auto")),
-        tools: req.tools,
-        top_p: req.top_p.unwrap_or(1.0),
-        truncation: Cow::Borrowed("disabled"),
-        usage: None,
-        metadata: req.metadata.unwrap_or_default(),
-    };
+    base_resp.model = turn_stream.resolved_model.as_str().to_owned();
 
     if is_stream {
         stream_openai_responses(
@@ -739,7 +771,9 @@ async fn collect_openai_response(
     resp.output.extend(tool_items);
     resp.status = Cow::Borrowed("completed");
     resp.usage = Some(ResponsesUsage::from(final_usage));
-    pool.store_response(resp.clone());
+    if resp.store {
+        pool.store_response(resp.clone());
+    }
 
     Json(resp).into_response()
 }
@@ -1898,7 +1932,9 @@ fn stream_openai_responses(
         resp.status = Cow::Borrowed("completed");
         resp.output = finalized_items;
         resp.usage = Some(ResponsesUsage::from(final_usage));
-        pool.store_response(resp.clone());
+        if resp.store {
+            pool.store_response(resp.clone());
+        }
 
         let _ = send_sse_frame(
             &sse_tx,
@@ -2201,49 +2237,41 @@ struct AnthropicRenderOptions {
 
 async fn handle_anthropic_count_tokens<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_anthropic_response();
-    }
-    let req: AnthropicMessagesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_anthropic_response();
-        }
-    };
+    let (req, _memory_permit): (AnthropicMessagesRequest, ActiveMemoryPermit) =
+        match read_authenticated_json_body(&state, http_req).await {
+            Ok(pair) => pair,
+            Err(err) => return err.into_anthropic_response(),
+        };
     let input_tokens = estimate_anthropic_tokens(&req);
     Json(AnthropicCountTokensResponse { input_tokens }).into_response()
 }
 
 async fn handle_anthropic_messages<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_anthropic_response();
-    }
-
-    let req: AnthropicMessagesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_anthropic_response();
-        }
-    };
+    let (req, mut memory_permit): (AnthropicMessagesRequest, ActiveMemoryPermit) =
+        match read_authenticated_json_body(&state, http_req).await {
+            Ok(pair) => pair,
+            Err(err) => return err.into_anthropic_response(),
+        };
     let requested_model_echo = req.model.clone();
 
     let normalized = match normalize_anthropic_request(req) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_anthropic_response(),
     };
+
+    let admission_timeout = Duration::from_secs(state.config.limits.turn_timeout_secs().get())
+        .min(MAX_ADMISSION_WAIT_TIMEOUT);
+    if let Err(err) = memory_permit
+        .adjust_to_bytes(normalized.estimated_retained_bytes(), admission_timeout)
+        .await
+    {
+        return err.into_anthropic_response();
+    }
 
     let is_stream = normalized.stream;
     let render_opts = AnthropicRenderOptions {
@@ -2261,6 +2289,7 @@ async fn handle_anthropic_messages<B: AcpBackend>(
         TaskProtocol::AnthropicMessages,
         normalized,
         msg_id.clone(),
+        memory_permit,
     )
     .await
     {
@@ -3316,6 +3345,104 @@ fn check_auth(headers: &HeaderMap, expected_key: Option<&str>) -> Result<(), Gat
     }
 
     Err(GatewayError::Unauthorized)
+}
+
+fn parse_content_length_hint(
+    headers: &HeaderMap,
+    max_body: usize,
+) -> Result<Option<usize>, GatewayError> {
+    let Some(raw) = headers.get(header::CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let trimmed = raw
+        .to_str()
+        .map_err(|_| GatewayError::BadJson {
+            message: "invalid Content-Length header".to_owned(),
+        })?
+        .trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GatewayError::BadJson {
+            message: "invalid Content-Length header".to_owned(),
+        });
+    }
+    let len = trimmed
+        .parse::<usize>()
+        .map_err(|_| GatewayError::PayloadTooLarge {
+            max_bytes: max_body,
+        })?;
+    if len > max_body {
+        return Err(GatewayError::PayloadTooLarge {
+            max_bytes: max_body,
+        });
+    }
+    Ok(Some(len))
+}
+
+async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBackend>(
+    state: &AppState<B>,
+    req: Request,
+) -> Result<(T, ActiveMemoryPermit), GatewayError> {
+    check_auth(req.headers(), state.config.api_key.as_deref())?;
+
+    let max_body = state.config.limits.max_body_bytes().get();
+    let content_length_hint = parse_content_length_hint(req.headers(), max_body)?;
+
+    let timeout_secs = state.config.limits.turn_timeout_secs().get();
+    let turn_timeout = Duration::from_secs(timeout_secs);
+    let read_deadline = tokio::time::Instant::now() + turn_timeout.min(MAX_BODY_READ_TIMEOUT);
+    let admission_timeout = turn_timeout.min(MAX_ADMISSION_WAIT_TIMEOUT);
+
+    let mut permit = state.pool.new_active_memory_permit();
+    let mut buf = Vec::with_capacity(
+        content_length_hint
+            .unwrap_or(0)
+            .min(BODY_PERMIT_QUANTUM_BYTES),
+    );
+    let mut body = req.into_body();
+
+    loop {
+        let next_frame =
+            tokio::time::timeout_at(read_deadline, http_body_util::BodyExt::frame(&mut body))
+                .await
+                .map_err(|_| GatewayError::BadJson {
+                    message: "timed out reading HTTP request body".to_owned(),
+                })?;
+        let Some(frame_res) = next_frame else {
+            break;
+        };
+        let frame = frame_res.map_err(|err| GatewayError::BadJson {
+            message: format!("failed to read HTTP request body: {err}"),
+        })?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let next_len = buf.len().saturating_add(chunk.len());
+        if next_len > max_body {
+            return Err(GatewayError::PayloadTooLarge {
+                max_bytes: max_body,
+            });
+        }
+        let reservation = match content_length_hint {
+            Some(exact) if exact <= BODY_PERMIT_QUANTUM_BYTES && next_len <= exact => exact,
+            _ => next_len
+                .div_ceil(BODY_PERMIT_QUANTUM_BYTES)
+                .saturating_mul(BODY_PERMIT_QUANTUM_BYTES)
+                .min(max_body),
+        };
+        permit.grow_to_bytes(reservation, admission_timeout).await?;
+        buf.extend_from_slice(&chunk);
+    }
+
+    permit
+        .grow_to_bytes(buf.len().saturating_mul(2), admission_timeout)
+        .await?;
+    let parsed: T = serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
+        message: err.to_string(),
+    })?;
+    Ok((parsed, permit))
 }
 
 const fn next_seq(seq: &mut u64) -> u64 {

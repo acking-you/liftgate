@@ -112,6 +112,12 @@ pub enum GatewayError {
     #[error("invalid or missing gateway API key")]
     Unauthorized,
 
+    #[error("request payload exceeds maximum allowed size ({max_bytes} bytes)")]
+    PayloadTooLarge { max_bytes: usize },
+
+    #[error("gateway concurrent request memory budget exhausted")]
+    RequestBudgetExhausted,
+
     #[error("requested resource `{resource}` was not found")]
     NotFound { resource: String },
 
@@ -142,6 +148,8 @@ impl GatewayError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestBudgetExhausted => StatusCode::TOO_MANY_REQUESTS,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_status(source),
@@ -158,6 +166,8 @@ impl GatewayError {
     pub fn anthropic_status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestBudgetExhausted => StatusCode::TOO_MANY_REQUESTS,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_anthropic_status(source),
@@ -215,6 +225,8 @@ impl GatewayError {
     pub fn stable_kind(&self) -> (&'static str, &'static str) {
         match self {
             Self::Unauthorized => ("authentication_error", "invalid_api_key"),
+            Self::PayloadTooLarge { .. } => ("invalid_request_error", "request_too_large"),
+            Self::RequestBudgetExhausted => ("rate_limit_error", "server_busy"),
             Self::NotFound { .. } => ("not_found_error", "not_found"),
             Self::BadJson { .. } => ("invalid_request_error", "invalid_request"),
             Self::Protocol { source } => {
@@ -234,6 +246,8 @@ impl GatewayError {
     pub fn anthropic_error_type(&self) -> &'static str {
         match self {
             Self::Unauthorized => "authentication_error",
+            Self::PayloadTooLarge { .. } => "request_too_large",
+            Self::RequestBudgetExhausted => "rate_limit_error",
             Self::NotFound { .. } => "not_found_error",
             Self::BadJson { .. } | Self::Protocol { .. } => "invalid_request_error",
             Self::Acp { source } => Self::acp_anthropic_error_type(source),
@@ -300,7 +314,11 @@ impl GatewayError {
             }
             Self::Acp { source } => Self::acp_context_overflow_tokens(source),
             Self::SharedAcp { source } => Self::acp_context_overflow_tokens(source),
-            Self::Unauthorized | Self::NotFound { .. } | Self::BadJson { .. } => None,
+            Self::Unauthorized
+            | Self::PayloadTooLarge { .. }
+            | Self::RequestBudgetExhausted
+            | Self::NotFound { .. }
+            | Self::BadJson { .. } => None,
         }
     }
 
@@ -348,6 +366,13 @@ impl GatewayError {
     pub fn client_message(&self) -> String {
         match self {
             Self::Unauthorized => "Invalid or missing API key.".to_owned(),
+            Self::PayloadTooLarge { max_bytes } => {
+                format!("Request body exceeds maximum allowed size ({max_bytes} bytes).")
+            }
+            Self::RequestBudgetExhausted => {
+                "Server is busy processing large concurrent requests; please retry shortly."
+                    .to_owned()
+            }
             Self::NotFound { resource } => format!("Resource `{resource}` was not found."),
             Self::BadJson { message } => format!("Malformed JSON request body: {message}"),
             Self::Protocol { source } => source.to_string(),

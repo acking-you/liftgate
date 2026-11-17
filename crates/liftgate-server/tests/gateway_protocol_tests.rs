@@ -4939,3 +4939,312 @@ async fn active_streamed_tool_interrupted_by_thought_or_error_fails_instead_of_c
         "mid-tool 429 with unclosed tool_use block must never emit message_stop"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
+    use std::convert::Infallible;
+    use std::sync::atomic::AtomicBool;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let max_body = 32 * 1024;
+    let limits = GatewayLimits::try_new(64 * 1024, max_body, 64, 32, 32, 30).unwrap();
+    let mut scripts = Vec::new();
+    // 1 stateless Anthropic + 1 stateless OpenAI(store:false) + 10 stateful OpenAI(store:true)
+    for _ in 0..12 {
+        scripts.push(MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["ack".to_owned()],
+        });
+    }
+    for _ in 0..7 {
+        scripts.push(MockScript::HangForever);
+    }
+    scripts.push(MockScript::Immediate {
+        thoughts: vec![],
+        chunks_template: vec!["recovered".to_owned()],
+    });
+
+    let backend = Arc::new(MockAcpBackend::new(scripts));
+    let state = AppState {
+        backend: Arc::clone(&backend),
+        pool: Arc::new(SessionPool::new(limits)),
+        telemetry: Arc::new(TelemetryHub::new()),
+        config: GatewayRuntimeConfig {
+            title_model_file: None,
+            long_context: false,
+            default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
+            acp_mode: AcpModeId::try_new("auto").unwrap(),
+            api_key: Some(Arc::from("secret-gate-key")),
+            limits,
+        },
+        ui_dist_dir: None,
+        embedded_ui: &[],
+        admin_shutdown: None,
+    };
+    let app = build_router(state.clone());
+
+    // 1. Unauthenticated requests must be rejected BEFORE polling a single body frame.
+    for uri in ["/v1/responses", "/v1/messages", "/v1/messages/count_tokens"] {
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_flag = Arc::clone(&polled);
+        let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, Infallible>>(2);
+        let producer = tokio::spawn(async move {
+            if tx
+                .send(Ok(axum::body::Bytes::from(vec![b'x'; max_body + 4096])))
+                .await
+                .is_ok()
+            {
+                let _ = tx
+                    .send(Ok(axum::body::Bytes::from_static(b"trailing")))
+                    .await;
+            }
+        });
+        let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), move |item| {
+            polled_flag.store(true, Ordering::SeqCst);
+            item
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        producer.abort();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "uri={uri}");
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "unauthenticated request on {uri} must not read body frames before check_auth"
+        );
+    }
+
+    // 2. Authenticated oversized Content-Length rejects immediately with 413 without reading body,
+    //    and chunked oversized bodies abort mid-stream with 413 (`request_too_large`).
+    let polled_cl = Arc::new(AtomicBool::new(false));
+    let polled_cl_flag = Arc::clone(&polled_cl);
+    let (_cl_tx, cl_rx) = mpsc::channel::<Result<axum::body::Bytes, Infallible>>(1);
+    let cl_stream = tokio_stream::StreamExt::map(ReceiverStream::new(cl_rx), move |item| {
+        polled_cl_flag.store(true, Ordering::SeqCst);
+        item
+    });
+    let cl_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .header("content-length", (max_body + 1).to_string())
+                .body(Body::from_stream(cl_stream))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cl_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!polled_cl.load(Ordering::SeqCst));
+    let cl_json: Value =
+        serde_json::from_slice(&cl_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(cl_json["error"]["code"], "request_too_large");
+
+    let chunked_oversized = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "a".repeat(max_body + 1024) }]
+    })
+    .to_string();
+    let anth_413 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(tokio_stream::iter([
+                    Ok::<_, Infallible>(axum::body::Bytes::from(chunked_oversized)),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anth_413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let anth_413_json: Value =
+        serde_json::from_slice(&anth_413.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(anth_413_json["error"]["type"], "request_too_large");
+
+    // 3. Stateless Anthropic & OpenAI(store:false) turns retain zero message history bytes
+    //    while preserving exact telemetry `message_count` and warm prefix-hash continuation.
+    let anth_payload = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 128,
+        "messages": [{ "role": "user", "content": "z".repeat(16 * 1024) }]
+    });
+    let anth_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(anth_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anth_ok.status(), StatusCode::OK);
+    let (idle_after_anth, stored_after_anth) = state.pool.retained_memory_bytes();
+    assert_eq!(stored_after_anth, 0);
+    assert!(
+        idle_after_anth < 2048,
+        "stateless Anthropic session should retain only compact metadata, got {idle_after_anth} bytes"
+    );
+    let snap = state.pool.snapshot();
+    assert_eq!(snap.sessions.first().map(|s| s.message_count), Some(2));
+
+    let oai_nostore = json!({
+        "model": "gpt-5.4",
+        "store": false,
+        "input": [{ "role": "user", "content": "w".repeat(16 * 1024) }]
+    });
+    let oai_nostore_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(oai_nostore.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oai_nostore_resp.status(), StatusCode::OK);
+    let (_, stored_after_nostore) = state.pool.retained_memory_bytes();
+    assert_eq!(stored_after_nostore, 0);
+
+    // 4. Stateful OpenAI(store:true) turns enforce global retained idle & stored response byte caps.
+    let aborted_before_evict = backend.aborted_count.load(Ordering::SeqCst);
+    for idx in 0..10 {
+        let stateful_req = json!({
+            "model": "gpt-5.4",
+            "store": true,
+            "instructions": format!("inst-{idx}-{}", "p".repeat(8 * 1024)),
+            "input": [{ "role": "user", "content": format!("turn-{idx}-{}", "q".repeat(18 * 1024)) }]
+        });
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret-gate-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(stateful_req.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let (retained_idle, retained_resp) = state.pool.retained_memory_bytes();
+    assert!(
+        retained_idle <= state.pool.max_idle_retained_bytes(),
+        "retained_idle={retained_idle} exceeded cap={}",
+        state.pool.max_idle_retained_bytes()
+    );
+    assert!(
+        retained_resp <= state.pool.max_stored_response_bytes(),
+        "retained_resp={retained_resp} exceeded cap={}",
+        state.pool.max_stored_response_bytes()
+    );
+    let snap_after = state.pool.snapshot();
+    assert!(
+        snap_after.idle_cached_sessions < 10,
+        "expected byte-budget LRU eviction before 32-session count cap, got {}",
+        snap_after.idle_cached_sessions
+    );
+    assert!(backend.aborted_count.load(Ordering::SeqCst) > aborted_before_evict);
+
+    // 5. Concurrent active turn memory saturation enforces global active byte cap (429 server_busy)
+    //    and releases permits cleanly via RAII when stalled streams are dropped.
+    let mut hanging_streams = Vec::new();
+    for idx in 0..7 {
+        let big_stream_req = json!({
+            "model": "gpt-5.4",
+            "stream": true,
+            "store": false,
+            "input": [{ "role": "user", "content": format!("hang-{idx}-{}", "m".repeat(29 * 1024)) }]
+        });
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret-gate-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big_stream_req.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        hanging_streams.push(r);
+    }
+
+    let ninth_req = json!({
+        "model": "gpt-5.4",
+        "store": false,
+        "input": [{ "role": "user", "content": format!("overflow-{}", "n".repeat(29 * 1024)) }]
+    });
+    let ninth_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(ninth_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ninth_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let ninth_json: Value =
+        serde_json::from_slice(&ninth_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(ninth_json["error"]["code"], "server_busy");
+
+    drop(hanging_streams);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    let recovery_req = json!({
+        "model": "gpt-5.4",
+        "store": false,
+        "input": [{ "role": "user", "content": "ping after recovery" }]
+    });
+    let recovery_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(recovery_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovery_resp.status(), StatusCode::OK);
+}

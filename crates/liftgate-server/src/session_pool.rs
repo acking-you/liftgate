@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use liftgate_types::{
     canonical::{CanonicalMessage, CanonicalToolSpec},
@@ -8,8 +9,84 @@ use liftgate_types::{
     session_key::ConversationHash,
     telemetry::{SessionPoolTelemetry, SessionSlotState, SessionSummary},
 };
+use tokio::sync::Semaphore;
 
-use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
+use crate::{acp_client::AcpBackend, error::GatewayError, telemetry::unix_timestamp_ms};
+
+const PERMIT_UNIT_BYTES: usize = 1024;
+const MAX_ACTIVE_MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
+const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+fn bytes_to_permits(bytes: usize) -> u32 {
+    if bytes == 0 {
+        return 0;
+    }
+    let units = bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
+    u32::try_from(units).unwrap_or(u32::MAX)
+}
+
+/// Cancel-safe RAII reservation against `SessionPool`'s global active request/turn byte budget.
+pub struct ActiveMemoryPermit {
+    sem: Arc<Semaphore>,
+    max_permits: u32,
+    permits: u32,
+}
+
+impl ActiveMemoryPermit {
+    /// Approximate bytes currently reserved by this permit.
+    #[must_use]
+    pub const fn reserved_bytes(&self) -> usize {
+        (self.permits as usize).saturating_mul(PERMIT_UNIT_BYTES)
+    }
+
+    /// Acquires additional 1 KiB permits up to `target_bytes` (clamped to pool capacity).
+    pub async fn grow_to_bytes(
+        &mut self,
+        target_bytes: usize,
+        timeout: Duration,
+    ) -> Result<(), GatewayError> {
+        let target_permits = bytes_to_permits(target_bytes).min(self.max_permits);
+        if target_permits > self.permits {
+            let delta = target_permits - self.permits;
+            let acquired = tokio::time::timeout(timeout, self.sem.acquire_many(delta))
+                .await
+                .map_err(|_| GatewayError::RequestBudgetExhausted)?
+                .map_err(|_| GatewayError::RequestBudgetExhausted)?;
+            acquired.forget();
+            self.permits = target_permits;
+        }
+        Ok(())
+    }
+
+    /// Resizes this reservation to `target_bytes`, releasing excess permits immediately without waiting.
+    pub async fn adjust_to_bytes(
+        &mut self,
+        target_bytes: usize,
+        timeout: Duration,
+    ) -> Result<(), GatewayError> {
+        let target_permits = bytes_to_permits(target_bytes).min(self.max_permits);
+        if target_permits <= self.permits {
+            let release = (self.permits - target_permits) as usize;
+            if release > 0 {
+                self.sem.add_permits(release);
+                self.permits = target_permits;
+            }
+            Ok(())
+        } else {
+            self.grow_to_bytes(target_bytes, timeout).await
+        }
+    }
+}
+
+impl Drop for ActiveMemoryPermit {
+    fn drop(&mut self) {
+        if self.permits > 0 {
+            self.sem.add_permits(self.permits as usize);
+            self.permits = 0;
+        }
+    }
+}
 
 /// Cached metadata for an idle ACP session awaiting a multi-turn continuation.
 #[derive(Clone, Debug)]
@@ -23,9 +100,32 @@ pub struct IdleSessionEntry {
     pub last_context_used: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub message_count: usize,
     pub turn_count: u64,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
+    retained_bytes: usize,
+}
+
+impl IdleSessionEntry {
+    /// Estimates total heap + structural bytes retained while cached in `SessionPool`.
+    #[must_use]
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let tool_bytes = self.declared_tools.iter().fold(0usize, |acc, t| {
+            acc.saturating_add(t.estimated_heap_bytes())
+        });
+        let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
+            acc.saturating_add(m.estimated_heap_bytes())
+        });
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.session_id.as_str().len())
+            .saturating_add(self.tool_nonce.len())
+            .saturating_add(self.model_id.as_str().len())
+            .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
+            .saturating_add(tool_bytes)
+            .saturating_add(msg_bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -38,16 +138,29 @@ struct ActiveLeaseMeta {
     last_response_id: Option<String>,
 }
 
+struct StoredResponseEntry {
+    id: String,
+    retained_bytes: usize,
+    response: ResponseObject,
+}
+
 /// Bounded LRU pool of idle ACP sessions, active leases, and recent OpenAI `ResponseObject` records.
 pub struct SessionPool {
     limits: GatewayLimits,
+    active_memory_sem: Arc<Semaphore>,
+    max_active_permits: u32,
+    max_active_bytes: usize,
+    max_idle_retained_bytes: usize,
+    max_stored_response_bytes: usize,
     inner: Mutex<PoolInner>,
 }
 
 struct PoolInner {
     active_leases: BTreeMap<String, ActiveLeaseMeta>,
     idle_sessions: VecDeque<IdleSessionEntry>,
-    stored_responses: VecDeque<(String, ResponseObject)>,
+    retained_idle_bytes: usize,
+    stored_responses: VecDeque<StoredResponseEntry>,
+    retained_response_bytes: usize,
     total_sessions_created: u64,
     total_sessions_reused: u64,
     total_sessions_closed_or_evicted: u64,
@@ -57,18 +170,78 @@ struct PoolInner {
 impl SessionPool {
     #[must_use]
     pub fn new(limits: GatewayLimits) -> Self {
+        let max_body = limits.max_body_bytes().get();
+        let max_active_bytes = max_body
+            .saturating_mul(8)
+            .min(MAX_ACTIVE_MEMORY_CAP_BYTES)
+            .max(max_body);
+        let max_idle_retained_bytes = max_body
+            .saturating_mul(6)
+            .min(MAX_IDLE_RETAINED_CAP_BYTES)
+            .max(max_body);
+        let max_stored_response_bytes = max_body
+            .saturating_mul(2)
+            .min(MAX_STORED_RESPONSES_CAP_BYTES)
+            .max(max_body);
+        let max_active_permits = bytes_to_permits(max_active_bytes).max(1);
+
         Self {
             limits,
+            active_memory_sem: Arc::new(Semaphore::new(max_active_permits as usize)),
+            max_active_permits,
+            max_active_bytes,
+            max_idle_retained_bytes,
+            max_stored_response_bytes,
             inner: Mutex::new(PoolInner {
                 active_leases: BTreeMap::new(),
                 idle_sessions: VecDeque::with_capacity(limits.max_idle_sessions().get()),
+                retained_idle_bytes: 0,
                 stored_responses: VecDeque::with_capacity(limits.max_stored_responses().get()),
+                retained_response_bytes: 0,
                 total_sessions_created: 0,
                 total_sessions_reused: 0,
                 total_sessions_closed_or_evicted: 0,
                 last_activity_unix_ms: unix_timestamp_ms(),
             }),
         }
+    }
+
+    /// Creates an empty RAII memory permit bound to this pool's active byte budget.
+    #[must_use]
+    pub fn new_active_memory_permit(&self) -> ActiveMemoryPermit {
+        ActiveMemoryPermit {
+            sem: Arc::clone(&self.active_memory_sem),
+            max_permits: self.max_active_permits,
+            permits: 0,
+        }
+    }
+
+    /// Global byte ceiling across concurrent HTTP body reads and running turns.
+    #[must_use]
+    pub const fn max_active_memory_bytes(&self) -> usize {
+        self.max_active_bytes
+    }
+
+    /// Global byte ceiling across cached idle ACP sessions.
+    #[must_use]
+    pub const fn max_idle_retained_bytes(&self) -> usize {
+        self.max_idle_retained_bytes
+    }
+
+    /// Global byte ceiling across cached `GET /v1/responses/{id}` objects.
+    #[must_use]
+    pub const fn max_stored_response_bytes(&self) -> usize {
+        self.max_stored_response_bytes
+    }
+
+    /// Returns `(retained_idle_session_bytes, retained_stored_response_bytes)` currently held.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> (usize, usize) {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (guard.retained_idle_bytes, guard.retained_response_bytes)
     }
 
     /// Atomically removes and returns an idle session matching `previous_response_id`.
@@ -78,13 +251,16 @@ impl SessionPool {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let pos = guard
-            .idle_sessions
-            .iter()
-            .rposition(|e| e.last_response_id.as_deref() == Some(response_id))?;
+        let pos = guard.idle_sessions.iter().rposition(|e| {
+            !e.accumulated_messages.is_empty() && e.last_response_id.as_deref() == Some(response_id)
+        })?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        Some(entry)
     }
 
     /// Atomically removes and returns an idle session matching a canonical prefix hash.
@@ -100,7 +276,11 @@ impl SessionPool {
             .rposition(|e| &e.post_turn_hash == hash)?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        Some(entry)
     }
 
     /// Atomically removes and returns an idle session matching a pure dialogue hash
@@ -117,7 +297,11 @@ impl SessionPool {
             .rposition(|e| &e.post_turn_dialogue_hash == hash)?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        Some(entry)
     }
 
     /// Returns `(active_leased_sessions, idle_cached_sessions)` without cloning session entries.
@@ -148,6 +332,7 @@ impl SessionPool {
         };
         let count = guard.idle_sessions.len() as u64;
         guard.total_sessions_closed_or_evicted += count;
+        guard.retained_idle_bytes = 0;
         guard.idle_sessions.drain(..).collect()
     }
 
@@ -166,7 +351,12 @@ impl SessionPool {
                 return false;
             };
             guard.total_sessions_closed_or_evicted += 1;
-            guard.idle_sessions.remove(pos)
+            let entry = guard.idle_sessions.remove(pos);
+            if let Some(ref e) = entry {
+                guard.retained_idle_bytes =
+                    guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
+            }
+            entry
         };
 
         if let Some(entry) = removed {
@@ -179,16 +369,36 @@ impl SessionPool {
 
     /// Stores a completed OpenAI `ResponseObject` for `GET /v1/responses/{id}` inspection.
     pub fn store_response(&self, response: ResponseObject) {
+        if !response.store {
+            return;
+        }
+        let resp_bytes = response.estimated_retained_bytes();
+        if resp_bytes > self.max_stored_response_bytes {
+            return;
+        }
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.stored_responses.len() >= self.limits.max_stored_responses().get() {
-            let _ = guard.stored_responses.pop_front();
+        while guard.stored_responses.len() >= self.limits.max_stored_responses().get()
+            || (!guard.stored_responses.is_empty()
+                && guard.retained_response_bytes.saturating_add(resp_bytes)
+                    > self.max_stored_response_bytes)
+        {
+            if let Some(old) = guard.stored_responses.pop_front() {
+                guard.retained_response_bytes = guard
+                    .retained_response_bytes
+                    .saturating_sub(old.retained_bytes);
+            } else {
+                break;
+            }
         }
-        guard
-            .stored_responses
-            .push_back((response.id.clone(), response));
+        guard.retained_response_bytes = guard.retained_response_bytes.saturating_add(resp_bytes);
+        guard.stored_responses.push_back(StoredResponseEntry {
+            id: response.id.clone(),
+            retained_bytes: resp_bytes,
+            response,
+        });
     }
 
     #[must_use]
@@ -201,8 +411,8 @@ impl SessionPool {
             .stored_responses
             .iter()
             .rev()
-            .find(|(id, _)| id == response_id)
-            .map(|(_, obj)| obj.clone())
+            .find(|entry| entry.id == response_id)
+            .map(|entry| entry.response.clone())
     }
 
     /// Captures a telemetry snapshot of all running and cached ACP sessions.
@@ -233,7 +443,7 @@ impl SessionPool {
                 model_id: idle.model_id.as_str().to_owned(),
                 state: SessionSlotState::Idle,
                 turn_count: idle.turn_count,
-                message_count: idle.accumulated_messages.len(),
+                message_count: idle.message_count,
                 created_at_unix_ms: idle.created_at_unix_ms,
                 last_active_unix_ms: idle.last_active_unix_ms,
                 last_response_id: idle.last_response_id.clone(),
@@ -285,7 +495,46 @@ impl SessionPool {
         guard.last_activity_unix_ms = unix_timestamp_ms();
     }
 
-    fn checkin<B: AcpBackend>(&self, entry: IdleSessionEntry, backend: &B) {
+    /// Returns a checked-out idle session back to the LRU pool when turn admission is rejected
+    /// before any RPC mutates the underlying ACP session.
+    pub(crate) fn restore_idle_on_reject<B: AcpBackend>(
+        &self,
+        entry: IdleSessionEntry,
+        backend: &B,
+    ) {
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.total_sessions_reused = guard.total_sessions_reused.saturating_sub(1);
+        }
+        self.checkin(entry, backend);
+    }
+
+    fn checkin<B: AcpBackend>(&self, mut entry: IdleSessionEntry, backend: &B) {
+        let mut entry_bytes = entry.estimated_retained_bytes();
+        if entry_bytes > self.max_idle_retained_bytes && !entry.accumulated_messages.is_empty() {
+            entry.accumulated_messages.clear();
+            entry.accumulated_messages.shrink_to_fit();
+            entry_bytes = entry.estimated_retained_bytes();
+        }
+        entry.retained_bytes = entry_bytes;
+
+        if entry_bytes > self.max_idle_retained_bytes {
+            {
+                let mut guard = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.last_activity_unix_ms = entry.last_active_unix_ms;
+                let _ = guard.active_leases.remove(entry.session_id.as_str());
+                guard.total_sessions_closed_or_evicted += 1;
+            }
+            backend.abort_session_nonblocking(&entry.session_id);
+            return;
+        }
+
         let evicted = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
@@ -293,20 +542,45 @@ impl SessionPool {
             };
             guard.last_activity_unix_ms = entry.last_active_unix_ms;
             let _ = guard.active_leases.remove(entry.session_id.as_str());
-            let evicted = if guard.idle_sessions.len() >= self.limits.max_idle_sessions().get() {
-                guard.total_sessions_closed_or_evicted += 1;
-                guard.idle_sessions.pop_front()
-            } else {
-                None
-            };
+            let mut evicted = Vec::new();
+            while guard.idle_sessions.len() >= self.limits.max_idle_sessions().get()
+                || (!guard.idle_sessions.is_empty()
+                    && guard
+                        .retained_idle_bytes
+                        .saturating_add(entry.retained_bytes)
+                        > self.max_idle_retained_bytes)
+            {
+                if let Some(old) = guard.idle_sessions.pop_front() {
+                    guard.retained_idle_bytes =
+                        guard.retained_idle_bytes.saturating_sub(old.retained_bytes);
+                    guard.total_sessions_closed_or_evicted += 1;
+                    evicted.push(old);
+                } else {
+                    break;
+                }
+            }
+            guard.retained_idle_bytes = guard
+                .retained_idle_bytes
+                .saturating_add(entry.retained_bytes);
             guard.idle_sessions.push_back(entry);
             evicted
         };
 
-        if let Some(old) = evicted {
+        for old in evicted {
             backend.abort_session_nonblocking(&old.session_id);
         }
     }
+}
+
+/// Post-turn session state committed back to `SessionPool` when an interactive turn completes.
+pub struct CommittedSessionTurn {
+    pub post_turn_hash: ConversationHash,
+    pub post_turn_dialogue_hash: ConversationHash,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub last_context_used: u64,
+    pub message_count: usize,
+    pub last_response_id: Option<String>,
+    pub accumulated_messages: Vec<CanonicalMessage>,
 }
 
 /// RAII lease guard for an active ACP session turn.
@@ -431,30 +705,24 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     }
 
     /// Disarms abort-on-drop and returns the healthy session to `pool` for future turns.
-    pub fn commit(
-        mut self,
-        post_turn_hash: ConversationHash,
-        post_turn_dialogue_hash: ConversationHash,
-        declared_tools: Vec<CanonicalToolSpec>,
-        last_context_used: u64,
-        last_response_id: Option<String>,
-        accumulated_messages: Vec<CanonicalMessage>,
-    ) {
+    pub fn commit(mut self, committed: CommittedSessionTurn) {
         self.armed = false;
         let now_ms = unix_timestamp_ms();
         let entry = IdleSessionEntry {
             session_id: self.session_id.clone(),
             tool_nonce: Arc::clone(&self.tool_nonce),
             model_id: self.model_id.clone(),
-            post_turn_hash,
-            post_turn_dialogue_hash,
-            declared_tools,
-            last_context_used,
-            last_response_id,
-            accumulated_messages,
+            post_turn_hash: committed.post_turn_hash,
+            post_turn_dialogue_hash: committed.post_turn_dialogue_hash,
+            declared_tools: committed.declared_tools,
+            last_context_used: committed.last_context_used,
+            last_response_id: committed.last_response_id,
+            accumulated_messages: committed.accumulated_messages,
+            message_count: committed.message_count,
             turn_count: self.turn_count,
             created_at_unix_ms: self.created_at_unix_ms,
             last_active_unix_ms: now_ms,
+            retained_bytes: 0,
         };
         self.pool.checkin(entry, &*self.backend);
     }

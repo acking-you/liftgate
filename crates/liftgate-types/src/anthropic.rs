@@ -521,6 +521,7 @@ pub fn normalize_anthropic_request(
         web_fetch_blocked_domains,
         auxiliary_task,
         previous_response_id: None,
+        retain_response_history: false,
         reasoning_effort,
         include_thinking,
         omit_thinking_text,
