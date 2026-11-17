@@ -286,7 +286,7 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
             let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
             let (window, _) =
                 liftgate_types::model::context_limits(&model_id, state.config.long_context);
-            let supports_1m = window >= 1_000_000;
+            let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let raw_desc = format!(
                 "{}k ctx \u{00b7} Antigravity ACP ({model_id})",
                 window / 1_000
@@ -299,7 +299,7 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
                 "created_at": "2026-01-01T00:00:00Z",
                 "description": description,
             });
-            if supports_1m && let Some(obj) = item.as_object_mut() {
+            if supports_extended && let Some(obj) = item.as_object_mut() {
                 obj.insert("supports1m".to_owned(), json!(true));
                 obj.insert("prefer1m".to_owned(), json!(true));
             }
@@ -335,11 +335,16 @@ fn build_model_card(
 ) -> ModelCard {
     let (context_window, auto_compact_token_limit) =
         liftgate_types::model::context_limits(&id, long_context);
+    let description = format!(
+        "{}k ctx \u{00b7} Antigravity ACP ({id})",
+        context_window / 1_000
+    );
     ModelCard {
         id,
         object: "model",
         item_type: "model",
         display_name,
+        description,
         created,
         created_at: "2026-01-01T00:00:00Z",
         owned_by: "antigravity",

@@ -74,11 +74,11 @@ standard reactive-compaction wire format expected by each client (`code:
 both HTTP `400` and SSE failure frames).
 
 Model metadata and generated client settings use conservative context and
-auto-compact limits: Gemini `280k / 245k`, Claude `200k / 170k`, and GPT-OSS
+auto-compact limits: Gemini `500k / 425k`, Claude `200k / 170k`, and GPT-OSS
 `128k / 110k`. Codex uses per-model catalog entries, and Claude Code uses
 per-model `autoCompactWindow` settings. Canonical Claude aliases shared by
 several gateway models take the smallest limit. These settings aim to trigger
-client compaction before the upstream compaction observed around `300k–320k`;
+client compaction cleanly within Antigravity's 500k session window;
 they do not change that upstream policy.
 
 Only explicit `--long-context` enables hydration and Gemini's experimental
@@ -128,6 +128,5 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | `crates/liftgate-desktop` | standalone native GPUI desktop control center (`gpui-kit`) with Warm Editorial Light/Dark themes, `中文`/`EN` switch, 100% CLI capability parity, and built-in headless `serve` / `__desktop-watch` daemon modes |
 | `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release builds via `crates/liftgate-core/build.rs` |
 | `run-gateway.{sh,ps1,cmd}` | build and run the gateway |
-| `start-agy.{sh,ps1,cmd}` | launch Claude Code or Codex through the gateway |
 
 Dependencies point one way: `{liftgate, liftgate-desktop}` → `liftgate-core` → `liftgate-server` → `liftgate-types`.

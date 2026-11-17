@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
 
-pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
+pub const DEFAULT_MAX_LINE_BYTES: usize = 48 * 1024 * 1024;
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 pub const DEFAULT_MAX_IDLE_SESSIONS: usize = 64;
 pub const DEFAULT_MAX_STORED_RESPONSES: usize = 256;

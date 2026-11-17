@@ -130,11 +130,11 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 
 | 模型系列 | 声明窗口 | 自动压缩阈值 |
 | --- | --- | --- |
-| Gemini | 280,000 | 245,000 |
+| Gemini | 500,000 | 425,000 |
 | Claude | 200,000 | 170,000 |
 | GPT-OSS | 128,000 | 110,000 |
 
-这是网关的运行窗口，并非模型宣传的原生容量，目的是为实测约 300k–320k tokens 的上游压缩行为留出余量。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
+默认窗口对齐上游 Antigravity 的 500K ACP 会话容量，并为输出与客户端主动压缩预留充足余量。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
 
 每次 ACP 请求有 `176,000` 字节的单轮文本预算。当某次工具调用输出或单轮输入超出预算时，Liftgate 会按水位线分配算法仅对超长块做按行对齐的首尾保留中间截断（保留约 55% 开头与 45% 结尾，并插入明确省略行号范围的提示标记），保持同轮其它小工具输出完整无损，且不影响后续轮次的 `SessionPool` 热会话前缀命中。冷启动回放会在必要时带标记缩减旧历史；真正发生上下文窗口溢出时，网关会返回客户端标准可自动触发压缩的错误格式（Codex 为 `context_length_exceeded`，Claude Code 为 `prompt is too long: N tokens > M maximum`）。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
 
@@ -190,25 +190,6 @@ liftgate config --uninstall         # 精准清理 Liftgate 写入的配置项�
 | `-h` · `--help` | 查看脚本帮助 |
 
 其它参数原样传给 `liftgate`（见[参数与环境变量](#参数与环境变量)）。用 `curl http://127.0.0.1:8787/healthz` 确认已启动，用 `curl http://127.0.0.1:8787/v1/models` 查看可用模型。
-
-## 一键启动器
-
-`start-agy` 会在网关未运行时自动启动它，同步实时模型列表，再打开已指向网关的 Claude Code 或 Codex。配置只作用于它启动的进程，退出后终端环境保持原样。
-
-| | Linux / macOS | Windows |
-| --- | --- | --- |
-| Claude Code | `./start-agy.sh` | `.\start-agy.cmd` |
-| Codex CLI | `./start-agy.sh --codex` | `.\start-agy.cmd -Codex` |
-| 标准权限确认模式 | `./start-agy.sh --no-bypass` | `.\start-agy.cmd -NoBypass` |
-| 只启动服务 | `./start-agy.sh --services-only` | `.\start-agy.cmd -BackgroundOnly` |
-| 停止服务 | `./start-agy.sh --stop` | `.\start-agy.cmd -StopServices` |
-
-- 默认以全自动免确认模式启动 Claude Code（`--dangerously-skip-permissions`）与 Codex（`--dangerously-bypass-approvals-and-sandbox`）；加 `--no-bypass` / `-NoBypass`（或显式传入 `--permission-mode` / `--sandbox`）即可保留常规权限确认。
-- 其余参数原样传给 `claude` 或 `codex`（如 `./start-agy.sh -p "你好"`）。
-- 修改默认值：可用参数 `--gateway-model`（`-GatewayModel`）、`--fast-model`（`-FastModel`）、`--host`（`-ListenHost`）、`--port`（`-ListenPort`）、`--ui-port`（`-UiPort`）、`--api-key`（`-ApiKey`），或环境变量 `AGY_MODEL`、`AGY_FAST_MODEL`、`AGY_HOST`、`AGY_PORT`、`AGY_WEB_PORT`、`AGY_API_KEY`。
-- 装有 Bun 时还会在 `5173` 端口启动监控面板的开发服务器。
-- 只在仓库目录内写文件：`.agy-runtime/`（日志、PID、Codex 模型目录）、`claude-carbon.settings.json` 与 `.claude/settings.local.json`。
-- Windows 上可显式加 `-InstallEnv` 把变量写入用户环境，之后新开终端里的 `claude` 都走 Liftgate；`-UninstallEnv` 清除它们。
 
 ## Codex CLI
 
@@ -318,8 +299,8 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--max-idle-sessions` | | `64` |
 | `--max-stored-responses` | | `256` |
 | `--turn-timeout-secs` | 网关单轮请求的总时限，单位为秒 | `1800` |
-| `--max-body-bytes` | | 12 MiB |
-| `--max-line-bytes`（单行 ACP JSON-RPC） | | 16 MiB |
+| `--max-body-bytes` | | 32 MiB |
+| `--max-line-bytes`（单行 ACP JSON-RPC） | | 48 MiB |
 | `--channel-capacity`（每个流） | | `256` |
 
 日志级别由 `RUST_LOG` 控制（默认 `info`）。`liftgate --help` 输出同样的列表。

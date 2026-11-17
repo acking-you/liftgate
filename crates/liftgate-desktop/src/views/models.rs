@@ -83,7 +83,7 @@ impl DesktopApp {
                     format!(
                         "{}/v1/models · {}",
                         report.gateway_url,
-                        tr(lang, "280k 标准窗口", "280k Standard")
+                        tr(lang, "500k 标准窗口", "500k Standard")
                     )
                 },
             ))

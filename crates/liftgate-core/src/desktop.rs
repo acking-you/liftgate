@@ -1073,12 +1073,12 @@ pub fn build_claude_desktop_3p_profile(
         .map(|(model_id, label)| {
             let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
             let (window, _) = liftgate_types::model::context_limits(&model_id, long_context);
-            let supports_1m = window >= 1_000_000;
+            let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let mut item = json!({
                 "name": route_id,
                 "labelOverride": label,
             });
-            if supports_1m && let Some(obj) = item.as_object_mut() {
+            if supports_extended && let Some(obj) = item.as_object_mut() {
                 obj.insert("supports1m".to_owned(), json!(true));
                 obj.insert("prefer1m".to_owned(), json!(true));
             }
@@ -3245,16 +3245,17 @@ fn main() {
         assert_eq!(active_cfg.get("deploymentMode"), Some(&json!("3p")));
         assert!(paths.profile_path.is_file());
         let written_profile = read_json_object_or_empty(&paths.profile_path).unwrap();
-        let first_model_name = written_profile
+        let first_model = written_profile
             .get("inferenceModels")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
             .unwrap();
+        let first_model_name = first_model.get("name").and_then(Value::as_str).unwrap();
         assert!(liftgate_types::model::is_claude_desktop_safe_model_id(
             first_model_name
         ));
+        assert_eq!(first_model.get("supports1m"), Some(&json!(true)));
+        assert_eq!(first_model.get("prefer1m"), Some(&json!(true)));
 
         // Simulate the user adding a new MCP server inside Claude Desktop while running!
         patch_json_key_atomic(

@@ -73,5 +73,7 @@ print(reply.content[0].text)
 
 Use any ID from `GET /v1/models`, such as `gemini-4-carbon-high` or
 `gemini-3.8-flash-low`. An unknown or generic name (for example a client's
-built-in default) maps to `--default-model`. The catalog reports a 1,000,000
-token context window for `gemini-*` models and 200,000 for the others.
+built-in default) maps to `--default-model`. By default, the catalog reports a
+500,000-token context window (`auto_compact_token_limit = 425,000`) for
+`gemini-*` models (1,000,000 / 850,000 with `--long-context`), 200,000 /
+170,000 for Claude models, and 128,000 / 110,000 for `gpt-oss*` models.

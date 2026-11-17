@@ -167,8 +167,8 @@ lg upgrade               # check GitHub Releases (--check) & self-upgrade `lg` +
 lg down                  # gracefully stop the background gateway
 ```
 
-Running straight from a source checkout via `./run-gateway.{sh,cmd}` and
-`./start-agy.{sh,cmd}` works as well. Full command reference and SDK examples:
+Running straight from a source checkout via `./run-gateway.{sh,cmd}` works as
+well. Full command reference and SDK examples:
 [usage guide](docs/usage.md).
 
 ## What it does

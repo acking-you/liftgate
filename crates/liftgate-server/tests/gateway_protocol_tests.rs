@@ -639,7 +639,7 @@ async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retr
         assert_eq!(anth_body["error"]["type"], "invalid_request_error");
         assert_eq!(
             anth_body["error"]["message"],
-            "prompt is too long: 280001 tokens > 280000 maximum"
+            "prompt is too long: 500001 tokens > 500000 maximum"
         );
 
         assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 2);
@@ -1364,6 +1364,18 @@ async fn models_count_tokens_and_api_key_enforcement() {
             .unwrap();
     let live_count = models_json["data"].as_array().unwrap().len();
     assert!(live_count > 0);
+    let carbon_card = models_json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "gemini-4-carbon-high")
+        .expect("gemini-4-carbon-high in /v1/models");
+    assert_eq!(carbon_card["context_window"], 500_000);
+    assert_eq!(carbon_card["auto_compact_token_limit"], 425_000);
+    assert_eq!(
+        carbon_card["description"],
+        "500k ctx · Antigravity ACP (gemini-4-carbon-high)"
+    );
 
     // Bearer token -> 200 `/v1/codex-models` full Codex picker catalog replacement
     let codex_catalog_resp = app
@@ -1396,11 +1408,34 @@ async fn models_count_tokens_and_api_key_enforcement() {
     assert_eq!(codex_models[0]["shell_type"], "shell_command");
     assert_eq!(codex_models[0]["default_reasoning_level"], "high");
     assert_eq!(codex_models[0]["apply_patch_tool_type"], "freeform");
+    assert_eq!(codex_models[0]["context_window"], 200_000);
+    assert_eq!(codex_models[0]["truncation_policy"]["limit"], 40_000);
+    let codex_carbon = codex_models
+        .iter()
+        .find(|m| m["slug"] == "gemini-4-carbon-high")
+        .expect("gemini-4-carbon-high in /v1/codex-models");
+    assert_eq!(codex_carbon["context_window"], 500_000);
+    assert_eq!(codex_carbon["max_context_window"], 500_000);
+    assert_eq!(codex_carbon["auto_compact_token_limit"], 425_000);
+    assert_eq!(codex_carbon["truncation_policy"]["limit"], 80_000);
 
     // `x-api-key` -> 200 `/v1/messages/count_tokens`
     let count_req = json!({
         "model": "claude-opus-4-6",
-        "messages": [{ "role": "user", "content": "Hello Liftgate!" }]
+        "messages": [
+            { "role": "user", "content": "Hello Liftgate!" },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
+                    }]
+                }]
+            }
+        ]
     });
     let count_resp = app
         .oneshot(
@@ -1418,6 +1453,7 @@ async fn models_count_tokens_and_api_key_enforcement() {
     let count_json: Value =
         serde_json::from_slice(&count_resp.into_body().collect().await.unwrap().to_bytes())
             .unwrap();
+    assert!(count_json["input_tokens"].as_u64().unwrap() >= 256);
     assert!(count_json["input_tokens"].as_u64().unwrap() > 0);
 }
 

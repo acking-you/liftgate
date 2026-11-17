@@ -1239,6 +1239,7 @@ pub struct ModelCard {
     #[serde(rename = "type")]
     pub item_type: &'static str,
     pub display_name: String,
+    pub description: String,
     pub created: u64,
     pub created_at: &'static str,
     pub owned_by: &'static str,
@@ -1298,6 +1299,17 @@ pub struct CodexReasoningPreset {
 pub struct CodexTruncationPolicy {
     pub mode: &'static str,
     pub limit: i64,
+}
+
+/// Per-tool output byte cap advertised in Codex `model_catalog_json`, scaled up for 500k+ windows
+/// while staying well below the single-turn ACP prompt text ceiling (`176,000` bytes).
+#[must_use]
+pub const fn codex_truncation_limit_bytes(context_window: u64) -> i64 {
+    if context_window >= crate::model::GEMINI_DEFAULT_WINDOW {
+        80_000
+    } else {
+        40_000
+    }
 }
 
 const CODEX_AGY_BASE_INSTRUCTIONS: &str = "\
@@ -1431,7 +1443,7 @@ pub fn build_codex_model_catalog_with_tool_mode(
                 support_verbosity: false,
                 truncation_policy: CodexTruncationPolicy {
                     mode: "bytes",
-                    limit: 40_000,
+                    limit: codex_truncation_limit_bytes(window),
                 },
                 supports_parallel_tool_calls: true,
                 context_window,
@@ -1544,8 +1556,9 @@ mod tests {
         let first = catalog.models.first().expect("non-empty catalog");
         assert_eq!(
             (first.context_window, first.auto_compact_token_limit),
-            (280_000, 245_000)
+            (500_000, 425_000)
         );
+        assert_eq!(first.truncation_policy.limit, 80_000);
         let experimental =
             build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high", true);
         let first_long = experimental.models.first().unwrap();

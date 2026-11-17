@@ -76,10 +76,10 @@ pub fn infer_live_long_context(
             continue;
         }
         saw_gemini = true;
-        if model.auto_compact_token_limit > 280_000
-            && model.auto_compact_token_limit <= model.context_window
-            && model.context_window <= 1_000_000
-        {
+        if liftgate_types::model::is_gemini_long_context(
+            model.context_window,
+            model.auto_compact_token_limit,
+        ) {
             return true;
         }
     }
@@ -681,6 +681,14 @@ mod tests {
 
     #[test]
     fn infers_live_long_context_without_promoting_legacy_gateways() {
+        let default_500k = vec![DiscoveredModel {
+            id: "gemini-4-carbon-high".to_owned(),
+            display_name: String::new(),
+            context_window: 500_000,
+            auto_compact_token_limit: 425_000,
+        }];
+        assert!(!infer_live_long_context(&default_500k, Some(true)));
+
         let default_v013 = vec![DiscoveredModel {
             id: "gemini-4-carbon-high".to_owned(),
             display_name: String::new(),

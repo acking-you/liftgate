@@ -186,12 +186,12 @@ mode uses warm ACP sessions and client-side compaction without Flash seed turns:
 
 | Model family | Declared window | Auto-compact threshold |
 | --- | --- | --- |
-| Gemini | 280,000 | 245,000 |
+| Gemini | 500,000 | 425,000 |
 | Claude | 200,000 | 170,000 |
 | GPT-OSS | 128,000 | 110,000 |
 
-These are gateway limits, not the models' advertised native capacities. They
-leave room before the upstream compaction observed around 300k–320k tokens.
+These match Antigravity's 500K ACP session context window for Gemini models
+while leaving generous output headroom before upstream compaction.
 Codex reads the policy per model from its catalog. Claude Code uses
 `modelSettings.autoCompactWindow` (requires v2.1.288 or later); when several
 gateway models share a canonical Claude name, the smaller threshold wins.
@@ -279,37 +279,6 @@ builds `liftgate` with `cargo build --release --locked`, then starts it.
 Any other argument goes to `liftgate` unchanged ([flags](#flags-and-environment)).
 Check it is up with `curl http://127.0.0.1:8787/healthz`, and list your models
 with `curl http://127.0.0.1:8787/v1/models`.
-
-## Launchers
-
-`start-agy` starts the gateway if it is not running, syncs the live model list
-and opens Claude Code or Codex already pointed at it. Its settings apply only
-to the process it launches; when that exits, your shell is as it was.
-
-| | Linux / macOS | Windows |
-| --- | --- | --- |
-| Claude Code | `./start-agy.sh` | `.\start-agy.cmd` |
-| Codex CLI | `./start-agy.sh --codex` | `.\start-agy.cmd -Codex` |
-| Standard permissions | `./start-agy.sh --no-bypass` | `.\start-agy.cmd -NoBypass` |
-| Services only | `./start-agy.sh --services-only` | `.\start-agy.cmd -BackgroundOnly` |
-| Stop services | `./start-agy.sh --stop` | `.\start-agy.cmd -StopServices` |
-
-- By default `start-agy` passes `--dangerously-skip-permissions` to Claude Code
-  and `--dangerously-bypass-approvals-and-sandbox` to Codex; pass
-  `--no-bypass` / `-NoBypass` (or your own `--permission-mode` / `--sandbox`
-  flag) to keep standard prompts.
-- Remaining arguments pass through to `claude` or `codex`
-  (`./start-agy.sh -p "hello"`).
-- Change the defaults with `--gateway-model` (`-GatewayModel`), `--fast-model`
-  (`-FastModel`), `--host` (`-ListenHost`), `--port` (`-ListenPort`),
-  `--ui-port` (`-UiPort`) and `--api-key` (`-ApiKey`), or with `AGY_MODEL`,
-  `AGY_FAST_MODEL`, `AGY_HOST`, `AGY_PORT`, `AGY_WEB_PORT` and `AGY_API_KEY`.
-- With Bun installed it also starts the dashboard dev server on port `5173`.
-- It writes only inside the repository: `.agy-runtime/` (logs, PIDs, the Codex
-  catalog), `claude-carbon.settings.json` and `.claude/settings.local.json`.
-- On Windows, `-InstallEnv` opts in to saving the variables to your user
-  profile so any new terminal's `claude` uses Liftgate; `-UninstallEnv` removes
-  them.
 
 ## Codex CLI
 
@@ -450,8 +419,8 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--max-idle-sessions` | | `64` |
 | `--max-stored-responses` | | `256` |
 | `--turn-timeout-secs` | Overall gateway deadline per turn, in seconds | `1800` |
-| `--max-body-bytes` | | 12 MiB |
-| `--max-line-bytes` (one ACP JSON-RPC line) | | 16 MiB |
+| `--max-body-bytes` | | 32 MiB |
+| `--max-line-bytes` (one ACP JSON-RPC line) | | 48 MiB |
 | `--channel-capacity` (per stream) | | `256` |
 
 Logs follow `RUST_LOG` (default `info`). `liftgate --help` prints the same list.

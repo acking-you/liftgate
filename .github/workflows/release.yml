@@ -331,7 +331,6 @@ jobs:
             if [ "${{ matrix.platform.include_desktop }}" = "true" ]; then
               cp "target/${target}/release/liftgate-desktop.exe" "${stage}/"
             fi
-            cp start-agy.ps1 start-agy.cmd "${stage}/"
             (cd dist && 7z a -tzip "${pkg}.zip" "${pkg}" >/dev/null)
           else
             cp "target/${target}/release/liftgate" "${stage}/"
@@ -341,8 +340,6 @@ jobs:
               cp "target/${target}/release/liftgate-desktop" "${stage}/"
               chmod +x "${stage}/liftgate-desktop"
             fi
-            cp start-agy.sh "${stage}/"
-            chmod +x "${stage}/start-agy.sh"
             tar -czf "dist/${pkg}.tar.gz" -C dist "${pkg}"
           fi
           rm -rf "${stage}"

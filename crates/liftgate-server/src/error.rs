@@ -290,7 +290,7 @@ impl GatewayError {
         match self {
             Self::Protocol { source } => {
                 let bytes = source.context_overflow_bytes()?;
-                let max_tokens = 200_000u64;
+                let max_tokens = liftgate_types::model::GEMINI_DEFAULT_WINDOW;
                 let used_tokens = ((bytes as u64) / 4).max(max_tokens + 1);
                 Some((used_tokens, max_tokens))
             }
@@ -302,7 +302,10 @@ impl GatewayError {
 
     fn acp_context_overflow_tokens(source: &AcpError) -> Option<(u64, u64)> {
         match source {
-            AcpError::HydrationCompacted => Some((280_001, 280_000)),
+            AcpError::HydrationCompacted => Some((
+                liftgate_types::model::GEMINI_DEFAULT_WINDOW + 1,
+                liftgate_types::model::GEMINI_DEFAULT_WINDOW,
+            )),
             AcpError::ContextLengthExceeded { model, .. } => {
                 let (max_tokens, _) = liftgate_types::model::context_limits(model, false);
                 Some((max_tokens + 1, max_tokens))

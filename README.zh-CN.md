@@ -137,7 +137,7 @@ lg upgrade               # 检查 GitHub Releases（--check）并自动校验升
 lg down                  # 优雅停止后台网关服务
 ```
 
-在源码仓库中继续使用 `./run-gateway.{sh,cmd}` 与 `./start-agy.{sh,cmd}` 同样完全兼容。完整子命令说明、参数列表与 SDK 接入方式见[使用指南](docs/usage.zh-CN.md)。
+在源码仓库中继续使用 `./run-gateway.{sh,cmd}` 启动网关同样完全兼容。完整子命令说明、参数列表与 SDK 接入方式见[使用指南](docs/usage.zh-CN.md)。
 
 ## 能做什么
 

@@ -6,14 +6,14 @@ use crate::config::ModelId;
 /// from the reversibly encoded Antigravity ACP model identifier.
 pub const CLAUDE_DESKTOP_ROUTE_MARKER: &str = "-lg--";
 
-const GEMINI_DEFAULT_WINDOW: u64 = 280_000;
-const GEMINI_DEFAULT_COMPACT_LIMIT: u64 = 245_000;
-const GEMINI_LONG_WINDOW: u64 = 1_000_000;
-const GEMINI_LONG_COMPACT_LIMIT: u64 = 850_000;
-const CLAUDE_DEFAULT_WINDOW: u64 = 200_000;
-const CLAUDE_DEFAULT_COMPACT_LIMIT: u64 = 170_000;
-const GPT_OSS_DEFAULT_WINDOW: u64 = 128_000;
-const GPT_OSS_DEFAULT_COMPACT_LIMIT: u64 = 110_000;
+pub const GEMINI_DEFAULT_WINDOW: u64 = 500_000;
+pub const GEMINI_DEFAULT_COMPACT_LIMIT: u64 = 425_000;
+pub const GEMINI_LONG_WINDOW: u64 = 1_000_000;
+pub const GEMINI_LONG_COMPACT_LIMIT: u64 = 850_000;
+pub const CLAUDE_DEFAULT_WINDOW: u64 = 200_000;
+pub const CLAUDE_DEFAULT_COMPACT_LIMIT: u64 = 170_000;
+pub const GPT_OSS_DEFAULT_WINDOW: u64 = 128_000;
+pub const GPT_OSS_DEFAULT_COMPACT_LIMIT: u64 = 110_000;
 
 const _: () = {
     assert!(
@@ -35,6 +35,16 @@ const _: () = {
         "GPT-OSS window must exceed its auto-compaction threshold and stay >= 100k"
     );
 };
+
+/// Returns `true` when a discovered Gemini model's advertised limits come from a gateway
+/// running with experimental `--long-context` (`1M / 850k`) rather than the standard 500k
+/// window (`500k / 425k`) or a legacy server.
+#[must_use]
+pub const fn is_gemini_long_context(context_window: u64, auto_compact_token_limit: u64) -> bool {
+    auto_compact_token_limit > GEMINI_DEFAULT_WINDOW
+        && auto_compact_token_limit <= context_window
+        && context_window <= GEMINI_LONG_WINDOW
+}
 
 /// Advertised context window and client compaction threshold for the ACP transport.
 /// The experimental Gemini window does not disable upstream automatic compaction.
@@ -367,7 +377,8 @@ fn strip_known_effort_suffix(model: &str) -> &str {
 
 fn strip_context_window_tag(model: &str) -> &str {
     for suffix in [
-        "[1m]", "[1M]", "[280k]", "[280K]", "[200k]", "[200K]", "[128k]", "[128K]",
+        "[1m]", "[1M]", "[500k]", "[500K]", "[280k]", "[280K]", "[200k]", "[200K]", "[128k]",
+        "[128K]",
     ] {
         if let Some(stripped) = model.strip_suffix(suffix) {
             return stripped.trim();
@@ -381,7 +392,7 @@ fn strip_context_window_tag(model: &str) -> &str {
 #[must_use]
 pub fn is_claude_desktop_safe_model_id(model_id: &str) -> bool {
     let normalized = model_id.trim().to_ascii_lowercase();
-    if normalized.contains("[1m]") {
+    if normalized.contains('[') || normalized.contains(']') {
         return false;
     }
     let Some(tail) = normalized
@@ -678,5 +689,33 @@ mod tests {
         );
         assert!(!is_claude_desktop_safe_model_id("gemini-4-carbon-high"));
         assert!(!is_claude_desktop_safe_model_id("claude-sonnet-"));
+        assert!(!is_claude_desktop_safe_model_id(&format!(
+            "{carbon_route}[500k]"
+        )));
+        assert_eq!(
+            resolve_model_id(Some("gemini-4-carbon-high[500k]"), None, &catalog, &default).as_str(),
+            "gemini-4-carbon-high"
+        );
+    }
+
+    #[test]
+    fn gemini_default_context_window_is_500k_with_425k_auto_compact() {
+        assert_eq!(
+            context_limits("gemini-4-carbon-high", false),
+            (500_000, 425_000)
+        );
+        assert_eq!(
+            context_limits("gemini-4-carbon-high", true),
+            (1_000_000, 850_000)
+        );
+        assert_eq!(
+            context_limits("claude-sonnet-5-5-high", false),
+            (200_000, 170_000)
+        );
+        assert_eq!(context_limits("gpt-oss-120b", false), (128_000, 110_000));
+        assert!(!is_gemini_long_context(500_000, 425_000));
+        assert!(!is_gemini_long_context(280_000, 245_000));
+        assert!(!is_gemini_long_context(1_000_000, 0));
+        assert!(is_gemini_long_context(1_000_000, 850_000));
     }
 }

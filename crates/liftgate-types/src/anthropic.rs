@@ -566,7 +566,22 @@ pub fn estimate_anthropic_tokens(req: &AnthropicMessagesRequest) -> u64 {
                         }
                         AnthropicInputBlock::ToolResult { content, .. } => {
                             if let Some(c) = content {
-                                chars = chars.saturating_add(c.to_plain_string().len());
+                                match c {
+                                    AnthropicToolResultContent::Text(s) => {
+                                        chars = chars.saturating_add(s.len());
+                                    }
+                                    AnthropicToolResultContent::Blocks(blocks) => {
+                                        for tb in blocks {
+                                            if let Some(t) = &tb.text {
+                                                chars = chars.saturating_add(t.len());
+                                            }
+                                            if let Some(src) = &tb.source {
+                                                chars = chars
+                                                    .saturating_add(src.data.len() / 16 + 1024);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         AnthropicInputBlock::WebSearchToolResult { content, .. }
