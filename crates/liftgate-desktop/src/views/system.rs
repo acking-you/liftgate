@@ -4,10 +4,12 @@ use clap_complete::Shell;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{IconName, Sizable as _};
+use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::*;
 use liftgate_core::BUILD_TARGET;
+use liftgate_core::daemon::open_browser;
 use liftgate_core::format::{format_bytes, format_utc_hms};
+use liftgate_core::upgrade::detect_packaged_bundle_kind;
 
 use crate::app::{DesktopApp, render_completions_text};
 use crate::i18n::tr;
@@ -495,6 +497,10 @@ impl DesktopApp {
 
         // --- 3B. Atomic Verified Self-Upgrade (`lg upgrade`) ---
         let upg = self.upgrade_outcome.as_ref();
+        let packaged_bundle = detect_packaged_bundle_kind(&self.current_exe);
+        let desktop_releases_url = upg
+            .map(|u| format!("{}-ui", u.release_url))
+            .unwrap_or_else(|| "https://github.com/acking-you/liftgate/releases".to_owned());
         let upgrade_card = editorial_card(p)
             .flex_1()
             .child(section_header(
@@ -523,6 +529,17 @@ impl DesktopApp {
                         format!("v{}", env!("CARGO_PKG_VERSION")),
                     ))
                     .child(kv_row(p, tr(lang, "编译目标平台", "Target Triple"), BUILD_TARGET))
+                    .children(packaged_bundle.map(|bundle_kind| {
+                        kv_row(
+                            p,
+                            tr(lang, "运行封装形态", "Package Mode"),
+                            if lang.is_en() {
+                                format!("{bundle_kind} (download desktop package to update)")
+                            } else {
+                                format!("{bundle_kind}（请下载桌面端安装包更新）")
+                            },
+                        )
+                    }))
                     .children(upg.map(|u| {
                         kv_row(
                             p,
@@ -580,12 +597,23 @@ impl DesktopApp {
                             .small()
                             .primary()
                             .loading(self.busy_upgrade)
+                            .disabled(packaged_bundle.is_some())
                             .icon(IconName::ArrowDown)
                             .label(tr(lang, "下载校验并执行升级", "Download & Atomic Upgrade"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.action_run_upgrade(false, cx);
                             })),
-                    ),
+                    )
+                    .children(packaged_bundle.map(|_| {
+                        Button::new("upg-open-releases-btn")
+                            .small()
+                            .outline()
+                            .icon(IconName::ExternalLink)
+                            .label(tr(lang, "打开桌面端发布页", "Open Desktop Releases"))
+                            .on_click(cx.listener(move |_, _, _, _| {
+                                let _ = open_browser(&desktop_releases_url);
+                            }))
+                    })),
             );
 
         div()

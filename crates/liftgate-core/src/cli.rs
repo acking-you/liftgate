@@ -774,7 +774,7 @@ pub struct AliasArgs {
     pub uninstall: bool,
 }
 
-#[derive(Clone, Debug, Default, Args)]
+#[derive(Clone, Debug, Args)]
 pub struct UpgradeArgs {
     /// Only check whether a newer release is available without downloading or modifying binaries.
     #[arg(short = 'c', long)]
@@ -815,6 +815,29 @@ pub struct UpgradeArgs {
     /// Internal/mirror base URL override (used for self-hosted mirrors and integration tests).
     #[arg(long, hide = true, env = "LIFTGATE_UPDATE_BASE_URL")]
     pub base_url: Option<String>,
+}
+
+impl Default for UpgradeArgs {
+    fn default() -> Self {
+        let repo = std::env::var("LIFTGATE_UPDATE_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "acking-you/liftgate".to_owned());
+        let base_url = std::env::var("LIFTGATE_UPDATE_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        Self {
+            check: false,
+            version: None,
+            force: false,
+            target: None,
+            repo,
+            proxy: None,
+            no_restart: false,
+            json: false,
+            base_url,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]

@@ -88,10 +88,51 @@ pub async fn start_daemon_with_exe(
         serve.max_stored_responses,
         serve.turn_timeout_secs,
     )?;
-    let resolved_agy = resolve_effective_agy_bin(serve.agy_bin.clone(), &settings)
-        .ok_or(CliError::AgyBinaryNotFound)?;
 
     let existing_daemon = state_paths.read_daemon()?;
+    if !force_restart
+        && let Some(existing) = &existing_daemon
+        && is_pid_alive(existing.pid)
+    {
+        let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
+        if existing_client
+            .check_health(Duration::from_millis(800))
+            .await
+        {
+            let requested_key = normalize_optional_api_key(serve.api_key.as_deref());
+            let config_matches = existing.listen == serve.listen
+                && existing.ui_listen == serve.ui_listen
+                && existing.default_model == serve.default_model
+                && existing.acp_mode == serve.acp_mode
+                && existing.api_key == requested_key
+                && existing.agy_proxy.as_deref() == effective_proxy.as_ref().map(ProxyUrl::as_str)
+                && existing.agy_auto_update == effective_auto_update
+                && existing.long_context == long_context
+                && existing.max_line_bytes == serve.max_line_bytes
+                && existing.max_body_bytes == serve.max_body_bytes
+                && existing.channel_capacity == serve.channel_capacity
+                && existing.max_idle_sessions == serve.max_idle_sessions
+                && existing.max_stored_responses == serve.max_stored_responses
+                && existing.turn_timeout_secs == serve.turn_timeout_secs;
+            let live_model_count = existing_client.fetch_models().await.map_or(0, |m| m.len());
+            return Ok(DaemonStartOutcome {
+                daemon: existing.clone(),
+                already_running: true,
+                config_matches,
+                live_model_count,
+            });
+        }
+    }
+
+    let resolved_agy = resolve_effective_agy_bin(
+        serve
+            .agy_bin
+            .clone()
+            .or_else(|| existing_daemon.as_ref().and_then(|d| d.agy_bin.clone())),
+        &settings,
+    )
+    .ok_or(CliError::AgyBinaryNotFound)?;
+
     let existing_owns_target_listen = existing_daemon
         .as_ref()
         .is_some_and(|d| is_pid_alive(d.pid) && d.listen == serve.listen);
@@ -103,43 +144,8 @@ pub async fn start_daemon_with_exe(
     }
 
     if let Some(existing) = existing_daemon {
-        let existing_client = GatewayClient::new(existing.listen, existing.api_key.clone());
         if is_pid_alive(existing.pid) {
-            if existing_client
-                .check_health(Duration::from_millis(800))
-                .await
-            {
-                if force_restart {
-                    let _ = stop_daemon(state_paths).await?;
-                } else {
-                    let requested_key = normalize_optional_api_key(serve.api_key.as_deref());
-                    let config_matches = existing.listen == serve.listen
-                        && existing.ui_listen == serve.ui_listen
-                        && existing.default_model == serve.default_model
-                        && existing.acp_mode == serve.acp_mode
-                        && existing.api_key == requested_key
-                        && existing.agy_proxy.as_deref()
-                            == effective_proxy.as_ref().map(ProxyUrl::as_str)
-                        && existing.agy_auto_update == effective_auto_update
-                        && existing.long_context == long_context
-                        && existing.max_line_bytes == serve.max_line_bytes
-                        && existing.max_body_bytes == serve.max_body_bytes
-                        && existing.channel_capacity == serve.channel_capacity
-                        && existing.max_idle_sessions == serve.max_idle_sessions
-                        && existing.max_stored_responses == serve.max_stored_responses
-                        && existing.turn_timeout_secs == serve.turn_timeout_secs;
-                    let live_model_count =
-                        existing_client.fetch_models().await.map_or(0, |m| m.len());
-                    return Ok(DaemonStartOutcome {
-                        daemon: existing,
-                        already_running: true,
-                        config_matches,
-                        live_model_count,
-                    });
-                }
-            } else {
-                let _ = stop_daemon(state_paths).await?;
-            }
+            let _ = stop_daemon(state_paths).await?;
         } else {
             state_paths.remove_daemon()?;
         }
@@ -1916,5 +1922,77 @@ mod tests {
         install_or_remove_alias(&other_src, &target, "lg", false, true).unwrap();
         assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reuses_healthy_daemon_before_requiring_discoverable_agy_binary() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let temp = std::env::temp_dir().join(format!("liftgate-reuse-daemon-{}", Uuid::new_v4()));
+        let state_paths = StatePaths::resolve(Some(temp.clone())).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 1024];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let body = if req.starts_with("GET /v1/models ") {
+                    r#"{"object":"list","data":[{"id":"claude-opus-4-6-thinking"}]}"#
+                } else {
+                    r#"{"status":"ok"}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let daemon = DaemonState {
+            pid: std::process::id(),
+            listen: addr,
+            ui_listen: None,
+            default_model: "claude-opus-4-6-thinking".to_owned(),
+            acp_mode: "agent".to_owned(),
+            api_key: None,
+            agy_bin: Some(PathBuf::from("/custom/non-path/agy")),
+            acp_cwd: None,
+            ui_dir: None,
+            agy_proxy: None,
+            agy_auto_update: true,
+            long_context: false,
+            max_line_bytes: 33_554_432,
+            max_body_bytes: 16_777_216,
+            channel_capacity: 256,
+            max_idle_sessions: 16,
+            max_stored_responses: 64,
+            turn_timeout_secs: 1800,
+            shutdown_token: "tok".to_owned(),
+            started_at_unix_ms: 1,
+            log_file: state_paths.log_file(),
+        };
+        state_paths.write_daemon(&daemon).unwrap();
+
+        let serve = ServeArgs {
+            listen: addr,
+            agy_bin: Some(temp.join("missing-agy-binary")),
+            ..ServeArgs::default()
+        };
+        let outcome = start_daemon_with_exe(&state_paths, None, serve, false)
+            .await
+            .unwrap();
+        assert!(outcome.already_running);
+        assert_eq!(outcome.daemon.listen, addr);
+        assert_eq!(outcome.live_model_count, 1);
+
+        server_task.abort();
+        let _ = fs::remove_dir_all(&temp);
     }
 }
