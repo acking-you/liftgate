@@ -424,7 +424,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         match setup_res {
             Ok(t) => t,
             Err(err) => {
-                let err = upgrade_gateway_error(err, &resolved_model);
+                let err = upgrade_gateway_error(err, &resolved_model, cfg.long_context);
                 task_guard.fail(err.to_string());
                 return Err(err);
             }
@@ -453,6 +453,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         web_cfg,
         active_model,
         initial_rpc_model,
+        cfg.long_context,
         retire_after_turn,
         worker_resp_id,
         deadline,
@@ -589,6 +590,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
     mut current_rpc_model: ModelId,
+    long_context: bool,
     retire_after_turn: bool,
     response_id: String,
     deadline: Instant,
@@ -640,6 +642,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 &session_id,
                 &chunk_blocks,
                 &current_rpc_model,
+                &active_model,
+                long_context,
                 &mut state,
                 deadline,
                 timeout_secs,
@@ -655,7 +659,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "ACP context hydration seed step failed");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -678,7 +682,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "failed to switch hydrated ACP session to target model");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -921,7 +925,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
             if let Some(old_lease) = lease.take() {
                 old_lease.finish_ephemeral();
             }
-            let err = signal_to_acp_error(sig, &active_model, detail);
+            let err = signal_to_acp_error(sig, &active_model, long_context, detail);
             tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream quota/context/rate-limit/fatal banner");
             task_guard.fail(err.to_string());
             let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -1085,7 +1089,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "ACP prompt turn failed");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -1121,6 +1125,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
         let recent_stderr = backend.recent_stderr_since(last_step_started_ms);
         let err = build_zero_output_error(
             &active_model,
+            long_context,
             &final_stop_reason,
             last_turn_error.as_deref(),
             &last_suppressed_banners,
@@ -1290,6 +1295,8 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     session_id: &liftgate_types::config::SessionId,
     chunk_blocks: &[AcpPromptBlock],
     seed_model: &ModelId,
+    target_model: &ModelId,
+    long_context: bool,
     state: &mut TurnStreamState,
     deadline: Instant,
     timeout_secs: u64,
@@ -1321,7 +1328,13 @@ async fn run_hydration_seed_step<B: AcpBackend>(
                         sink.clear();
                         banner_filter.feed(&content.text, &mut sink);
                         if let Some((sig, detail)) = banner_filter.take_signal() {
-                            return Err(signal_to_acp_error(sig, seed_model, detail));
+                            let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded
+                            {
+                                target_model
+                            } else {
+                                seed_model
+                            };
+                            return Err(signal_to_acp_error(sig, model_for_err, long_context, detail));
                         }
                     }
                     Some(SessionUpdatePayload::Error { message, error }) => {
@@ -1329,7 +1342,13 @@ async fn run_hydration_seed_step<B: AcpBackend>(
                         if !detail.is_empty() {
                             let sig = classify_upstream_error_text(&detail)
                                 .unwrap_or(UpstreamBannerSignal::FatalAgentError);
-                            return Err(signal_to_acp_error(sig, seed_model, detail));
+                            let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded
+                            {
+                                target_model
+                            } else {
+                                seed_model
+                            };
+                            return Err(signal_to_acp_error(sig, model_for_err, long_context, detail));
                         }
                     }
                     Some(SessionUpdatePayload::UsageUpdate { used, size }) => {
@@ -1360,7 +1379,17 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     sink.clear();
     banner_filter.finish(&mut sink);
     if let Some((sig, detail)) = banner_filter.take_signal() {
-        return Err(signal_to_acp_error(sig, seed_model, detail));
+        let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded {
+            target_model
+        } else {
+            seed_model
+        };
+        return Err(signal_to_acp_error(
+            sig,
+            model_for_err,
+            long_context,
+            detail,
+        ));
     }
 
     match outcome {
@@ -1592,16 +1621,16 @@ fn format_update_error_detail(message: &str, error: Option<&RawValue>) -> String
     }
 }
 
-fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
+fn upgrade_gateway_error(err: GatewayError, model: &ModelId, long_context: bool) -> GatewayError {
     match err {
         GatewayError::Acp { source } => GatewayError::Acp {
-            source: upgrade_acp_error(source, model),
+            source: upgrade_acp_error(source, model, long_context),
         },
         GatewayError::SharedAcp { source } => {
             if let AcpError::Rpc { message, .. } = source.as_ref()
                 && let Some(sig) = classify_upstream_error_text(message)
             {
-                let upgraded = signal_to_acp_error(sig, model, message.clone());
+                let upgraded = signal_to_acp_error(sig, model, long_context, message.clone());
                 return GatewayError::SharedAcp {
                     source: Arc::new(upgraded),
                 };
@@ -1615,7 +1644,7 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
     }
 }
 
-fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
+fn upgrade_acp_error(err: AcpError, model: &ModelId, long_context: bool) -> AcpError {
     match err {
         AcpError::Rpc {
             method,
@@ -1623,7 +1652,7 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
             message,
         } => {
             if let Some(sig) = classify_upstream_error_text(&message) {
-                signal_to_acp_error(sig, model, message)
+                signal_to_acp_error(sig, model, long_context, message)
             } else {
                 AcpError::Rpc {
                     method,
@@ -1650,7 +1679,12 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
     }
 }
 
-fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: String) -> AcpError {
+fn signal_to_acp_error(
+    sig: UpstreamBannerSignal,
+    model: &ModelId,
+    long_context: bool,
+    detail: String,
+) -> AcpError {
     match sig {
         UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
             model: model.as_str().to_owned(),
@@ -1658,6 +1692,7 @@ fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: Strin
         },
         UpstreamBannerSignal::ContextLengthExceeded => AcpError::ContextLengthExceeded {
             model: model.as_str().to_owned(),
+            long_context,
             detail,
         },
         UpstreamBannerSignal::RateLimited => AcpError::UpstreamRateLimited {
@@ -1670,6 +1705,7 @@ fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: Strin
 
 fn build_zero_output_error(
     model: &ModelId,
+    long_context: bool,
     stop_reason: &str,
     turn_error: Option<&str>,
     suppressed_banners: &[String],
@@ -1690,7 +1726,7 @@ fn build_zero_output_error(
             first_hint = Some(trimmed.to_owned());
         }
         if let Some(sig) = classify_upstream_error_text(trimmed) {
-            return signal_to_acp_error(sig, model, trimmed.to_owned());
+            return signal_to_acp_error(sig, model, long_context, trimmed.to_owned());
         }
     }
 

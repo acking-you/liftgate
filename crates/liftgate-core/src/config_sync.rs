@@ -273,6 +273,10 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         params.discovered_models.clone()
     };
 
+    // Clear prior Liftgate-managed `modelSettings[*].autoCompactWindow` entries before replacing
+    // `modelOverrides` and `modelPicker` so retired models or old aliases never linger as orphans.
+    strip_managed_claude_context(existing);
+
     let mut model_overrides = Map::new();
     for (canonical, target) in [
         ("claude-fable-5-2", &params.primary_model),
@@ -1606,6 +1610,50 @@ mod tests {
         assert_eq!(
             live_500k_settings["modelOverrides"]["claude-opus-5-5"],
             "gemini-4-carbon-high"
+        );
+
+        // Re-syncing over an older 280k/245k settings map cleans up retired model aliases while
+        // preserving unrelated user-configured `modelSettings` entries.
+        let mut stale_v020: Map<String, Value> = serde_json::from_value(json!({
+            "modelOverrides": {
+                "claude-opus-5-5": "gemini-4-argon",
+                "claude-sonnet-4-6": "gemini-4-argon"
+            },
+            "modelPicker": {
+                "replaceBuiltInOptions": true,
+                "options": [{
+                    "model": "gemini-4-argon-high",
+                    "label": "Gemini 4 Argon (High)",
+                    "description": "280k ctx · Antigravity ACP (gemini-4-argon-high)",
+                    "behavesAs": "claude-opus-5-5"
+                }]
+            },
+            "modelSettings": {
+                "gemini-4-argon": { "autoCompactWindow": 245000 },
+                "gemini-4-argon-high": { "autoCompactWindow": 245000 },
+                "claude-sonnet-4-6": { "autoCompactWindow": 245000 },
+                "unrelated-model": { "autoCompactWindow": 450000, "effortLevel": "low" }
+            }
+        }))
+        .unwrap();
+        merged_claude_settings_into(&mut stale_v020, &live_500k_params);
+        assert!(stale_v020["modelSettings"].get("gemini-4-argon").is_none());
+        assert!(
+            stale_v020["modelSettings"]
+                .get("gemini-4-argon-high")
+                .is_none()
+        );
+        assert_eq!(
+            stale_v020["modelSettings"]["claude-sonnet-4-6"]["autoCompactWindow"],
+            170000
+        );
+        assert_eq!(
+            stale_v020["modelSettings"]["gemini-4-carbon-high"]["autoCompactWindow"],
+            425000
+        );
+        assert_eq!(
+            stale_v020["modelSettings"]["unrelated-model"]["autoCompactWindow"],
+            450000
         );
 
         // Alias primary models (`gemini-4-carbon`) on a `--long-context` gateway must resolve

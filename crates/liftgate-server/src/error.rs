@@ -23,7 +23,11 @@ pub enum AcpError {
     HydrationCompacted,
 
     #[error("upstream ACP model `{model}` context window exceeded: {detail}")]
-    ContextLengthExceeded { model: String, detail: String },
+    ContextLengthExceeded {
+        model: String,
+        long_context: bool,
+        detail: String,
+    },
     #[error("failed to spawn ACP subprocess `{}`", path.display())]
     SpawnProcess {
         path: PathBuf,
@@ -306,8 +310,12 @@ impl GatewayError {
                 liftgate_types::model::GEMINI_DEFAULT_WINDOW + 1,
                 liftgate_types::model::GEMINI_DEFAULT_WINDOW,
             )),
-            AcpError::ContextLengthExceeded { model, .. } => {
-                let (max_tokens, _) = liftgate_types::model::context_limits(model, false);
+            AcpError::ContextLengthExceeded {
+                model,
+                long_context,
+                ..
+            } => {
+                let (max_tokens, _) = liftgate_types::model::context_limits(model, *long_context);
                 Some((max_tokens + 1, max_tokens))
             }
             AcpError::SpawnProcess { .. }
