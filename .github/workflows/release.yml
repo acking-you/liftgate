@@ -95,6 +95,18 @@ jobs:
               '' \
               "> Looking for native OS desktop installers (\`.dmg\`, Windows \`-setup.exe\`, \`.AppImage\`, \`.deb\`)? Download [**Liftgate Desktop ${tag}**](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}-ui)." \
               '' \
+              '### One-Line CLI Install (`lg` + `liftgate`)' \
+              '' \
+              '```bash' \
+              '# macOS / Linux / FreeBSD' \
+              "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh" \
+              '```' \
+              '' \
+              '```powershell' \
+              '# Windows (PowerShell)' \
+              "irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.ps1 | iex" \
+              '```' \
+              '' \
               '### Quick Download Guide' \
               '' \
               '| Platform | Architecture | Recommended Archive |' \

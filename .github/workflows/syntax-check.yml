@@ -60,11 +60,12 @@ jobs:
             case "$file" in
               crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|Cross.toml|rustfmt.toml|clippy.toml|*/Cargo.toml)
                 rust=true
+                release_scripts=true
                 ;;
               web/*)
                 web=true
                 ;;
-              scripts/release/*|packaging/*|.github/workflows/release*.yml)
+              scripts/install.sh|scripts/install.ps1|scripts/release/*|packaging/*|.github/workflows/release*.yml|README.md|README.zh-CN.md)
                 release_scripts=true
                 ;;
               .github/workflows/syntax-check.yml)
@@ -234,6 +235,7 @@ jobs:
               plistlib.loads(plist.read_bytes())
               print(f'Validated {plist}')
           PY
+          sh -n scripts/install.sh
           bash -n scripts/release/package_linux_desktop.sh
           desktop-file-validate packaging/linux/liftgate-desktop.desktop
 
