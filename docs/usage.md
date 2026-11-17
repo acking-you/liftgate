@@ -8,9 +8,20 @@ client at it. Every address below assumes the default
 
 ## Before you start
 
-- **Liftgate (`lg` / `liftgate`)**, installed globally from a
-  [GitHub Release](https://github.com/acking-you/liftgate/releases) archive,
-  `cargo binstall liftgate`, or built from source with **Rust 1.100.0**:
+- **Liftgate (`lg` / `liftgate`)**, installed in one command (or as the
+  standalone **Liftgate Desktop** GPUI app from
+  [Desktop Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop)):
+  ```bash
+  # macOS / Linux / FreeBSD
+  curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
+  ```
+  You can also install via `cargo binstall liftgate`, download an archive from
+  [GitHub Releases](https://github.com/acking-you/liftgate/releases/latest),
+  or build from source with **Rust 1.100.0**:
   ```bash
   cargo install --path crates/liftgate --locked
   ```

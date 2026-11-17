@@ -2,12 +2,15 @@
 
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 
 from ui_release_manifest import CHECKSUMS, EXPECTED, build, read_workspace_version, sign, verify
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class DesktopReleaseManifestTests(unittest.TestCase):
@@ -81,6 +84,31 @@ class DesktopReleaseManifestTests(unittest.TestCase):
         manifest_path.write_text(manifest_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
         with self.assertRaises(subprocess.CalledProcessError):
             verify(manifest_path, pub)
+
+    def test_readmes_link_current_desktop_release_and_cli_installers(self):
+        version = read_workspace_version(REPO_ROOT / "Cargo.toml")
+        ui_tag = f"v{version}-ui"
+        required_snippets = (
+            "curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh",
+            "irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex",
+            f"https://github.com/acking-you/liftgate/releases/tag/{ui_tag}",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-macos-arm64.dmg",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-macos-x86_64.dmg",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-windows-x86_64-setup.exe",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-windows-arm64-setup.exe",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-linux-x86_64.AppImage",
+            f"https://github.com/acking-you/liftgate/releases/download/{ui_tag}/liftgate-desktop-linux-amd64.deb",
+        )
+        for doc_name in ("README.md", "README.zh-CN.md"):
+            content = (REPO_ROOT / doc_name).read_text(encoding="utf-8")
+            for snippet in required_snippets:
+                self.assertIn(snippet, content, f"{doc_name} missing {snippet}")
+            found_ui_tags = set(re.findall(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?-ui", content))
+            self.assertEqual(
+                found_ui_tags,
+                {ui_tag},
+                f"{doc_name} references stale desktop tag(s): {found_ui_tags} (expected only {ui_tag})",
+            )
 
 
 if __name__ == "__main__":

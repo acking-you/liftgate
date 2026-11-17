@@ -6,7 +6,16 @@
 
 ## 准备工作
 
-- **全局安装 `lg` / `liftgate`**：从 [GitHub Releases](https://github.com/acking-you/liftgate/releases) 下载对应平台发行包放入 `PATH`（或运行 `cargo binstall liftgate`），亦可使用 **Rust 1.100.0** 从源码全局安装：
+- **全局安装 `lg` / `liftgate`**（或直接从 [桌面端 Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) 下载独立的原生 GPUI 应用 **Liftgate Desktop**）：
+  ```bash
+  # macOS / Linux / FreeBSD
+  curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
+  ```
+  也可运行 `cargo binstall liftgate`、从 [最新 CLI Release](https://github.com/acking-you/liftgate/releases/latest) 手动下载归档，或使用 **Rust 1.100.0** 从源码全局安装：
   ```bash
   cargo install --path crates/liftgate --locked
   ```
