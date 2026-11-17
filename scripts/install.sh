@@ -224,7 +224,7 @@ archive_url="${download_base}/${archive_name}"
 checksums_url="${download_base}/SHA256SUMS"
 
 # --- locate any existing standalone CLI installation ------------------------
-is_packaged_bundle_path() {
+check_single_packaged_path() {
   case "$1" in
     *.app/Contents/MacOS/* | /tmp/.mount_*) return 0 ;;
   esac
@@ -234,6 +234,33 @@ is_packaged_bundle_path() {
   if command -v rpm >/dev/null 2>&1 && rpm -qf "$1" >/dev/null 2>&1; then
     return 0
   fi
+  return 1
+}
+
+is_packaged_bundle_path() {
+  check_single_packaged_path "$1" && return 0
+
+  # Resolve directory symlinks (e.g. merged-/usr `/bin -> /usr/bin` on Debian/Ubuntu,
+  # where `dpkg -S` performs a literal path lookup against `/usr/bin/liftgate`).
+  cand_dir_phys="$(cd -P "$(dirname "$1")" 2>/dev/null && pwd -P || true)"
+  if [ -n "$cand_dir_phys" ]; then
+    cand_phys="${cand_dir_phys}/$(basename "$1")"
+    if [ "$cand_phys" != "$1" ] && check_single_packaged_path "$cand_phys"; then
+      return 0
+    fi
+  fi
+
+  # Also resolve leaf symlinks when `realpath` or `readlink -f` is available.
+  cand_real=""
+  if command -v realpath >/dev/null 2>&1; then
+    cand_real="$(realpath "$1" 2>/dev/null || true)"
+  elif command -v readlink >/dev/null 2>&1; then
+    cand_real="$(readlink -f "$1" 2>/dev/null || true)"
+  fi
+  if [ -n "$cand_real" ] && [ "$cand_real" != "$1" ] && check_single_packaged_path "$cand_real"; then
+    return 0
+  fi
+
   return 1
 }
 
@@ -366,6 +393,19 @@ installed_ver="$("$bindir/liftgate" --version </dev/null 2>/dev/null | awk 'NR==
 info "installed liftgate & lg ${installed_ver} -> ${bindir}"
 
 # --- ensure bin dir is on PATH ----------------------------------------------
+ensure_profile_line() {
+  target_profile="$1"
+  target_dir="$2"
+  export_line="$3"
+
+  mkdir -p "$(dirname "$target_profile")"
+  if [ -f "$target_profile" ] && grep -Fq "$target_dir" "$target_profile" 2>/dev/null; then
+    return 0
+  fi
+  printf '\n# added by Liftgate installer\n%s\n' "$export_line" >>"$target_profile"
+  info "added $target_dir to PATH in $target_profile"
+}
+
 add_to_path() {
   dir="$1"
   case ":${PATH:-}:" in
@@ -386,39 +426,35 @@ add_to_path() {
       ;;
   esac
 
+  posix_line="case \":\$PATH:\" in *\":$dir:\"*) ;; *) export PATH=\"$dir:\$PATH\" ;; esac"
   shell_name="$(basename "${SHELL:-/bin/sh}")"
   case "$shell_name" in
     fish)
-      profile="${HOME}/.config/fish/config.fish"
-      line="fish_add_path \"$dir\""
+      ensure_profile_line "${HOME}/.config/fish/config.fish" "$dir" "fish_add_path \"$dir\""
       ;;
     zsh)
-      profile="${ZDOTDIR:-$HOME}/.zshrc"
-      line="export PATH=\"$dir:\$PATH\""
+      ensure_profile_line "${ZDOTDIR:-$HOME}/.zshrc" "$dir" "$posix_line"
       ;;
     bash)
-      if [ -f "$HOME/.bashrc" ]; then
-        profile="$HOME/.bashrc"
-      elif [ "$os" = "Darwin" ] && [ -f "$HOME/.bash_profile" ]; then
-        profile="$HOME/.bash_profile"
+      ensure_profile_line "$HOME/.bashrc" "$dir" "$posix_line"
+      if [ -f "$HOME/.bash_profile" ]; then
+        login_profile="$HOME/.bash_profile"
+      elif [ -f "$HOME/.bash_login" ]; then
+        login_profile="$HOME/.bash_login"
+      elif [ -f "$HOME/.profile" ]; then
+        login_profile="$HOME/.profile"
+      elif [ "$os" = "Darwin" ]; then
+        login_profile="$HOME/.bash_profile"
       else
-        profile="$HOME/.bashrc"
+        login_profile="$HOME/.profile"
       fi
-      line="export PATH=\"$dir:\$PATH\""
+      ensure_profile_line "$login_profile" "$dir" "$posix_line"
       ;;
     *)
-      profile="$HOME/.profile"
-      line="export PATH=\"$dir:\$PATH\""
+      ensure_profile_line "$HOME/.profile" "$dir" "$posix_line"
       ;;
   esac
 
-  mkdir -p "$(dirname "$profile")"
-  if [ -f "$profile" ] && grep -Fq "$dir" "$profile" 2>/dev/null; then
-    :
-  else
-    printf '\n# added by Liftgate installer\n%s\n' "$line" >>"$profile"
-    info "added $dir to PATH in $profile"
-  fi
   warn "open a new terminal, or run this in your current shell:"
   printf '    export PATH="%s:$PATH"\n' "$dir"
 }

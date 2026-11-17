@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **One-line CLI installers (`scripts/install.sh` & `scripts/install.ps1`)**:
+  - Added a strict POSIX `sh` installer (`curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh`) for Linux (`musl` static & `glibc`), macOS (Apple Silicon & Intel, preferring native `aarch64-apple-darwin` even under Rosetta 2), and FreeBSD, plus a PowerShell installer (`irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex`) for Windows (`x64`, `ARM64`, and `x86`).
+  - Enforces fail-closed `SHA256SUMS` verification, `--version` smoke checks, atomic same-directory staging safe while a background gateway is running, isolation from system-packaged (`dpkg`/`rpm`, including merged-`/usr` `/bin` symlinks) and Inno Setup desktop installs, login + interactive shell `PATH` setup, and `LIFTGATE_VERSION`, `LIFTGATE_BIN_DIR`, `LIFTGATE_NO_MODIFY_PATH`, `LIFTGATE_TARGET`, `LIFTGATE_REPO`, and `LIFTGATE_BASE_URL` overrides.
+
+### Changed
+- Refreshed `README.md`, `README.zh-CN.md`, and `docs/usage*.md` with one-line CLI install commands, a dedicated **Liftgate Desktop** overview, and direct download links to the latest `vX.Y.Z-ui` desktop installers.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added

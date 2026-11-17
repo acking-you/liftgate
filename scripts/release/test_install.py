@@ -234,6 +234,74 @@ class PosixInstallScriptTests(unittest.TestCase):
         self.assertNotEqual(res_inc.returncode, 0)
         self.assertIn("0.1.8", existing.read_text(encoding="utf-8"))
 
+    def test_merged_usr_dpkg_symlink_and_bash_login_profile_are_handled(self):
+        target = "x86_64-unknown-linux-musl"
+        server = self._serve_release(target, tag="v0.2.0")
+
+        # Simulate merged-/usr: real file at usr/bin/liftgate owned by dpkg, exposed via bin -> usr/bin.
+        fake_usr_bin = self.root / "usr" / "bin"
+        fake_usr_bin.mkdir(parents=True)
+        packaged_bin = fake_usr_bin / "liftgate"
+        packaged_bin.write_text("#!/bin/sh\necho 'liftgate 0.1.0-deb'\n", encoding="utf-8")
+        packaged_bin.chmod(0o755)
+
+        fake_bin_link = self.root / "bin"
+        fake_bin_link.symlink_to(fake_usr_bin)
+
+        # Mock `dpkg -S` doing literal path lookup (succeeds only for usr/bin/liftgate, fails for bin/liftgate).
+        mock_tools = self.root / "mock-tools"
+        mock_tools.mkdir()
+        mock_dpkg = mock_tools / "dpkg"
+        mock_dpkg.write_text(
+            f"#!/bin/sh\nif [ \"$1\" = \"-S\" ] && [ \"$2\" = \"{packaged_bin.resolve()}\" ]; then\n"
+            "  echo 'liftgate-desktop: /usr/bin/liftgate'\n  exit 0\nfi\nexit 1\n",
+            encoding="utf-8",
+        )
+        mock_dpkg.chmod(0o755)
+
+        fake_home = self.root / "home"
+        fake_home.mkdir()
+        # Pre-existing .bashrc without .bash_profile sourcing it.
+        (fake_home / ".bashrc").write_text("# existing bashrc\n", encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "HOME": str(fake_home),
+            "SHELL": "/bin/bash",
+            "PATH": f"{mock_tools}:{fake_bin_link}:{os.environ.get('PATH', '')}",
+            "LIFTGATE_BASE_URL": server.base_url,
+            "LIFTGATE_TARGET": target,
+        }
+        res = subprocess.run(
+            ["sh", str(INSTALL_SH)],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+        # dpkg-owned usr/bin/liftgate must remain untouched; standalone CLI installed in ~/.local/bin.
+        self.assertIn("0.1.0-deb", packaged_bin.read_text(encoding="utf-8"))
+        local_bin = fake_home / ".local" / "bin"
+        self.assertTrue((local_bin / "liftgate").is_file())
+        self.assertTrue((local_bin / "lg").is_file())
+
+        # Both .bashrc and login profile (.profile on Linux) must configure PATH idempotently.
+        self.assertIn(str(local_bin), (fake_home / ".bashrc").read_text(encoding="utf-8"))
+        self.assertIn(str(local_bin), (fake_home / ".profile").read_text(encoding="utf-8"))
+        if shutil.which("bash"):
+            login_path = subprocess.check_output(
+                ["bash", "--login", "-c", "printf '%s' \"$PATH\""],
+                env={"HOME": str(fake_home), "PATH": "/usr/bin:/bin"},
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            entries = [p for p in login_path.split(":") if p == str(local_bin)]
+            self.assertEqual(len(entries), 1, f"expected {local_bin} once in login PATH, got: {login_path}")
+
 
 @unittest.skipUnless(
     os.name == "nt" and (shutil.which("pwsh") or shutil.which("powershell")),
