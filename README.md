@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.0-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.0-D97757"></a>
+  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.1-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.1-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-`LIFTGATE_VERSION=v0.2.0` pins a tag, `LIFTGATE_BIN_DIR` sets the install
+`LIFTGATE_VERSION=v0.2.1` pins a tag, `LIFTGATE_BIN_DIR` sets the install
 directory, and `LIFTGATE_NO_MODIFY_PATH=1` skips updating `PATH`. Once
 installed, run `lg upgrade` anytime to update in place.
 
@@ -113,18 +113,18 @@ compiled right in).
   6. **System** — Live gateway & `agy` stderr logs, environment doctor, `lg`
      `PATH` alias & shell completions installer, and release upgrade checker.
 
-**Download the latest Desktop release — [Liftgate Desktop `v0.2.0`](https://github.com/acking-you/liftgate/releases/tag/v0.2.0-ui)**
+**Download the latest Desktop release — [Liftgate Desktop `v0.2.1`](https://github.com/acking-you/liftgate/releases/tag/v0.2.1-ui)**
 ([all Desktop releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/release-manifest.json)):
+[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/SHA256SUMS) ·
+[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/release-manifest.json)):
 
 | Platform | Installer (Recommended) | Portable Bundle |
 | --- | --- | --- |
-| **macOS (Apple Silicon · M1–M4)** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS (Intel · x86_64)** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows (x64)** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows (ARM64)** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux (x86_64 · glibc 2.35+)** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.0-ui/liftgate-desktop-linux-x86_64.tar.gz) |
+| **macOS (Apple Silicon · M1–M4)** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-arm64.zip) |
+| **macOS (Intel · x86_64)** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-x86_64.zip) |
+| **Windows (x64)** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-x86_64.zip) |
+| **Windows (ARM64)** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-arm64.zip) |
+| **Linux (x86_64 · glibc 2.35+)** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-x86_64.tar.gz) |
 
 > [!NOTE]
 > macOS builds are currently ad-hoc signed; if Gatekeeper blocks first launch,

@@ -1615,8 +1615,8 @@ pub(crate) async fn run_idle_agy_auto_updater_with_options(
                     &live_client,
                     &pool,
                     &telemetry,
+                    &prev_str,
                     &manifest,
-                    proxy.as_ref(),
                     &opts,
                 )
                 .await
@@ -1626,11 +1626,6 @@ pub(crate) async fn run_idle_agy_auto_updater_with_options(
                             from = %prev_str,
                             to = %manifest.version,
                             "automatically updated `agy` CLI while gateway was idle"
-                        );
-                        live_client.record_auto_update_applied(
-                            prev_str.clone(),
-                            manifest.version.clone(),
-                            Some(format!("auto-updated v{prev_str} -> v{}", manifest.version)),
                         );
                         telemetry.notify_change();
                         pending_manifest = None;
@@ -1683,20 +1678,30 @@ async fn apply_idle_agy_hot_update(
     live_client: &Arc<LiveAcpClient>,
     pool: &Arc<SessionPool>,
     telemetry: &Arc<TelemetryHub>,
+    previous_version: &str,
     manifest: &AgyManifest,
-    proxy: Option<&ProxyUrl>,
     opts: &IdleAutoUpdateOptions,
 ) -> Result<bool, CliError> {
     let stage = StageDirGuard::create(state_paths, "agy-auto-stage")?;
-    let staged_bin = download_and_verify_agy_staged(manifest, &stage.path, proxy).await?;
+    let proxy = live_client.agy_proxy().cloned();
+    let staged_bin = download_and_verify_agy_staged(manifest, &stage.path, proxy.as_ref()).await?;
 
     let client_ref = Arc::clone(live_client);
     let pool_ref = Arc::clone(pool);
     let telemetry_ref = Arc::clone(telemetry);
     let opts_ref = opts.clone();
+    let auto_update_record = Some((
+        previous_version.to_owned(),
+        manifest.version.clone(),
+        Some(format!(
+            "auto-updated v{previous_version} -> v{}",
+            manifest.version
+        )),
+    ));
     let swapped = live_client
         .hot_swap_binary_when_idle(
             pool,
+            auto_update_record,
             || is_gateway_idle_for_update(&client_ref, &pool_ref, &telemetry_ref, &opts_ref),
             move |target_bin| install_staged_agy_binary(&staged_bin, target_bin),
         )
@@ -2089,6 +2094,7 @@ fn main() {{
         let swap_err = live_client
             .hot_swap_binary_when_idle(
                 &pool,
+                None,
                 || true,
                 move |target| install_staged_agy_binary(&broken_stage, target),
             )

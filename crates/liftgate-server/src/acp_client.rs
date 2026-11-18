@@ -675,6 +675,7 @@ impl LiveAcpClient {
     pub async fn hot_swap_binary_when_idle<CheckIdle, SwapFn>(
         &self,
         pool: &SessionPool,
+        auto_update_record: Option<(String, String, Option<String>)>,
         is_still_idle: CheckIdle,
         swap_binary: SwapFn,
     ) -> Result<Option<String>, AcpError>
@@ -730,15 +731,26 @@ impl LiveAcpClient {
             Ok(fresh_raw) => {
                 swap_guard.commit();
                 let fresh = Arc::new(fresh_raw);
+                if let Ok(probe) = fresh.create_session_once("", &self.models_tx).await {
+                    let _: Result<serde::de::IgnoredAny, AcpError> = fresh
+                        .inner
+                        .call_rpc(
+                            "session/close",
+                            SessionCloseParams {
+                                session_id: probe.session_id.as_str(),
+                            },
+                        )
+                        .await;
+                }
+                if let Some((previous_version, new_version, note)) = auto_update_record {
+                    self.record_auto_update_applied(previous_version, new_version, note);
+                }
                 {
                     let mut write_guard = match self.generation.write() {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
                     *write_guard = Arc::clone(&fresh);
-                }
-                if let Ok(probe) = fresh.create_session_once("", &self.models_tx).await {
-                    let _ = self.close_session_inner(&probe.session_id).await;
                 }
                 Ok(Some(
                     self.current_agent_version()
