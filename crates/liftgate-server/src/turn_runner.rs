@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
-    session_pool::{ActiveMemoryPermit, CommittedSessionTurn, SessionLeaseGuard, SessionPool},
+    session_pool::{CommittedSessionTurn, SessionLeaseGuard, SessionPool},
     telemetry::{ActiveTaskGuard, TelemetryHub, unix_timestamp_ms},
     web_fetch::WebFetchOutcome,
 };
@@ -118,10 +118,6 @@ pub struct GatewayRuntimeConfig {
 
 /// Prepares an ACP session (reusing a matching multi-turn session when available, or creating
 /// a new isolated one) and starts streaming `TurnEvent`s.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "explicit gateway dependencies and RAII active memory permit without wrapper churn"
-)]
 pub async fn execute_normalized_turn<B: AcpBackend>(
     backend: Arc<B>,
     pool: Arc<SessionPool>,
@@ -130,7 +126,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     protocol: TaskProtocol,
     mut req: NormalizedTurnRequest,
     response_id: String,
-    mut memory_permit: ActiveMemoryPermit,
 ) -> Result<ActiveTurnStream, GatewayError> {
     if let Some(aux_kind) = req.auxiliary_task {
         req.client_tools.clear();
@@ -193,10 +188,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 && let Some(checkout) =
                     pool.checkout_by_response_id(prev_resp_id, Arc::clone(&backend))
             {
-                let cached_bytes = checkout.entry().estimated_retained_bytes();
-                memory_permit.try_grow_to_bytes(
-                    memory_permit.reserved_bytes().saturating_add(cached_bytes),
-                )?;
                 let combined_len = checkout
                     .entry()
                     .accumulated_messages
@@ -450,7 +441,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         prompt_plan,
         base_messages,
         req,
-        memory_permit,
         web_cfg,
         active_model,
         initial_rpc_model,
@@ -588,7 +578,6 @@ async fn run_turn_pipeline<B: AcpBackend>(
     prompt_plan: AcpPromptPlan,
     mut full_messages: Vec<CanonicalMessage>,
     req: NormalizedTurnRequest,
-    _memory_permit: ActiveMemoryPermit,
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
     mut current_rpc_model: ModelId,
@@ -1648,7 +1637,6 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId, long_context: bool)
         }
         GatewayError::Unauthorized
         | GatewayError::PayloadTooLarge { .. }
-        | GatewayError::RequestBudgetExhausted
         | GatewayError::NotFound { .. }
         | GatewayError::BadJson { .. }
         | GatewayError::Protocol { .. } => err,

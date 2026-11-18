@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use bytes::Bytes;
 use liftgate_types::{
     canonical::{CanonicalMessage, CanonicalToolSpec},
     config::{GatewayLimits, ModelId, SessionId},
@@ -9,127 +9,11 @@ use liftgate_types::{
     session_key::ConversationHash,
     telemetry::{SessionPoolTelemetry, SessionSlotState, SessionSummary},
 };
-use tokio::sync::Semaphore;
 
-use crate::{acp_client::AcpBackend, error::GatewayError, telemetry::unix_timestamp_ms};
+use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
 
-const PERMIT_UNIT_BYTES: usize = 1024;
-const MAX_ACTIVE_MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
 const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
-
-/// Baseline active memory reservation for receiving and JSON-decoding an HTTP body of `body_bytes`.
-#[must_use]
-pub const fn baseline_parse_reservation_bytes(body_bytes: usize) -> usize {
-    if body_bytes == 0 {
-        return 0;
-    }
-    let candidate_slack = body_bytes / 16;
-    let slack = if candidate_slack > 4 * 1024 {
-        candidate_slack
-    } else {
-        4 * 1024
-    };
-    body_bytes.saturating_mul(2).saturating_add(slack)
-}
-
-fn bytes_to_permits(bytes: usize) -> u32 {
-    if bytes == 0 {
-        return 0;
-    }
-    let units = bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
-    u32::try_from(units).unwrap_or(u32::MAX)
-}
-
-/// Cancel-safe RAII reservation against `SessionPool`'s global active request/turn byte budget.
-pub struct ActiveMemoryPermit {
-    sem: Arc<Semaphore>,
-    max_permits: u32,
-    permits: u32,
-}
-
-impl ActiveMemoryPermit {
-    /// Approximate bytes currently reserved by this permit.
-    #[must_use]
-    pub const fn reserved_bytes(&self) -> usize {
-        (self.permits as usize).saturating_mul(PERMIT_UNIT_BYTES)
-    }
-
-    fn checked_permits(&self, target_bytes: usize) -> Result<u32, GatewayError> {
-        let target_permits = bytes_to_permits(target_bytes);
-        if target_permits > self.max_permits {
-            return Err(GatewayError::RequestBudgetExhausted);
-        }
-        Ok(target_permits)
-    }
-
-    /// Acquires the initial reservation for a request before it holds any partial permits.
-    ///
-    /// Waiting on `Semaphore::acquire_many` is permitted *only* when `self.permits == 0` so
-    /// concurrent requests can never form a hold-and-wait deadlock cycle. If already holding
-    /// permits, delegates to non-blocking [`Self::try_grow_to_bytes`].
-    pub async fn acquire_initial_bytes(
-        &mut self,
-        target_bytes: usize,
-        timeout: Duration,
-    ) -> Result<(), GatewayError> {
-        if self.permits > 0 {
-            return self.try_grow_to_bytes(target_bytes);
-        }
-        let target_permits = self.checked_permits(target_bytes)?;
-        if target_permits == 0 {
-            return Ok(());
-        }
-        let acquired = tokio::time::timeout(timeout, self.sem.acquire_many(target_permits))
-            .await
-            .map_err(|_| GatewayError::RequestBudgetExhausted)?
-            .map_err(|_| GatewayError::RequestBudgetExhausted)?;
-        acquired.forget();
-        self.permits = target_permits;
-        Ok(())
-    }
-
-    /// Non-blockingly grows an existing reservation to `target_bytes`, failing immediately if
-    /// `target_bytes` exceeds pool capacity or insufficient permits are currently free.
-    pub fn try_grow_to_bytes(&mut self, target_bytes: usize) -> Result<(), GatewayError> {
-        let target_permits = self.checked_permits(target_bytes)?;
-        if target_permits > self.permits {
-            let delta = target_permits - self.permits;
-            let acquired = self
-                .sem
-                .try_acquire_many(delta)
-                .map_err(|_| GatewayError::RequestBudgetExhausted)?;
-            acquired.forget();
-            self.permits = target_permits;
-        }
-        Ok(())
-    }
-
-    /// Resizes this reservation to `target_bytes` without blocking: shrinks immediately via
-    /// `add_permits`, or attempts non-blocking growth via [`Self::try_grow_to_bytes`].
-    pub fn try_adjust_to_bytes(&mut self, target_bytes: usize) -> Result<(), GatewayError> {
-        let target_permits = self.checked_permits(target_bytes)?;
-        if target_permits <= self.permits {
-            let release = (self.permits - target_permits) as usize;
-            if release > 0 {
-                self.sem.add_permits(release);
-                self.permits = target_permits;
-            }
-            Ok(())
-        } else {
-            self.try_grow_to_bytes(target_bytes)
-        }
-    }
-}
-
-impl Drop for ActiveMemoryPermit {
-    fn drop(&mut self) {
-        if self.permits > 0 {
-            self.sem.add_permits(self.permits as usize);
-            self.permits = 0;
-        }
-    }
-}
 
 /// Cached metadata for an idle ACP session awaiting a multi-turn continuation.
 #[derive(Clone, Debug)]
@@ -184,15 +68,12 @@ struct ActiveLeaseMeta {
 struct StoredResponseEntry {
     id: String,
     retained_bytes: usize,
-    response: ResponseObject,
+    raw_json: Bytes,
 }
 
 /// Bounded LRU pool of idle ACP sessions, active leases, and recent OpenAI `ResponseObject` records.
 pub struct SessionPool {
     limits: GatewayLimits,
-    active_memory_sem: Arc<Semaphore>,
-    max_active_permits: u32,
-    max_active_bytes: usize,
     max_idle_retained_bytes: usize,
     max_stored_response_bytes: usize,
     inner: Mutex<PoolInner>,
@@ -214,11 +95,6 @@ impl SessionPool {
     #[must_use]
     pub fn new(limits: GatewayLimits) -> Self {
         let max_body = limits.max_body_bytes().get();
-        let min_single_turn_bytes = baseline_parse_reservation_bytes(max_body);
-        let max_active_bytes = max_body
-            .saturating_mul(8)
-            .min(MAX_ACTIVE_MEMORY_CAP_BYTES)
-            .max(min_single_turn_bytes);
         let max_idle_retained_bytes = max_body
             .saturating_mul(6)
             .min(MAX_IDLE_RETAINED_CAP_BYTES)
@@ -227,13 +103,9 @@ impl SessionPool {
             .saturating_mul(2)
             .min(MAX_STORED_RESPONSES_CAP_BYTES)
             .max(max_body);
-        let max_active_permits = bytes_to_permits(max_active_bytes).max(1);
 
         Self {
             limits,
-            active_memory_sem: Arc::new(Semaphore::new(max_active_permits as usize)),
-            max_active_permits,
-            max_active_bytes,
             max_idle_retained_bytes,
             max_stored_response_bytes,
             inner: Mutex::new(PoolInner {
@@ -248,22 +120,6 @@ impl SessionPool {
                 last_activity_unix_ms: unix_timestamp_ms(),
             }),
         }
-    }
-
-    /// Creates an empty RAII memory permit bound to this pool's active byte budget.
-    #[must_use]
-    pub fn new_active_memory_permit(&self) -> ActiveMemoryPermit {
-        ActiveMemoryPermit {
-            sem: Arc::clone(&self.active_memory_sem),
-            max_permits: self.max_active_permits,
-            permits: 0,
-        }
-    }
-
-    /// Global byte ceiling across concurrent HTTP body reads and running turns.
-    #[must_use]
-    pub const fn max_active_memory_bytes(&self) -> usize {
-        self.max_active_bytes
     }
 
     /// Global byte ceiling across cached idle ACP sessions.
@@ -434,7 +290,13 @@ impl SessionPool {
         if !response.store {
             return;
         }
-        let resp_bytes = response.estimated_retained_bytes();
+        let Ok(serialized) = serde_json::to_vec(&response) else {
+            return;
+        };
+        let raw_json = Bytes::from(serialized);
+        let resp_bytes = std::mem::size_of::<StoredResponseEntry>()
+            .saturating_add(response.id.len())
+            .saturating_add(raw_json.len());
         if resp_bytes > self.max_stored_response_bytes {
             return;
         }
@@ -457,14 +319,14 @@ impl SessionPool {
         }
         guard.retained_response_bytes = guard.retained_response_bytes.saturating_add(resp_bytes);
         guard.stored_responses.push_back(StoredResponseEntry {
-            id: response.id.clone(),
+            id: response.id,
             retained_bytes: resp_bytes,
-            response,
+            raw_json,
         });
     }
 
     #[must_use]
-    pub fn get_response(&self, response_id: &str) -> Option<ResponseObject> {
+    pub fn get_response_json(&self, response_id: &str) -> Option<Bytes> {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -474,7 +336,7 @@ impl SessionPool {
             .iter()
             .rev()
             .find(|entry| entry.id == response_id)
-            .map(|entry| entry.response.clone())
+            .map(|entry| entry.raw_json.clone())
     }
 
     /// Captures a telemetry snapshot of all running and cached ACP sessions.

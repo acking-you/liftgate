@@ -220,30 +220,6 @@ impl NormalizedTurnRequest {
             );
         }
     }
-
-    /// Estimates total in-memory bytes retained while this normalized turn is active.
-    #[must_use]
-    pub fn estimated_retained_bytes(&self) -> usize {
-        let msg_bytes = self.messages.iter().fold(0usize, |acc, m| {
-            acc.saturating_add(m.estimated_heap_bytes())
-        });
-        let tool_bytes = self.client_tools.iter().fold(0usize, |acc, t| {
-            acc.saturating_add(t.estimated_heap_bytes())
-        });
-        let domain_bytes = self
-            .web_fetch_allowed_domains
-            .iter()
-            .chain(self.web_fetch_blocked_domains.iter())
-            .fold(0usize, |acc, d| acc.saturating_add(d.len()));
-
-        std::mem::size_of::<Self>()
-            .saturating_add(self.requested_model.as_deref().map_or(0, str::len))
-            .saturating_add(self.system_instructions.as_deref().map_or(0, str::len))
-            .saturating_add(self.previous_response_id.as_deref().map_or(0, str::len))
-            .saturating_add(msg_bytes)
-            .saturating_add(tool_bytes)
-            .saturating_add(domain_bytes)
-    }
 }
 
 /// Detects whether an incoming normalized turn is a harness-internal classifier or background

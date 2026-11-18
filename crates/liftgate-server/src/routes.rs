@@ -40,7 +40,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
-    session_pool::{ActiveMemoryPermit, SessionPool},
+    session_pool::SessionPool,
     telemetry::{TelemetryHub, unix_timestamp_ms},
     turn_runner::{
         ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
@@ -53,14 +53,8 @@ use crate::{
 pub const ADMIN_SHUTDOWN_HEADER: &str = "x-liftgate-shutdown-token";
 
 const CONTROL_ROUTE_BODY_LIMIT_BYTES: usize = 256 * 1024;
-const BODY_PERMIT_QUANTUM_BYTES: usize = 64 * 1024;
+const INITIAL_BODY_ALLOC_CAP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_JSON_NESTING_DEPTH: usize = 64;
-const MAX_JSON_CONTAINERS: usize = 65_536;
-const MAX_JSON_ELEMENTS: usize = 262_144;
-const JSON_CONTAINER_OVERHEAD_BYTES: usize = 384;
-const JSON_ELEMENT_OVERHEAD_BYTES: usize = 64;
 
 /// Compile-time `(relative_slash_path, bytes)` entry for embedded companion web assets.
 pub type EmbeddedUiAsset = (&'static str, &'static [u8]);
@@ -501,8 +495,8 @@ async fn handle_get_response<B: AcpBackend>(
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
-    match state.pool.get_response(&response_id) {
-        Some(resp) => Json(resp).into_response(),
+    match state.pool.get_response_json(&response_id) {
+        Some(raw_json) => ([(header::CONTENT_TYPE, "application/json")], raw_json).into_response(),
         None => GatewayError::NotFound {
             resource: response_id,
         }
@@ -532,11 +526,10 @@ async fn handle_create_response<B: AcpBackend>(
     State(state): State<AppState<B>>,
     http_req: Request,
 ) -> Response {
-    let (req, mut memory_permit): (CreateResponseRequest, ActiveMemoryPermit) =
-        match read_authenticated_json_body(&state, http_req).await {
-            Ok(pair) => pair,
-            Err(err) => return err.into_openai_response(),
-        };
+    let req: CreateResponseRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_openai_response(),
+    };
 
     let normalized = match normalize_responses_request(&req) {
         Ok(n) => n,
@@ -596,13 +589,6 @@ async fn handle_create_response<B: AcpBackend>(
         metadata: metadata.unwrap_or_default(),
     };
 
-    let active_retained = normalized
-        .estimated_retained_bytes()
-        .saturating_add(base_resp.estimated_retained_bytes());
-    if let Err(err) = memory_permit.try_adjust_to_bytes(active_retained) {
-        return err.into_openai_response();
-    }
-
     let turn_stream = match execute_normalized_turn(
         Arc::clone(&state.backend),
         Arc::clone(&state.pool),
@@ -611,7 +597,6 @@ async fn handle_create_response<B: AcpBackend>(
         TaskProtocol::OpenaiResponses,
         normalized,
         resp_id,
-        memory_permit,
     )
     .await
     {
@@ -2239,11 +2224,10 @@ async fn handle_anthropic_count_tokens<B: AcpBackend>(
     State(state): State<AppState<B>>,
     http_req: Request,
 ) -> Response {
-    let (req, _memory_permit): (AnthropicMessagesRequest, ActiveMemoryPermit) =
-        match read_authenticated_json_body(&state, http_req).await {
-            Ok(pair) => pair,
-            Err(err) => return err.into_anthropic_response(),
-        };
+    let req: AnthropicMessagesRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_anthropic_response(),
+    };
     let input_tokens = estimate_anthropic_tokens(&req);
     Json(AnthropicCountTokensResponse { input_tokens }).into_response()
 }
@@ -2252,21 +2236,16 @@ async fn handle_anthropic_messages<B: AcpBackend>(
     State(state): State<AppState<B>>,
     http_req: Request,
 ) -> Response {
-    let (req, mut memory_permit): (AnthropicMessagesRequest, ActiveMemoryPermit) =
-        match read_authenticated_json_body(&state, http_req).await {
-            Ok(pair) => pair,
-            Err(err) => return err.into_anthropic_response(),
-        };
+    let req: AnthropicMessagesRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_anthropic_response(),
+    };
     let requested_model_echo = req.model.clone();
 
     let normalized = match normalize_anthropic_request(req) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_anthropic_response(),
     };
-
-    if let Err(err) = memory_permit.try_adjust_to_bytes(normalized.estimated_retained_bytes()) {
-        return err.into_anthropic_response();
-    }
 
     let is_stream = normalized.stream;
     let render_opts = AnthropicRenderOptions {
@@ -2284,7 +2263,6 @@ async fn handle_anthropic_messages<B: AcpBackend>(
         TaskProtocol::AnthropicMessages,
         normalized,
         msg_id.clone(),
-        memory_permit,
     )
     .await
     {
@@ -3373,79 +3351,10 @@ fn parse_content_length_hint(
     Ok(Some(len))
 }
 
-fn validate_and_estimate_json_parse_bytes(buf: &[u8]) -> Result<usize, GatewayError> {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut depth = 0usize;
-    let mut containers = 0usize;
-    let mut elements = 0usize;
-    let mut string_bytes = 0usize;
-
-    for &byte in buf {
-        if in_string {
-            if escaped {
-                escaped = false;
-                string_bytes = string_bytes.saturating_add(1);
-            } else if byte == b'\\' {
-                escaped = true;
-                string_bytes = string_bytes.saturating_add(1);
-            } else if byte == b'"' {
-                in_string = false;
-            } else {
-                string_bytes = string_bytes.saturating_add(1);
-            }
-            continue;
-        }
-
-        match byte {
-            b'"' => in_string = true,
-            b'{' | b'[' => {
-                depth = depth.saturating_add(1);
-                if depth > MAX_JSON_NESTING_DEPTH {
-                    return Err(GatewayError::BadJson {
-                        message: format!(
-                            "JSON nesting depth exceeds maximum of {MAX_JSON_NESTING_DEPTH}"
-                        ),
-                    });
-                }
-                containers = containers.saturating_add(1);
-                if containers > MAX_JSON_CONTAINERS {
-                    return Err(GatewayError::BadJson {
-                        message: format!(
-                            "JSON container count exceeds maximum of {MAX_JSON_CONTAINERS}"
-                        ),
-                    });
-                }
-            }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-            }
-            b',' | b':' => {
-                elements = elements.saturating_add(1);
-                if elements > MAX_JSON_ELEMENTS {
-                    return Err(GatewayError::BadJson {
-                        message: format!(
-                            "JSON element count exceeds maximum of {MAX_JSON_ELEMENTS}"
-                        ),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let ast_bytes = string_bytes
-        .saturating_add(containers.saturating_mul(JSON_CONTAINER_OVERHEAD_BYTES))
-        .saturating_add(elements.saturating_mul(JSON_ELEMENT_OVERHEAD_BYTES));
-    Ok(buf.len().saturating_add(ast_bytes))
-}
-
 async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBackend>(
     state: &AppState<B>,
     req: Request,
-) -> Result<(T, ActiveMemoryPermit), GatewayError> {
-    use crate::session_pool::baseline_parse_reservation_bytes;
-
+) -> Result<T, GatewayError> {
     check_auth(req.headers(), state.config.api_key.as_deref())?;
 
     let max_body = state.config.limits.max_body_bytes().get();
@@ -3454,7 +3363,6 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
     let timeout_secs = state.config.limits.turn_timeout_secs().get();
     let turn_timeout = Duration::from_secs(timeout_secs);
     let read_deadline = tokio::time::Instant::now() + turn_timeout.min(MAX_BODY_READ_TIMEOUT);
-    let admission_timeout = turn_timeout.min(MAX_ADMISSION_WAIT_TIMEOUT);
 
     let mut body = req.into_body();
     let body_exact_hint = match axum::body::HttpBody::size_hint(&body).exact() {
@@ -3473,19 +3381,10 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
     };
     let exact_length_hint = header_length_hint.or(body_exact_hint);
 
-    let mut permit = state.pool.new_active_memory_permit();
-    if let Some(exact) = exact_length_hint
-        && exact > 0
-    {
-        permit
-            .acquire_initial_bytes(baseline_parse_reservation_bytes(exact), admission_timeout)
-            .await?;
-    }
-
     let mut buf = Vec::with_capacity(
         exact_length_hint
             .unwrap_or(0)
-            .min(BODY_PERMIT_QUANTUM_BYTES),
+            .min(INITIAL_BODY_ALLOC_CAP_BYTES),
     );
 
     loop {
@@ -3513,25 +3412,12 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
                 max_bytes: max_body,
             });
         }
-        if let Some(exact) = exact_length_hint {
-            if next_len > exact {
-                return Err(GatewayError::BadJson {
-                    message: "HTTP request body exceeded declared Content-Length".to_owned(),
-                });
-            }
-        } else {
-            let rounded_body = next_len
-                .div_ceil(BODY_PERMIT_QUANTUM_BYTES)
-                .saturating_mul(BODY_PERMIT_QUANTUM_BYTES)
-                .min(max_body);
-            let reservation = baseline_parse_reservation_bytes(rounded_body);
-            if permit.reserved_bytes() == 0 {
-                permit
-                    .acquire_initial_bytes(reservation, admission_timeout)
-                    .await?;
-            } else {
-                permit.try_grow_to_bytes(reservation)?;
-            }
+        if let Some(exact) = exact_length_hint
+            && next_len > exact
+        {
+            return Err(GatewayError::BadJson {
+                message: "HTTP request body exceeded declared Content-Length".to_owned(),
+            });
         }
         buf.extend_from_slice(&chunk);
     }
@@ -3544,20 +3430,9 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
         });
     }
 
-    let parse_reservation = validate_and_estimate_json_parse_bytes(&buf)?;
-    if parse_reservation > 0 {
-        if permit.reserved_bytes() == 0 {
-            permit
-                .acquire_initial_bytes(parse_reservation, admission_timeout)
-                .await?;
-        } else {
-            permit.try_grow_to_bytes(parse_reservation)?;
-        }
-    }
-    let parsed: T = serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
+    serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
         message: err.to_string(),
-    })?;
-    Ok((parsed, permit))
+    })
 }
 
 const fn next_seq(seq: &mut u64) -> u64 {
