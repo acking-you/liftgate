@@ -190,44 +190,31 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         //    check out or cancel the user's active conversation session).
         if !is_ephemeral_aux {
             if let Some(prev_resp_id) = req.previous_response_id.as_deref()
-                && let Some(mut cached) = pool.checkout_by_response_id(prev_resp_id)
+                && let Some(checkout) =
+                    pool.checkout_by_response_id(prev_resp_id, Arc::clone(&backend))
             {
-                let cached_bytes = cached.estimated_retained_bytes();
-                let admission_timeout = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(15));
-                if let Err(err) = memory_permit
-                    .grow_to_bytes(
-                        memory_permit.reserved_bytes().saturating_add(cached_bytes),
-                        admission_timeout,
-                    )
-                    .await
-                {
-                    pool.restore_idle_on_reject(cached, &*backend);
-                    return Err(err);
-                }
-                let combined_len = cached
+                let cached_bytes = checkout.entry().estimated_retained_bytes();
+                memory_permit.try_grow_to_bytes(
+                    memory_permit.reserved_bytes().saturating_add(cached_bytes),
+                )?;
+                let combined_len = checkout
+                    .entry()
                     .accumulated_messages
                     .len()
                     .saturating_add(req.messages.len());
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    combined_len,
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let plan = build_acp_prompt_plan(
                     &req.messages,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     tools_delta.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, mut combined) = checkout.into_lease_guard(combined_len);
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -246,7 +233,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 if guard.model_id() != &resolved_model {
                     guard.set_model_id(resolved_model.clone());
                 }
-                let mut combined = std::mem::take(&mut cached.accumulated_messages);
                 combined.extend(std::mem::take(&mut req.messages));
                 return Ok((
                     guard,
@@ -268,27 +254,22 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             is_compaction_turn = routing.compaction_lookup.is_some();
 
             if let Some((prefix_hash, delta_start)) = routing.prefix_lookup
-                && let Some(cached) = pool.checkout_by_hash(&prefix_hash)
                 && let Some(delta_slice) = req.messages.get(delta_start..)
+                && let Some(checkout) = pool.checkout_by_hash(&prefix_hash, Arc::clone(&backend))
             {
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    req.messages.len(),
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let plan = build_acp_prompt_plan(
                     delta_slice,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     tools_delta.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -318,19 +299,14 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             }
 
             if let Some((dialogue_hash, delta_start)) = routing.compaction_lookup
-                && let Some(cached) = pool.checkout_by_dialogue_hash(&dialogue_hash)
                 && let Some(delta_slice) = req.messages.get(delta_start..)
+                && let Some(checkout) =
+                    pool.checkout_by_dialogue_hash(&dialogue_hash, Arc::clone(&backend))
             {
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    req.messages.len(),
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let directive = build_compaction_directive_xml(
                     req.system_instructions.as_deref(),
@@ -338,11 +314,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 );
                 let plan = build_acp_prompt_plan(
                     delta_slice,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     directive.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {

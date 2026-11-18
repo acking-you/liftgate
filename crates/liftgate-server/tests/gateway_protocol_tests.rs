@@ -4950,7 +4950,8 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
     let limits = GatewayLimits::try_new(64 * 1024, max_body, 64, 32, 32, 30).unwrap();
     let mut scripts = Vec::new();
     // 1 stateless Anthropic + 1 stateless OpenAI(store:false) + 10 stateful OpenAI(store:true)
-    for _ in 0..12 {
+    // + 8 synchronized concurrent uploads
+    for _ in 0..20 {
         scripts.push(MockScript::Immediate {
             thoughts: vec![],
             chunks_template: vec!["ack".to_owned()],
@@ -4959,10 +4960,12 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
     for _ in 0..7 {
         scripts.push(MockScript::HangForever);
     }
-    scripts.push(MockScript::Immediate {
-        thoughts: vec![],
-        chunks_template: vec!["recovered".to_owned()],
-    });
+    for _ in 0..2 {
+        scripts.push(MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["recovered".to_owned()],
+        });
+    }
 
     let backend = Arc::new(MockAcpBackend::new(scripts));
     let state = AppState {
@@ -5132,6 +5135,7 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
 
     // 4. Stateful OpenAI(store:true) turns enforce global retained idle & stored response byte caps.
     let aborted_before_evict = backend.aborted_count.load(Ordering::SeqCst);
+    let mut last_stateful_resp_id = String::new();
     for idx in 0..10 {
         let stateful_req = json!({
             "model": "gpt-5.4",
@@ -5153,6 +5157,11 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+        if idx == 9 {
+            let body_json: Value =
+                serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            last_stateful_resp_id = body_json["id"].as_str().unwrap().to_owned();
+        }
     }
     let (retained_idle, retained_resp) = state.pool.retained_memory_bytes();
     assert!(
@@ -5172,6 +5181,107 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
         snap_after.idle_cached_sessions
     );
     assert!(backend.aborted_count.load(Ordering::SeqCst) > aborted_before_evict);
+
+    // 4b. Synchronized concurrent large uploads do not deadlock in hold-and-wait cycles:
+    //     8 parallel ~28 KiB uploads require ~504 KiB of combined parse headroom (> 256 KiB cap),
+    //     yet upfront zero-permit FIFO admission + immediate post-parse shrink completes all 8.
+    let sync_start = tokio::time::Instant::now();
+    let mut join_set = tokio::task::JoinSet::new();
+    for idx in 0..8 {
+        let app_clone = app.clone();
+        let sync_req = json!({
+            "model": "gpt-5.4",
+            "store": false,
+            "input": [{ "role": "user", "content": format!("sync-{idx}-{}", "s".repeat(28 * 1024)) }]
+        });
+        join_set.spawn(async move {
+            app_clone
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("authorization", "Bearer secret-gate-key")
+                        .header("content-type", "application/json")
+                        .body(Body::from(sync_req.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(joined) = join_set.join_next().await {
+        assert_eq!(joined.unwrap(), StatusCode::OK);
+    }
+    assert!(
+        sync_start.elapsed() < Duration::from_secs(1),
+        "synchronized uploads stalled for {:?} (hold-and-wait regression)",
+        sync_start.elapsed()
+    );
+
+    // 4c. Structural JSON amplification & metadata container bombs are bounded before allocation.
+    let metadata_bomb = json!({
+        "model": "gpt-5.4",
+        "store": false,
+        "input": "ping",
+        "metadata": { "nested": [[], []] }
+    });
+    let meta_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(metadata_bomb.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta_resp.status(), StatusCode::BAD_REQUEST);
+
+    let deep_nesting = format!(
+        r#"{{"model":"gpt-5.4","tool_choice":{}{}}}"#,
+        "[".repeat(65),
+        "]".repeat(65)
+    );
+    let deep_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(deep_nesting))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deep_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 700 empty `[]` containers in a ~2.2 KiB body amplify to >300 KiB estimated AST (> 256 KiB pool cap)
+    // and must fail with 429 (`server_busy`) rather than silently clamping to `max_permits`.
+    let many_arrays = std::iter::repeat_n("[]", 700).collect::<Vec<_>>().join(",");
+    let amp_body = format!(
+        r#"{{"model":"gpt-5.4","store":false,"input":[{{"type":"tool_search_output","tools":[{many_arrays}]}}]}}"#
+    );
+    assert!(amp_body.len() < 4096);
+    let amp_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(amp_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(amp_resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // 5. Concurrent active turn memory saturation enforces global active byte cap (429 server_busy)
     //    and releases permits cleanly via RAII when stalled streams are dropped.
@@ -5224,10 +5334,79 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
             .unwrap();
     assert_eq!(ninth_json["error"]["code"], "server_busy");
 
+    // 5b. Checked-out warm continuations preserve the idle session across both dropped
+    //     `IdleCheckoutGuard`s (cancellation before lease promotion) and active-budget rejection.
+    let aborted_before_checkout = backend.aborted_count.load(Ordering::SeqCst);
+    {
+        let guard = state
+            .pool
+            .checkout_by_response_id(&last_stateful_resp_id, Arc::clone(&backend))
+            .expect("warm stateful session must still be cached");
+        drop(guard);
+    }
+    assert_eq!(
+        backend.aborted_count.load(Ordering::SeqCst),
+        aborted_before_checkout,
+        "dropping IdleCheckoutGuard before RPC must restore warm session without aborting"
+    );
+
+    let saturated_cont_req = json!({
+        "model": "gpt-5.4",
+        "store": true,
+        "previous_response_id": last_stateful_resp_id,
+        "input": [{ "role": "user", "content": format!("cont-busy-{}", "u".repeat(19 * 1024)) }]
+    });
+    let saturated_cont_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(saturated_cont_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saturated_cont_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        backend.aborted_count.load(Ordering::SeqCst),
+        aborted_before_checkout,
+        "rejected previous_response_id continuation must restore warm session intact"
+    );
+
     drop(hanging_streams);
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
+
+    let reused_before = state.pool.snapshot().total_sessions_reused;
+    let warm_cont_req = json!({
+        "model": "gpt-5.4",
+        "store": true,
+        "previous_response_id": last_stateful_resp_id,
+        "input": [{ "role": "user", "content": "follow up after pressure" }]
+    });
+    let warm_cont_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(warm_cont_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warm_cont_resp.status(), StatusCode::OK);
+    assert_eq!(
+        state.pool.snapshot().total_sessions_reused,
+        reused_before + 1,
+        "warm session restored by IdleCheckoutGuard must be reused after pressure clears"
+    );
 
     let recovery_req = json!({
         "model": "gpt-5.4",

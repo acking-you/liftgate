@@ -56,6 +56,11 @@ const CONTROL_ROUTE_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const BODY_PERMIT_QUANTUM_BYTES: usize = 64 * 1024;
 const MAX_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_JSON_NESTING_DEPTH: usize = 64;
+const MAX_JSON_CONTAINERS: usize = 65_536;
+const MAX_JSON_ELEMENTS: usize = 262_144;
+const JSON_CONTAINER_OVERHEAD_BYTES: usize = 384;
+const JSON_ELEMENT_OVERHEAD_BYTES: usize = 64;
 
 /// Compile-time `(relative_slash_path, bytes)` entry for embedded companion web assets.
 pub type EmbeddedUiAsset = (&'static str, &'static [u8]);
@@ -594,12 +599,7 @@ async fn handle_create_response<B: AcpBackend>(
     let active_retained = normalized
         .estimated_retained_bytes()
         .saturating_add(base_resp.estimated_retained_bytes());
-    let admission_timeout = Duration::from_secs(state.config.limits.turn_timeout_secs().get())
-        .min(MAX_ADMISSION_WAIT_TIMEOUT);
-    if let Err(err) = memory_permit
-        .adjust_to_bytes(active_retained, admission_timeout)
-        .await
-    {
+    if let Err(err) = memory_permit.try_adjust_to_bytes(active_retained) {
         return err.into_openai_response();
     }
 
@@ -2264,12 +2264,7 @@ async fn handle_anthropic_messages<B: AcpBackend>(
         Err(err) => return GatewayError::from(err).into_anthropic_response(),
     };
 
-    let admission_timeout = Duration::from_secs(state.config.limits.turn_timeout_secs().get())
-        .min(MAX_ADMISSION_WAIT_TIMEOUT);
-    if let Err(err) = memory_permit
-        .adjust_to_bytes(normalized.estimated_retained_bytes(), admission_timeout)
-        .await
-    {
+    if let Err(err) = memory_permit.try_adjust_to_bytes(normalized.estimated_retained_bytes()) {
         return err.into_anthropic_response();
     }
 
@@ -3378,27 +3373,120 @@ fn parse_content_length_hint(
     Ok(Some(len))
 }
 
+fn validate_and_estimate_json_parse_bytes(buf: &[u8]) -> Result<usize, GatewayError> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut containers = 0usize;
+    let mut elements = 0usize;
+    let mut string_bytes = 0usize;
+
+    for &byte in buf {
+        if in_string {
+            if escaped {
+                escaped = false;
+                string_bytes = string_bytes.saturating_add(1);
+            } else if byte == b'\\' {
+                escaped = true;
+                string_bytes = string_bytes.saturating_add(1);
+            } else if byte == b'"' {
+                in_string = false;
+            } else {
+                string_bytes = string_bytes.saturating_add(1);
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_JSON_NESTING_DEPTH {
+                    return Err(GatewayError::BadJson {
+                        message: format!(
+                            "JSON nesting depth exceeds maximum of {MAX_JSON_NESTING_DEPTH}"
+                        ),
+                    });
+                }
+                containers = containers.saturating_add(1);
+                if containers > MAX_JSON_CONTAINERS {
+                    return Err(GatewayError::BadJson {
+                        message: format!(
+                            "JSON container count exceeds maximum of {MAX_JSON_CONTAINERS}"
+                        ),
+                    });
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+            }
+            b',' | b':' => {
+                elements = elements.saturating_add(1);
+                if elements > MAX_JSON_ELEMENTS {
+                    return Err(GatewayError::BadJson {
+                        message: format!(
+                            "JSON element count exceeds maximum of {MAX_JSON_ELEMENTS}"
+                        ),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ast_bytes = string_bytes
+        .saturating_add(containers.saturating_mul(JSON_CONTAINER_OVERHEAD_BYTES))
+        .saturating_add(elements.saturating_mul(JSON_ELEMENT_OVERHEAD_BYTES));
+    Ok(buf.len().saturating_add(ast_bytes))
+}
+
 async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBackend>(
     state: &AppState<B>,
     req: Request,
 ) -> Result<(T, ActiveMemoryPermit), GatewayError> {
+    use crate::session_pool::baseline_parse_reservation_bytes;
+
     check_auth(req.headers(), state.config.api_key.as_deref())?;
 
     let max_body = state.config.limits.max_body_bytes().get();
-    let content_length_hint = parse_content_length_hint(req.headers(), max_body)?;
+    let header_length_hint = parse_content_length_hint(req.headers(), max_body)?;
 
     let timeout_secs = state.config.limits.turn_timeout_secs().get();
     let turn_timeout = Duration::from_secs(timeout_secs);
     let read_deadline = tokio::time::Instant::now() + turn_timeout.min(MAX_BODY_READ_TIMEOUT);
     let admission_timeout = turn_timeout.min(MAX_ADMISSION_WAIT_TIMEOUT);
 
+    let mut body = req.into_body();
+    let body_exact_hint = match axum::body::HttpBody::size_hint(&body).exact() {
+        Some(exact_u64) => {
+            let exact = usize::try_from(exact_u64).map_err(|_| GatewayError::PayloadTooLarge {
+                max_bytes: max_body,
+            })?;
+            if exact > max_body {
+                return Err(GatewayError::PayloadTooLarge {
+                    max_bytes: max_body,
+                });
+            }
+            Some(exact)
+        }
+        None => None,
+    };
+    let exact_length_hint = header_length_hint.or(body_exact_hint);
+
     let mut permit = state.pool.new_active_memory_permit();
+    if let Some(exact) = exact_length_hint
+        && exact > 0
+    {
+        permit
+            .acquire_initial_bytes(baseline_parse_reservation_bytes(exact), admission_timeout)
+            .await?;
+    }
+
     let mut buf = Vec::with_capacity(
-        content_length_hint
+        exact_length_hint
             .unwrap_or(0)
             .min(BODY_PERMIT_QUANTUM_BYTES),
     );
-    let mut body = req.into_body();
 
     loop {
         let next_frame =
@@ -3425,20 +3513,47 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
                 max_bytes: max_body,
             });
         }
-        let reservation = match content_length_hint {
-            Some(exact) if exact <= BODY_PERMIT_QUANTUM_BYTES && next_len <= exact => exact,
-            _ => next_len
+        if let Some(exact) = exact_length_hint {
+            if next_len > exact {
+                return Err(GatewayError::BadJson {
+                    message: "HTTP request body exceeded declared Content-Length".to_owned(),
+                });
+            }
+        } else {
+            let rounded_body = next_len
                 .div_ceil(BODY_PERMIT_QUANTUM_BYTES)
                 .saturating_mul(BODY_PERMIT_QUANTUM_BYTES)
-                .min(max_body),
-        };
-        permit.grow_to_bytes(reservation, admission_timeout).await?;
+                .min(max_body);
+            let reservation = baseline_parse_reservation_bytes(rounded_body);
+            if permit.reserved_bytes() == 0 {
+                permit
+                    .acquire_initial_bytes(reservation, admission_timeout)
+                    .await?;
+            } else {
+                permit.try_grow_to_bytes(reservation)?;
+            }
+        }
         buf.extend_from_slice(&chunk);
     }
 
-    permit
-        .grow_to_bytes(buf.len().saturating_mul(2), admission_timeout)
-        .await?;
+    if let Some(exact) = header_length_hint
+        && buf.len() != exact
+    {
+        return Err(GatewayError::BadJson {
+            message: "HTTP request body length did not match declared Content-Length".to_owned(),
+        });
+    }
+
+    let parse_reservation = validate_and_estimate_json_parse_bytes(&buf)?;
+    if parse_reservation > 0 {
+        if permit.reserved_bytes() == 0 {
+            permit
+                .acquire_initial_bytes(parse_reservation, admission_timeout)
+                .await?;
+        } else {
+            permit.try_grow_to_bytes(parse_reservation)?;
+        }
+    }
     let parsed: T = serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
         message: err.to_string(),
     })?;

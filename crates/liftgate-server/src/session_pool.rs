@@ -18,6 +18,21 @@ const MAX_ACTIVE_MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
 const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// Baseline active memory reservation for receiving and JSON-decoding an HTTP body of `body_bytes`.
+#[must_use]
+pub const fn baseline_parse_reservation_bytes(body_bytes: usize) -> usize {
+    if body_bytes == 0 {
+        return 0;
+    }
+    let candidate_slack = body_bytes / 16;
+    let slack = if candidate_slack > 4 * 1024 {
+        candidate_slack
+    } else {
+        4 * 1024
+    };
+    body_bytes.saturating_mul(2).saturating_add(slack)
+}
+
 fn bytes_to_permits(bytes: usize) -> u32 {
     if bytes == 0 {
         return 0;
@@ -40,18 +55,49 @@ impl ActiveMemoryPermit {
         (self.permits as usize).saturating_mul(PERMIT_UNIT_BYTES)
     }
 
-    /// Acquires additional 1 KiB permits up to `target_bytes` (clamped to pool capacity).
-    pub async fn grow_to_bytes(
+    fn checked_permits(&self, target_bytes: usize) -> Result<u32, GatewayError> {
+        let target_permits = bytes_to_permits(target_bytes);
+        if target_permits > self.max_permits {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        Ok(target_permits)
+    }
+
+    /// Acquires the initial reservation for a request before it holds any partial permits.
+    ///
+    /// Waiting on `Semaphore::acquire_many` is permitted *only* when `self.permits == 0` so
+    /// concurrent requests can never form a hold-and-wait deadlock cycle. If already holding
+    /// permits, delegates to non-blocking [`Self::try_grow_to_bytes`].
+    pub async fn acquire_initial_bytes(
         &mut self,
         target_bytes: usize,
         timeout: Duration,
     ) -> Result<(), GatewayError> {
-        let target_permits = bytes_to_permits(target_bytes).min(self.max_permits);
+        if self.permits > 0 {
+            return self.try_grow_to_bytes(target_bytes);
+        }
+        let target_permits = self.checked_permits(target_bytes)?;
+        if target_permits == 0 {
+            return Ok(());
+        }
+        let acquired = tokio::time::timeout(timeout, self.sem.acquire_many(target_permits))
+            .await
+            .map_err(|_| GatewayError::RequestBudgetExhausted)?
+            .map_err(|_| GatewayError::RequestBudgetExhausted)?;
+        acquired.forget();
+        self.permits = target_permits;
+        Ok(())
+    }
+
+    /// Non-blockingly grows an existing reservation to `target_bytes`, failing immediately if
+    /// `target_bytes` exceeds pool capacity or insufficient permits are currently free.
+    pub fn try_grow_to_bytes(&mut self, target_bytes: usize) -> Result<(), GatewayError> {
+        let target_permits = self.checked_permits(target_bytes)?;
         if target_permits > self.permits {
             let delta = target_permits - self.permits;
-            let acquired = tokio::time::timeout(timeout, self.sem.acquire_many(delta))
-                .await
-                .map_err(|_| GatewayError::RequestBudgetExhausted)?
+            let acquired = self
+                .sem
+                .try_acquire_many(delta)
                 .map_err(|_| GatewayError::RequestBudgetExhausted)?;
             acquired.forget();
             self.permits = target_permits;
@@ -59,13 +105,10 @@ impl ActiveMemoryPermit {
         Ok(())
     }
 
-    /// Resizes this reservation to `target_bytes`, releasing excess permits immediately without waiting.
-    pub async fn adjust_to_bytes(
-        &mut self,
-        target_bytes: usize,
-        timeout: Duration,
-    ) -> Result<(), GatewayError> {
-        let target_permits = bytes_to_permits(target_bytes).min(self.max_permits);
+    /// Resizes this reservation to `target_bytes` without blocking: shrinks immediately via
+    /// `add_permits`, or attempts non-blocking growth via [`Self::try_grow_to_bytes`].
+    pub fn try_adjust_to_bytes(&mut self, target_bytes: usize) -> Result<(), GatewayError> {
+        let target_permits = self.checked_permits(target_bytes)?;
         if target_permits <= self.permits {
             let release = (self.permits - target_permits) as usize;
             if release > 0 {
@@ -74,7 +117,7 @@ impl ActiveMemoryPermit {
             }
             Ok(())
         } else {
-            self.grow_to_bytes(target_bytes, timeout).await
+            self.try_grow_to_bytes(target_bytes)
         }
     }
 }
@@ -171,10 +214,11 @@ impl SessionPool {
     #[must_use]
     pub fn new(limits: GatewayLimits) -> Self {
         let max_body = limits.max_body_bytes().get();
+        let min_single_turn_bytes = baseline_parse_reservation_bytes(max_body);
         let max_active_bytes = max_body
             .saturating_mul(8)
             .min(MAX_ACTIVE_MEMORY_CAP_BYTES)
-            .max(max_body);
+            .max(min_single_turn_bytes);
         let max_idle_retained_bytes = max_body
             .saturating_mul(6)
             .min(MAX_IDLE_RETAINED_CAP_BYTES)
@@ -244,9 +288,14 @@ impl SessionPool {
         (guard.retained_idle_bytes, guard.retained_response_bytes)
     }
 
-    /// Atomically removes and returns an idle session matching `previous_response_id`.
+    /// Atomically removes an idle session matching `previous_response_id` wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`].
     #[must_use]
-    pub fn checkout_by_response_id(&self, response_id: &str) -> Option<IdleSessionEntry> {
+    pub fn checkout_by_response_id<B: AcpBackend>(
+        self: &Arc<Self>,
+        response_id: &str,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -260,12 +309,18 @@ impl SessionPool {
         guard.retained_idle_bytes = guard
             .retained_idle_bytes
             .saturating_sub(entry.retained_bytes);
-        Some(entry)
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
-    /// Atomically removes and returns an idle session matching a canonical prefix hash.
+    /// Atomically removes an idle session matching a canonical prefix hash wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`].
     #[must_use]
-    pub fn checkout_by_hash(&self, hash: &ConversationHash) -> Option<IdleSessionEntry> {
+    pub fn checkout_by_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -280,13 +335,19 @@ impl SessionPool {
         guard.retained_idle_bytes = guard
             .retained_idle_bytes
             .saturating_sub(entry.retained_bytes);
-        Some(entry)
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
-    /// Atomically removes and returns an idle session matching a pure dialogue hash
+    /// Atomically removes an idle session matching a pure dialogue hash wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`]
     /// (used to run `/compact` summarization against the warm pre-compaction ACP session).
     #[must_use]
-    pub fn checkout_by_dialogue_hash(&self, hash: &ConversationHash) -> Option<IdleSessionEntry> {
+    pub fn checkout_by_dialogue_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -301,7 +362,8 @@ impl SessionPool {
         guard.retained_idle_bytes = guard
             .retained_idle_bytes
             .saturating_sub(entry.retained_bytes);
-        Some(entry)
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
     /// Returns `(active_leased_sessions, idle_cached_sessions)` without cloning session entries.
@@ -581,6 +643,65 @@ pub struct CommittedSessionTurn {
     pub message_count: usize,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+}
+
+/// RAII guard for a warm session checked out of `idle_sessions` before it transitions into an
+/// active turn lease ([`SessionLeaseGuard`]).
+///
+/// If dropped before [`Self::into_lease_guard`] (for example on admission rejection, prompt
+/// validation failure, early `?`, or caller future cancellation), restores the untouched warm
+/// session back to `idle_sessions` (or aborts it if the idle pool has since exceeded capacity).
+pub struct IdleCheckoutGuard<B: AcpBackend> {
+    entry: Option<IdleSessionEntry>,
+    pool: Arc<SessionPool>,
+    backend: Arc<B>,
+}
+
+impl<B: AcpBackend> IdleCheckoutGuard<B> {
+    #[must_use]
+    fn new(entry: IdleSessionEntry, pool: Arc<SessionPool>, backend: Arc<B>) -> Self {
+        Self {
+            entry: Some(entry),
+            pool,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub fn entry(&self) -> &IdleSessionEntry {
+        self.entry
+            .as_ref()
+            .expect("IdleCheckoutGuard entry invariant: populated until into_lease_guard or drop")
+    }
+
+    /// Disarms idle-restore-on-drop and promotes this checked-out session into an active
+    /// [`SessionLeaseGuard`], returning any previously accumulated messages by value.
+    #[must_use]
+    pub fn into_lease_guard(
+        mut self,
+        new_message_count: usize,
+    ) -> (SessionLeaseGuard<B>, Vec<CanonicalMessage>) {
+        let mut entry = self
+            .entry
+            .take()
+            .expect("IdleCheckoutGuard entry invariant: populated until into_lease_guard or drop");
+        let accumulated = std::mem::take(&mut entry.accumulated_messages);
+        let lease = SessionLeaseGuard::from_cached(
+            &entry,
+            new_message_count,
+            Arc::clone(&self.pool),
+            Arc::clone(&self.backend),
+        );
+        (lease, accumulated)
+    }
+}
+
+impl<B: AcpBackend> Drop for IdleCheckoutGuard<B> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.pool.restore_idle_on_reject(entry, &*self.backend);
+        }
+    }
 }
 
 /// RAII lease guard for an active ACP session turn.
