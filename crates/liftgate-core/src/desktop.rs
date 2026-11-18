@@ -38,7 +38,6 @@ use std::time::Duration;
 use liftgate_server::platform::{
     canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
 };
-use liftgate_types::acp::AvailableModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -605,10 +604,6 @@ pub async fn launch_claude_desktop(
 
     let discovered = target.client.fetch_models().await.unwrap_or_default();
     let long_context = infer_live_long_context(&discovered, target.managed_long_context);
-    let available_models: Vec<AvailableModel> = discovered
-        .iter()
-        .map(DiscoveredModel::to_available_model)
-        .collect();
 
     let path_sets = resolve_claude_desktop_path_sets()?;
     let backups = snapshot_claude_desktop_path_sets(&path_sets)?;
@@ -638,7 +633,7 @@ pub async fn launch_claude_desktop(
         &gateway_3p_url,
         &auth_token,
         &primary_model,
-        &available_models,
+        &discovered,
         long_context,
     );
     apply_claude_desktop_3p_profile(&path_sets, &profile_doc)?;
@@ -1032,19 +1027,19 @@ pub fn build_claude_desktop_3p_profile(
     gateway_3p_url: &str,
     api_key: &str,
     primary_model: &str,
-    discovered_models: &[AvailableModel],
+    discovered_models: &[DiscoveredModel],
     long_context: bool,
 ) -> Value {
     let mut ordered: Vec<(String, String)> =
         Vec::with_capacity(discovered_models.len().saturating_add(1));
     let primary_label = discovered_models
         .iter()
-        .find(|m| m.model_id.eq_ignore_ascii_case(primary_model))
+        .find(|m| m.id.eq_ignore_ascii_case(primary_model))
         .map(|m| {
-            if m.name.trim().is_empty() {
-                m.model_id.clone()
+            if m.display_name.trim().is_empty() {
+                m.id.clone()
             } else {
-                m.name.clone()
+                m.display_name.clone()
             }
         })
         .unwrap_or_else(|| primary_model.to_owned());
@@ -1053,16 +1048,16 @@ pub fn build_claude_desktop_3p_profile(
     for model in discovered_models {
         if ordered
             .iter()
-            .any(|(existing_id, _)| existing_id.eq_ignore_ascii_case(&model.model_id))
+            .any(|(existing_id, _)| existing_id.eq_ignore_ascii_case(&model.id))
         {
             continue;
         }
-        let label = if model.name.trim().is_empty() {
-            model.model_id.clone()
+        let label = if model.display_name.trim().is_empty() {
+            model.id.clone()
         } else {
-            model.name.clone()
+            model.display_name.clone()
         };
-        ordered.push((model.model_id.clone(), label));
+        ordered.push((model.id.clone(), label));
         if ordered.len() >= MAX_INFERENCE_MODELS {
             break;
         }
@@ -1072,13 +1067,19 @@ pub fn build_claude_desktop_3p_profile(
         .into_iter()
         .map(|(model_id, label)| {
             let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
-            let (window, _) = liftgate_types::model::context_limits(&model_id, long_context);
-            let supports_1m = window >= 1_000_000;
+            let (window, _) = discovered_models
+                .iter()
+                .find(|m| m.id.eq_ignore_ascii_case(&model_id))
+                .map_or_else(
+                    || liftgate_types::model::context_limits(&model_id, long_context),
+                    |m| m.context_limits(long_context),
+                );
+            let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let mut item = json!({
                 "name": route_id,
                 "labelOverride": label,
             });
-            if supports_1m && let Some(obj) = item.as_object_mut() {
+            if supports_extended && let Some(obj) = item.as_object_mut() {
                 obj.insert("supports1m".to_owned(), json!(true));
                 obj.insert("prefer1m".to_owned(), json!(true));
             }
@@ -3232,9 +3233,11 @@ fn main() {
             "http://127.0.0.1:8787/claude-desktop",
             "agy-local",
             "gemini-4-carbon-high",
-            &[AvailableModel {
-                model_id: "gemini-4-carbon-high".to_owned(),
-                name: "Gemini 4 Carbon (High)".to_owned(),
+            &[DiscoveredModel {
+                id: "gemini-4-carbon-high".to_owned(),
+                display_name: "Gemini 4 Carbon (High)".to_owned(),
+                context_window: 500_000,
+                auto_compact_token_limit: 425_000,
             }],
             false,
         );
@@ -3245,16 +3248,17 @@ fn main() {
         assert_eq!(active_cfg.get("deploymentMode"), Some(&json!("3p")));
         assert!(paths.profile_path.is_file());
         let written_profile = read_json_object_or_empty(&paths.profile_path).unwrap();
-        let first_model_name = written_profile
+        let first_model = written_profile
             .get("inferenceModels")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
             .unwrap();
+        let first_model_name = first_model.get("name").and_then(Value::as_str).unwrap();
         assert!(liftgate_types::model::is_claude_desktop_safe_model_id(
             first_model_name
         ));
+        assert_eq!(first_model.get("supports1m"), Some(&json!(true)));
+        assert_eq!(first_model.get("prefer1m"), Some(&json!(true)));
 
         // Simulate the user adding a new MCP server inside Claude Desktop while running!
         patch_json_key_atomic(

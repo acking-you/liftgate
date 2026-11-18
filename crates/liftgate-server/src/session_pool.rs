@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use liftgate_types::{
     canonical::{CanonicalMessage, CanonicalToolSpec},
     config::{GatewayLimits, ModelId, SessionId},
@@ -10,6 +11,9 @@ use liftgate_types::{
 };
 
 use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
+
+const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
+const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cached metadata for an idle ACP session awaiting a multi-turn continuation.
 #[derive(Clone, Debug)]
@@ -23,9 +27,32 @@ pub struct IdleSessionEntry {
     pub last_context_used: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub message_count: usize,
     pub turn_count: u64,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
+    retained_bytes: usize,
+}
+
+impl IdleSessionEntry {
+    /// Estimates total heap + structural bytes retained while cached in `SessionPool`.
+    #[must_use]
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let tool_bytes = self.declared_tools.iter().fold(0usize, |acc, t| {
+            acc.saturating_add(t.estimated_heap_bytes())
+        });
+        let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
+            acc.saturating_add(m.estimated_heap_bytes())
+        });
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.session_id.as_str().len())
+            .saturating_add(self.tool_nonce.len())
+            .saturating_add(self.model_id.as_str().len())
+            .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
+            .saturating_add(tool_bytes)
+            .saturating_add(msg_bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -38,16 +65,26 @@ struct ActiveLeaseMeta {
     last_response_id: Option<String>,
 }
 
+struct StoredResponseEntry {
+    id: String,
+    retained_bytes: usize,
+    raw_json: Bytes,
+}
+
 /// Bounded LRU pool of idle ACP sessions, active leases, and recent OpenAI `ResponseObject` records.
 pub struct SessionPool {
     limits: GatewayLimits,
+    max_idle_retained_bytes: usize,
+    max_stored_response_bytes: usize,
     inner: Mutex<PoolInner>,
 }
 
 struct PoolInner {
     active_leases: BTreeMap<String, ActiveLeaseMeta>,
     idle_sessions: VecDeque<IdleSessionEntry>,
-    stored_responses: VecDeque<(String, ResponseObject)>,
+    retained_idle_bytes: usize,
+    stored_responses: VecDeque<StoredResponseEntry>,
+    retained_response_bytes: usize,
     total_sessions_created: u64,
     total_sessions_reused: u64,
     total_sessions_closed_or_evicted: u64,
@@ -57,12 +94,26 @@ struct PoolInner {
 impl SessionPool {
     #[must_use]
     pub fn new(limits: GatewayLimits) -> Self {
+        let max_body = limits.max_body_bytes().get();
+        let max_idle_retained_bytes = max_body
+            .saturating_mul(6)
+            .min(MAX_IDLE_RETAINED_CAP_BYTES)
+            .max(max_body);
+        let max_stored_response_bytes = max_body
+            .saturating_mul(2)
+            .min(MAX_STORED_RESPONSES_CAP_BYTES)
+            .max(max_body);
+
         Self {
             limits,
+            max_idle_retained_bytes,
+            max_stored_response_bytes,
             inner: Mutex::new(PoolInner {
                 active_leases: BTreeMap::new(),
                 idle_sessions: VecDeque::with_capacity(limits.max_idle_sessions().get()),
+                retained_idle_bytes: 0,
                 stored_responses: VecDeque::with_capacity(limits.max_stored_responses().get()),
+                retained_response_bytes: 0,
                 total_sessions_created: 0,
                 total_sessions_reused: 0,
                 total_sessions_closed_or_evicted: 0,
@@ -71,25 +122,61 @@ impl SessionPool {
         }
     }
 
-    /// Atomically removes and returns an idle session matching `previous_response_id`.
+    /// Global byte ceiling across cached idle ACP sessions.
     #[must_use]
-    pub fn checkout_by_response_id(&self, response_id: &str) -> Option<IdleSessionEntry> {
+    pub const fn max_idle_retained_bytes(&self) -> usize {
+        self.max_idle_retained_bytes
+    }
+
+    /// Global byte ceiling across cached `GET /v1/responses/{id}` objects.
+    #[must_use]
+    pub const fn max_stored_response_bytes(&self) -> usize {
+        self.max_stored_response_bytes
+    }
+
+    /// Returns `(retained_idle_session_bytes, retained_stored_response_bytes)` currently held.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> (usize, usize) {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (guard.retained_idle_bytes, guard.retained_response_bytes)
+    }
+
+    /// Atomically removes an idle session matching `previous_response_id` wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`].
+    #[must_use]
+    pub fn checkout_by_response_id<B: AcpBackend>(
+        self: &Arc<Self>,
+        response_id: &str,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let pos = guard
-            .idle_sessions
-            .iter()
-            .rposition(|e| e.last_response_id.as_deref() == Some(response_id))?;
+        let pos = guard.idle_sessions.iter().rposition(|e| {
+            !e.accumulated_messages.is_empty() && e.last_response_id.as_deref() == Some(response_id)
+        })?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
-    /// Atomically removes and returns an idle session matching a canonical prefix hash.
+    /// Atomically removes an idle session matching a canonical prefix hash wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`].
     #[must_use]
-    pub fn checkout_by_hash(&self, hash: &ConversationHash) -> Option<IdleSessionEntry> {
+    pub fn checkout_by_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -100,13 +187,23 @@ impl SessionPool {
             .rposition(|e| &e.post_turn_hash == hash)?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
-    /// Atomically removes and returns an idle session matching a pure dialogue hash
+    /// Atomically removes an idle session matching a pure dialogue hash wrapped in a
+    /// cancel-safe [`IdleCheckoutGuard`]
     /// (used to run `/compact` summarization against the warm pre-compaction ACP session).
     #[must_use]
-    pub fn checkout_by_dialogue_hash(&self, hash: &ConversationHash) -> Option<IdleSessionEntry> {
+    pub fn checkout_by_dialogue_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -117,7 +214,12 @@ impl SessionPool {
             .rposition(|e| &e.post_turn_dialogue_hash == hash)?;
         guard.total_sessions_reused += 1;
         guard.last_activity_unix_ms = unix_timestamp_ms();
-        guard.idle_sessions.remove(pos)
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
     }
 
     /// Returns `(active_leased_sessions, idle_cached_sessions)` without cloning session entries.
@@ -148,6 +250,7 @@ impl SessionPool {
         };
         let count = guard.idle_sessions.len() as u64;
         guard.total_sessions_closed_or_evicted += count;
+        guard.retained_idle_bytes = 0;
         guard.idle_sessions.drain(..).collect()
     }
 
@@ -166,7 +269,12 @@ impl SessionPool {
                 return false;
             };
             guard.total_sessions_closed_or_evicted += 1;
-            guard.idle_sessions.remove(pos)
+            let entry = guard.idle_sessions.remove(pos);
+            if let Some(ref e) = entry {
+                guard.retained_idle_bytes =
+                    guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
+            }
+            entry
         };
 
         if let Some(entry) = removed {
@@ -179,20 +287,46 @@ impl SessionPool {
 
     /// Stores a completed OpenAI `ResponseObject` for `GET /v1/responses/{id}` inspection.
     pub fn store_response(&self, response: ResponseObject) {
+        if !response.store {
+            return;
+        }
+        let Ok(serialized) = serde_json::to_vec(&response) else {
+            return;
+        };
+        let raw_json = Bytes::from(serialized);
+        let resp_bytes = std::mem::size_of::<StoredResponseEntry>()
+            .saturating_add(response.id.len())
+            .saturating_add(raw_json.len());
+        if resp_bytes > self.max_stored_response_bytes {
+            return;
+        }
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.stored_responses.len() >= self.limits.max_stored_responses().get() {
-            let _ = guard.stored_responses.pop_front();
+        while guard.stored_responses.len() >= self.limits.max_stored_responses().get()
+            || (!guard.stored_responses.is_empty()
+                && guard.retained_response_bytes.saturating_add(resp_bytes)
+                    > self.max_stored_response_bytes)
+        {
+            if let Some(old) = guard.stored_responses.pop_front() {
+                guard.retained_response_bytes = guard
+                    .retained_response_bytes
+                    .saturating_sub(old.retained_bytes);
+            } else {
+                break;
+            }
         }
-        guard
-            .stored_responses
-            .push_back((response.id.clone(), response));
+        guard.retained_response_bytes = guard.retained_response_bytes.saturating_add(resp_bytes);
+        guard.stored_responses.push_back(StoredResponseEntry {
+            id: response.id,
+            retained_bytes: resp_bytes,
+            raw_json,
+        });
     }
 
     #[must_use]
-    pub fn get_response(&self, response_id: &str) -> Option<ResponseObject> {
+    pub fn get_response_json(&self, response_id: &str) -> Option<Bytes> {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -201,8 +335,8 @@ impl SessionPool {
             .stored_responses
             .iter()
             .rev()
-            .find(|(id, _)| id == response_id)
-            .map(|(_, obj)| obj.clone())
+            .find(|entry| entry.id == response_id)
+            .map(|entry| entry.raw_json.clone())
     }
 
     /// Captures a telemetry snapshot of all running and cached ACP sessions.
@@ -233,7 +367,7 @@ impl SessionPool {
                 model_id: idle.model_id.as_str().to_owned(),
                 state: SessionSlotState::Idle,
                 turn_count: idle.turn_count,
-                message_count: idle.accumulated_messages.len(),
+                message_count: idle.message_count,
                 created_at_unix_ms: idle.created_at_unix_ms,
                 last_active_unix_ms: idle.last_active_unix_ms,
                 last_response_id: idle.last_response_id.clone(),
@@ -285,7 +419,46 @@ impl SessionPool {
         guard.last_activity_unix_ms = unix_timestamp_ms();
     }
 
-    fn checkin<B: AcpBackend>(&self, entry: IdleSessionEntry, backend: &B) {
+    /// Returns a checked-out idle session back to the LRU pool when turn admission is rejected
+    /// before any RPC mutates the underlying ACP session.
+    pub(crate) fn restore_idle_on_reject<B: AcpBackend>(
+        &self,
+        entry: IdleSessionEntry,
+        backend: &B,
+    ) {
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.total_sessions_reused = guard.total_sessions_reused.saturating_sub(1);
+        }
+        self.checkin(entry, backend);
+    }
+
+    fn checkin<B: AcpBackend>(&self, mut entry: IdleSessionEntry, backend: &B) {
+        let mut entry_bytes = entry.estimated_retained_bytes();
+        if entry_bytes > self.max_idle_retained_bytes && !entry.accumulated_messages.is_empty() {
+            entry.accumulated_messages.clear();
+            entry.accumulated_messages.shrink_to_fit();
+            entry_bytes = entry.estimated_retained_bytes();
+        }
+        entry.retained_bytes = entry_bytes;
+
+        if entry_bytes > self.max_idle_retained_bytes {
+            {
+                let mut guard = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.last_activity_unix_ms = entry.last_active_unix_ms;
+                let _ = guard.active_leases.remove(entry.session_id.as_str());
+                guard.total_sessions_closed_or_evicted += 1;
+            }
+            backend.abort_session_nonblocking(&entry.session_id);
+            return;
+        }
+
         let evicted = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
@@ -293,18 +466,102 @@ impl SessionPool {
             };
             guard.last_activity_unix_ms = entry.last_active_unix_ms;
             let _ = guard.active_leases.remove(entry.session_id.as_str());
-            let evicted = if guard.idle_sessions.len() >= self.limits.max_idle_sessions().get() {
-                guard.total_sessions_closed_or_evicted += 1;
-                guard.idle_sessions.pop_front()
-            } else {
-                None
-            };
+            let mut evicted = Vec::new();
+            while guard.idle_sessions.len() >= self.limits.max_idle_sessions().get()
+                || (!guard.idle_sessions.is_empty()
+                    && guard
+                        .retained_idle_bytes
+                        .saturating_add(entry.retained_bytes)
+                        > self.max_idle_retained_bytes)
+            {
+                if let Some(old) = guard.idle_sessions.pop_front() {
+                    guard.retained_idle_bytes =
+                        guard.retained_idle_bytes.saturating_sub(old.retained_bytes);
+                    guard.total_sessions_closed_or_evicted += 1;
+                    evicted.push(old);
+                } else {
+                    break;
+                }
+            }
+            guard.retained_idle_bytes = guard
+                .retained_idle_bytes
+                .saturating_add(entry.retained_bytes);
             guard.idle_sessions.push_back(entry);
             evicted
         };
 
-        if let Some(old) = evicted {
+        for old in evicted {
             backend.abort_session_nonblocking(&old.session_id);
+        }
+    }
+}
+
+/// Post-turn session state committed back to `SessionPool` when an interactive turn completes.
+pub struct CommittedSessionTurn {
+    pub post_turn_hash: ConversationHash,
+    pub post_turn_dialogue_hash: ConversationHash,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub last_context_used: u64,
+    pub message_count: usize,
+    pub last_response_id: Option<String>,
+    pub accumulated_messages: Vec<CanonicalMessage>,
+}
+
+/// RAII guard for a warm session checked out of `idle_sessions` before it transitions into an
+/// active turn lease ([`SessionLeaseGuard`]).
+///
+/// If dropped before [`Self::into_lease_guard`] (for example on admission rejection, prompt
+/// validation failure, early `?`, or caller future cancellation), restores the untouched warm
+/// session back to `idle_sessions` (or aborts it if the idle pool has since exceeded capacity).
+pub struct IdleCheckoutGuard<B: AcpBackend> {
+    entry: Option<IdleSessionEntry>,
+    pool: Arc<SessionPool>,
+    backend: Arc<B>,
+}
+
+impl<B: AcpBackend> IdleCheckoutGuard<B> {
+    #[must_use]
+    fn new(entry: IdleSessionEntry, pool: Arc<SessionPool>, backend: Arc<B>) -> Self {
+        Self {
+            entry: Some(entry),
+            pool,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub fn entry(&self) -> &IdleSessionEntry {
+        self.entry
+            .as_ref()
+            .expect("IdleCheckoutGuard entry invariant: populated until into_lease_guard or drop")
+    }
+
+    /// Disarms idle-restore-on-drop and promotes this checked-out session into an active
+    /// [`SessionLeaseGuard`], returning any previously accumulated messages by value.
+    #[must_use]
+    pub fn into_lease_guard(
+        mut self,
+        new_message_count: usize,
+    ) -> (SessionLeaseGuard<B>, Vec<CanonicalMessage>) {
+        let mut entry = self
+            .entry
+            .take()
+            .expect("IdleCheckoutGuard entry invariant: populated until into_lease_guard or drop");
+        let accumulated = std::mem::take(&mut entry.accumulated_messages);
+        let lease = SessionLeaseGuard::from_cached(
+            &entry,
+            new_message_count,
+            Arc::clone(&self.pool),
+            Arc::clone(&self.backend),
+        );
+        (lease, accumulated)
+    }
+}
+
+impl<B: AcpBackend> Drop for IdleCheckoutGuard<B> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.pool.restore_idle_on_reject(entry, &*self.backend);
         }
     }
 }
@@ -431,30 +688,24 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     }
 
     /// Disarms abort-on-drop and returns the healthy session to `pool` for future turns.
-    pub fn commit(
-        mut self,
-        post_turn_hash: ConversationHash,
-        post_turn_dialogue_hash: ConversationHash,
-        declared_tools: Vec<CanonicalToolSpec>,
-        last_context_used: u64,
-        last_response_id: Option<String>,
-        accumulated_messages: Vec<CanonicalMessage>,
-    ) {
+    pub fn commit(mut self, committed: CommittedSessionTurn) {
         self.armed = false;
         let now_ms = unix_timestamp_ms();
         let entry = IdleSessionEntry {
             session_id: self.session_id.clone(),
             tool_nonce: Arc::clone(&self.tool_nonce),
             model_id: self.model_id.clone(),
-            post_turn_hash,
-            post_turn_dialogue_hash,
-            declared_tools,
-            last_context_used,
-            last_response_id,
-            accumulated_messages,
+            post_turn_hash: committed.post_turn_hash,
+            post_turn_dialogue_hash: committed.post_turn_dialogue_hash,
+            declared_tools: committed.declared_tools,
+            last_context_used: committed.last_context_used,
+            last_response_id: committed.last_response_id,
+            accumulated_messages: committed.accumulated_messages,
+            message_count: committed.message_count,
             turn_count: self.turn_count,
             created_at_unix_ms: self.created_at_unix_ms,
             last_active_unix_ms: now_ms,
+            retained_bytes: 0,
         };
         self.pool.checkin(entry, &*self.backend);
     }

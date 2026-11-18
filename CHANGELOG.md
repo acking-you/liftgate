@@ -10,7 +10,13 @@ All notable changes to this project will be documented in this file.
   - Enforces fail-closed `SHA256SUMS` verification, `--version` smoke checks, atomic same-directory staging safe while a background gateway is running, isolation from system-packaged (`dpkg`/`rpm`, including merged-`/usr` `/bin` symlinks) and Inno Setup desktop installs, login + interactive shell `PATH` setup, and `LIFTGATE_VERSION`, `LIFTGATE_BIN_DIR`, `LIFTGATE_NO_MODIFY_PATH`, `LIFTGATE_TARGET`, `LIFTGATE_REPO`, and `LIFTGATE_BASE_URL` overrides.
 
 ### Changed
+- **500K default Gemini context window across `/v1/responses`, `/v1/messages`, `lg cc`, and `lg cx`**:
+  - Raised default `gemini-*` context limits from `280,000 / 245,000` to **`500,000 / 425,000`** tokens across `GET /v1/models` (now including per-model `description` metadata), `GET /v1/codex-models`, Claude Code `modelSettings.autoCompactWindow`, CLI status, and `liftgate-desktop` (retaining `1,000,000 / 850,000` under explicit `--long-context`), and updated `infer_live_long_context` so 500k default gateways are never misclassified as experimental 1M mode.
+  - Scaled Codex per-tool output `truncation_policy.limit` to `80,000` bytes on 500k+ models, raised default HTTP request body / ACP line limits to `32 MiB` / `48 MiB` (with pre-body authentication, streaming `413` payload caps, zero-clone message handoff, stateless history elision, and compact `Bytes`-backed response caching in `SessionPool`), doubled lossless cold-session Flash hydration capacity (`MAX_HYDRATION_SEED_CHUNKS = 10`, ~1.73 MB) and bounded cold-history tail retention, counted embedded `tool_result` image blocks in `POST /v1/messages/count_tokens`, unlocked extended >200k context (`supports1m` / `prefer1m`) for 500k Gemini models in Claude Desktop (`lg cd`), added `ANTHROPIC_DEFAULT_FABLE_MODEL` routing, and prevented `modelOverrides` from shadowing distinct selectable models (such as `claude-sonnet-4-6`) in Claude Code's `/model` picker.
 - Refreshed `README.md`, `README.zh-CN.md`, and `docs/usage*.md` with one-line CLI install commands, a dedicated **Liftgate Desktop** overview, and direct download links to the latest `vX.Y.Z-ui` desktop installers.
+
+### Removed
+- Removed obsolete `start-agy.{ps1,cmd,sh}` wrapper scripts from the repository and release archives (superseded by the single-binary `lg cx`, `lg cc`, `lg cxa`, and `lg cd` launchers).
 
 ## [0.2.0] - 2026-11-17
 

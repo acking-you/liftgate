@@ -23,7 +23,11 @@ pub enum AcpError {
     HydrationCompacted,
 
     #[error("upstream ACP model `{model}` context window exceeded: {detail}")]
-    ContextLengthExceeded { model: String, detail: String },
+    ContextLengthExceeded {
+        model: String,
+        long_context: bool,
+        detail: String,
+    },
     #[error("failed to spawn ACP subprocess `{}`", path.display())]
     SpawnProcess {
         path: PathBuf,
@@ -108,6 +112,9 @@ pub enum GatewayError {
     #[error("invalid or missing gateway API key")]
     Unauthorized,
 
+    #[error("request payload exceeds maximum allowed size ({max_bytes} bytes)")]
+    PayloadTooLarge { max_bytes: usize },
+
     #[error("requested resource `{resource}` was not found")]
     NotFound { resource: String },
 
@@ -138,6 +145,7 @@ impl GatewayError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_status(source),
@@ -154,6 +162,7 @@ impl GatewayError {
     pub fn anthropic_status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_anthropic_status(source),
@@ -211,6 +220,7 @@ impl GatewayError {
     pub fn stable_kind(&self) -> (&'static str, &'static str) {
         match self {
             Self::Unauthorized => ("authentication_error", "invalid_api_key"),
+            Self::PayloadTooLarge { .. } => ("invalid_request_error", "request_too_large"),
             Self::NotFound { .. } => ("not_found_error", "not_found"),
             Self::BadJson { .. } => ("invalid_request_error", "invalid_request"),
             Self::Protocol { source } => {
@@ -230,6 +240,7 @@ impl GatewayError {
     pub fn anthropic_error_type(&self) -> &'static str {
         match self {
             Self::Unauthorized => "authentication_error",
+            Self::PayloadTooLarge { .. } => "request_too_large",
             Self::NotFound { .. } => "not_found_error",
             Self::BadJson { .. } | Self::Protocol { .. } => "invalid_request_error",
             Self::Acp { source } => Self::acp_anthropic_error_type(source),
@@ -290,21 +301,31 @@ impl GatewayError {
         match self {
             Self::Protocol { source } => {
                 let bytes = source.context_overflow_bytes()?;
-                let max_tokens = 200_000u64;
+                let max_tokens = liftgate_types::model::GEMINI_DEFAULT_WINDOW;
                 let used_tokens = ((bytes as u64) / 4).max(max_tokens + 1);
                 Some((used_tokens, max_tokens))
             }
             Self::Acp { source } => Self::acp_context_overflow_tokens(source),
             Self::SharedAcp { source } => Self::acp_context_overflow_tokens(source),
-            Self::Unauthorized | Self::NotFound { .. } | Self::BadJson { .. } => None,
+            Self::Unauthorized
+            | Self::PayloadTooLarge { .. }
+            | Self::NotFound { .. }
+            | Self::BadJson { .. } => None,
         }
     }
 
     fn acp_context_overflow_tokens(source: &AcpError) -> Option<(u64, u64)> {
         match source {
-            AcpError::HydrationCompacted => Some((280_001, 280_000)),
-            AcpError::ContextLengthExceeded { model, .. } => {
-                let (max_tokens, _) = liftgate_types::model::context_limits(model, false);
+            AcpError::HydrationCompacted => Some((
+                liftgate_types::model::GEMINI_DEFAULT_WINDOW + 1,
+                liftgate_types::model::GEMINI_DEFAULT_WINDOW,
+            )),
+            AcpError::ContextLengthExceeded {
+                model,
+                long_context,
+                ..
+            } => {
+                let (max_tokens, _) = liftgate_types::model::context_limits(model, *long_context);
                 Some((max_tokens + 1, max_tokens))
             }
             AcpError::SpawnProcess { .. }
@@ -337,6 +358,9 @@ impl GatewayError {
     pub fn client_message(&self) -> String {
         match self {
             Self::Unauthorized => "Invalid or missing API key.".to_owned(),
+            Self::PayloadTooLarge { max_bytes } => {
+                format!("Request body exceeds maximum allowed size ({max_bytes} bytes).")
+            }
             Self::NotFound { resource } => format!("Resource `{resource}` was not found."),
             Self::BadJson { message } => format!("Malformed JSON request body: {message}"),
             Self::Protocol { source } => source.to_string(),

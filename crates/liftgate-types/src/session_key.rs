@@ -1249,8 +1249,9 @@ pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 176_000;
 /// Progressive schema-compaction ceiling for spilled or incremental `<client_tools_update>` blocks.
 const MAX_TOOL_DIRECTIVE_BYTES: usize = 48_000;
 
-/// Maximum number of fast Flash seed chunks before the final target-model turn (`5 * 156 KB + 176 KB ≈ 956 KB`).
-pub const MAX_HYDRATION_SEED_CHUNKS: usize = 5;
+/// Maximum number of fast Flash seed chunks before the final target-model turn
+/// (`10 * 156 KB + 176 KB ≈ 1.73 MB`, scaling lossless hydration to 500k context sessions).
+pub const MAX_HYDRATION_SEED_CHUNKS: usize = 10;
 
 /// Maximum text capacity before framing; fragmented blocks can reach the turn cap sooner.
 pub const MAX_LOSSLESS_HYDRATION_BYTES: usize =
@@ -1260,7 +1261,7 @@ const SEED_CHUNK_TARGET_TEXT_BYTES: usize = 156_000;
 
 const MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES: usize = 76_000;
 const MAX_HISTORY_RESERVE_BYTES: usize = 48_000;
-const RECENT_TAIL_HISTORY_MESSAGES: usize = 14;
+const RECENT_TAIL_HISTORY_MESSAGES: usize = 28;
 
 const _: () = {
     assert!(
@@ -3137,7 +3138,7 @@ mod tests {
             role: CanonicalRole::User,
             parts: vec![CanonicalPart::Text(format!(
                 "MEGA_HEAD_MARKER\n{}\nMEGA_TAIL_MARKER",
-                "x".repeat(980_000)
+                "x".repeat(MAX_LOSSLESS_HYDRATION_BYTES + 64_000)
             ))],
         }];
         let bounded_mega = build_acp_prompt_plan(&oversized, "nonce", false, None, true)
@@ -3153,6 +3154,39 @@ mod tests {
         assert!(mega_text.contains("MEGA_HEAD_MARKER"));
         assert!(mega_text.contains("MEGA_TAIL_MARKER"));
         assert!(mega_text.contains("[Gateway truncated input text:"));
+
+        // A ~1.25 MB (~350k token) multi-turn transcript within the 500k context ceiling must
+        // hydrate 100% losslessly without any middle-truncation markers.
+        let mut history_500k = Vec::new();
+        for step in 0..8 {
+            history_500k.push(CanonicalMessage {
+                role: if step % 2 == 0 {
+                    CanonicalRole::User
+                } else {
+                    CanonicalRole::Assistant
+                },
+                parts: vec![CanonicalPart::Text(format!(
+                    "STEP_MARKER_{step}\n{}",
+                    "y".repeat(150_000)
+                ))],
+            });
+        }
+        let plan_500k = build_acp_prompt_plan(&history_500k, "nonce", true, None, true).unwrap();
+        assert!(
+            plan_500k.seed_chunks.len() >= 6
+                && plan_500k.seed_chunks.len() <= MAX_HYDRATION_SEED_CHUNKS
+        );
+        for chunk in plan_500k
+            .seed_chunks
+            .iter()
+            .chain([&plan_500k.final_blocks])
+        {
+            for block in chunk {
+                if let AcpPromptBlock::Text { text } = block {
+                    assert!(!text.contains("[Gateway truncated input text:"));
+                }
+            }
+        }
         assert!(
             !plan.seed_chunks.is_empty() && plan.seed_chunks.len() <= MAX_HYDRATION_SEED_CHUNKS,
             "expected 1..={} seed chunks, got {}",

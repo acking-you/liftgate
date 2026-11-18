@@ -568,6 +568,10 @@ fn build_claude_gateway_env_pairs(
         ("ANTHROPIC_AUTH_TOKEN".to_owned(), auth_token.to_owned()),
         ("ANTHROPIC_MODEL".to_owned(), primary_model.to_owned()),
         (
+            "ANTHROPIC_DEFAULT_FABLE_MODEL".to_owned(),
+            primary_model.to_owned(),
+        ),
+        (
             "ANTHROPIC_DEFAULT_OPUS_MODEL".to_owned(),
             primary_model.to_owned(),
         ),

@@ -1033,12 +1033,12 @@ export function App(): React.JSX.Element {
                 <CardContent>
                   <pre className="overflow-x-auto rounded-lg border bg-black/50 p-3 font-mono text-xs leading-relaxed">
                     {`# 推荐一键启动（自动从 /v1/codex-models 同步全量模型目录，不改动原有配置）
-.\\start-agy.cmd -Codex   # Linux/macOS: ./start-agy.sh --codex
+lg cx   # 或打开桌面端: lg cxa
 
 # 或手动写入 ~/.codex/config.toml
 model = "${acp?.default_model ?? "gemini-4-carbon-high"}"
 model_provider = "agy"
-model_catalog_json = ".agy-runtime/codex-model-catalog.json"
+model_catalog_json = "~/.codex/agy-models.json"
 web_search = "live"
 
 [model_providers.agy]
@@ -1058,16 +1058,19 @@ wire_api = "responses"`}
                 </CardHeader>
                 <CardContent>
                   <pre className="overflow-x-auto rounded-lg border bg-black/50 p-3 font-mono text-xs leading-relaxed">
-                    {`# Linux / macOS
+                    {`# 推荐一键启动（自动同步 500k 逐模型压缩窗口，不改动原有配置）
+lg cc   # 或打开桌面端: lg cd
+
+# Linux / macOS 手动环境变量
 export ANTHROPIC_BASE_URL="${effectiveGatewayOrigin}"
 export ANTHROPIC_AUTH_TOKEN="${apiKey || "local-agy"}"
-export ANTHROPIC_MODEL="claude-sonnet-5-5-high"
+export ANTHROPIC_MODEL="${acp?.default_model ?? "gemini-4-carbon-high"}"
 claude
 
-# Windows PowerShell
+# Windows PowerShell 手动环境变量
 $env:ANTHROPIC_BASE_URL="${effectiveGatewayOrigin}"
 $env:ANTHROPIC_AUTH_TOKEN="${apiKey || "local-agy"}"
-$env:ANTHROPIC_MODEL="claude-sonnet-5-5-high"
+$env:ANTHROPIC_MODEL="${acp?.default_model ?? "gemini-4-carbon-high"}"
 claude`}
                   </pre>
                 </CardContent>

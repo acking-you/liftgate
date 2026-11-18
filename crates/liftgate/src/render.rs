@@ -241,7 +241,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         if report.long_context {
             "experimental long-context (1M Gemini / Flash hydration)"
         } else {
-            "native single-turn (280k Gemini / 200k Claude / 128k GPT-OSS)"
+            "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)"
         },
     );
     ui::kv("Service Log", &report.log_file.display().to_string());

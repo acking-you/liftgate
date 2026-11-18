@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
-    session_pool::{SessionLeaseGuard, SessionPool},
+    session_pool::{CommittedSessionTurn, SessionLeaseGuard, SessionPool},
     telemetry::{ActiveTaskGuard, TelemetryHub, unix_timestamp_ms},
     web_fetch::WebFetchOutcome,
 };
@@ -185,28 +185,27 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         //    check out or cancel the user's active conversation session).
         if !is_ephemeral_aux {
             if let Some(prev_resp_id) = req.previous_response_id.as_deref()
-                && let Some(cached) = pool.checkout_by_response_id(prev_resp_id)
+                && let Some(checkout) =
+                    pool.checkout_by_response_id(prev_resp_id, Arc::clone(&backend))
             {
-                let mut combined = cached.accumulated_messages.clone();
-                combined.extend(req.messages.iter().cloned());
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    combined.len(),
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
+                let combined_len = checkout
+                    .entry()
+                    .accumulated_messages
+                    .len()
+                    .saturating_add(req.messages.len());
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let plan = build_acp_prompt_plan(
                     &req.messages,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     tools_delta.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, mut combined) = checkout.into_lease_guard(combined_len);
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -225,6 +224,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 if guard.model_id() != &resolved_model {
                     guard.set_model_id(resolved_model.clone());
                 }
+                combined.extend(std::mem::take(&mut req.messages));
                 return Ok((
                     guard,
                     true,
@@ -245,27 +245,22 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             is_compaction_turn = routing.compaction_lookup.is_some();
 
             if let Some((prefix_hash, delta_start)) = routing.prefix_lookup
-                && let Some(cached) = pool.checkout_by_hash(&prefix_hash)
                 && let Some(delta_slice) = req.messages.get(delta_start..)
+                && let Some(checkout) = pool.checkout_by_hash(&prefix_hash, Arc::clone(&backend))
             {
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    req.messages.len(),
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let plan = build_acp_prompt_plan(
                     delta_slice,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     tools_delta.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -290,24 +285,19 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     is_compaction_turn,
                     initial_rpc_model.clone(),
                     plan,
-                    req.messages.clone(),
+                    std::mem::take(&mut req.messages),
                 ));
             }
 
             if let Some((dialogue_hash, delta_start)) = routing.compaction_lookup
-                && let Some(cached) = pool.checkout_by_dialogue_hash(&dialogue_hash)
                 && let Some(delta_slice) = req.messages.get(delta_start..)
+                && let Some(checkout) =
+                    pool.checkout_by_dialogue_hash(&dialogue_hash, Arc::clone(&backend))
             {
-                let mut guard = SessionLeaseGuard::from_cached(
-                    &cached,
-                    req.messages.len(),
-                    Arc::clone(&pool),
-                    Arc::clone(&backend),
-                );
                 let tools_delta = build_client_tools_delta_xml(
-                    guard.declared_tools(),
+                    &checkout.entry().declared_tools,
                     &req.client_tools,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                 );
                 let directive = build_compaction_directive_xml(
                     req.system_instructions.as_deref(),
@@ -315,11 +305,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 );
                 let plan = build_acp_prompt_plan(
                     delta_slice,
-                    guard.tool_nonce(),
+                    &checkout.entry().tool_nonce,
                     false,
                     directive.as_deref(),
                     cfg.long_context,
                 )?;
+                let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
                 let initial_rpc_model = if plan.seed_chunks.is_empty() {
                     &resolved_model
                 } else {
@@ -349,7 +340,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     true,
                     initial_rpc_model.clone(),
                     plan,
-                    req.messages.clone(),
+                    std::mem::take(&mut req.messages),
                 ));
             }
         }
@@ -415,7 +406,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             is_ephemeral_aux || is_compaction_turn,
             initial_rpc_model.clone(),
             plan,
-            req.messages.clone(),
+            std::mem::take(&mut req.messages),
         ))
     }
     .await;
@@ -424,7 +415,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         match setup_res {
             Ok(t) => t,
             Err(err) => {
-                let err = upgrade_gateway_error(err, &resolved_model);
+                let err = upgrade_gateway_error(err, &resolved_model, cfg.long_context);
                 task_guard.fail(err.to_string());
                 return Err(err);
             }
@@ -453,6 +444,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         web_cfg,
         active_model,
         initial_rpc_model,
+        cfg.long_context,
         retire_after_turn,
         worker_resp_id,
         deadline,
@@ -589,6 +581,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
     mut current_rpc_model: ModelId,
+    long_context: bool,
     retire_after_turn: bool,
     response_id: String,
     deadline: Instant,
@@ -640,6 +633,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 &session_id,
                 &chunk_blocks,
                 &current_rpc_model,
+                &active_model,
+                long_context,
                 &mut state,
                 deadline,
                 timeout_secs,
@@ -655,7 +650,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "ACP context hydration seed step failed");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -678,7 +673,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "failed to switch hydrated ACP session to target model");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -921,7 +916,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
             if let Some(old_lease) = lease.take() {
                 old_lease.finish_ephemeral();
             }
-            let err = signal_to_acp_error(sig, &active_model, detail);
+            let err = signal_to_acp_error(sig, &active_model, long_context, detail);
             tracing::error!(error = ?err, "aborting ACP prompt immediately due to upstream quota/context/rate-limit/fatal banner");
             task_guard.fail(err.to_string());
             let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -1085,7 +1080,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 if let Some(old_lease) = lease.take() {
                     old_lease.finish_ephemeral();
                 }
-                let err = upgrade_acp_error(err, &active_model);
+                let err = upgrade_acp_error(err, &active_model, long_context);
                 tracing::error!(error = ?err, "ACP prompt turn failed");
                 task_guard.fail(err.to_string());
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
@@ -1121,6 +1116,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
         let recent_stderr = backend.recent_stderr_since(last_step_started_ms);
         let err = build_zero_output_error(
             &active_model,
+            long_context,
             &final_stop_reason,
             last_turn_error.as_deref(),
             &last_suppressed_banners,
@@ -1161,19 +1157,26 @@ async fn run_turn_pipeline<B: AcpBackend>(
             let dialogue_hash =
                 hash_dialogue_with_reply(final_lease.model_id(), &full_messages, &assistant_msg);
             full_messages.push(assistant_msg);
+            let message_count = full_messages.len();
+            let retained_messages = if req.retain_response_history {
+                full_messages
+            } else {
+                Vec::new()
+            };
             let committed_context_used = if state.turn_peak_context_used > 0 {
                 state.latest_context_used
             } else {
                 context_usage.total_tokens
             };
-            final_lease.commit(
-                post_hash,
-                dialogue_hash,
-                req.client_tools,
-                committed_context_used,
-                Some(response_id),
-                full_messages,
-            );
+            final_lease.commit(CommittedSessionTurn {
+                post_turn_hash: post_hash,
+                post_turn_dialogue_hash: dialogue_hash,
+                declared_tools: req.client_tools,
+                last_context_used: committed_context_used,
+                message_count,
+                last_response_id: Some(response_id),
+                accumulated_messages: retained_messages,
+            });
         }
     }
 
@@ -1290,6 +1293,8 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     session_id: &liftgate_types::config::SessionId,
     chunk_blocks: &[AcpPromptBlock],
     seed_model: &ModelId,
+    target_model: &ModelId,
+    long_context: bool,
     state: &mut TurnStreamState,
     deadline: Instant,
     timeout_secs: u64,
@@ -1321,7 +1326,13 @@ async fn run_hydration_seed_step<B: AcpBackend>(
                         sink.clear();
                         banner_filter.feed(&content.text, &mut sink);
                         if let Some((sig, detail)) = banner_filter.take_signal() {
-                            return Err(signal_to_acp_error(sig, seed_model, detail));
+                            let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded
+                            {
+                                target_model
+                            } else {
+                                seed_model
+                            };
+                            return Err(signal_to_acp_error(sig, model_for_err, long_context, detail));
                         }
                     }
                     Some(SessionUpdatePayload::Error { message, error }) => {
@@ -1329,7 +1340,13 @@ async fn run_hydration_seed_step<B: AcpBackend>(
                         if !detail.is_empty() {
                             let sig = classify_upstream_error_text(&detail)
                                 .unwrap_or(UpstreamBannerSignal::FatalAgentError);
-                            return Err(signal_to_acp_error(sig, seed_model, detail));
+                            let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded
+                            {
+                                target_model
+                            } else {
+                                seed_model
+                            };
+                            return Err(signal_to_acp_error(sig, model_for_err, long_context, detail));
                         }
                     }
                     Some(SessionUpdatePayload::UsageUpdate { used, size }) => {
@@ -1360,7 +1377,17 @@ async fn run_hydration_seed_step<B: AcpBackend>(
     sink.clear();
     banner_filter.finish(&mut sink);
     if let Some((sig, detail)) = banner_filter.take_signal() {
-        return Err(signal_to_acp_error(sig, seed_model, detail));
+        let model_for_err = if sig == UpstreamBannerSignal::ContextLengthExceeded {
+            target_model
+        } else {
+            seed_model
+        };
+        return Err(signal_to_acp_error(
+            sig,
+            model_for_err,
+            long_context,
+            detail,
+        ));
     }
 
     match outcome {
@@ -1592,16 +1619,16 @@ fn format_update_error_detail(message: &str, error: Option<&RawValue>) -> String
     }
 }
 
-fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
+fn upgrade_gateway_error(err: GatewayError, model: &ModelId, long_context: bool) -> GatewayError {
     match err {
         GatewayError::Acp { source } => GatewayError::Acp {
-            source: upgrade_acp_error(source, model),
+            source: upgrade_acp_error(source, model, long_context),
         },
         GatewayError::SharedAcp { source } => {
             if let AcpError::Rpc { message, .. } = source.as_ref()
                 && let Some(sig) = classify_upstream_error_text(message)
             {
-                let upgraded = signal_to_acp_error(sig, model, message.clone());
+                let upgraded = signal_to_acp_error(sig, model, long_context, message.clone());
                 return GatewayError::SharedAcp {
                     source: Arc::new(upgraded),
                 };
@@ -1609,13 +1636,14 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
             GatewayError::SharedAcp { source }
         }
         GatewayError::Unauthorized
+        | GatewayError::PayloadTooLarge { .. }
         | GatewayError::NotFound { .. }
         | GatewayError::BadJson { .. }
         | GatewayError::Protocol { .. } => err,
     }
 }
 
-fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
+fn upgrade_acp_error(err: AcpError, model: &ModelId, long_context: bool) -> AcpError {
     match err {
         AcpError::Rpc {
             method,
@@ -1623,7 +1651,7 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
             message,
         } => {
             if let Some(sig) = classify_upstream_error_text(&message) {
-                signal_to_acp_error(sig, model, message)
+                signal_to_acp_error(sig, model, long_context, message)
             } else {
                 AcpError::Rpc {
                     method,
@@ -1650,7 +1678,12 @@ fn upgrade_acp_error(err: AcpError, model: &ModelId) -> AcpError {
     }
 }
 
-fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: String) -> AcpError {
+fn signal_to_acp_error(
+    sig: UpstreamBannerSignal,
+    model: &ModelId,
+    long_context: bool,
+    detail: String,
+) -> AcpError {
     match sig {
         UpstreamBannerSignal::QuotaExhausted => AcpError::UpstreamQuotaExhausted {
             model: model.as_str().to_owned(),
@@ -1658,6 +1691,7 @@ fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: Strin
         },
         UpstreamBannerSignal::ContextLengthExceeded => AcpError::ContextLengthExceeded {
             model: model.as_str().to_owned(),
+            long_context,
             detail,
         },
         UpstreamBannerSignal::RateLimited => AcpError::UpstreamRateLimited {
@@ -1670,6 +1704,7 @@ fn signal_to_acp_error(sig: UpstreamBannerSignal, model: &ModelId, detail: Strin
 
 fn build_zero_output_error(
     model: &ModelId,
+    long_context: bool,
     stop_reason: &str,
     turn_error: Option<&str>,
     suppressed_banners: &[String],
@@ -1690,7 +1725,7 @@ fn build_zero_output_error(
             first_hint = Some(trimmed.to_owned());
         }
         if let Some(sig) = classify_upstream_error_text(trimmed) {
-            return signal_to_acp_error(sig, model, trimmed.to_owned());
+            return signal_to_acp_error(sig, model, long_context, trimmed.to_owned());
         }
     }
 

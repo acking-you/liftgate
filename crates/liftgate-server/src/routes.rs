@@ -52,6 +52,10 @@ use crate::{
 /// Header name required by `POST /api/admin/shutdown` for managed daemon lifecycle control.
 pub const ADMIN_SHUTDOWN_HEADER: &str = "x-liftgate-shutdown-token";
 
+const CONTROL_ROUTE_BODY_LIMIT_BYTES: usize = 256 * 1024;
+const INITIAL_BODY_ALLOC_CAP_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Compile-time `(relative_slash_path, bytes)` entry for embedded companion web assets.
 pub type EmbeddedUiAsset = (&'static str, &'static [u8]);
 
@@ -120,19 +124,9 @@ impl<B: AcpBackend> Clone for AppState<B> {
 /// Anthropic `/v1/messages`, `/v1/models`, `/healthz`, real-time `/api/telemetry/*`,
 /// and optional companion web UI static hosting.
 pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
-    let max_body = state.config.limits.max_body_bytes().get();
-    Router::new()
-        .route("/healthz", get(handle_healthz))
-        .route("/v1/models", get(handle_list_models::<B>))
-        .route("/models", get(handle_list_models::<B>))
-        .route("/v1/codex-models", get(handle_codex_model_catalog::<B>))
-        .route("/codex-models", get(handle_codex_model_catalog::<B>))
-        .route("/v1/models/{model_id}", get(handle_get_model::<B>))
-        .route("/models/{model_id}", get(handle_get_model::<B>))
+    let turn_routes = Router::new()
         .route("/v1/responses", post(handle_create_response::<B>))
         .route("/responses", post(handle_create_response::<B>))
-        .route("/v1/responses/{response_id}", get(handle_get_response::<B>))
-        .route("/responses/{response_id}", get(handle_get_response::<B>))
         .route("/v1/messages", post(handle_anthropic_messages::<B>))
         .route("/messages", post(handle_anthropic_messages::<B>))
         .route(
@@ -142,22 +136,6 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
-        )
-        .route(
-            "/claude-desktop/v1/models",
-            get(handle_claude_desktop_models::<B>),
-        )
-        .route(
-            "/claude-desktop/models",
-            get(handle_claude_desktop_models::<B>),
-        )
-        .route(
-            "/claude-desktop/v1/models/{model_id}",
-            get(handle_get_model::<B>),
-        )
-        .route(
-            "/claude-desktop/models/{model_id}",
-            get(handle_get_model::<B>),
         )
         .route(
             "/claude-desktop/v1/messages",
@@ -174,6 +152,34 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/claude-desktop/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
+        )
+        .layer(DefaultBodyLimit::disable());
+
+    let control_routes = Router::new()
+        .route("/healthz", get(handle_healthz))
+        .route("/v1/models", get(handle_list_models::<B>))
+        .route("/models", get(handle_list_models::<B>))
+        .route("/v1/codex-models", get(handle_codex_model_catalog::<B>))
+        .route("/codex-models", get(handle_codex_model_catalog::<B>))
+        .route("/v1/models/{model_id}", get(handle_get_model::<B>))
+        .route("/models/{model_id}", get(handle_get_model::<B>))
+        .route("/v1/responses/{response_id}", get(handle_get_response::<B>))
+        .route("/responses/{response_id}", get(handle_get_response::<B>))
+        .route(
+            "/claude-desktop/v1/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/claude-desktop/v1/models/{model_id}",
+            get(handle_get_model::<B>),
+        )
+        .route(
+            "/claude-desktop/models/{model_id}",
+            get(handle_get_model::<B>),
         )
         .route(
             "/claude-desktop/api/event_logging/batch",
@@ -196,7 +202,10 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
-        .layer(DefaultBodyLimit::max(max_body))
+        .layer(DefaultBodyLimit::max(CONTROL_ROUTE_BODY_LIMIT_BYTES));
+
+    control_routes
+        .merge(turn_routes)
         .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
 }
@@ -286,7 +295,7 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
             let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
             let (window, _) =
                 liftgate_types::model::context_limits(&model_id, state.config.long_context);
-            let supports_1m = window >= 1_000_000;
+            let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let raw_desc = format!(
                 "{}k ctx \u{00b7} Antigravity ACP ({model_id})",
                 window / 1_000
@@ -299,7 +308,7 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
                 "created_at": "2026-01-01T00:00:00Z",
                 "description": description,
             });
-            if supports_1m && let Some(obj) = item.as_object_mut() {
+            if supports_extended && let Some(obj) = item.as_object_mut() {
                 obj.insert("supports1m".to_owned(), json!(true));
                 obj.insert("prefer1m".to_owned(), json!(true));
             }
@@ -335,11 +344,16 @@ fn build_model_card(
 ) -> ModelCard {
     let (context_window, auto_compact_token_limit) =
         liftgate_types::model::context_limits(&id, long_context);
+    let description = format!(
+        "{}k ctx \u{00b7} Antigravity ACP ({id})",
+        context_window / 1_000
+    );
     ModelCard {
         id,
         object: "model",
         item_type: "model",
         display_name,
+        description,
         created,
         created_at: "2026-01-01T00:00:00Z",
         owned_by: "antigravity",
@@ -481,8 +495,8 @@ async fn handle_get_response<B: AcpBackend>(
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
-    match state.pool.get_response(&response_id) {
-        Some(resp) => Json(resp).into_response(),
+    match state.pool.get_response_json(&response_id) {
+        Some(raw_json) => ([(header::CONTENT_TYPE, "application/json")], raw_json).into_response(),
         None => GatewayError::NotFound {
             resource: response_id,
         }
@@ -510,38 +524,70 @@ struct OpenAiRenderOptions {
 
 async fn handle_create_response<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_openai_response();
-    }
-
-    let req: CreateResponseRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_openai_response();
-        }
+    let req: CreateResponseRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_openai_response(),
     };
 
     let normalized = match normalize_responses_request(&req) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_openai_response(),
     };
+    let CreateResponseRequest {
+        model,
+        input,
+        instructions,
+        previous_response_id,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning,
+        include,
+        stream: _,
+        max_output_tokens,
+        temperature,
+        top_p,
+        store,
+        metadata,
+    } = req;
+    drop((model, input, reasoning, include));
 
     let is_stream = normalized.stream;
     let render_opts = OpenAiRenderOptions {
         emit_web_search_items: normalized.enable_native_web_search,
         force_web_search: normalized.force_native_web_search,
         emit_web_fetch_items: normalized.enable_native_web_fetch,
-        emit_tool_search_items: req.tools.iter().any(|t| t.tool_type == "tool_search"),
+        emit_tool_search_items: tools.iter().any(|t| t.tool_type == "tool_search"),
         include_encrypted_reasoning: normalized.include_encrypted_reasoning,
         query_hint: extract_search_query_hint(&normalized.messages),
     };
     let resp_id = format!("resp_{}", generate_short_nonce());
+    let created_at = unix_timestamp_secs();
+    let mut base_resp = ResponseObject {
+        id: resp_id.clone(),
+        object: Cow::Borrowed("response"),
+        created_at,
+        status: Cow::Borrowed("in_progress"),
+        error: None,
+        incomplete_details: None,
+        instructions,
+        max_output_tokens,
+        model: String::new(),
+        output: Vec::new(),
+        parallel_tool_calls: parallel_tool_calls.unwrap_or(true),
+        previous_response_id,
+        store: store.unwrap_or(true),
+        temperature: temperature.unwrap_or(1.0),
+        text: ResponseTextFormatConfig::default(),
+        tool_choice: tool_choice.unwrap_or_else(|| json!("auto")),
+        tools,
+        top_p: top_p.unwrap_or(1.0),
+        truncation: Cow::Borrowed("disabled"),
+        usage: None,
+        metadata: metadata.unwrap_or_default(),
+    };
 
     let turn_stream = match execute_normalized_turn(
         Arc::clone(&state.backend),
@@ -550,38 +596,14 @@ async fn handle_create_response<B: AcpBackend>(
         &state.config,
         TaskProtocol::OpenaiResponses,
         normalized,
-        resp_id.clone(),
+        resp_id,
     )
     .await
     {
         Ok(s) => s,
         Err(err) => return err.into_openai_response(),
     };
-
-    let created_at = unix_timestamp_secs();
-    let base_resp = ResponseObject {
-        id: resp_id,
-        object: Cow::Borrowed("response"),
-        created_at,
-        status: Cow::Borrowed("in_progress"),
-        error: None,
-        incomplete_details: None,
-        instructions: req.instructions,
-        max_output_tokens: req.max_output_tokens,
-        model: turn_stream.resolved_model.as_str().to_owned(),
-        output: Vec::new(),
-        parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: req.previous_response_id,
-        store: req.store.unwrap_or(true),
-        temperature: req.temperature.unwrap_or(1.0),
-        text: ResponseTextFormatConfig::default(),
-        tool_choice: req.tool_choice.unwrap_or_else(|| json!("auto")),
-        tools: req.tools,
-        top_p: req.top_p.unwrap_or(1.0),
-        truncation: Cow::Borrowed("disabled"),
-        usage: None,
-        metadata: req.metadata.unwrap_or_default(),
-    };
+    base_resp.model = turn_stream.resolved_model.as_str().to_owned();
 
     if is_stream {
         stream_openai_responses(
@@ -734,7 +756,9 @@ async fn collect_openai_response(
     resp.output.extend(tool_items);
     resp.status = Cow::Borrowed("completed");
     resp.usage = Some(ResponsesUsage::from(final_usage));
-    pool.store_response(resp.clone());
+    if resp.store {
+        pool.store_response(resp.clone());
+    }
 
     Json(resp).into_response()
 }
@@ -1893,7 +1917,9 @@ fn stream_openai_responses(
         resp.status = Cow::Borrowed("completed");
         resp.output = finalized_items;
         resp.usage = Some(ResponsesUsage::from(final_usage));
-        pool.store_response(resp.clone());
+        if resp.store {
+            pool.store_response(resp.clone());
+        }
 
         let _ = send_sse_frame(
             &sse_tx,
@@ -2196,20 +2222,11 @@ struct AnthropicRenderOptions {
 
 async fn handle_anthropic_count_tokens<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_anthropic_response();
-    }
-    let req: AnthropicMessagesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_anthropic_response();
-        }
+    let req: AnthropicMessagesRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_anthropic_response(),
     };
     let input_tokens = estimate_anthropic_tokens(&req);
     Json(AnthropicCountTokensResponse { input_tokens }).into_response()
@@ -2217,21 +2234,11 @@ async fn handle_anthropic_count_tokens<B: AcpBackend>(
 
 async fn handle_anthropic_messages<B: AcpBackend>(
     State(state): State<AppState<B>>,
-    headers: HeaderMap,
-    body: Bytes,
+    http_req: Request,
 ) -> Response {
-    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
-        return err.into_anthropic_response();
-    }
-
-    let req: AnthropicMessagesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(err) => {
-            return GatewayError::BadJson {
-                message: err.to_string(),
-            }
-            .into_anthropic_response();
-        }
+    let req: AnthropicMessagesRequest = match read_authenticated_json_body(&state, http_req).await {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_anthropic_response(),
     };
     let requested_model_echo = req.model.clone();
 
@@ -3311,6 +3318,121 @@ fn check_auth(headers: &HeaderMap, expected_key: Option<&str>) -> Result<(), Gat
     }
 
     Err(GatewayError::Unauthorized)
+}
+
+fn parse_content_length_hint(
+    headers: &HeaderMap,
+    max_body: usize,
+) -> Result<Option<usize>, GatewayError> {
+    let Some(raw) = headers.get(header::CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let trimmed = raw
+        .to_str()
+        .map_err(|_| GatewayError::BadJson {
+            message: "invalid Content-Length header".to_owned(),
+        })?
+        .trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GatewayError::BadJson {
+            message: "invalid Content-Length header".to_owned(),
+        });
+    }
+    let len = trimmed
+        .parse::<usize>()
+        .map_err(|_| GatewayError::PayloadTooLarge {
+            max_bytes: max_body,
+        })?;
+    if len > max_body {
+        return Err(GatewayError::PayloadTooLarge {
+            max_bytes: max_body,
+        });
+    }
+    Ok(Some(len))
+}
+
+async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBackend>(
+    state: &AppState<B>,
+    req: Request,
+) -> Result<T, GatewayError> {
+    check_auth(req.headers(), state.config.api_key.as_deref())?;
+
+    let max_body = state.config.limits.max_body_bytes().get();
+    let header_length_hint = parse_content_length_hint(req.headers(), max_body)?;
+
+    let timeout_secs = state.config.limits.turn_timeout_secs().get();
+    let turn_timeout = Duration::from_secs(timeout_secs);
+    let read_deadline = tokio::time::Instant::now() + turn_timeout.min(MAX_BODY_READ_TIMEOUT);
+
+    let mut body = req.into_body();
+    let body_exact_hint = match axum::body::HttpBody::size_hint(&body).exact() {
+        Some(exact_u64) => {
+            let exact = usize::try_from(exact_u64).map_err(|_| GatewayError::PayloadTooLarge {
+                max_bytes: max_body,
+            })?;
+            if exact > max_body {
+                return Err(GatewayError::PayloadTooLarge {
+                    max_bytes: max_body,
+                });
+            }
+            Some(exact)
+        }
+        None => None,
+    };
+    let exact_length_hint = header_length_hint.or(body_exact_hint);
+
+    let mut buf = Vec::with_capacity(
+        exact_length_hint
+            .unwrap_or(0)
+            .min(INITIAL_BODY_ALLOC_CAP_BYTES),
+    );
+
+    loop {
+        let next_frame =
+            tokio::time::timeout_at(read_deadline, http_body_util::BodyExt::frame(&mut body))
+                .await
+                .map_err(|_| GatewayError::BadJson {
+                    message: "timed out reading HTTP request body".to_owned(),
+                })?;
+        let Some(frame_res) = next_frame else {
+            break;
+        };
+        let frame = frame_res.map_err(|err| GatewayError::BadJson {
+            message: format!("failed to read HTTP request body: {err}"),
+        })?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let next_len = buf.len().saturating_add(chunk.len());
+        if next_len > max_body {
+            return Err(GatewayError::PayloadTooLarge {
+                max_bytes: max_body,
+            });
+        }
+        if let Some(exact) = exact_length_hint
+            && next_len > exact
+        {
+            return Err(GatewayError::BadJson {
+                message: "HTTP request body exceeded declared Content-Length".to_owned(),
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    if let Some(exact) = header_length_hint
+        && buf.len() != exact
+    {
+        return Err(GatewayError::BadJson {
+            message: "HTTP request body length did not match declared Content-Length".to_owned(),
+        });
+    }
+
+    serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
+        message: err.to_string(),
+    })
 }
 
 const fn next_seq(seq: &mut u64) -> u64 {
