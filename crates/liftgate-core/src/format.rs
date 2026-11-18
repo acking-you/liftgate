@@ -38,17 +38,49 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
-/// Formats byte counts into compact readable units (`512 B`, `42.0 KiB`, `14.20 MiB`).
+/// Formats byte counts into compact readable units (`512 B`, `42.0 KiB`, `14.20 MiB`, `1.25 GiB`).
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
     const KIB: f64 = 1024.0;
-    if bytes >= 1024 * 1024 {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", (bytes as f64) / GIB)
+    } else if bytes >= 1024 * 1024 {
         format!("{:.2} MiB", (bytes as f64) / MIB)
     } else if bytes >= 1024 {
         format!("{:.1} KiB", (bytes as f64) / KIB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+/// Formats a byte-per-second transfer rate (`0 B/s`, `840 B/s`, `512.0 KiB/s`, `18.42 MiB/s`).
+#[must_use]
+pub fn format_transfer_rate(bytes_per_sec: f64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 {
+        "0 B/s".to_owned()
+    } else if bytes_per_sec >= GIB {
+        format!("{:.2} GiB/s", bytes_per_sec / GIB)
+    } else if bytes_per_sec >= MIB {
+        format!("{:.2} MiB/s", bytes_per_sec / MIB)
+    } else if bytes_per_sec >= KIB {
+        format!("{:.1} KiB/s", bytes_per_sec / KIB)
+    } else {
+        format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
+/// Formats an estimated time remaining in seconds (`<1s`, `14s`, `2m 05s`).
+#[must_use]
+pub fn format_eta(secs: u64) -> String {
+    if secs == 0 {
+        "<1s".to_owned()
+    } else {
+        format_duration_secs(secs)
     }
 }
 
@@ -113,6 +145,16 @@ mod tests {
 
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.00 GiB");
+
+        assert_eq!(format_transfer_rate(0.0), "0 B/s");
+        assert_eq!(format_transfer_rate(f64::NAN), "0 B/s");
+        assert_eq!(format_transfer_rate(840.0), "840 B/s");
+        assert_eq!(format_transfer_rate(512.0 * 1024.0), "512.0 KiB/s");
+        assert_eq!(format_transfer_rate(18.5 * 1024.0 * 1024.0), "18.50 MiB/s");
+        assert_eq!(format_eta(0), "<1s");
+        assert_eq!(format_eta(14), "14s");
+        assert_eq!(format_eta(125), "2m 05s");
 
         assert_eq!(format_relative_ms(10_000, 12_000), "just now");
         assert_eq!(format_relative_ms(10_000, 40_000), "30s ago");

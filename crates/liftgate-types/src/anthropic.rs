@@ -497,11 +497,9 @@ pub fn normalize_anthropic_request(
     } else {
         match &req.thinking {
             Some(cfg) if cfg.thinking_type == "enabled" || cfg.thinking_type == "adaptive" => {
-                let effort = explicit_effort.unwrap_or_else(|| {
-                    cfg.budget_tokens
-                        .map_or(ReasoningEffort::High, ReasoningEffort::from_budget_tokens)
-                });
-                (true, Some(effort))
+                let effort = explicit_effort
+                    .or_else(|| cfg.budget_tokens.map(ReasoningEffort::from_budget_tokens));
+                (true, effort)
             }
             _ => (false, explicit_effort),
         }

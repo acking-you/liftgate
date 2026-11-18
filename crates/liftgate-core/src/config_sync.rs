@@ -303,7 +303,10 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             let behaves_as = if lower.starts_with("gpt-oss") {
                 "claude-haiku-4-5-20251001"
             } else if lower.starts_with("gemini-") {
-                if lower.contains("flash-low") {
+                if lower.contains("flash-low")
+                    || lower.contains("hydrogen-low")
+                    || lower.contains("neon-low")
+                {
                     "claude-haiku-5-5"
                 } else if lower.ends_with("-medium") {
                     "claude-sonnet-5-5"

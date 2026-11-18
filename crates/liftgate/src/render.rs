@@ -7,14 +7,15 @@ use std::io::{
     BufRead as _, BufReader, IsTerminal as _, Seek as _, SeekFrom, Write as _, stdin, stdout,
 };
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use comfy_table::Cell;
 use liftgate_core::{
     agy_manager::{
         AgyAuthStatus, AgyInstallOutcome, AgyInstallStatus, AgyUpdateOutcome, AgyUpdateStatus,
-        execute_agy_auto_update, execute_agy_install, execute_agy_update, execute_proxy,
-        inspect_agy_status, probe_agy_auth, run_agy_passthrough, spawn_interactive_agy,
+        execute_agy_auto_update, execute_agy_install_with_progress,
+        execute_agy_update_with_progress, execute_proxy, inspect_agy_status, probe_agy_auth,
+        run_agy_passthrough, spawn_interactive_agy,
     },
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
@@ -34,12 +35,13 @@ use liftgate_core::{
     error::CliError,
     harness,
     state::{DaemonState, StatePaths, resolve_effective_agy_bin, resolve_effective_agy_proxy},
-    upgrade::execute_upgrade,
+    upgrade::{TransferProgress, execute_upgrade_with_progress},
 };
 use liftgate_types::telemetry::{TaskPhase, TaskProtocol};
 use serde_json::json;
+use tokio::sync::watch;
 
-use crate::ui::{self, Spinner, Tone};
+use crate::ui::{self, Spinner, Tone, TransferProgressDisplay};
 
 pub async fn run_start(state_paths: &StatePaths, args: StartArgs) -> Result<(), CliError> {
     let sp = Spinner::start(format!(
@@ -831,14 +833,22 @@ pub async fn run_upgrade(state_paths: &StatePaths, args: UpgradeArgs) -> Result<
     let msg = if args.check {
         format!("Checking GitHub Releases ({})…", args.repo)
     } else {
-        format!("Downloading & verifying release from {}…", args.repo)
+        format!("Preparing release upgrade from {}…", args.repo)
     };
-    let sp = (!args.json).then(|| Spinner::start(msg));
-    let out_res = execute_upgrade(state_paths, &args, &current_exe).await;
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
+    let started = Instant::now();
+    let (prog_tx, progress_display) = if args.json {
+        (None, None)
+    } else {
+        let (tx, rx) = watch::channel(TransferProgress::checking(msg));
+        (Some(tx), Some(TransferProgressDisplay::start(rx)))
+    };
+    let out_res = execute_upgrade_with_progress(state_paths, &args, &current_exe, prog_tx).await;
+    let stats = match progress_display {
+        Some(display) => display.finish_and_clear().await,
+        None => ui::TransferDisplayStats::default(),
+    };
     let out = out_res?;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if args.json {
         println!(
@@ -888,6 +898,22 @@ pub async fn run_upgrade(state_paths: &StatePaths, args: UpgradeArgs) -> Result<
                     out.current_version, out.target_version, out.target_triple
                 ),
             );
+            let transferred = out
+                .archive_size_bytes
+                .filter(|&b| b > 0)
+                .or((stats.downloaded_bytes > 0).then_some(stats.downloaded_bytes));
+            if let Some(size) = transferred {
+                let avg_rate = size as f64 / started.elapsed().as_secs_f64().max(0.001);
+                ui::kv(
+                    "Transfer",
+                    &format!(
+                        "{} in {} (avg {})",
+                        ui::format_bytes(size),
+                        ui::format_latency_ms(elapsed_ms),
+                        ui::format_transfer_rate(avg_rate),
+                    ),
+                );
+            }
             for bin_path in &out.installed_binaries {
                 ui::kv_accent("Installed", bin_path);
             }
@@ -1325,14 +1351,22 @@ pub async fn run_agy_install(
     let msg = if args.check {
         "Querying official Antigravity CLI manifest…"
     } else {
-        "Downloading & verifying official Antigravity CLI (`agy`)…"
+        "Preparing Antigravity CLI (`agy`) download…"
     };
-    let sp = (!json_out).then(|| Spinner::start(msg));
-    let out_res = execute_agy_install(state_paths, &args).await;
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
+    let started = Instant::now();
+    let (prog_tx, progress_display) = if json_out {
+        (None, None)
+    } else {
+        let (tx, rx) = watch::channel(TransferProgress::checking(msg));
+        (Some(tx), Some(TransferProgressDisplay::start(rx)))
+    };
+    let out_res = execute_agy_install_with_progress(state_paths, &args, prog_tx).await;
+    let stats = match progress_display {
+        Some(display) => display.finish_and_clear().await,
+        None => ui::TransferDisplayStats::default(),
+    };
     let out = out_res?;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if json_out {
         println!(
@@ -1369,6 +1403,21 @@ pub async fn run_agy_install(
                     out.version
                 ),
             );
+            if stats.downloaded_bytes > 0 {
+                let avg_rate =
+                    stats.downloaded_bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+                ui::kv(
+                    "Transfer",
+                    &format!(
+                        "{} in {} (avg {})",
+                        ui::format_bytes(stats.downloaded_bytes),
+                        ui::format_latency_ms(elapsed_ms),
+                        ui::format_transfer_rate(avg_rate),
+                    ),
+                );
+            } else {
+                ui::kv("Completed In", &ui::format_latency_ms(elapsed_ms));
+            }
         }
     }
     ui::kv_accent("Binary Path", &out.binary_path.display().to_string());
@@ -1396,14 +1445,23 @@ async fn run_agy_update(
     let msg = if args.check {
         "Checking official Antigravity CLI release manifest…"
     } else {
-        "Updating Antigravity CLI (`agy`)…"
+        "Preparing Antigravity CLI (`agy`) update…"
     };
-    let sp = (!json_out).then(|| Spinner::start(msg));
-    let out_res = execute_agy_update(state_paths, explicit_agy_bin, &args).await;
-    if let Some(s) = sp {
-        s.finish_and_clear().await;
-    }
+    let started = Instant::now();
+    let (prog_tx, progress_display) = if json_out {
+        (None, None)
+    } else {
+        let (tx, rx) = watch::channel(TransferProgress::checking(msg));
+        (Some(tx), Some(TransferProgressDisplay::start(rx)))
+    };
+    let out_res =
+        execute_agy_update_with_progress(state_paths, explicit_agy_bin, &args, prog_tx).await;
+    let stats = match progress_display {
+        Some(display) => display.finish_and_clear().await,
+        None => ui::TransferDisplayStats::default(),
+    };
     let out = out_res?;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if json_out {
         println!(
@@ -1438,6 +1496,21 @@ async fn run_agy_update(
                     out.latest_version
                 ),
             );
+            if stats.downloaded_bytes > 0 {
+                let avg_rate =
+                    stats.downloaded_bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+                ui::kv(
+                    "Transfer",
+                    &format!(
+                        "{} in {} (avg {})",
+                        ui::format_bytes(stats.downloaded_bytes),
+                        ui::format_latency_ms(elapsed_ms),
+                        ui::format_transfer_rate(avg_rate),
+                    ),
+                );
+            } else {
+                ui::kv("Completed In", &ui::format_latency_ms(elapsed_ms));
+            }
         }
     }
     ui::kv_accent("Binary Path", &out.binary_path.display().to_string());

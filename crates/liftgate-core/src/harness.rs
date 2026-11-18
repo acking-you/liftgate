@@ -837,7 +837,9 @@ fn has_explicit_codex_config_key(args: &[String], key: &str) -> bool {
 
 fn default_claude_effort_level(model_id: &str) -> Option<&'static str> {
     let lower = model_id.trim().to_ascii_lowercase();
-    if lower.ends_with("-xhigh") || lower.ends_with("-high") || lower.ends_with("-thinking") {
+    if lower.ends_with("-xhigh") {
+        Some("xhigh")
+    } else if lower.ends_with("-high") || lower.ends_with("-thinking") {
         Some("high")
     } else if lower.ends_with("-medium") {
         Some("medium")
@@ -1198,6 +1200,10 @@ mod tests {
 
     #[test]
     fn infers_default_claude_effort_level_from_model_suffix() {
+        assert_eq!(
+            default_claude_effort_level("gemini-4-neon-xhigh"),
+            Some("xhigh")
+        );
         assert_eq!(
             default_claude_effort_level("gemini-4-carbon-high"),
             Some("high")

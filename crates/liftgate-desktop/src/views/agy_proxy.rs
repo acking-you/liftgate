@@ -11,6 +11,7 @@ use crate::app::{DesktopApp, ProxyApplyMode};
 use crate::i18n::tr;
 use crate::theme::{
     BadgeTone, Palette, editorial_card, kv_row, pill_badge, section_header, sf_terminal_box,
+    transfer_progress_panel,
 };
 
 impl DesktopApp {
@@ -132,6 +133,11 @@ impl DesktopApp {
                     .child(kv_row(p, tr(lang, "当前已安装版本", "Installed Version"), ver_str))
                     .child(kv_row(p, tr(lang, "上游最新稳定版", "Latest Upstream"), latest_str))
                     .child(kv_row(p, tr(lang, "账号鉴权详情", "Auth Status"), auth_detail)),
+            )
+            .children(
+                self.agy_progress
+                    .as_ref()
+                    .map(|prog| transfer_progress_panel(p, lang, prog)),
             )
             .child(
                 div()

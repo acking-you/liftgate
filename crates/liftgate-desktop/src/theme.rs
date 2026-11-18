@@ -6,6 +6,9 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use liftgate_core::ReportTone;
+use liftgate_core::format::{format_bytes, format_eta, format_transfer_rate};
+use liftgate_core::state::DesktopLang;
+use liftgate_core::upgrade::{TransferProgress, TransferStage};
 
 /// Complete StaticFlow (`ackingliu.top`) color palette for Light and Dark editorial modes.
 #[derive(Clone, Copy, Debug)]
@@ -368,6 +371,190 @@ pub fn kv_row(p: &Palette, key: impl Into<SharedString>, value: impl Into<Shared
         )
 }
 
+/// Editorial live progress bar panel for Liftgate self-upgrade and `agy` downloads.
+#[must_use]
+pub fn transfer_progress_panel(p: &Palette, lang: DesktopLang, progress: &TransferProgress) -> Div {
+    let (stage_label, badge_tone) = match progress.stage {
+        TransferStage::Checking => (
+            if lang.is_en() {
+                "1/6 · CHECKING"
+            } else {
+                "1/6 · 检查版本"
+            },
+            BadgeTone::Info,
+        ),
+        TransferStage::Downloading => (
+            if lang.is_en() {
+                "2/6 · DOWNLOADING"
+            } else {
+                "2/6 · 正在下载"
+            },
+            BadgeTone::Primary,
+        ),
+        TransferStage::Verifying => (
+            if lang.is_en() {
+                "3/6 · VERIFYING"
+            } else {
+                "3/6 · 校验摘要"
+            },
+            BadgeTone::Info,
+        ),
+        TransferStage::Extracting => (
+            if lang.is_en() {
+                "4/6 · EXTRACTING"
+            } else {
+                "4/6 · 解压文件"
+            },
+            BadgeTone::Info,
+        ),
+        TransferStage::Testing => (
+            if lang.is_en() {
+                "5/6 · SMOKE TEST"
+            } else {
+                "5/6 · 启动自检"
+            },
+            BadgeTone::Info,
+        ),
+        TransferStage::Installing => (
+            if lang.is_en() {
+                "6/6 · INSTALLING"
+            } else {
+                "6/6 · 替换安装"
+            },
+            BadgeTone::Ok,
+        ),
+    };
+
+    let title = match (&progress.asset_name, &progress.target_version) {
+        (Some(asset), Some(ver)) if !asset.contains(ver) => format!("{asset} · {ver}"),
+        (Some(asset), _) => asset.clone(),
+        (None, Some(ver)) => ver.clone(),
+        (None, None) => progress.message.clone(),
+    };
+
+    let (fill_ratio, pct_text) = if progress.stage == TransferStage::Downloading {
+        match progress.progress_fraction() {
+            Some(frac) => (frac as f32, format!("{:.1}%", frac * 100.0)),
+            None => (
+                0.35_f32,
+                if lang.is_en() {
+                    "Streaming…".to_owned()
+                } else {
+                    "流式下载中…".to_owned()
+                },
+            ),
+        }
+    } else {
+        let step_ratio = (f32::from(progress.stage.step_index()) / 6.0).clamp(0.1, 1.0);
+        (step_ratio, format!("{}/6", progress.stage.step_index()))
+    };
+
+    let left_detail = if progress.stage == TransferStage::Downloading {
+        match progress.total_bytes.filter(|&t| t > 0) {
+            Some(total) => format!(
+                "{} / {}",
+                format_bytes(progress.downloaded_bytes),
+                format_bytes(total)
+            ),
+            None => format_bytes(progress.downloaded_bytes),
+        }
+    } else {
+        progress.message.clone()
+    };
+
+    let right_detail = if progress.stage == TransferStage::Downloading {
+        let rate = format_transfer_rate(progress.bytes_per_sec);
+        match progress.eta_secs {
+            Some(eta) => {
+                if lang.is_en() {
+                    format!("{rate} · ETA {}", format_eta(eta))
+                } else {
+                    format!("{rate} · 剩余 {}", format_eta(eta))
+                }
+            }
+            None => rate,
+        }
+    } else {
+        String::new()
+    };
+
+    div()
+        .w_full()
+        .p_3()
+        .rounded(px(8.0))
+        .bg(p.surface_alt)
+        .border_1()
+        .border_color(p.border_strong)
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(pill_badge(p, badge_tone, stage_label))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.primary)
+                        .child(pct_text),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(8.0))
+                .rounded(px(999.0))
+                .bg(p.border)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .rounded(px(999.0))
+                        .bg(if progress.stage == TransferStage::Installing {
+                            p.ok
+                        } else {
+                            p.primary
+                        })
+                        .w(relative(fill_ratio.clamp(0.02, 1.0))),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(left_detail))
+                .when(!right_detail.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.ok)
+                            .child(right_detail),
+                    )
+                }),
+        )
+}
 /// Signature `.sf-term` dark editorial terminal output container (`#111110` surface with
 /// warm terracotta/ochre/sage window dots and scrollable monospace viewport).
 #[must_use]

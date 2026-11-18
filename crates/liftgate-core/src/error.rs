@@ -228,9 +228,22 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::NoSystemProxyDetected => Some(format!(
             "Set an explicit proxy with `{bin} proxy 7890` (or `{bin} proxy socks5://127.0.0.1:1080`), or clear with `{bin} proxy off`."
         )),
-        CliError::AgyInstallFailed { .. } => Some(format!(
-            "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
-        )),
+        CliError::AgyInstallFailed { detail } => {
+            let lower = detail.to_ascii_lowercase();
+            if lower.contains("safety size bound")
+                || lower.contains("tar.gz")
+                || lower.contains("did not contain")
+                || lower.contains("smoke check")
+            {
+                Some(format!(
+                    "Verify the downloaded archive or update Liftgate with `{bin} upgrade`, then re-run `{bin} agy update --force`."
+                ))
+            } else {
+                Some(format!(
+                    "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
+                ))
+            }
+        }
         CliError::GatewayUnreachable { .. } => Some(format!(
             "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
         )),

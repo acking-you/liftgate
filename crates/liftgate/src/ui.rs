@@ -10,7 +10,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Write as _, stderr, stdout};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets};
 use liftgate_core::ReportTone;
@@ -20,9 +20,10 @@ use tokio::task::JoinHandle;
 
 use liftgate_core::error::{CliError, recovery_hint_for_error};
 pub use liftgate_core::format::{
-    format_duration_secs, format_latency_ms, format_relative_ms, format_tokens, format_utc_hms,
-    progress_bar,
+    format_bytes, format_duration_secs, format_eta, format_latency_ms, format_relative_ms,
+    format_tokens, format_transfer_rate, format_utc_hms, progress_bar,
 };
+use liftgate_core::upgrade::{TransferProgress, TransferStage};
 
 const FALLBACK_TABLE_WIDTH: u16 = 120;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -470,6 +471,409 @@ impl Drop for Spinner {
     }
 }
 
+/// Final summary stats captured while [`TransferProgressDisplay`] observed a transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferDisplayStats {
+    pub downloaded_bytes: u64,
+}
+
+/// Non-blocking animated stderr progress display for verified downloads & binary upgrades.
+///
+/// Renders a live stage header, smooth Unicode progress bar, downloaded/total bytes,
+/// transfer speed, and ETA on color TTYs; degrades cleanly to single-line stage notices on
+/// plain terminals and remains silent under `--json`, non-TTY pipes, or active raw TUI mode.
+pub struct TransferProgressDisplay {
+    stop_tx: Option<watch::Sender<bool>>,
+    join_handle: Option<JoinHandle<(usize, u64)>>,
+    animated: bool,
+}
+
+impl TransferProgressDisplay {
+    #[must_use]
+    pub fn start(mut progress_rx: watch::Receiver<TransferProgress>) -> Self {
+        if crate::tui::is_tui_raw_active() {
+            return Self {
+                stop_tx: None,
+                join_handle: None,
+                animated: false,
+            };
+        }
+
+        let is_tty = stderr().is_terminal();
+        let is_dumb_term = env::var("TERM").is_ok_and(|t| t.eq_ignore_ascii_case("dumb"));
+        let animated = is_tty && !is_dumb_term;
+        if !is_tty {
+            return Self {
+                stop_tx: None,
+                join_handle: None,
+                animated: false,
+            };
+        }
+
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        if !animated {
+            let handle = tokio::spawn(async move {
+                let mut last_key: Option<(TransferStage, String)> = None;
+                let mut last_dl_log = Instant::now();
+                let mut peak_downloaded = 0u64;
+                let print_plain = |snap: &TransferProgress,
+                                   last: &mut Option<(TransferStage, String)>,
+                                   last_dl: &mut Instant,
+                                   peak: &mut u64| {
+                    *peak = (*peak).max(snap.downloaded_bytes);
+                    let key = (snap.stage, snap.message.clone());
+                    if last.as_ref() != Some(&key) {
+                        eprintln!("· [{}/6] {}", snap.stage.step_index(), snap.message);
+                        *last = Some(key);
+                        *last_dl = Instant::now();
+                    } else if snap.stage == TransferStage::Downloading
+                        && snap.downloaded_bytes > 0
+                        && last_dl.elapsed() >= Duration::from_secs(5)
+                    {
+                        *last_dl = Instant::now();
+                        let rate = format_transfer_rate(snap.bytes_per_sec);
+                        match snap.total_bytes.filter(|&t| t > 0) {
+                            Some(total) => {
+                                let pct = snap.progress_fraction().unwrap_or(0.0) * 100.0;
+                                let eta = snap
+                                    .eta_secs
+                                    .map(|s| format!(" · ETA {}", format_eta(s)))
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "· [{}/6] {:.1}% ({} / {} · {rate}{eta})",
+                                    snap.stage.step_index(),
+                                    pct,
+                                    format_bytes(snap.downloaded_bytes),
+                                    format_bytes(total)
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "· [{}/6] {} · {rate}",
+                                    snap.stage.step_index(),
+                                    format_bytes(snap.downloaded_bytes)
+                                );
+                            }
+                        }
+                    }
+                };
+                print_plain(
+                    &progress_rx.borrow().clone(),
+                    &mut last_key,
+                    &mut last_dl_log,
+                    &mut peak_downloaded,
+                );
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop_rx.wait_for(|&stopped| stopped) => break,
+                        changed = progress_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            print_plain(
+                                &progress_rx.borrow().clone(),
+                                &mut last_key,
+                                &mut last_dl_log,
+                                &mut peak_downloaded,
+                            );
+                        }
+                    }
+                }
+                (0, peak_downloaded)
+            });
+            return Self {
+                stop_tx: Some(stop_tx),
+                join_handle: Some(handle),
+                animated: false,
+            };
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut tick_idx = 0usize;
+            let mut rendered_lines = 0usize;
+            let mut peak_downloaded = 0u64;
+            loop {
+                let snap = progress_rx.borrow().clone();
+                peak_downloaded = peak_downloaded.max(snap.downloaded_bytes);
+                let width = usize::from(terminal_width().unwrap_or(100));
+                let colored = use_color_stderr();
+                let lines = format_transfer_lines(&snap, tick_idx, width, colored);
+                redraw_stderr_lines(&lines, rendered_lines);
+                rendered_lines = lines.len();
+                tick_idx = tick_idx.wrapping_add(1);
+
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.wait_for(|&stopped| stopped) => break,
+                    changed = progress_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(80)) => {}
+                }
+            }
+            (rendered_lines, peak_downloaded)
+        });
+
+        Self {
+            stop_tx: Some(stop_tx),
+            join_handle: Some(handle),
+            animated: true,
+        }
+    }
+
+    pub async fn finish_and_clear(mut self) -> TransferDisplayStats {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send_replace(true);
+        }
+        let (rendered_lines, downloaded_bytes) = if let Some(handle) = self.join_handle.take() {
+            handle.await.unwrap_or((1, 0))
+        } else {
+            (0, 0)
+        };
+        if self.animated && rendered_lines > 0 {
+            clear_stderr_lines(rendered_lines);
+            self.animated = false;
+        }
+        TransferDisplayStats { downloaded_bytes }
+    }
+}
+
+impl Drop for TransferProgressDisplay {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send_replace(true);
+        }
+        if let Some(handle) = self.join_handle.take() {
+            handle.abort();
+        }
+        if self.animated {
+            clear_stderr_lines(2);
+        }
+    }
+}
+
+fn redraw_stderr_lines(lines: &[String], prev_lines: usize) {
+    let mut out = String::with_capacity(256);
+    if prev_lines > 1 {
+        let _ = write!(out, "\x1b[{}A", prev_lines - 1);
+    }
+    out.push_str("\r\x1b[J");
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    let _ = write!(stderr(), "{out}");
+    let _ = stderr().flush();
+}
+
+fn clear_stderr_lines(lines: usize) {
+    let mut out = String::with_capacity(32);
+    if lines > 1 {
+        let _ = write!(out, "\x1b[{}A", lines - 1);
+    }
+    out.push_str("\r\x1b[J");
+    let _ = write!(stderr(), "{out}");
+    let _ = stderr().flush();
+}
+
+fn style_if(text: &str, style: Style, colored: bool) -> String {
+    if colored {
+        text.style(style).to_string()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn format_transfer_lines(
+    snap: &TransferProgress,
+    tick_idx: usize,
+    cols: usize,
+    colored: bool,
+) -> Vec<String> {
+    let frame = SPINNER_FRAMES
+        .get(tick_idx % SPINNER_FRAMES.len())
+        .copied()
+        .unwrap_or("⠋");
+    let glyph = style_if(frame, Style::new().cyan().bold(), colored);
+    let step_tag = style_if(
+        &format!("[{}/6]", snap.stage.step_index()),
+        Style::new().dimmed(),
+        colored,
+    );
+    let stage_lbl = style_if(snap.stage.label(), Style::new().cyan().bold(), colored);
+    let max_body = cols.saturating_sub(24).max(20);
+
+    if snap.stage != TransferStage::Downloading {
+        let msg = truncate_display_text(&snap.message, max_body);
+        return vec![format!("{glyph} {step_tag} {stage_lbl}  {msg}")];
+    }
+
+    let mut title = snap
+        .asset_name
+        .as_deref()
+        .unwrap_or(&snap.message)
+        .to_owned();
+    if let Some(ver) = &snap.target_version
+        && !title.contains(ver)
+    {
+        let _ = write!(title, " ({ver})");
+    }
+    let title_clean = truncate_display_text(&title, max_body);
+    let line1 = format!("{glyph} {step_tag} {stage_lbl}  {title_clean}");
+
+    let rate_str = format_transfer_rate(snap.bytes_per_sec);
+    let metrics_plain = match snap.total_bytes.filter(|&t| t > 0) {
+        Some(total) => {
+            let pct = snap.progress_fraction().unwrap_or(0.0) * 100.0;
+            let bytes_part = format!(
+                "{} / {}",
+                format_bytes(snap.downloaded_bytes),
+                format_bytes(total)
+            );
+            let eta_part = snap
+                .eta_secs
+                .map(|s| format!("  ·  ETA {}", format_eta(s)))
+                .unwrap_or_default();
+            format!(" {pct:5.1}%  {bytes_part}  ·  {rate_str}{eta_part}")
+        }
+        None => {
+            format!("  {}  ·  {rate_str}", format_bytes(snap.downloaded_bytes))
+        }
+    };
+
+    let bar_width = cols
+        .saturating_sub(metrics_plain.chars().count().saturating_add(6))
+        .clamp(12, 34);
+    let bar_rendered = render_download_bar(snap.progress_fraction(), tick_idx, bar_width, colored);
+    let line2 = match snap.total_bytes.filter(|&t| t > 0) {
+        Some(total) => {
+            let pct = style_if(
+                &format!("{:5.1}%", snap.progress_fraction().unwrap_or(0.0) * 100.0),
+                Style::new().bold(),
+                colored,
+            );
+            let bytes_part = format!(
+                "{} / {}",
+                format_bytes(snap.downloaded_bytes),
+                format_bytes(total)
+            );
+            let sep = style_if("·", Style::new().dimmed(), colored);
+            let rate_colored = style_if(&rate_str, Style::new().green().bold(), colored);
+            let eta_part = snap
+                .eta_secs
+                .map(|s| {
+                    let eta_txt = style_if(
+                        &format!("ETA {}", format_eta(s)),
+                        Style::new().dimmed(),
+                        colored,
+                    );
+                    format!("  {sep}  {eta_txt}")
+                })
+                .unwrap_or_default();
+            format!("  {bar_rendered}  {pct}  {bytes_part}  {sep}  {rate_colored}{eta_part}")
+        }
+        None => {
+            let bytes_part = format_bytes(snap.downloaded_bytes);
+            let sep = style_if("·", Style::new().dimmed(), colored);
+            let rate_colored = style_if(&rate_str, Style::new().green().bold(), colored);
+            format!("  {bar_rendered}  {bytes_part}  {sep}  {rate_colored}")
+        }
+    };
+
+    vec![line1, line2]
+}
+
+fn render_download_bar(
+    fraction: Option<f64>,
+    tick_idx: usize,
+    width: usize,
+    colored: bool,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if let Some(frac) = fraction {
+        let clamped = frac.clamp(0.0, 1.0);
+        let filled = ((clamped * width as f64).round() as usize).min(width);
+        if filled >= width {
+            return style_if(&"━".repeat(width), Style::new().green().bold(), colored);
+        }
+        let mut out = String::new();
+        if filled > 0 {
+            out.push_str(&style_if(
+                &"━".repeat(filled),
+                Style::new().cyan().bold(),
+                colored,
+            ));
+        }
+        let rem = width.saturating_sub(filled);
+        if rem > 0 {
+            if filled > 0 {
+                out.push_str(&style_if("╸", Style::new().cyan(), colored));
+                if rem > 1 {
+                    out.push_str(&style_if(
+                        &"━".repeat(rem - 1),
+                        Style::new().dimmed(),
+                        colored,
+                    ));
+                }
+            } else {
+                out.push_str(&style_if(&"━".repeat(rem), Style::new().dimmed(), colored));
+            }
+        }
+        out
+    } else {
+        let pulse_len = (width / 4).clamp(3, 6).min(width);
+        let span = width.saturating_sub(pulse_len).max(1);
+        let cycle = span * 2;
+        let pos_in_cycle = tick_idx % cycle;
+        let start = if pos_in_cycle <= span {
+            pos_in_cycle
+        } else {
+            cycle - pos_in_cycle
+        };
+        let end = (start + pulse_len).min(width);
+        let mut out = String::new();
+        if start > 0 {
+            out.push_str(&style_if(
+                &"━".repeat(start),
+                Style::new().dimmed(),
+                colored,
+            ));
+        }
+        out.push_str(&style_if(
+            &"━".repeat(end - start),
+            Style::new().cyan().bold(),
+            colored,
+        ));
+        if end < width {
+            out.push_str(&style_if(
+                &"━".repeat(width - end),
+                Style::new().dimmed(),
+                colored,
+            ));
+        }
+        out
+    }
+}
+
+fn truncate_display_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
 /// Prints a single log line with structured level and timestamp highlighting on TTYs.
 pub fn print_log_line(line: &str) {
     if !use_color() {
@@ -534,5 +938,40 @@ mod tests {
         assert_eq!(format_relative_ms(10_000, 40_000), "30s ago");
         assert_eq!(format_relative_ms(10_000, 190_000), "3m ago");
         assert_eq!(format_utc_hms(0), "00:00:00Z");
+    }
+
+    #[test]
+    fn renders_transfer_progress_lines_with_bar_rate_and_eta() {
+        let checking = TransferProgress::checking("Querying GitHub Releases…");
+        let lines_chk = format_transfer_lines(&checking, 0, 100, false);
+        assert_eq!(lines_chk.len(), 1);
+        assert!(lines_chk[0].contains("[1/6]"));
+        assert!(!lines_chk[0].contains("\x1b["));
+
+        let downloading = TransferProgress {
+            stage: TransferStage::Downloading,
+            message: "Downloading cli_windows_x64.exe…".to_owned(),
+            asset_name: Some("cli_windows_x64.exe".to_owned()),
+            target_version: Some("v1.5.11".to_owned()),
+            downloaded_bytes: 120 * 1024 * 1024,
+            total_bytes: Some(240 * 1024 * 1024),
+            bytes_per_sec: 16.0 * 1024.0 * 1024.0,
+            eta_secs: Some(8),
+        };
+        let lines_dl = format_transfer_lines(&downloading, 2, 100, true);
+        assert_eq!(lines_dl.len(), 2);
+        assert!(lines_dl[0].contains("cli_windows_x64.exe (v1.5.11)"));
+        assert!(lines_dl[1].contains("50.0%"));
+        assert!(lines_dl[1].contains("16.00 MiB/s"));
+        assert!(lines_dl[1].contains("ETA 8s"));
+
+        let unknown = TransferProgress {
+            total_bytes: None,
+            eta_secs: None,
+            ..downloading
+        };
+        let lines_narrow = format_transfer_lines(&unknown, 5, 48, false);
+        assert_eq!(lines_narrow.len(), 2);
+        assert!(lines_narrow[1].contains("16.00 MiB/s"));
     }
 }
