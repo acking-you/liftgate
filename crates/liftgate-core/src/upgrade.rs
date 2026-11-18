@@ -14,6 +14,7 @@
 //!   (with automatic rollback and Windows running-executable rename handling).
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -21,15 +22,16 @@ use std::io::{self, Read as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tar::Archive;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufWriter};
 use tokio::net::TcpStream;
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -43,11 +45,201 @@ const CURRENT_VERSION_RAW: &str = env!("CARGO_PKG_VERSION");
 const COMPILE_TARGET: &str = env!("LIFTGATE_BUILD_TARGET");
 
 const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_BINARY_EXTRACT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_BINARY_EXTRACT_BYTES: u64 = 512 * 1024 * 1024;
 const FETCH_METADATA_TIMEOUT: Duration = Duration::from_secs(25);
-const FETCH_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
+const FETCH_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
 const BACKUP_MARKER: &str = ".old-upgrade";
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(60);
+const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
+const MAX_HTTP_HEADER_FILE_BYTES: u64 = 256 * 1024;
+
+/// High-level lifecycle stage of an active Liftgate self-upgrade or `agy` install/update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStage {
+    Checking,
+    Downloading,
+    Verifying,
+    Extracting,
+    Testing,
+    Installing,
+}
+
+impl TransferStage {
+    /// Short human-readable stage title.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Checking => "Checking",
+            Self::Downloading => "Downloading",
+            Self::Verifying => "Verifying",
+            Self::Extracting => "Extracting",
+            Self::Testing => "Testing",
+            Self::Installing => "Installing",
+        }
+    }
+
+    /// 1-based step index across the 6-stage upgrade lifecycle.
+    #[must_use]
+    pub const fn step_index(self) -> u8 {
+        match self {
+            Self::Checking => 1,
+            Self::Downloading => 2,
+            Self::Verifying => 3,
+            Self::Extracting => 4,
+            Self::Testing => 5,
+            Self::Installing => 6,
+        }
+    }
+}
+
+/// Real-time progress snapshot emitted during verified downloads and binary installations.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TransferProgress {
+    pub stage: TransferStage,
+    pub message: String,
+    pub asset_name: Option<String>,
+    pub target_version: Option<String>,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub bytes_per_sec: f64,
+    pub eta_secs: Option<u64>,
+}
+
+impl TransferProgress {
+    /// Creates a checking-stage initial progress snapshot.
+    #[must_use]
+    pub fn checking(message: impl Into<String>) -> Self {
+        Self {
+            stage: TransferStage::Checking,
+            message: message.into(),
+            asset_name: None,
+            target_version: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            bytes_per_sec: 0.0,
+            eta_secs: None,
+        }
+    }
+
+    /// Creates a non-download lifecycle stage snapshot carrying optional asset/version metadata.
+    #[must_use]
+    pub fn stage(
+        stage: TransferStage,
+        message: impl Into<String>,
+        asset_name: Option<String>,
+        target_version: Option<String>,
+    ) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+            asset_name,
+            target_version,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            bytes_per_sec: 0.0,
+            eta_secs: None,
+        }
+    }
+
+    /// Returns download completion ratio in `0.0..=1.0` when total byte length is known.
+    #[must_use]
+    pub fn progress_fraction(&self) -> Option<f64> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0))
+    }
+}
+
+pub(crate) struct DownloadProgressContext<'a> {
+    pub tx: &'a watch::Sender<TransferProgress>,
+    pub asset_name: String,
+    pub target_version: Option<String>,
+    pub known_total_bytes: Option<u64>,
+}
+
+pub(crate) fn emit_progress(tx: Option<&watch::Sender<TransferProgress>>, snap: TransferProgress) {
+    if let Some(sender) = tx {
+        let _ = sender.send_replace(snap);
+    }
+}
+
+struct SpeedTracker {
+    started_at: Instant,
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl SpeedTracker {
+    fn new(now: Instant) -> Self {
+        let mut samples = VecDeque::with_capacity(32);
+        samples.push_back((now, 0));
+        Self {
+            started_at: now,
+            samples,
+        }
+    }
+
+    fn record(&mut self, now: Instant, downloaded_bytes: u64) -> f64 {
+        const WINDOW: Duration = Duration::from_secs(2);
+        const MIN_SAMPLE_GAP: Duration = Duration::from_millis(80);
+
+        let should_push = self
+            .samples
+            .back()
+            .is_none_or(|(last_t, _)| now.duration_since(*last_t) >= MIN_SAMPLE_GAP);
+        if should_push {
+            self.samples.push_back((now, downloaded_bytes));
+        }
+        while self.samples.len() > 2
+            && self
+                .samples
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > WINDOW)
+        {
+            let _ = self.samples.pop_front();
+        }
+
+        if let Some(&(oldest_t, oldest_b)) = self.samples.front() {
+            let dt = now.duration_since(oldest_t).as_secs_f64();
+            if dt >= 0.15 {
+                return downloaded_bytes.saturating_sub(oldest_b) as f64 / dt;
+            }
+        }
+        let elapsed = now.duration_since(self.started_at).as_secs_f64();
+        if elapsed > 0.01 {
+            downloaded_bytes as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+}
+
+fn estimate_eta_secs(downloaded: u64, total: Option<u64>, rate_bps: f64) -> Option<u64> {
+    let total = total?;
+    if downloaded >= total {
+        return Some(0);
+    }
+    if !rate_bps.is_finite() || rate_bps < 1.0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(downloaded) as f64;
+    let secs = (remaining / rate_bps).ceil();
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs.min(u64::MAX as f64) as u64)
+    } else {
+        None
+    }
+}
+
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PreId {
@@ -354,6 +546,16 @@ pub async fn execute_upgrade(
     args: &UpgradeArgs,
     current_exe: &Path,
 ) -> Result<UpgradeOutcome, CliError> {
+    execute_upgrade_with_progress(state_paths, args, current_exe, None).await
+}
+
+pub async fn execute_upgrade_with_progress(
+    state_paths: &StatePaths,
+    args: &UpgradeArgs,
+    current_exe: &Path,
+    progress: Option<watch::Sender<TransferProgress>>,
+) -> Result<UpgradeOutcome, CliError> {
+    let progress_tx = progress.as_ref();
     validate_repo_slug(&args.repo)?;
     let requested_tag = match args
         .version
@@ -389,6 +591,10 @@ pub async fn execute_upgrade(
         });
     }
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::checking(format!("Querying GitHub Releases ({})…", args.repo)),
+    );
     let plan = resolve_release_plan(
         &args.repo,
         requested_tag.as_deref(),
@@ -496,6 +702,15 @@ pub async fn execute_upgrade(
     let stage = StageDirGuard::create(state_paths)?;
     let (staged, verified_sha256) =
         async {
+            emit_progress(
+                progress_tx,
+                TransferProgress::stage(
+                    TransferStage::Checking,
+                    format!("Fetching SHA256SUMS for {}…", plan.tag),
+                    Some(plan.archive_name.clone()),
+                    Some(plan.tag.clone()),
+                ),
+            );
             let sums_bytes = fetch_bytes_bounded(
                 &plan.checksums_url,
                 MAX_METADATA_BYTES,
@@ -525,15 +740,31 @@ pub async fn execute_upgrade(
             }
 
             let archive_path = stage.path.join(&plan.archive_name);
-            download_url_to_path(
+            let dl_ctx = progress_tx.map(|tx| DownloadProgressContext {
+                tx,
+                asset_name: plan.archive_name.clone(),
+                target_version: Some(plan.tag.clone()),
+                known_total_bytes: plan.archive_size,
+            });
+            download_url_to_path_with_progress(
                 &plan.archive_url,
                 &archive_path,
                 MAX_ARCHIVE_BYTES,
                 FETCH_ARCHIVE_TIMEOUT,
                 args.proxy.as_deref(),
+                dl_ctx.as_ref(),
             )
             .await?;
 
+            emit_progress(
+                progress_tx,
+                TransferProgress::stage(
+                    TransferStage::Verifying,
+                    format!("Verifying SHA-256 checksum of {}…", plan.archive_name),
+                    Some(plan.archive_name.clone()),
+                    Some(plan.tag.clone()),
+                ),
+            );
             let actual_sha256 = compute_file_sha256(&archive_path)?;
             if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
                 return Err(CliError::UpgradeChecksumMismatch {
@@ -543,6 +774,15 @@ pub async fn execute_upgrade(
                 });
             }
 
+            emit_progress(
+                progress_tx,
+                TransferProgress::stage(
+                    TransferStage::Extracting,
+                    format!("Unpacking release binaries from {}…", plan.archive_name),
+                    Some(plan.archive_name.clone()),
+                    Some(plan.tag.clone()),
+                ),
+            );
             let unpacked = unpack_release_binaries(&archive_path, &plan.archive_name, &stage.path)?;
             let invoked_from_desktop = current_exe
                 .file_stem()
@@ -556,6 +796,15 @@ pub async fn execute_upgrade(
                 });
             }
             if plan.target_triple == COMPILE_TARGET {
+                emit_progress(
+                    progress_tx,
+                    TransferProgress::stage(
+                        TransferStage::Testing,
+                        "Running `--version` smoke check on staged binaries…",
+                        Some(plan.archive_name.clone()),
+                        Some(plan.tag.clone()),
+                    ),
+                );
                 smoke_check_staged_binary(&unpacked.liftgate_bin).await?;
                 if let Some(desktop_bin) = &unpacked.desktop_bin {
                     smoke_check_staged_binary(desktop_bin).await?;
@@ -565,6 +814,15 @@ pub async fn execute_upgrade(
         }
         .await?;
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::stage(
+            TransferStage::Installing,
+            format!("Installing {} & updating background gateway…", plan.tag),
+            Some(plan.archive_name.clone()),
+            Some(plan.tag.clone()),
+        ),
+    );
     // Check if a managed background daemon is running so we unlock `liftgate.exe` on Windows
     // and bring the daemon back online running the newly installed version.
     let install_targets = plan_install_targets(current_exe, &staged, &plan.target_triple);
@@ -937,6 +1195,7 @@ pub(crate) async fn fetch_bytes_with_policy(
         proxy,
         force_direct_when_no_proxy,
         accept_github_json,
+        None,
     )
     .await;
     if let Err(err) = res {
@@ -951,31 +1210,38 @@ pub(crate) async fn fetch_bytes_with_policy(
     bytes
 }
 
-async fn download_url_to_path(
+async fn download_url_to_path_with_progress(
     url: &str,
     dest: &Path,
     max_bytes: u64,
     max_duration: Duration,
     proxy: Option<&str>,
+    progress: Option<&DownloadProgressContext<'_>>,
 ) -> Result<(), CliError> {
-    download_url_with_policy(url, dest, max_bytes, max_duration, proxy, false).await
+    download_url_with_policy_and_progress(
+        url,
+        dest,
+        max_bytes,
+        max_duration,
+        proxy,
+        false,
+        progress,
+    )
+    .await
 }
 
-pub(crate) async fn download_url_with_policy(
+pub(crate) async fn download_url_with_policy_and_progress(
     url: &str,
     dest: &Path,
     max_bytes: u64,
     max_duration: Duration,
     proxy: Option<&str>,
     force_direct_when_no_proxy: bool,
+    progress: Option<&DownloadProgressContext<'_>>,
 ) -> Result<(), CliError> {
     if let Some(loopback) = parse_loopback_http_url(url) {
-        let bytes = fetch_loopback_http(&loopback, max_bytes, max_duration).await?;
-        fs::write(dest, &bytes).map_err(|source| CliError::StateIo {
-            path: dest.to_path_buf(),
-            source,
-        })?;
-        return Ok(());
+        return download_loopback_http_to_path(&loopback, dest, max_bytes, max_duration, progress)
+            .await;
     }
     download_https_via_system_tool(
         url,
@@ -985,10 +1251,15 @@ pub(crate) async fn download_url_with_policy(
         proxy,
         force_direct_when_no_proxy,
         false,
+        progress,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal transport helper carries explicit download bounds, proxy policy, and optional progress sink"
+)]
 async fn download_https_via_system_tool(
     url: &str,
     dest: &Path,
@@ -997,12 +1268,22 @@ async fn download_https_via_system_tool(
     proxy: Option<&str>,
     force_direct_when_no_proxy: bool,
     accept_github_json: bool,
+    progress: Option<&DownloadProgressContext<'_>>,
 ) -> Result<(), CliError> {
     if !url.starts_with("https://") {
         return Err(CliError::UpgradeInvalidInput {
             reason: format!("refusing non-HTTPS upgrade URL `{url}`"),
         });
     }
+
+    let header_path = dest.with_file_name(format!(
+        "liftgate-hdr-{}-{}.tmp",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let _header_guard = TempFileGuard {
+        path: header_path.clone(),
+    };
 
     let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
     let mut cmd = Command::new(curl_bin);
@@ -1024,14 +1305,14 @@ async fn download_https_via_system_tool(
         &max_size_str,
         "--config",
         "-",
-        "-o",
+        "-D",
     ])
-    .arg(dest)
-    .args(["-w", "%{http_code}"])
+    .arg(&header_path)
     .arg(url)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
 
     if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
         cmd.arg("--proxy").arg(p);
@@ -1057,53 +1338,311 @@ async fn download_https_via_system_tool(
                 let _ = stdin_pipe.write_all(curl_cfg.as_bytes()).await;
                 let _ = stdin_pipe.shutdown().await;
             }
-            let out = timeout(
-                max_duration.saturating_add(Duration::from_secs(5)),
-                child.wait_with_output(),
-            )
-            .await
-            .map_err(|_| CliError::UpgradeNetwork {
-                url: url.to_owned(),
-                detail: "request timed out".to_owned(),
-            })?
-            .map_err(|err| CliError::UpgradeNetwork {
-                url: url.to_owned(),
-                detail: format!("I/O error waiting on curl: {err}"),
-            })?;
 
-            let status_code = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<u16>()
-                .unwrap_or(0);
-            if status_code >= 400 {
-                let _ = fs::remove_file(dest);
+            let Some(mut stdout_pipe) = child.stdout.take() else {
+                let _ = child.kill().await;
                 return Err(CliError::UpgradeNetwork {
                     url: url.to_owned(),
-                    detail: format!("HTTP {status_code}"),
+                    detail: "curl stdout pipe was unavailable".to_owned(),
                 });
-            }
-            if !out.status.success() {
-                let _ = fs::remove_file(dest);
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                return Err(CliError::UpgradeNetwork {
+            };
+            let stderr_pipe = child.stderr.take();
+            let stderr_task = tokio::spawn(async move {
+                let Some(pipe) = stderr_pipe else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                let mut limited = pipe.take(MAX_CURL_STDERR_BYTES as u64);
+                let _ = limited.read_to_end(&mut out).await;
+                out
+            });
+            let stderr_abort = stderr_task.abort_handle();
+
+            let stream_res = timeout(max_duration.saturating_add(Duration::from_secs(5)), async {
+                let file =
+                    tokio::fs::File::create(dest)
+                        .await
+                        .map_err(|source| CliError::StateIo {
+                            path: dest.to_path_buf(),
+                            source,
+                        })?;
+                let mut writer = BufWriter::with_capacity(64 * 1024, file);
+                let mut buf = vec![0u8; 32 * 1024];
+                let mut downloaded: u64 = 0;
+                let mut total_bytes = progress.and_then(|p| p.known_total_bytes);
+                let mut header_checked = false;
+                let mut tracker = SpeedTracker::new(Instant::now());
+                let mut last_emit = Instant::now();
+
+                if let Some(p) = progress {
+                    let _ = p.tx.send_replace(TransferProgress {
+                        stage: TransferStage::Downloading,
+                        message: format!("Downloading {}…", p.asset_name),
+                        asset_name: Some(p.asset_name.clone()),
+                        target_version: p.target_version.clone(),
+                        downloaded_bytes: 0,
+                        total_bytes,
+                        bytes_per_sec: 0.0,
+                        eta_secs: None,
+                    });
+                }
+
+                loop {
+                    let n = stdout_pipe.read(&mut buf).await.map_err(|err| {
+                        CliError::UpgradeNetwork {
+                            url: url.to_owned(),
+                            detail: format!("I/O error reading curl stream: {err}"),
+                        }
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+
+                    if !header_checked || total_bytes.is_none() {
+                        let meta = parse_http_headers_file(&header_path);
+                        if let Some(code) = meta.status_code {
+                            header_checked = true;
+                            if code >= 400 {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                return Err(CliError::UpgradeNetwork {
+                                    url: url.to_owned(),
+                                    detail: format!("HTTP {code}"),
+                                });
+                            }
+                        }
+                        if total_bytes.is_none() && meta.content_length.is_some() {
+                            total_bytes = meta.content_length;
+                        }
+                    }
+
+                    downloaded = downloaded.saturating_add(n as u64);
+                    if downloaded > max_bytes {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(CliError::UpgradeNetwork {
+                            url: url.to_owned(),
+                            detail: format!(
+                                "download exceeded safety limit ({} MiB)",
+                                max_bytes / (1024 * 1024)
+                            ),
+                        });
+                    }
+
+                    if let Some(chunk) = buf.get(..n) {
+                        writer
+                            .write_all(chunk)
+                            .await
+                            .map_err(|source| CliError::StateIo {
+                                path: dest.to_path_buf(),
+                                source,
+                            })?;
+                    }
+
+                    if let Some(p) = progress {
+                        let now = Instant::now();
+                        let rate = tracker.record(now, downloaded);
+                        if now.duration_since(last_emit) >= PROGRESS_EMIT_INTERVAL
+                            || downloaded == n as u64
+                        {
+                            last_emit = now;
+                            let _ = p.tx.send_replace(TransferProgress {
+                                stage: TransferStage::Downloading,
+                                message: format!("Downloading {}…", p.asset_name),
+                                asset_name: Some(p.asset_name.clone()),
+                                target_version: p.target_version.clone(),
+                                downloaded_bytes: downloaded,
+                                total_bytes,
+                                bytes_per_sec: rate,
+                                eta_secs: estimate_eta_secs(downloaded, total_bytes, rate),
+                            });
+                        }
+                    }
+                }
+
+                writer.flush().await.map_err(|source| CliError::StateIo {
+                    path: dest.to_path_buf(),
+                    source,
+                })?;
+                drop(writer);
+
+                let exit_status = child.wait().await.map_err(|err| CliError::UpgradeNetwork {
                     url: url.to_owned(),
-                    detail: if stderr.is_empty() {
-                        format!("curl exited with {}", out.status)
-                    } else {
-                        stderr
-                    },
-                });
+                    detail: format!("I/O error waiting on curl: {err}"),
+                })?;
+                let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+                let meta = parse_http_headers_file(&header_path);
+                if let Some(code) = meta.status_code
+                    && code >= 400
+                {
+                    return Err(CliError::UpgradeNetwork {
+                        url: url.to_owned(),
+                        detail: format!("HTTP {code}"),
+                    });
+                }
+                if !exit_status.success() {
+                    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+                    return Err(CliError::UpgradeNetwork {
+                        url: url.to_owned(),
+                        detail: if stderr.is_empty() {
+                            format!("curl exited with {exit_status}")
+                        } else {
+                            stderr
+                        },
+                    });
+                }
+
+                if let Some(p) = progress {
+                    let now = Instant::now();
+                    let rate = tracker.record(now, downloaded);
+                    let final_total = total_bytes.or(meta.content_length).or(Some(downloaded));
+                    let _ = p.tx.send_replace(TransferProgress {
+                        stage: TransferStage::Downloading,
+                        message: format!("Downloaded {}", p.asset_name),
+                        asset_name: Some(p.asset_name.clone()),
+                        target_version: p.target_version.clone(),
+                        downloaded_bytes: downloaded,
+                        total_bytes: final_total,
+                        bytes_per_sec: rate,
+                        eta_secs: Some(0),
+                    });
+                }
+                Ok(())
+            })
+            .await;
+
+            match stream_res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => {
+                    stderr_abort.abort();
+                    let _ = fs::remove_file(dest);
+                    Err(err)
+                }
+                Err(_) => {
+                    stderr_abort.abort();
+                    let _ = fs::remove_file(dest);
+                    Err(CliError::UpgradeNetwork {
+                        url: url.to_owned(),
+                        detail: "request timed out".to_owned(),
+                    })
+                }
             }
-            Ok(())
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            download_https_fallback(url, dest, max_duration, proxy, force_direct_when_no_proxy)
-                .await
+            download_https_fallback(
+                url,
+                dest,
+                max_duration,
+                proxy,
+                force_direct_when_no_proxy,
+                progress,
+            )
+            .await
         }
         Err(err) => Err(CliError::UpgradeNetwork {
             url: url.to_owned(),
             detail: format!("failed to spawn curl: {err}"),
         }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HttpHeaderMeta {
+    status_code: Option<u16>,
+    content_length: Option<u64>,
+}
+
+/// Parses `curl -D` response headers and returns the final non-1xx, non-CONNECT HTTP block.
+fn parse_http_headers_file(path: &Path) -> HttpHeaderMeta {
+    let Ok(bytes) = read_file_bounded(path, MAX_HTTP_HEADER_FILE_BYTES) else {
+        return HttpHeaderMeta::default();
+    };
+    parse_http_headers_text(&String::from_utf8_lossy(&bytes))
+}
+
+fn parse_http_headers_text(text: &str) -> HttpHeaderMeta {
+    let mut result = HttpHeaderMeta::default();
+    let mut in_ignored_block = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("HTTP/"))
+        {
+            let code = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|tok| tok.parse::<u16>().ok());
+            let is_proxy_connect = line.to_ascii_lowercase().contains("connection established");
+            if is_proxy_connect || code.is_some_and(|c| (100..200).contains(&c)) {
+                in_ignored_block = true;
+            } else {
+                in_ignored_block = false;
+                result = HttpHeaderMeta {
+                    status_code: code,
+                    content_length: None,
+                };
+            }
+            continue;
+        }
+        if in_ignored_block {
+            continue;
+        }
+        if let Some((name, val)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+            && let Ok(len) = val.trim().parse::<u64>()
+        {
+            result.content_length = Some(len);
+        }
+    }
+    result
+}
+
+async fn wait_child_with_file_progress(
+    child: tokio::process::Child,
+    dest: &Path,
+    max_duration: Duration,
+    progress: Option<&DownloadProgressContext<'_>>,
+) -> Result<std::process::Output, io::Error> {
+    let Some(p) = progress else {
+        return match timeout(max_duration, child.wait_with_output()).await {
+            Ok(res) => res,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "download timed out",
+            )),
+        };
+    };
+
+    let mut tracker = SpeedTracker::new(Instant::now());
+    let mut wait_fut = std::pin::pin!(child.wait_with_output());
+    let mut tick = tokio::time::interval(Duration::from_millis(120));
+    let deadline = tokio::time::Instant::now() + max_duration;
+    loop {
+        tokio::select! {
+            res = &mut wait_fut => return res,
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "download timed out"));
+            }
+            _ = tick.tick() => {
+                let downloaded = fs::metadata(dest).map_or(0, |m| m.len());
+                let rate = tracker.record(Instant::now(), downloaded);
+                let _ = p.tx.send_replace(TransferProgress {
+                    stage: TransferStage::Downloading,
+                    message: format!("Downloading {}…", p.asset_name),
+                    asset_name: Some(p.asset_name.clone()),
+                    target_version: p.target_version.clone(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: p.known_total_bytes,
+                    bytes_per_sec: rate,
+                    eta_secs: estimate_eta_secs(downloaded, p.known_total_bytes, rate),
+                });
+            }
+        }
     }
 }
 
@@ -1113,6 +1652,7 @@ async fn download_https_fallback(
     max_duration: Duration,
     proxy: Option<&str>,
     force_direct_when_no_proxy: bool,
+    progress: Option<&DownloadProgressContext<'_>>,
 ) -> Result<(), CliError> {
     #[cfg(windows)]
     {
@@ -1127,7 +1667,8 @@ async fn download_https_fallback(
         .env("LG_UPG_OUT", dest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
         if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
             cmd.env("LG_UPG_PROXY", p);
         } else {
@@ -1146,15 +1687,22 @@ async fn download_https_fallback(
             }
         }
         suppress_windows_console(&mut cmd);
-        let out = timeout(max_duration, cmd.output())
+        let child = cmd.spawn().map_err(|err| CliError::UpgradeNetwork {
+            url: url.to_owned(),
+            detail: format!("failed to invoke curl.exe or powershell.exe: {err}"),
+        })?;
+        let out = wait_child_with_file_progress(child, dest, max_duration, progress)
             .await
-            .map_err(|_| CliError::UpgradeNetwork {
-                url: url.to_owned(),
-                detail: "PowerShell download timed out".to_owned(),
-            })?
-            .map_err(|err| CliError::UpgradeNetwork {
-                url: url.to_owned(),
-                detail: format!("failed to invoke curl.exe or powershell.exe: {err}"),
+            .map_err(|err| {
+                let _ = fs::remove_file(dest);
+                CliError::UpgradeNetwork {
+                    url: url.to_owned(),
+                    detail: if err.kind() == io::ErrorKind::TimedOut {
+                        "PowerShell download timed out".to_owned()
+                    } else {
+                        format!("PowerShell download I/O error: {err}")
+                    },
+                }
             })?;
         if !out.status.success() {
             let _ = fs::remove_file(dest);
@@ -1181,7 +1729,8 @@ async fn download_https_fallback(
                 .arg(url)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped());
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
             if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
                 cmd.env("https_proxy", p).env("HTTPS_PROXY", p);
             } else if force_direct_when_no_proxy {
@@ -1198,15 +1747,18 @@ async fn download_https_fallback(
             }
             match cmd.spawn() {
                 Ok(child) => {
-                    let out = timeout(max_duration, child.wait_with_output())
+                    let out = wait_child_with_file_progress(child, dest, max_duration, progress)
                         .await
-                        .map_err(|_| CliError::UpgradeNetwork {
-                            url: url.to_owned(),
-                            detail: format!("{tool} download timed out"),
-                        })?
-                        .map_err(|err| CliError::UpgradeNetwork {
-                            url: url.to_owned(),
-                            detail: format!("{tool} I/O error: {err}"),
+                        .map_err(|err| {
+                            let _ = fs::remove_file(dest);
+                            CliError::UpgradeNetwork {
+                                url: url.to_owned(),
+                                detail: if err.kind() == io::ErrorKind::TimedOut {
+                                    format!("{tool} download timed out")
+                                } else {
+                                    format!("{tool} I/O error: {err}")
+                                },
+                            }
                         })?;
                     if out.status.success() {
                         return Ok(());
@@ -1261,6 +1813,180 @@ fn parse_loopback_http_url(url: &str) -> Option<LoopbackUrl> {
         path_and_query: path_part,
         raw_url: url.to_owned(),
     })
+}
+
+async fn download_loopback_http_to_path(
+    target: &LoopbackUrl,
+    dest: &Path,
+    max_bytes: u64,
+    max_duration: Duration,
+    progress: Option<&DownloadProgressContext<'_>>,
+) -> Result<(), CliError> {
+    let res = timeout(max_duration, async {
+        let mut stream = TcpStream::connect(target.addr).await.map_err(|err| {
+            CliError::UpgradeNetwork {
+                url: target.raw_url.clone(),
+                detail: format!("connect failed: {err}"),
+            }
+        })?;
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Liftgate-CLI-Updater\r\nConnection: close\r\n\r\n",
+            target.path_and_query, target.host_header
+        );
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|err| CliError::UpgradeNetwork {
+                url: target.raw_url.clone(),
+                detail: format!("write failed: {err}"),
+            })?;
+
+        let mut header_buf = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        let hdr_end = loop {
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|err| CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: format!("read failed: {err}"),
+                })?;
+            if n == 0 {
+                return Err(CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: "malformed HTTP response header".to_owned(),
+                });
+            }
+            if let Some(chunk) = buf.get(..n) {
+                header_buf.extend_from_slice(chunk);
+            }
+            if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            if header_buf.len() > 65_536 {
+                return Err(CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: "HTTP response header exceeded safety limit".to_owned(),
+                });
+            }
+        };
+
+        let header_str = String::from_utf8_lossy(header_buf.get(..hdr_end).unwrap_or_default());
+        let meta = parse_http_headers_text(&header_str);
+        let status = meta.status_code.unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(CliError::UpgradeNetwork {
+                url: target.raw_url.clone(),
+                detail: format!("HTTP {status}"),
+            });
+        }
+
+        let total_bytes = progress
+            .and_then(|p| p.known_total_bytes)
+            .or(meta.content_length);
+        let file = tokio::fs::File::create(dest)
+            .await
+            .map_err(|source| CliError::StateIo {
+                path: dest.to_path_buf(),
+                source,
+            })?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        let mut downloaded: u64 = 0;
+        let mut tracker = SpeedTracker::new(Instant::now());
+        let mut last_emit = Instant::now();
+
+        let initial_body = header_buf.get(hdr_end + 4..).unwrap_or_default();
+        if !initial_body.is_empty() {
+            downloaded = downloaded.saturating_add(initial_body.len() as u64);
+            if downloaded > max_bytes {
+                return Err(CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: "body exceeded maximum allowed byte size".to_owned(),
+                });
+            }
+            writer
+                .write_all(initial_body)
+                .await
+                .map_err(|source| CliError::StateIo {
+                    path: dest.to_path_buf(),
+                    source,
+                })?;
+        }
+
+        loop {
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|err| CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: format!("read failed: {err}"),
+                })?;
+            if n == 0 {
+                break;
+            }
+            downloaded = downloaded.saturating_add(n as u64);
+            if downloaded > max_bytes {
+                return Err(CliError::UpgradeNetwork {
+                    url: target.raw_url.clone(),
+                    detail: "body exceeded maximum allowed byte size".to_owned(),
+                });
+            }
+            if let Some(chunk) = buf.get(..n) {
+                writer
+                    .write_all(chunk)
+                    .await
+                    .map_err(|source| CliError::StateIo {
+                        path: dest.to_path_buf(),
+                        source,
+                    })?;
+            }
+            if let Some(p) = progress {
+                let now = Instant::now();
+                let rate = tracker.record(now, downloaded);
+                if now.duration_since(last_emit) >= PROGRESS_EMIT_INTERVAL {
+                    last_emit = now;
+                    let _ = p.tx.send_replace(TransferProgress {
+                        stage: TransferStage::Downloading,
+                        message: format!("Downloading {}…", p.asset_name),
+                        asset_name: Some(p.asset_name.clone()),
+                        target_version: p.target_version.clone(),
+                        downloaded_bytes: downloaded,
+                        total_bytes,
+                        bytes_per_sec: rate,
+                        eta_secs: estimate_eta_secs(downloaded, total_bytes, rate),
+                    });
+                }
+            }
+        }
+
+        writer.flush().await.map_err(|source| CliError::StateIo {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+        if let Some(p) = progress {
+            let rate = tracker.record(Instant::now(), downloaded);
+            let _ = p.tx.send_replace(TransferProgress {
+                stage: TransferStage::Downloading,
+                message: format!("Downloaded {}", p.asset_name),
+                asset_name: Some(p.asset_name.clone()),
+                target_version: p.target_version.clone(),
+                downloaded_bytes: downloaded,
+                total_bytes: total_bytes.or(Some(downloaded)),
+                bytes_per_sec: rate,
+                eta_secs: Some(0),
+            });
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| CliError::UpgradeNetwork {
+        url: target.raw_url.clone(),
+        detail: "loopback request timed out".to_owned(),
+    })?;
+    if res.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    res
 }
 
 async fn fetch_loopback_http(
@@ -1658,7 +2384,10 @@ fn write_bounded_stream_to_executable<R: io::Read>(
         let _ = fs::remove_file(dest);
         return Err(CliError::UpgradeArchive {
             asset: archive_name.to_owned(),
-            detail: "extracted binary exceeded 128 MiB safety limit".to_owned(),
+            detail: format!(
+                "extracted binary exceeded {} MiB safety limit",
+                MAX_BINARY_EXTRACT_BYTES / (1024 * 1024)
+            ),
         });
     }
     out.sync_all().map_err(|source| CliError::StateIo {
@@ -2370,5 +3099,70 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn parses_http_headers_across_proxy_connect_and_redirects() {
+        let headers = concat!(
+            "HTTP/1.1 200 Connection established\r\n",
+            "\r\n",
+            "HTTP/1.1 302 Found\r\n",
+            "Location: https://storage.googleapis.com/bucket/cli_windows_x64.exe\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+            "HTTP/2 200\r\n",
+            "content-type: application/octet-stream\r\n",
+            "Content-Length: 234827416\r\n",
+            "\r\n"
+        );
+        let meta = parse_http_headers_text(headers);
+        assert_eq!(meta.status_code, Some(200));
+        assert_eq!(meta.content_length, Some(234_827_416));
+
+        let err_meta = parse_http_headers_text("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n");
+        assert_eq!(err_meta.status_code, Some(404));
+        assert_eq!(err_meta.content_length, Some(0));
+    }
+
+    #[tokio::test]
+    async fn loopback_download_streams_progress_with_total_bytes_and_rate() {
+        let payload = vec![0x5Au8; 256 * 1024];
+        let mock_url = spawn_mock_release_server(
+            "v99.9.9",
+            "liftgate-demo.bin",
+            payload.clone(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await;
+        let dl_url = format!("{mock_url}/download/liftgate-demo.bin");
+        let temp_file = std::env::temp_dir().join(format!("lg-dl-prog-{}.bin", Uuid::new_v4()));
+        let (tx, rx) = watch::channel(TransferProgress::checking("init"));
+        let ctx = DownloadProgressContext {
+            tx: &tx,
+            asset_name: "liftgate-demo.bin".to_owned(),
+            target_version: Some("v99.9.9".to_owned()),
+            known_total_bytes: None,
+        };
+
+        download_url_with_policy_and_progress(
+            &dl_url,
+            &temp_file,
+            MAX_ARCHIVE_BYTES,
+            Duration::from_secs(10),
+            None,
+            false,
+            Some(&ctx),
+        )
+        .await
+        .unwrap();
+
+        let final_prog = rx.borrow().clone();
+        assert_eq!(final_prog.stage, TransferStage::Downloading);
+        assert_eq!(final_prog.downloaded_bytes, payload.len() as u64);
+        assert_eq!(final_prog.total_bytes, Some(payload.len() as u64));
+        assert_eq!(final_prog.progress_fraction(), Some(1.0));
+        assert_eq!(final_prog.eta_secs, Some(0));
+        assert_eq!(fs::read(&temp_file).unwrap(), payload);
+        let _ = fs::remove_file(&temp_file);
     }
 }

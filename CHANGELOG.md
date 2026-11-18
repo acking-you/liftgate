@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-11-19
+
+### Added
+- **Live upgrade progress bars, transfer speed, and ETA across CLI and Desktop**:
+  - Streamed verified HTTPS downloads (`lg upgrade`, `lg agy install`, `lg agy update`, and `liftgate-desktop`) with live `Content-Length` detection via `curl -D` response headers (handling HTTP proxy `CONNECT` tunnels and redirects), sliding-window transfer-rate estimation (`KiB/s` / `MiB/s` / `GiB/s`), and ETA calculation.
+  - Added a 6-stage animated terminal progress bar (`TransferProgressDisplay`) on interactive TTYs (honoring `NO_COLOR`, `TERM=dumb`, `--json`, and raw TUI mode) plus final transfer-size and average-speed summaries.
+  - Added a shared Warm Editorial progress panel (`transfer_progress_panel`) in `liftgate-desktop` across the System self-upgrade card, AGY lifecycle card, and Environment Doctor quick-install action.
+
+### Changed
+- **Gemini 4 Neon optimal routing & effort adaptation**:
+  - Confirmed `gemini-4-neon-*` and `gemini-pro-orchestrator-neon` inherit Liftgate's 500k / 425k default context policy (`1M / 850k` under `--long-context`, `80,000`-byte Codex truncation cap, and Claude Desktop `supports1m`/`prefer1m`), matching upstream Antigravity's `1,048,576`-token ACP `usage_update` window.
+  - Added `gemini-pro-orchestrator-neon` alias routing, ranked `neon` in `select_fastest_gemini_model` above Argon/Carbon when Hydrogen/Flash are unavailable, honored explicit effort lowering from `-xhigh` models (`xhigh` -> `high`/`medium`/`low`) without letting adaptive thinking accidentally downgrade explicit `-xhigh` selections, mapped `*-xhigh` to native Claude Code `effortLevel: "xhigh"`, aligned `neon-low`/`hydrogen-low` to the `claude-haiku-5-5` capability tier, prioritized Gemini 4 Neon in `/v1/codex-models`, and derived per-model `supported_reasoning_levels` dynamically from the live ACP catalog.
+
+### Fixed
+- **Raised `agy` and self-upgrade binary size limits (`1 GiB` for `agy`, `512 MiB` for Liftgate)** so `lg agy install` and `lg agy update` no longer fail with `extracted binary exceeded safety size bound` on larger Antigravity CLI v1.5.11+ builds (whose decompressed Unix binaries exceed 256 MiB and Windows `.exe` approaches 224 MiB), extended payload timeouts to 10 minutes, and refined recovery hints for local archive/extraction failures.
+
 ## [0.2.1] - 2026-11-18
 
 ### Added

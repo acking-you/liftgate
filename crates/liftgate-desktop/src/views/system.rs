@@ -15,6 +15,7 @@ use crate::app::{DesktopApp, render_completions_text};
 use crate::i18n::tr;
 use crate::theme::{
     BadgeTone, Palette, editorial_card, kv_row, pill_badge, section_header, sf_terminal_box,
+    transfer_progress_panel,
 };
 
 impl DesktopApp {
@@ -259,6 +260,7 @@ impl DesktopApp {
                                 Button::new("doc-fix-agy")
                                     .small()
                                     .outline()
+                                    .loading(self.busy_agy)
                                     .icon(IconName::ArrowDown)
                                     .label(tr(lang, "一键安装 agy", "Install agy"))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -287,6 +289,11 @@ impl DesktopApp {
                                     })),
                             ),
                     ),
+            )
+            .children(
+                self.agy_progress
+                    .as_ref()
+                    .map(|prog| transfer_progress_panel(p, lang, prog)),
             )
             .child(if let Some(d) = doc {
                 div()
@@ -557,6 +564,11 @@ impl DesktopApp {
                     .children(upg.and_then(|u| u.sha256.as_ref()).map(|sha| {
                         kv_row(p, "SHA-256", sha.clone())
                     })),
+            )
+            .children(
+                self.upgrade_progress
+                    .as_ref()
+                    .map(|prog| transfer_progress_panel(p, lang, prog)),
             )
             .child(Input::new(&self.in_upgrade_version).small().cleanable(true))
             .child(

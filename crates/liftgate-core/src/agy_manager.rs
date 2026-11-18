@@ -52,16 +52,20 @@ use crate::state::{
     StatePaths, now_unix_ms, resolve_effective_agy_bin, resolve_effective_agy_proxy, user_home_dir,
 };
 use crate::terminal::{TerminalLaunchSpec, spawn_in_system_terminal};
-use crate::upgrade::{SemVer, download_url_with_policy, fetch_bytes_with_policy};
+use crate::upgrade::{
+    DownloadProgressContext, SemVer, TransferProgress, TransferStage,
+    download_url_with_policy_and_progress, emit_progress, fetch_bytes_with_policy,
+};
 
 pub const DEFAULT_AGY_MANIFEST_BASE_URL: &str =
     "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app";
 
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_EXTRACTED_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CLI_CAPTURE_BYTES: usize = 128 * 1024;
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(15);
-const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const AGY_BACKUP_SUFFIX: &str = ".old-agy";
 
 const DEFAULT_AUTO_UPDATE_INITIAL_DELAY_SECS: u64 = 45;
@@ -530,7 +534,24 @@ fn is_tar_gz_url(url: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
 }
 
+fn asset_name_from_url(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    without_query
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or("agy-payload")
+        .to_owned()
+}
+
 fn extract_agy_from_tar_gz(archive_path: &Path, dest_bin: &Path) -> Result<(), CliError> {
+    extract_agy_from_tar_gz_with_limit(archive_path, dest_bin, MAX_EXTRACTED_BINARY_BYTES)
+}
+
+fn extract_agy_from_tar_gz_with_limit(
+    archive_path: &Path,
+    dest_bin: &Path,
+    max_extracted_bytes: u64,
+) -> Result<(), CliError> {
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
         source,
@@ -561,15 +582,18 @@ fn extract_agy_from_tar_gz(archive_path: &Path, dest_bin: &Path) -> Result<(), C
                 path: dest_bin.to_path_buf(),
                 source,
             })?;
-            let mut bounded = entry.take(MAX_PAYLOAD_BYTES + 1);
+            let mut bounded = entry.take(max_extracted_bytes.saturating_add(1));
             let written = io::copy(&mut bounded, &mut out).map_err(|source| CliError::StateIo {
                 path: dest_bin.to_path_buf(),
                 source,
             })?;
-            if written > MAX_PAYLOAD_BYTES {
+            if written > max_extracted_bytes {
                 let _ = fs::remove_file(dest_bin);
                 return Err(CliError::AgyInstallFailed {
-                    detail: "extracted binary exceeded safety size bound".to_owned(),
+                    detail: format!(
+                        "extracted binary exceeded safety size bound ({} MiB)",
+                        max_extracted_bytes / (1024 * 1024)
+                    ),
                 });
             }
             out.sync_all().map_err(|source| CliError::StateIo {
@@ -618,18 +642,37 @@ async fn download_and_verify_agy_staged(
     manifest: &AgyManifest,
     stage_dir: &Path,
     proxy: Option<&ProxyUrl>,
+    progress_tx: Option<&watch::Sender<TransferProgress>>,
 ) -> Result<PathBuf, CliError> {
     let payload_path = stage_dir.join("agy-payload.download");
-    download_url_with_policy(
+    let asset_name = asset_name_from_url(&manifest.url);
+    let target_version = Some(format!("v{}", manifest.version));
+    let dl_ctx = progress_tx.map(|tx| DownloadProgressContext {
+        tx,
+        asset_name: asset_name.clone(),
+        target_version: target_version.clone(),
+        known_total_bytes: None,
+    });
+    download_url_with_policy_and_progress(
         &manifest.url,
         &payload_path,
         MAX_PAYLOAD_BYTES,
         PAYLOAD_TIMEOUT,
         proxy.map(ProxyUrl::as_str),
         true,
+        dl_ctx.as_ref(),
     )
     .await?;
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::stage(
+            TransferStage::Verifying,
+            format!("Verifying SHA-512 checksum of {asset_name}…"),
+            Some(asset_name.clone()),
+            target_version.clone(),
+        ),
+    );
     let actual_sha512 = compute_file_sha512_hex(&payload_path)?;
     if !actual_sha512.eq_ignore_ascii_case(&manifest.sha512) {
         let _ = fs::remove_file(&payload_path);
@@ -642,6 +685,15 @@ async fn download_and_verify_agy_staged(
 
     let staged_bin = stage_dir.join(agy_binary_filename());
     if is_tar_gz_url(&manifest.url) {
+        emit_progress(
+            progress_tx,
+            TransferProgress::stage(
+                TransferStage::Extracting,
+                format!("Extracting `agy` binary from {asset_name}…"),
+                Some(asset_name.clone()),
+                target_version.clone(),
+            ),
+        );
         extract_agy_from_tar_gz(&payload_path, &staged_bin)?;
         let _ = fs::remove_file(&payload_path);
     } else {
@@ -654,6 +706,15 @@ async fn download_and_verify_agy_staged(
     make_executable_and_unquarantine(&staged_bin)?;
 
     // Smoke-test `--version` before ever touching the destination path.
+    emit_progress(
+        progress_tx,
+        TransferProgress::stage(
+            TransferStage::Testing,
+            "Running `agy --version` smoke check…",
+            Some(asset_name),
+            target_version,
+        ),
+    );
     if probe_agy_version(&staged_bin, proxy).await.is_none() {
         return Err(CliError::AgyInstallFailed {
             detail: "downloaded `agy` binary failed `--version` smoke check".to_owned(),
@@ -946,6 +1007,15 @@ pub async fn execute_agy_install(
     state_paths: &StatePaths,
     args: &AgyInstallArgs,
 ) -> Result<AgyInstallOutcome, CliError> {
+    execute_agy_install_with_progress(state_paths, args, None).await
+}
+
+pub async fn execute_agy_install_with_progress(
+    state_paths: &StatePaths,
+    args: &AgyInstallArgs,
+    progress: Option<watch::Sender<TransferProgress>>,
+) -> Result<AgyInstallOutcome, CliError> {
+    let progress_tx = progress.as_ref();
     let mut settings = state_paths.read_settings()?;
     let cli_proxy = args
         .proxy
@@ -969,6 +1039,12 @@ pub async fn execute_agy_install(
         None => None,
     };
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::checking(format!(
+            "Fetching official Antigravity manifest ({platform_slug})…"
+        )),
+    );
     let manifest = fetch_agy_manifest(
         args.manifest_base_url.as_deref(),
         platform_slug,
@@ -1040,9 +1116,23 @@ pub async fn execute_agy_install(
     };
 
     let stage = StageDirGuard::create(state_paths, "agy-install-stage")?;
-    let staged_bin =
-        download_and_verify_agy_staged(&manifest, &stage.path, effective_proxy.as_ref()).await?;
+    let staged_bin = download_and_verify_agy_staged(
+        &manifest,
+        &stage.path,
+        effective_proxy.as_ref(),
+        progress_tx,
+    )
+    .await?;
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::stage(
+            TransferStage::Installing,
+            format!("Installing `agy` v{} & updating gateway…", manifest.version),
+            Some(asset_name_from_url(&manifest.url)),
+            Some(format!("v{}", manifest.version)),
+        ),
+    );
     // If a managed background daemon is running on the binary we're replacing, stop it cleanly first.
     let was_daemon_running = if let Some(d) = state_paths.read_daemon()?
         && daemon::is_pid_alive(d.pid)
@@ -1127,6 +1217,16 @@ pub async fn execute_agy_update(
     explicit_agy_bin: Option<PathBuf>,
     args: &AgyUpdateArgs,
 ) -> Result<AgyUpdateOutcome, CliError> {
+    execute_agy_update_with_progress(state_paths, explicit_agy_bin, args, None).await
+}
+
+pub async fn execute_agy_update_with_progress(
+    state_paths: &StatePaths,
+    explicit_agy_bin: Option<PathBuf>,
+    args: &AgyUpdateArgs,
+    progress: Option<watch::Sender<TransferProgress>>,
+) -> Result<AgyUpdateOutcome, CliError> {
+    let progress_tx = progress.as_ref();
     let mut settings = state_paths.read_settings()?;
     let cli_proxy = args
         .proxy
@@ -1138,7 +1238,7 @@ pub async fn execute_agy_update(
         if args.check {
             return Err(CliError::AgyBinaryNotFound);
         }
-        let inst = execute_agy_install(
+        let inst = execute_agy_install_with_progress(
             state_paths,
             &AgyInstallArgs {
                 check: false,
@@ -1148,6 +1248,7 @@ pub async fn execute_agy_update(
                 skip_path: false,
                 manifest_base_url: args.manifest_base_url.clone(),
             },
+            progress,
         )
         .await?;
         return Ok(AgyUpdateOutcome {
@@ -1163,6 +1264,12 @@ pub async fn execute_agy_update(
 
     let platform_slug = detect_agy_platform_slug()?;
     let current_ver = probe_agy_version(&target_bin, effective_proxy.as_ref()).await;
+    emit_progress(
+        progress_tx,
+        TransferProgress::checking(format!(
+            "Checking official Antigravity manifest ({platform_slug})…"
+        )),
+    );
     let manifest = fetch_agy_manifest(
         args.manifest_base_url.as_deref(),
         platform_slug,
@@ -1195,9 +1302,26 @@ pub async fn execute_agy_update(
     }
 
     let stage = StageDirGuard::create(state_paths, "agy-update-stage")?;
-    let staged_bin =
-        download_and_verify_agy_staged(&manifest, &stage.path, effective_proxy.as_ref()).await?;
+    let staged_bin = download_and_verify_agy_staged(
+        &manifest,
+        &stage.path,
+        effective_proxy.as_ref(),
+        progress_tx,
+    )
+    .await?;
 
+    emit_progress(
+        progress_tx,
+        TransferProgress::stage(
+            TransferStage::Installing,
+            format!(
+                "Installing `agy` v{} & restarting gateway…",
+                manifest.version
+            ),
+            Some(asset_name_from_url(&manifest.url)),
+            Some(format!("v{}", manifest.version)),
+        ),
+    );
     let should_restart_daemon = !args.no_restart
         && state_paths
             .read_daemon()?
@@ -1684,7 +1808,8 @@ async fn apply_idle_agy_hot_update(
 ) -> Result<bool, CliError> {
     let stage = StageDirGuard::create(state_paths, "agy-auto-stage")?;
     let proxy = live_client.agy_proxy().cloned();
-    let staged_bin = download_and_verify_agy_staged(manifest, &stage.path, proxy.as_ref()).await?;
+    let staged_bin =
+        download_and_verify_agy_staged(manifest, &stage.path, proxy.as_ref(), None).await?;
 
     let client_ref = Arc::clone(live_client);
     let pool_ref = Arc::clone(pool);
@@ -1881,6 +2006,12 @@ mod tests {
         let out_bin = temp.join("agy");
         extract_agy_from_tar_gz(&tar_gz_path, &out_bin).unwrap();
         assert_eq!(fs::read(&out_bin).unwrap(), payload);
+
+        // Exceeding the extracted binary limit must fail closed and delete partial output.
+        let out_over = temp.join("agy-over");
+        let err = extract_agy_from_tar_gz_with_limit(&tar_gz_path, &out_over, 4).unwrap_err();
+        assert!(matches!(err, CliError::AgyInstallFailed { .. }));
+        assert!(!out_over.exists());
 
         let _ = fs::remove_dir_all(&temp);
     }

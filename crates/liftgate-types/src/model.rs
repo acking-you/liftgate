@@ -87,16 +87,22 @@ pub fn resolve_model_id(
     let decoded_desktop = decode_claude_desktop_route_id(raw_stripped);
     let raw = decoded_desktop.as_deref().unwrap_or(raw_stripped);
 
-    // 1. Exact match in ACP catalog — except when caller kept a `-high` default model while
-    //    explicitly lowering `--effort` (`low` or `medium`). Never upgrade `-high` -> `-xhigh`
-    //    or `-low` -> `-high` when an exact model ID was requested (Codex defaults unknown
-    //    third-party models to `reasoning.effort = "xhigh"`).
-    let caller_lowered_high_default = raw.to_ascii_lowercase().ends_with("-high")
+    // 1. Exact match in ACP catalog — except when caller kept a `-high` or `-xhigh` model while
+    //    explicitly lowering `--effort` (`-high` -> `low`/`medium`; `-xhigh` -> `low`/`medium`/`high`).
+    //    Never upgrade `-high` -> `-xhigh` or `-low` -> `-high` when an exact model ID was requested
+    //    (Codex defaults unknown third-party models to `reasoning.effort = "xhigh"`).
+    let raw_lower = raw.to_ascii_lowercase();
+    let caller_lowered_effort = (raw_lower.ends_with("-high")
         && matches!(
             effort_hint,
             Some(ReasoningEffort::Low | ReasoningEffort::Medium)
-        );
-    if !caller_lowered_high_default
+        ))
+        || (raw_lower.ends_with("-xhigh")
+            && matches!(
+                effort_hint,
+                Some(ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High)
+            ));
+    if !caller_lowered_effort
         && let Some(hit) = available
             .iter()
             .find(|m| m.model_id.eq_ignore_ascii_case(raw))
@@ -129,7 +135,9 @@ pub fn resolve_model_id(
             return id;
         }
     } else if lower.contains("orchestrator") {
-        let preferred = if lower.contains("argon") {
+        let preferred = if lower.contains("neon") {
+            "gemini-pro-orchestrator-neon"
+        } else if lower.contains("argon") {
             "gemini-pro-orchestrator-argon"
         } else {
             "gemini-pro-orchestrator"
@@ -187,10 +195,12 @@ pub fn select_fastest_gemini_model(available: &[AvailableModel], fallback: &Mode
         }
 
         let family_tier: u8 = if lower.contains("flash-lite") {
-            5
+            6
         } else if lower.contains("flash") {
-            4
+            5
         } else if lower.contains("hydrogen") {
+            4
+        } else if lower.contains("neon") {
             3
         } else if lower.contains("argon") {
             2
@@ -363,7 +373,9 @@ fn apply_effort_to_base(
         .and_then(|hit| ModelId::try_new(&hit.model_id).ok())
 }
 
-fn strip_known_effort_suffix(model: &str) -> &str {
+/// Strips a trailing Antigravity effort suffix (`-xhigh`, `-high`, `-medium`, `-low`).
+#[must_use]
+pub fn strip_known_effort_suffix(model: &str) -> &str {
     for suffix in ["-xhigh", "-high", "-medium", "-low"] {
         if let Some(split_at) = model.len().checked_sub(suffix.len())
             && let Some((head, tail)) = model.split_at_checked(split_at)
@@ -415,7 +427,11 @@ pub fn is_claude_desktop_safe_model_id(model_id: &str) -> bool {
 pub fn encode_claude_desktop_route_id(model_id: &str) -> String {
     let trimmed = model_id.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let role_prefix = if lower.contains("flash-low") || lower.contains("haiku") {
+    let role_prefix = if lower.contains("flash-low")
+        || lower.contains("hydrogen-low")
+        || lower.contains("neon-low")
+        || lower.contains("haiku")
+    {
         "claude-haiku-5-5"
     } else if lower.contains("sonnet") || lower.ends_with("-medium") {
         "claude-sonnet-5-5"
@@ -717,5 +733,127 @@ mod tests {
         assert!(!is_gemini_long_context(280_000, 245_000));
         assert!(!is_gemini_long_context(1_000_000, 0));
         assert!(is_gemini_long_context(1_000_000, 850_000));
+    }
+
+    #[test]
+    fn supports_gemini_4_neon_effort_lowering_orchestrator_and_fast_fallback() {
+        let neon_catalog = vec![
+            AvailableModel {
+                model_id: "gemini-4-neon-xhigh".to_owned(),
+                name: "Gemini 4 Neon (XHigh)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-high".to_owned(),
+                name: "Gemini 4 Neon (High)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-medium".to_owned(),
+                name: "Gemini 4 Neon (Medium)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-low".to_owned(),
+                name: "Gemini 4 Neon (Low)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-carbon-high".to_owned(),
+                name: "Gemini 4 Carbon (High)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-pro-orchestrator-neon".to_owned(),
+                name: "Orchestrator (Neon)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-pro-orchestrator".to_owned(),
+                name: "Orchestrator (Carbon)".to_owned(),
+            },
+        ];
+        let default = ModelId::try_new("gemini-4-neon-high").expect("valid default");
+
+        assert_eq!(
+            context_limits("gemini-4-neon-xhigh", false),
+            (500_000, 425_000)
+        );
+        assert_eq!(
+            context_limits("gemini-4-neon-xhigh", true),
+            (1_000_000, 850_000)
+        );
+        assert_eq!(
+            context_limits("gemini-pro-orchestrator-neon", false),
+            (500_000, 425_000)
+        );
+
+        assert_eq!(
+            resolve_model_id(
+                Some("gemini-4-neon"),
+                Some(ReasoningEffort::XHigh),
+                &neon_catalog,
+                &default
+            )
+            .as_str(),
+            "gemini-4-neon-xhigh"
+        );
+        assert_eq!(
+            resolve_model_id(
+                Some("gemini-4-neon-high"),
+                Some(ReasoningEffort::XHigh),
+                &neon_catalog,
+                &default
+            )
+            .as_str(),
+            "gemini-4-neon-high"
+        );
+        assert_eq!(
+            resolve_model_id(
+                Some("gemini-4-neon-xhigh"),
+                Some(ReasoningEffort::High),
+                &neon_catalog,
+                &default
+            )
+            .as_str(),
+            "gemini-4-neon-high"
+        );
+        assert_eq!(
+            resolve_model_id(
+                Some("gemini-4-neon-xhigh"),
+                Some(ReasoningEffort::Medium),
+                &neon_catalog,
+                &default
+            )
+            .as_str(),
+            "gemini-4-neon-medium"
+        );
+        assert_eq!(
+            resolve_model_id(
+                Some("gemini-4-neon-xhigh"),
+                Some(ReasoningEffort::Low),
+                &neon_catalog,
+                &default
+            )
+            .as_str(),
+            "gemini-4-neon-low"
+        );
+        assert_eq!(
+            resolve_model_id(Some("gemini-4-neon-xhigh"), None, &neon_catalog, &default).as_str(),
+            "gemini-4-neon-xhigh"
+        );
+
+        assert_eq!(
+            resolve_model_id(Some("orchestrator-neon"), None, &neon_catalog, &default).as_str(),
+            "gemini-pro-orchestrator-neon"
+        );
+
+        assert_eq!(
+            select_fastest_gemini_model(&neon_catalog, &default).as_str(),
+            "gemini-4-neon-low"
+        );
+
+        let neon_xhigh_route = encode_claude_desktop_route_id("gemini-4-neon-xhigh");
+        assert!(neon_xhigh_route.starts_with("claude-opus-5-5-lg--"));
+        assert_eq!(
+            decode_claude_desktop_route_id(&neon_xhigh_route).as_deref(),
+            Some("gemini-4-neon-xhigh")
+        );
+        let neon_low_route = encode_claude_desktop_route_id("gemini-4-neon-low");
+        assert!(neon_low_route.starts_with("claude-haiku-5-5-lg--"));
     }
 }

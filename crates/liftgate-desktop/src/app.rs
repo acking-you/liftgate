@@ -35,7 +35,7 @@ use liftgate_core::state::{
     detect_system_language,
 };
 use liftgate_core::terminal::{prepare_reusable_launcher_command, spawn_in_system_terminal};
-use liftgate_core::upgrade::{self, UpgradeOutcome};
+use liftgate_core::upgrade::{self, TransferProgress, UpgradeOutcome};
 use liftgate_types::telemetry::{GatewayTelemetrySnapshot, TaskProtocol};
 use tokio::sync::{oneshot, watch};
 
@@ -220,6 +220,7 @@ pub struct DesktopApp {
 
     // Antigravity & Proxy
     pub(crate) agy_report: Option<AgyStatusReport>,
+    pub(crate) agy_progress: Option<TransferProgress>,
     pub(crate) in_agy_custom_args: Entity<InputState>,
     pub(crate) agy_terminal_output: String,
     pub(crate) proxy_outcome: Option<ProxyOutcome>,
@@ -236,6 +237,7 @@ pub struct DesktopApp {
     pub(crate) selected_shell: Shell,
     pub(crate) completions_preview: String,
     pub(crate) upgrade_outcome: Option<UpgradeOutcome>,
+    pub(crate) upgrade_progress: Option<TransferProgress>,
     pub(crate) in_upgrade_version: Entity<InputState>,
     pub(crate) upgrade_force: bool,
 }
@@ -486,6 +488,7 @@ impl DesktopApp {
             in_model_search,
             model_family: ModelFamilyFilter::All,
             agy_report: None,
+            agy_progress: None,
             in_agy_custom_args,
             agy_terminal_output: String::new(),
             proxy_outcome: None,
@@ -500,6 +503,7 @@ impl DesktopApp {
             selected_shell: default_shell,
             completions_preview,
             upgrade_outcome: None,
+            upgrade_progress: None,
             in_upgrade_version,
             upgrade_force: false,
         };
@@ -2027,16 +2031,31 @@ impl DesktopApp {
             return;
         }
         self.busy_agy = true;
+        let init_prog = TransferProgress::checking(if check_only {
+            tr(
+                self.lang,
+                "正在检查官方 Antigravity CLI 版本…",
+                "Checking official Antigravity CLI manifest…",
+            )
+        } else {
+            tr(
+                self.lang,
+                "正在准备下载官方 Antigravity CLI…",
+                "Preparing Antigravity CLI download…",
+            )
+        });
+        self.agy_progress = Some(init_prog.clone());
         cx.notify();
 
         let state_paths = self.state_paths.clone();
         let installed_already = self.agy_report.as_ref().is_some_and(|r| r.installed);
         let rt = self.rt.clone();
         let (tx, rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = watch::channel(init_prog);
 
         rt.spawn(async move {
             let msg_res: Result<String, String> = if installed_already {
-                agy_manager::execute_agy_update(
+                agy_manager::execute_agy_update_with_progress(
                     &state_paths,
                     None,
                     &AgyUpdateArgs {
@@ -2046,6 +2065,7 @@ impl DesktopApp {
                         no_restart: false,
                         manifest_base_url: None,
                     },
+                    Some(prog_tx),
                 )
                 .await
                 .map(|o| {
@@ -2061,7 +2081,7 @@ impl DesktopApp {
                 })
                 .map_err(|e| e.to_string())
             } else {
-                agy_manager::execute_agy_install(
+                agy_manager::execute_agy_install_with_progress(
                     &state_paths,
                     &AgyInstallArgs {
                         check: check_only,
@@ -2071,6 +2091,7 @@ impl DesktopApp {
                         skip_path: false,
                         manifest_base_url: None,
                     },
+                    Some(prog_tx),
                 )
                 .await
                 .map(|o| {
@@ -2100,9 +2121,31 @@ impl DesktopApp {
         });
 
         cx.spawn(async move |this, cx| {
+            while prog_rx.changed().await.is_ok() {
+                let snap = prog_rx.borrow().clone();
+                let keep = this
+                    .update(cx, |app, cx| {
+                        if app.busy_agy {
+                            app.agy_progress = Some(snap);
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
             if let Ok((msg_res, fresh_status)) = rx.await {
                 let _ = this.update(cx, |app, cx| {
                     app.busy_agy = false;
+                    app.agy_progress = None;
                     if let Some(st) = fresh_status {
                         app.agy_report = Some(st);
                     }
@@ -2605,6 +2648,20 @@ impl DesktopApp {
             return;
         }
         self.busy_upgrade = true;
+        let init_prog = TransferProgress::checking(if check_only {
+            tr(
+                self.lang,
+                "正在查询 GitHub Releases 最新版本…",
+                "Querying GitHub Releases…",
+            )
+        } else {
+            tr(
+                self.lang,
+                "正在准备校验升级…",
+                "Preparing verified self-upgrade…",
+            )
+        });
+        self.upgrade_progress = Some(init_prog.clone());
         cx.notify();
 
         let state_paths = self.state_paths.clone();
@@ -2613,6 +2670,7 @@ impl DesktopApp {
         let force = self.upgrade_force;
         let rt = self.rt.clone();
         let (tx, rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = watch::channel(init_prog);
 
         rt.spawn(async move {
             let args = UpgradeArgs {
@@ -2621,14 +2679,42 @@ impl DesktopApp {
                 version,
                 ..Default::default()
             };
-            let res = upgrade::execute_upgrade(&state_paths, &args, &current_exe).await;
+            let res = upgrade::execute_upgrade_with_progress(
+                &state_paths,
+                &args,
+                &current_exe,
+                Some(prog_tx),
+            )
+            .await;
             let _ = tx.send(res);
         });
+
+        cx.spawn(async move |this, cx| {
+            while prog_rx.changed().await.is_ok() {
+                let snap = prog_rx.borrow().clone();
+                let keep = this
+                    .update(cx, |app, cx| {
+                        if app.busy_upgrade {
+                            app.upgrade_progress = Some(snap);
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
             if let Ok(res) = rx.await {
                 let _ = this.update(cx, |app, cx| {
                     app.busy_upgrade = false;
+                    app.upgrade_progress = None;
                     match res {
                         Ok(outcome) => {
                             let detail = format!(

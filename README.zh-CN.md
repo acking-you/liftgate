@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.1-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.1-D97757"></a>
+  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.2-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#许可证"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-支持环境变量自定义：`LIFTGATE_VERSION=v0.2.1` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
+支持环境变量自定义：`LIFTGATE_VERSION=v0.2.2` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
 
 <details>
 <summary>其它 CLI 安装方式（<code>cargo binstall</code>、手动下载、源码编译）</summary>
@@ -88,18 +88,18 @@ cargo install --path crates/liftgate --locked
   5. **`agy` 与代理（`agy` & Proxy）** — 官方 `agy` SHA-512 下载安装与更新、Google 交互式登录、HTTP/SOCKS5 代理注入与连通性探测、后台空闲自动热更新开关。
   6. **系统（System）** — 网关与 `agy` 实时日志流、环境全项自检（Doctor）、`lg` 命令别名与 Shell 补全安装、版本升级检测。
 
-**下载最新桌面端版本 — [Liftgate Desktop `v0.2.1`](https://github.com/acking-you/liftgate/releases/tag/v0.2.1-ui)**
+**下载最新桌面端版本 — [Liftgate Desktop `v0.2.2`](https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui)**
 （[全部桌面端版本](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/release-manifest.json)）：
+[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/SHA256SUMS) ·
+[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/release-manifest.json)）：
 
 | 平台 | 安装包（推荐） | 免安装便携包 |
 | --- | --- | --- |
-| **macOS（Apple Silicon · M1–M4）** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS（Intel · x86_64）** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows（x64）** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows（ARM64）** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux（x86_64 · glibc 2.35+）** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.1-ui/liftgate-desktop-linux-x86_64.tar.gz) |
+| **macOS（Apple Silicon · M1–M4）** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.zip) |
+| **macOS（Intel · x86_64）** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.zip) |
+| **Windows（x64）** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64.zip) |
+| **Windows（ARM64）** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64.zip) |
+| **Linux（x86_64 · glibc 2.35+）** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.tar.gz) |
 
 > [!NOTE]
 > 当前 macOS 安装包采用 ad-hoc 签名；首次拖入 `/Applications` 打开若遇到 Gatekeeper 拦截，执行一次 `xattr -cr /Applications/Liftgate.app` 即可。也可通过源码安装：`cargo install --path crates/liftgate-desktop --locked`。

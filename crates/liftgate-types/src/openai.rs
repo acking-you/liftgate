@@ -1389,25 +1389,6 @@ pub fn build_codex_model_catalog_with_tool_mode(
 
     ordered.sort_by_key(|(tier, idx, _, _)| (*tier, *idx));
 
-    let presets = vec![
-        CodexReasoningPreset {
-            effort: "low",
-            description: "Fast low-latency reasoning",
-        },
-        CodexReasoningPreset {
-            effort: "medium",
-            description: "Balanced speed and reasoning depth",
-        },
-        CodexReasoningPreset {
-            effort: "high",
-            description: "Deep multi-step coding and analysis",
-        },
-        CodexReasoningPreset {
-            effort: "xhigh",
-            description: "Maximum extended reasoning budget",
-        },
-    ];
-
     let models = ordered
         .into_iter()
         .enumerate()
@@ -1425,6 +1406,8 @@ pub fn build_codex_model_catalog_with_tool_mode(
             } else {
                 "high"
             };
+            let supported_reasoning_levels =
+                supported_reasoning_levels_for_model(slug, default_effort, available);
             let ctx_k = context_window / 1_000;
             let description = format!("{ctx_k}k ctx · Antigravity ACP ({slug})");
             let priority = i32::try_from(rank).unwrap_or(i32::MAX);
@@ -1434,7 +1417,7 @@ pub fn build_codex_model_catalog_with_tool_mode(
                 display_name,
                 description,
                 default_reasoning_level: default_effort,
-                supported_reasoning_levels: presets.clone(),
+                supported_reasoning_levels,
                 shell_type: "shell_command",
                 visibility: "list",
                 supported_in_api: true,
@@ -1472,21 +1455,71 @@ pub fn build_codex_model_catalog_with_tool_mode(
     CodexModelCatalogResponse { models }
 }
 
+fn codex_reasoning_preset(effort: &'static str) -> CodexReasoningPreset {
+    let description = match effort {
+        "low" => "Fast low-latency reasoning",
+        "medium" => "Balanced speed and reasoning depth",
+        "xhigh" => "Maximum extended reasoning budget",
+        _ => "Deep multi-step coding and analysis",
+    };
+    CodexReasoningPreset {
+        effort,
+        description,
+    }
+}
+
+fn supported_reasoning_levels_for_model(
+    slug: &str,
+    default_effort: &'static str,
+    available: &[AvailableModel],
+) -> Vec<CodexReasoningPreset> {
+    const ORDERED_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+    let base = crate::model::strip_known_effort_suffix(slug);
+    if available.is_empty() {
+        return ORDERED_EFFORTS
+            .into_iter()
+            .map(codex_reasoning_preset)
+            .collect();
+    }
+
+    let mut levels = Vec::with_capacity(4);
+    for effort in ORDERED_EFFORTS {
+        let candidate = format!("{base}-{effort}");
+        if available
+            .iter()
+            .any(|m| m.model_id.trim().eq_ignore_ascii_case(&candidate))
+        {
+            levels.push(codex_reasoning_preset(effort));
+        }
+    }
+
+    if !levels.iter().any(|p| p.effort == default_effort) {
+        levels.push(codex_reasoning_preset(default_effort));
+    }
+    levels
+}
+
 fn codex_catalog_sort_tier(model_id: &str, default_model: &str) -> u8 {
     if model_id.eq_ignore_ascii_case(default_model) {
         return 0;
     }
     let lower = model_id.to_ascii_lowercase();
-    if lower.starts_with("gemini-4-") && (lower.ends_with("-high") || lower.ends_with("-xhigh")) {
+    if lower.starts_with("gemini-4-neon-")
+        && (lower.ends_with("-high") || lower.ends_with("-xhigh"))
+    {
         1
-    } else if lower.starts_with("claude-") && lower.ends_with("-high") {
+    } else if lower.starts_with("gemini-4-")
+        && (lower.ends_with("-high") || lower.ends_with("-xhigh"))
+    {
         2
-    } else if lower.contains("orchestrator") || lower.ends_with("-medium") {
+    } else if lower.starts_with("claude-") && lower.ends_with("-high") {
         3
-    } else if lower.contains("flash") {
+    } else if lower.contains("orchestrator") || lower.ends_with("-medium") {
         4
-    } else {
+    } else if lower.contains("flash") {
         5
+    } else {
+        6
     }
 }
 
@@ -1691,5 +1724,73 @@ mod tests {
                     && output.contains("cargo 1.86.0")
                     && output.contains("[Audio attached in tool output]")
         ));
+    }
+
+    #[test]
+    fn codex_catalog_prioritizes_gemini_4_neon_and_advertises_exact_reasoning_levels() {
+        let catalog_input = vec![
+            AvailableModel {
+                model_id: "gemini-4-carbon-high".to_owned(),
+                name: "Gemini 4 Carbon (High)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-carbon-medium".to_owned(),
+                name: "Gemini 4 Carbon (Medium)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-carbon-low".to_owned(),
+                name: "Gemini 4 Carbon (Low)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-high".to_owned(),
+                name: "Gemini 4 Neon (High)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-xhigh".to_owned(),
+                name: "Gemini 4 Neon (XHigh)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-medium".to_owned(),
+                name: "Gemini 4 Neon (Medium)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-4-neon-low".to_owned(),
+                name: "Gemini 4 Neon (Low)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gemini-pro-orchestrator-neon".to_owned(),
+                name: "Orchestrator (Neon)".to_owned(),
+            },
+            AvailableModel {
+                model_id: "gpt-oss-120b-medium".to_owned(),
+                name: "GPT-OSS 120B (Medium)".to_owned(),
+            },
+        ];
+
+        let resp = build_codex_model_catalog(&catalog_input, "gemini-4-carbon-high", false);
+        assert_eq!(resp.models[0].slug, "gemini-4-carbon-high");
+        assert_eq!(resp.models[1].slug, "gemini-4-neon-high");
+        assert_eq!(resp.models[2].slug, "gemini-4-neon-xhigh");
+
+        let efforts_of = |slug: &str| -> Vec<&'static str> {
+            resp.models
+                .iter()
+                .find(|m| m.slug == slug)
+                .expect("model present")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort)
+                .collect()
+        };
+        assert_eq!(
+            efforts_of("gemini-4-neon-xhigh"),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            efforts_of("gemini-4-carbon-high"),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(efforts_of("gemini-pro-orchestrator-neon"), vec!["high"]);
+        assert_eq!(efforts_of("gpt-oss-120b-medium"), vec!["medium"]);
     }
 }
