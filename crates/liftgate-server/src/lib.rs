@@ -6,6 +6,7 @@ pub mod job;
 pub mod platform;
 pub mod routes;
 pub mod session_pool;
+pub mod spill_store;
 pub mod telemetry;
 pub mod title_model;
 pub mod turn_runner;

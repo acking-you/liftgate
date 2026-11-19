@@ -1,7 +1,21 @@
 use std::io;
 use std::sync::{Mutex, Once};
 
+use thiserror::Error;
 use tokio::process::{Child, Command};
+
+/// Errors returned when attaching an ACP child process to an OS process group or Job Object.
+#[derive(Debug, Error)]
+pub enum ProcessGroupError {
+    #[error("child process already exited before process-group attachment")]
+    ChildExited,
+
+    #[error("child PID {pid} exceeds positive i32 process-group range")]
+    PidOutOfRange { pid: u32 },
+
+    #[error("OS process-group or Job Object operation failed")]
+    Os(#[from] io::Error),
+}
 
 /// Installs a chained panic hook once per process so supervised ACP process groups / Job Objects
 /// are terminated even under `panic = "abort"`.
@@ -53,7 +67,7 @@ pub fn configure_command_group(cmd: &mut Command) {
 
 #[cfg(windows)]
 mod imp {
-    use super::{Child, Mutex, io};
+    use super::{Child, Mutex, ProcessGroupError, io};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
         System::JobObjects::{
@@ -86,18 +100,15 @@ mod imp {
     }
 
     impl ProcessGroupGuard {
-        pub fn attach(child: &Child) -> io::Result<Self> {
+        pub fn attach(child: &Child) -> Result<Self, ProcessGroupError> {
             let Some(raw_proc) = child.raw_handle() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "child process already exited or lacks raw handle",
-                ));
+                return Err(ProcessGroupError::ChildExited);
             };
 
             // SAFETY: Passing null security attributes and null name creates an unnamed Job Object.
             let job: HANDLE = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
             if job.is_null() {
-                return Err(io::Error::last_os_error());
+                return Err(ProcessGroupError::Os(io::Error::last_os_error()));
             }
 
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
@@ -120,7 +131,7 @@ mod imp {
                 unsafe {
                     let _ = CloseHandle(job);
                 }
-                return Err(err);
+                return Err(ProcessGroupError::Os(err));
             }
 
             // SAFETY: Both `job` and `raw_proc` are valid Win32 handles.
@@ -131,7 +142,7 @@ mod imp {
                 unsafe {
                     let _ = CloseHandle(job);
                 }
-                return Err(err);
+                return Err(ProcessGroupError::Os(err));
             }
 
             let raw_job = job as isize;
@@ -179,7 +190,7 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use super::{Child, Mutex, io};
+    use super::{Child, Mutex, ProcessGroupError};
 
     static ACTIVE_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
@@ -202,13 +213,9 @@ mod imp {
     }
 
     impl ProcessGroupGuard {
-        pub fn attach(child: &Child) -> io::Result<Self> {
-            let pid = child.id().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "child process already exited")
-            })?;
-            let pgid = i32::try_from(pid).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds i32")
-            })?;
+        pub fn attach(child: &Child) -> Result<Self, ProcessGroupError> {
+            let pid = child.id().ok_or(ProcessGroupError::ChildExited)?;
+            let pgid = i32::try_from(pid).map_err(|_| ProcessGroupError::PidOutOfRange { pid })?;
             match ACTIVE_PGIDS.lock() {
                 Ok(mut guard) => guard.push(pgid),
                 Err(poisoned) => poisoned.into_inner().push(pgid),

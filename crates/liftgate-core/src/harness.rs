@@ -14,7 +14,6 @@ use crate::cli::{
     ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, PLACEHOLDER_API_KEY,
     normalize_optional_api_key,
 };
-use crate::client::infer_live_long_context;
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
     resolve_fast_model,
@@ -163,7 +162,6 @@ async fn build_claude_invocation(
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let discovered = target.client.fetch_models().await.unwrap_or_default();
-    let long_context = infer_live_long_context(&discovered, target.managed_long_context);
 
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
     let (env_set, env_remove) = build_claude_gateway_env_pairs(
@@ -204,7 +202,6 @@ async fn build_claude_invocation(
         fast_model: fast_model.clone(),
         no_bypass: args.no_bypass,
         no_code_mode: args.no_code_mode,
-        long_context,
         discovered_models: discovered,
     };
     let has_explicit_model = explicit_passthrough_model.is_some();
@@ -420,11 +417,9 @@ async fn build_codex_invocation(
         Ok(bytes) => bytes,
         Err(_) => {
             let discovered = target.client.fetch_models().await.unwrap_or_default();
-            let long_context = infer_live_long_context(&discovered, target.managed_long_context);
             build_offline_codex_catalog_bytes_with_mode(
                 &discovered,
                 &primary_model,
-                long_context,
                 requested_tool_mode,
             )?
         }

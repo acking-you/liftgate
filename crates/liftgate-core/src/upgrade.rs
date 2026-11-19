@@ -38,7 +38,7 @@ use zip::ZipArchive;
 
 use crate::cli::UpgradeArgs;
 use crate::daemon;
-use crate::error::CliError;
+use crate::error::{ArchiveError, CliError, TransferError, UpgradeInputError};
 use crate::state::StatePaths;
 
 const CURRENT_VERSION_RAW: &str = env!("CARGO_PKG_VERSION");
@@ -723,10 +723,10 @@ pub async fn execute_upgrade_with_progress(
             let expected_sha256 = lookup_sha256_in_sums(&sums_text, &plan.archive_name)
                 .ok_or_else(|| CliError::UpgradeArchive {
                     asset: plan.archive_name.clone(),
-                    detail: format!(
-                        "`SHA256SUMS` for {} did not contain an entry for `{}`",
-                        plan.tag, plan.archive_name
-                    ),
+                    source: ArchiveError::MissingChecksumEntry {
+                        tag: plan.tag.clone(),
+                        asset: plan.archive_name.clone(),
+                    },
                 })?;
 
             if let Some(api_digest) = &plan.api_sha256
@@ -791,8 +791,7 @@ pub async fn execute_upgrade_with_progress(
             if invoked_from_desktop && unpacked.desktop_bin.is_none() {
                 return Err(CliError::UpgradeArchive {
                     asset: plan.archive_name.clone(),
-                    detail: "release archive for this target does not bundle `liftgate-desktop`"
-                        .to_owned(),
+                    source: ArchiveError::MissingDesktopBundle,
                 });
             }
             if plan.target_triple == COMPILE_TARGET {
@@ -935,16 +934,16 @@ async fn resolve_release_plan(
     {
         Ok(raw_json) => {
             let rel: GithubReleaseResponse =
-                serde_json::from_slice(&raw_json).map_err(|err| CliError::UpgradeNetwork {
+                serde_json::from_slice(&raw_json).map_err(|source| CliError::UpgradeNetwork {
                     url: api_url.clone(),
-                    detail: format!("invalid GitHub release JSON: {err}"),
+                    source: TransferError::InvalidJson { source },
                 })?;
             build_plan_from_api_release(repo, &web_base, rel, desired_target)
         }
-        Err(CliError::UpgradeNetwork { detail, .. })
-            if base_url_override.is_none()
-                && (detail.contains("HTTP 403") || detail.contains("HTTP 429")) =>
-        {
+        Err(CliError::UpgradeNetwork {
+            source: TransferError::HttpStatus { status: 403 | 429 },
+            ..
+        }) if base_url_override.is_none() => {
             // Fallback when unauthenticated `api.github.com` is rate-limited on shared NAT/VPN IPs.
             let resolved_tag = match requested_tag {
                 Some(t) => t.to_owned(),
@@ -1132,11 +1131,14 @@ async fn resolve_latest_tag_via_redirect(
         .await
         .map_err(|_| CliError::UpgradeNetwork {
             url: latest_url.clone(),
-            detail: "timed out resolving latest release tag".to_owned(),
+            source: TransferError::TimedOut,
         })?
         .map_err(|err| CliError::UpgradeNetwork {
             url: latest_url.clone(),
-            detail: format!("failed to invoke curl: {err}"),
+            source: TransferError::SpawnTool {
+                tool: "curl",
+                source: err,
+            },
         })?;
 
     let meta = String::from_utf8_lossy(&out.stdout);
@@ -1149,7 +1151,7 @@ async fn resolve_latest_tag_via_redirect(
     }
     Err(CliError::UpgradeNetwork {
         url: latest_url,
-        detail: "could not resolve latest release tag from GitHub redirect".to_owned(),
+        source: TransferError::MissingReleaseRedirectTag,
     })
 }
 
@@ -1202,10 +1204,7 @@ pub(crate) async fn fetch_bytes_with_policy(
         let _ = fs::remove_file(&temp_file);
         return Err(err);
     }
-    let bytes = read_file_bounded(&temp_file, max_bytes).map_err(|source| CliError::StateIo {
-        path: temp_file.clone(),
-        source,
-    });
+    let bytes = read_file_bounded(&temp_file, url, max_bytes);
     let _ = fs::remove_file(&temp_file);
     bytes
 }
@@ -1272,7 +1271,9 @@ async fn download_https_via_system_tool(
 ) -> Result<(), CliError> {
     if !url.starts_with("https://") {
         return Err(CliError::UpgradeInvalidInput {
-            reason: format!("refusing non-HTTPS upgrade URL `{url}`"),
+            source: UpgradeInputError::NonHttpsUrl {
+                url: url.to_owned(),
+            },
         });
     }
 
@@ -1343,7 +1344,7 @@ async fn download_https_via_system_tool(
                 let _ = child.kill().await;
                 return Err(CliError::UpgradeNetwork {
                     url: url.to_owned(),
-                    detail: "curl stdout pipe was unavailable".to_owned(),
+                    source: TransferError::MissingStdoutPipe { tool: "curl" },
                 });
             };
             let stderr_pipe = child.stderr.take();
@@ -1391,7 +1392,10 @@ async fn download_https_via_system_tool(
                     let n = stdout_pipe.read(&mut buf).await.map_err(|err| {
                         CliError::UpgradeNetwork {
                             url: url.to_owned(),
-                            detail: format!("I/O error reading curl stream: {err}"),
+                            source: TransferError::ToolIo {
+                                tool: "curl",
+                                source: err,
+                            },
                         }
                     })?;
                     if n == 0 {
@@ -1407,7 +1411,7 @@ async fn download_https_via_system_tool(
                                 let _ = child.wait().await;
                                 return Err(CliError::UpgradeNetwork {
                                     url: url.to_owned(),
-                                    detail: format!("HTTP {code}"),
+                                    source: TransferError::HttpStatus { status: code },
                                 });
                             }
                         }
@@ -1422,10 +1426,9 @@ async fn download_https_via_system_tool(
                         let _ = child.wait().await;
                         return Err(CliError::UpgradeNetwork {
                             url: url.to_owned(),
-                            detail: format!(
-                                "download exceeded safety limit ({} MiB)",
-                                max_bytes / (1024 * 1024)
-                            ),
+                            source: TransferError::PayloadTooLarge {
+                                limit_mib: (max_bytes / (1024 * 1024)).max(1),
+                            },
                         });
                     }
 
@@ -1468,7 +1471,10 @@ async fn download_https_via_system_tool(
 
                 let exit_status = child.wait().await.map_err(|err| CliError::UpgradeNetwork {
                     url: url.to_owned(),
-                    detail: format!("I/O error waiting on curl: {err}"),
+                    source: TransferError::ToolIo {
+                        tool: "curl",
+                        source: err,
+                    },
                 })?;
                 let stderr_bytes = stderr_task.await.unwrap_or_default();
 
@@ -1478,17 +1484,23 @@ async fn download_https_via_system_tool(
                 {
                     return Err(CliError::UpgradeNetwork {
                         url: url.to_owned(),
-                        detail: format!("HTTP {code}"),
+                        source: TransferError::HttpStatus { status: code },
                     });
                 }
                 if !exit_status.success() {
                     let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
                     return Err(CliError::UpgradeNetwork {
                         url: url.to_owned(),
-                        detail: if stderr.is_empty() {
-                            format!("curl exited with {exit_status}")
+                        source: if stderr.is_empty() {
+                            TransferError::ToolExitStatus {
+                                tool: "curl",
+                                status: exit_status,
+                            }
                         } else {
-                            stderr
+                            TransferError::ToolStderr {
+                                tool: "curl",
+                                stderr,
+                            }
                         },
                     });
                 }
@@ -1524,7 +1536,7 @@ async fn download_https_via_system_tool(
                     let _ = fs::remove_file(dest);
                     Err(CliError::UpgradeNetwork {
                         url: url.to_owned(),
-                        detail: "request timed out".to_owned(),
+                        source: TransferError::TimedOut,
                     })
                 }
             }
@@ -1542,7 +1554,10 @@ async fn download_https_via_system_tool(
         }
         Err(err) => Err(CliError::UpgradeNetwork {
             url: url.to_owned(),
-            detail: format!("failed to spawn curl: {err}"),
+            source: TransferError::SpawnTool {
+                tool: "curl",
+                source: err,
+            },
         }),
     }
 }
@@ -1555,7 +1570,7 @@ struct HttpHeaderMeta {
 
 /// Parses `curl -D` response headers and returns the final non-1xx, non-CONNECT HTTP block.
 fn parse_http_headers_file(path: &Path) -> HttpHeaderMeta {
-    let Ok(bytes) = read_file_bounded(path, MAX_HTTP_HEADER_FILE_BYTES) else {
+    let Ok(bytes) = read_file_bounded(path, "", MAX_HTTP_HEADER_FILE_BYTES) else {
         return HttpHeaderMeta::default();
     };
     parse_http_headers_text(&String::from_utf8_lossy(&bytes))
@@ -1603,18 +1618,16 @@ fn parse_http_headers_text(text: &str) -> HttpHeaderMeta {
 }
 
 async fn wait_child_with_file_progress(
+    tool: &'static str,
     child: tokio::process::Child,
     dest: &Path,
     max_duration: Duration,
     progress: Option<&DownloadProgressContext<'_>>,
-) -> Result<std::process::Output, io::Error> {
+) -> Result<std::process::Output, TransferError> {
     let Some(p) = progress else {
         return match timeout(max_duration, child.wait_with_output()).await {
-            Ok(res) => res,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "download timed out",
-            )),
+            Ok(res) => res.map_err(|source| TransferError::ToolIo { tool, source }),
+            Err(_) => Err(TransferError::TimedOut),
         };
     };
 
@@ -1624,9 +1637,11 @@ async fn wait_child_with_file_progress(
     let deadline = tokio::time::Instant::now() + max_duration;
     loop {
         tokio::select! {
-            res = &mut wait_fut => return res,
+            res = &mut wait_fut => {
+                return res.map_err(|source| TransferError::ToolIo { tool, source });
+            }
             () = tokio::time::sleep_until(deadline) => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "download timed out"));
+                return Err(TransferError::TimedOut);
             }
             _ = tick.tick() => {
                 let downloaded = fs::metadata(dest).map_or(0, |m| m.len());
@@ -1689,26 +1704,37 @@ async fn download_https_fallback(
         suppress_windows_console(&mut cmd);
         let child = cmd.spawn().map_err(|err| CliError::UpgradeNetwork {
             url: url.to_owned(),
-            detail: format!("failed to invoke curl.exe or powershell.exe: {err}"),
+            source: TransferError::SpawnTool {
+                tool: "powershell.exe",
+                source: err,
+            },
         })?;
-        let out = wait_child_with_file_progress(child, dest, max_duration, progress)
-            .await
-            .map_err(|err| {
-                let _ = fs::remove_file(dest);
-                CliError::UpgradeNetwork {
-                    url: url.to_owned(),
-                    detail: if err.kind() == io::ErrorKind::TimedOut {
-                        "PowerShell download timed out".to_owned()
-                    } else {
-                        format!("PowerShell download I/O error: {err}")
-                    },
-                }
-            })?;
+        let out =
+            wait_child_with_file_progress("powershell.exe", child, dest, max_duration, progress)
+                .await
+                .map_err(|source| {
+                    let _ = fs::remove_file(dest);
+                    CliError::UpgradeNetwork {
+                        url: url.to_owned(),
+                        source,
+                    }
+                })?;
         if !out.status.success() {
             let _ = fs::remove_file(dest);
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
             return Err(CliError::UpgradeNetwork {
                 url: url.to_owned(),
-                detail: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                source: if stderr.is_empty() {
+                    TransferError::ToolExitStatus {
+                        tool: "powershell.exe",
+                        status: out.status,
+                    }
+                } else {
+                    TransferError::ToolStderr {
+                        tool: "powershell.exe",
+                        stderr,
+                    }
+                },
             });
         }
         Ok(())
@@ -1747,40 +1773,45 @@ async fn download_https_fallback(
             }
             match cmd.spawn() {
                 Ok(child) => {
-                    let out = wait_child_with_file_progress(child, dest, max_duration, progress)
-                        .await
-                        .map_err(|err| {
-                            let _ = fs::remove_file(dest);
-                            CliError::UpgradeNetwork {
-                                url: url.to_owned(),
-                                detail: if err.kind() == io::ErrorKind::TimedOut {
-                                    format!("{tool} download timed out")
-                                } else {
-                                    format!("{tool} I/O error: {err}")
-                                },
-                            }
-                        })?;
+                    let out =
+                        wait_child_with_file_progress(tool, child, dest, max_duration, progress)
+                            .await
+                            .map_err(|source| {
+                                let _ = fs::remove_file(dest);
+                                CliError::UpgradeNetwork {
+                                    url: url.to_owned(),
+                                    source,
+                                }
+                            })?;
                     if out.status.success() {
                         return Ok(());
                     }
                     let _ = fs::remove_file(dest);
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
                     return Err(CliError::UpgradeNetwork {
                         url: url.to_owned(),
-                        detail: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                        source: if stderr.is_empty() {
+                            TransferError::ToolExitStatus {
+                                tool,
+                                status: out.status,
+                            }
+                        } else {
+                            TransferError::ToolStderr { tool, stderr }
+                        },
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     return Err(CliError::UpgradeNetwork {
                         url: url.to_owned(),
-                        detail: format!("failed to spawn {tool}: {err}"),
+                        source: TransferError::SpawnTool { tool, source: err },
                     });
                 }
             }
         }
         Err(CliError::UpgradeNetwork {
             url: url.to_owned(),
-            detail: "neither `curl`, `wget`, nor `fetch` was found on PATH".to_owned(),
+            source: TransferError::NoHttpsDownloadTool,
         })
     }
 }
@@ -1826,7 +1857,10 @@ async fn download_loopback_http_to_path(
         let mut stream = TcpStream::connect(target.addr).await.map_err(|err| {
             CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("connect failed: {err}"),
+                source: TransferError::LoopbackIo {
+                    op: "connect",
+                    source: err,
+                },
             }
         })?;
         let req = format!(
@@ -1838,7 +1872,10 @@ async fn download_loopback_http_to_path(
             .await
             .map_err(|err| CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("write failed: {err}"),
+                source: TransferError::LoopbackIo {
+                    op: "write",
+                    source: err,
+                },
             })?;
 
         let mut header_buf = Vec::new();
@@ -1849,12 +1886,15 @@ async fn download_loopback_http_to_path(
                 .await
                 .map_err(|err| CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: format!("read failed: {err}"),
+                    source: TransferError::LoopbackIo {
+                        op: "read",
+                        source: err,
+                    },
                 })?;
             if n == 0 {
                 return Err(CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: "malformed HTTP response header".to_owned(),
+                    source: TransferError::MalformedHttpHeader,
                 });
             }
             if let Some(chunk) = buf.get(..n) {
@@ -1866,7 +1906,7 @@ async fn download_loopback_http_to_path(
             if header_buf.len() > 65_536 {
                 return Err(CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: "HTTP response header exceeded safety limit".to_owned(),
+                    source: TransferError::HttpHeaderTooLarge,
                 });
             }
         };
@@ -1877,7 +1917,7 @@ async fn download_loopback_http_to_path(
         if !(200..300).contains(&status) {
             return Err(CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("HTTP {status}"),
+                source: TransferError::HttpStatus { status },
             });
         }
 
@@ -1901,7 +1941,9 @@ async fn download_loopback_http_to_path(
             if downloaded > max_bytes {
                 return Err(CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: "body exceeded maximum allowed byte size".to_owned(),
+                    source: TransferError::PayloadTooLarge {
+                        limit_mib: (max_bytes / (1024 * 1024)).max(1),
+                    },
                 });
             }
             writer
@@ -1919,7 +1961,10 @@ async fn download_loopback_http_to_path(
                 .await
                 .map_err(|err| CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: format!("read failed: {err}"),
+                    source: TransferError::LoopbackIo {
+                        op: "read",
+                        source: err,
+                    },
                 })?;
             if n == 0 {
                 break;
@@ -1928,7 +1973,9 @@ async fn download_loopback_http_to_path(
             if downloaded > max_bytes {
                 return Err(CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: "body exceeded maximum allowed byte size".to_owned(),
+                    source: TransferError::PayloadTooLarge {
+                        limit_mib: (max_bytes / (1024 * 1024)).max(1),
+                    },
                 });
             }
             if let Some(chunk) = buf.get(..n) {
@@ -1981,7 +2028,7 @@ async fn download_loopback_http_to_path(
     .await
     .map_err(|_| CliError::UpgradeNetwork {
         url: target.raw_url.clone(),
-        detail: "loopback request timed out".to_owned(),
+        source: TransferError::TimedOut,
     })?;
     if res.is_err() {
         let _ = fs::remove_file(dest);
@@ -1998,7 +2045,10 @@ async fn fetch_loopback_http(
         let mut stream = TcpStream::connect(target.addr).await.map_err(|err| {
             CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("connect failed: {err}"),
+                source: TransferError::LoopbackIo {
+                    op: "connect",
+                    source: err,
+                },
             }
         })?;
         let req = format!(
@@ -2010,7 +2060,10 @@ async fn fetch_loopback_http(
             .await
             .map_err(|err| CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("write failed: {err}"),
+                source: TransferError::LoopbackIo {
+                    op: "write",
+                    source: err,
+                },
             })?;
 
         let cap = usize::try_from(max_bytes.saturating_add(65_536)).unwrap_or(usize::MAX);
@@ -2022,7 +2075,10 @@ async fn fetch_loopback_http(
                 .await
                 .map_err(|err| CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: format!("read failed: {err}"),
+                    source: TransferError::LoopbackIo {
+                        op: "read",
+                        source: err,
+                    },
                 })?;
             if n == 0 {
                 break;
@@ -2033,7 +2089,9 @@ async fn fetch_loopback_http(
             if raw.len() > cap {
                 return Err(CliError::UpgradeNetwork {
                     url: target.raw_url.clone(),
-                    detail: "response exceeded maximum allowed byte size".to_owned(),
+                    source: TransferError::PayloadTooLarge {
+                        limit_mib: (max_bytes / (1024 * 1024)).max(1),
+                    },
                 });
             }
         }
@@ -2041,7 +2099,7 @@ async fn fetch_loopback_http(
         let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
             return Err(CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: "malformed HTTP response header".to_owned(),
+                source: TransferError::MalformedHttpHeader,
             });
         };
         let header_slice = raw.get(..hdr_end).unwrap_or_default();
@@ -2056,13 +2114,15 @@ async fn fetch_loopback_http(
         if !(200..300).contains(&status) {
             return Err(CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: format!("HTTP {status}"),
+                source: TransferError::HttpStatus { status },
             });
         }
         if u64::try_from(body_slice.len()).unwrap_or(u64::MAX) > max_bytes {
             return Err(CliError::UpgradeNetwork {
                 url: target.raw_url.clone(),
-                detail: "body exceeded maximum allowed byte size".to_owned(),
+                source: TransferError::PayloadTooLarge {
+                    limit_mib: (max_bytes / (1024 * 1024)).max(1),
+                },
             });
         }
         Ok(body_slice.to_vec())
@@ -2070,7 +2130,7 @@ async fn fetch_loopback_http(
     .await
     .map_err(|_| CliError::UpgradeNetwork {
         url: target.raw_url.clone(),
-        detail: "loopback request timed out".to_owned(),
+        source: TransferError::TimedOut,
     })?
 }
 
@@ -2104,16 +2164,26 @@ fn suppress_windows_console(cmd: &mut Command) {
     let _ = cmd;
 }
 
-fn read_file_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
+fn read_file_bounded(path: &Path, url: &str, max_bytes: u64) -> Result<Vec<u8>, CliError> {
+    let file = File::open(path).map_err(|source| CliError::StateIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut out = Vec::new();
     let mut limited = file.take(max_bytes.saturating_add(1));
-    limited.read_to_end(&mut out)?;
+    limited
+        .read_to_end(&mut out)
+        .map_err(|source| CliError::StateIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if u64::try_from(out.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file exceeds maximum allowed download size",
-        ));
+        return Err(CliError::UpgradeNetwork {
+            url: url.to_owned(),
+            source: TransferError::PayloadTooLarge {
+                limit_mib: (max_bytes / (1024 * 1024)).max(1),
+            },
+        });
     }
     Ok(out)
 }
@@ -2235,7 +2305,9 @@ fn unpack_release_binaries(
     if !staged_liftgate.is_file() {
         return Err(CliError::UpgradeArchive {
             asset: archive_name.to_owned(),
-            detail: format!("archive did not contain `{expected_liftgate}`"),
+            source: ArchiveError::MissingExecutable {
+                expected: expected_liftgate.to_owned(),
+            },
         });
     }
     if !staged_lg.is_file() {
@@ -2271,23 +2343,25 @@ fn extract_zip_binaries(
         path: archive_path.to_path_buf(),
         source,
     })?;
-    let mut zip = ZipArchive::new(file).map_err(|err| CliError::UpgradeArchive {
+    let mut zip = ZipArchive::new(file).map_err(|source| CliError::UpgradeArchive {
         asset: archive_name.to_owned(),
-        detail: format!("corrupt ZIP archive: {err}"),
+        source: ArchiveError::CorruptZip { source },
     })?;
 
     for idx in 0..zip.len() {
-        let entry = zip.by_index(idx).map_err(|err| CliError::UpgradeArchive {
-            asset: archive_name.to_owned(),
-            detail: format!("failed reading ZIP entry #{idx}: {err}"),
-        })?;
+        let entry = zip
+            .by_index(idx)
+            .map_err(|source| CliError::UpgradeArchive {
+                asset: archive_name.to_owned(),
+                source: ArchiveError::ZipEntry { index: idx, source },
+            })?;
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
         let dest = {
-            let entry_name = entry.name().map_err(|err| CliError::UpgradeArchive {
+            let entry_name = entry.name().map_err(|source| CliError::UpgradeArchive {
                 asset: archive_name.to_owned(),
-                detail: format!("invalid ZIP entry #{idx} name: {err}"),
+                source: ArchiveError::ZipEntry { index: idx, source },
             })?;
             let base_name = entry_name
                 .rsplit(['/', '\\'])
@@ -2330,22 +2404,24 @@ fn extract_targz_binaries(
     })?;
     let gz = GzDecoder::new(file);
     let mut archive = Archive::new(gz);
-    let entries = archive.entries().map_err(|err| CliError::UpgradeArchive {
-        asset: archive_name.to_owned(),
-        detail: format!("corrupt tar.gz archive: {err}"),
-    })?;
+    let entries = archive
+        .entries()
+        .map_err(|source| CliError::UpgradeArchive {
+            asset: archive_name.to_owned(),
+            source: ArchiveError::CorruptTarGz { source },
+        })?;
 
     for item in entries {
-        let entry = item.map_err(|err| CliError::UpgradeArchive {
+        let entry = item.map_err(|source| CliError::UpgradeArchive {
             asset: archive_name.to_owned(),
-            detail: format!("corrupt tar entry: {err}"),
+            source: ArchiveError::CorruptTarEntry { source },
         })?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let entry_path = entry.path().map_err(|err| CliError::UpgradeArchive {
+        let entry_path = entry.path().map_err(|source| CliError::UpgradeArchive {
             asset: archive_name.to_owned(),
-            detail: format!("invalid tar entry path: {err}"),
+            source: ArchiveError::InvalidTarEntryPath { source },
         })?;
         let Some(base_name) = entry_path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -2376,18 +2452,17 @@ fn write_bounded_stream_to_executable<R: io::Read>(
         source,
     })?;
     let mut limited = reader.take(MAX_BINARY_EXTRACT_BYTES.saturating_add(1));
-    let copied = io::copy(&mut limited, &mut out).map_err(|err| CliError::UpgradeArchive {
+    let copied = io::copy(&mut limited, &mut out).map_err(|source| CliError::UpgradeArchive {
         asset: archive_name.to_owned(),
-        detail: format!("decompression failed: {err}"),
+        source: ArchiveError::Decompress { source },
     })?;
     if copied > MAX_BINARY_EXTRACT_BYTES {
         let _ = fs::remove_file(dest);
         return Err(CliError::UpgradeArchive {
             asset: archive_name.to_owned(),
-            detail: format!(
-                "extracted binary exceeded {} MiB safety limit",
-                MAX_BINARY_EXTRACT_BYTES / (1024 * 1024)
-            ),
+            source: ArchiveError::ExtractedBinaryTooLarge {
+                limit_mib: MAX_BINARY_EXTRACT_BYTES / (1024 * 1024),
+            },
         });
     }
     out.sync_all().map_err(|source| CliError::StateIo {
@@ -2426,20 +2501,19 @@ async fn smoke_check_staged_binary(staged_exe: &Path) -> Result<(), CliError> {
         .await
         .map_err(|_| CliError::UpgradeArchive {
             asset: staged_exe.display().to_string(),
-            detail: "staged binary `--version` smoke check timed out".to_owned(),
+            source: ArchiveError::SmokeCheckTimeout,
         })?
-        .map_err(|err| CliError::UpgradeArchive {
+        .map_err(|source| CliError::UpgradeArchive {
             asset: staged_exe.display().to_string(),
-            detail: format!("staged binary failed to execute on this host: {err}"),
+            source: ArchiveError::SmokeCheckExec { source },
         })?;
     if !out.status.success() {
         return Err(CliError::UpgradeArchive {
             asset: staged_exe.display().to_string(),
-            detail: format!(
-                "staged binary `--version` exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
+            source: ArchiveError::SmokeCheckFailed {
+                status: out.status,
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            },
         });
     }
     Ok(())
@@ -2647,7 +2721,9 @@ fn validate_repo_slug(repo: &str) -> Result<(), CliError> {
     let trimmed = repo.trim();
     let Some((owner, name)) = trimmed.split_once('/') else {
         return Err(CliError::UpgradeInvalidInput {
-            reason: format!("repository `{repo}` must be in `owner/name` format"),
+            source: UpgradeInputError::InvalidRepoFormat {
+                repo: repo.to_owned(),
+            },
         });
     };
     let valid_part = |s: &str| {
@@ -2660,7 +2736,9 @@ fn validate_repo_slug(repo: &str) -> Result<(), CliError> {
     };
     if !valid_part(owner) || !valid_part(name) {
         return Err(CliError::UpgradeInvalidInput {
-            reason: format!("invalid GitHub repository slug `{repo}`"),
+            source: UpgradeInputError::InvalidRepoSlug {
+                repo: repo.to_owned(),
+            },
         });
     }
     Ok(())
@@ -2675,7 +2753,9 @@ fn normalize_tag_input(raw: &str) -> Result<String, CliError> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
     {
         return Err(CliError::UpgradeInvalidInput {
-            reason: format!("invalid release version/tag `{raw}`"),
+            source: UpgradeInputError::InvalidReleaseTag {
+                tag: raw.to_owned(),
+            },
         });
     }
     if trimmed.starts_with('v') || trimmed.starts_with('V') {
@@ -2692,7 +2772,9 @@ fn validate_target_triple(target: &str) -> Result<(), CliError> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     {
         return Err(CliError::UpgradeInvalidInput {
-            reason: format!("invalid target triple `{target}`"),
+            source: UpgradeInputError::InvalidTargetTriple {
+                target: target.to_owned(),
+            },
         });
     }
     Ok(())

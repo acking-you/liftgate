@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::cli::{
     ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, normalize_optional_api_key,
 };
-use crate::client::{DiscoveredModel, infer_live_long_context};
+use crate::client::DiscoveredModel;
 use crate::daemon::{ensure_gateway_ready, resolve_client_api_key};
 use crate::error::CliError;
 use crate::state::{StatePaths, format_connect_url, user_home_dir, write_file_atomic};
@@ -124,7 +124,6 @@ pub struct HarnessSyncParams {
     pub fast_model: String,
     pub no_bypass: bool,
     pub no_code_mode: bool,
-    pub long_context: bool,
     pub discovered_models: Vec<DiscoveredModel>,
 }
 
@@ -318,7 +317,7 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
             } else {
                 "claude-opus-4-6"
             };
-            let ctx_k = format!("{}k ctx", m.context_limits(params.long_context).0 / 1_000);
+            let ctx_k = format!("{}k ctx", m.context_limits().0 / 1_000);
             let label = if m.display_name.is_empty() {
                 m.id.clone()
             } else {
@@ -360,7 +359,7 @@ fn merge_claude_context_settings(existing: &mut Map<String, Value>, params: &Har
             .iter()
             .find(|m| m.id.eq_ignore_ascii_case(id))
         {
-            return exact.context_limits(params.long_context).1;
+            return exact.context_limits().1;
         }
         if !available.is_empty() {
             let mapped = resolve_model_id(Some(id), None, &available, &fallback_model);
@@ -369,10 +368,10 @@ fn merge_claude_context_settings(existing: &mut Map<String, Value>, params: &Har
                 .iter()
                 .find(|m| m.id.eq_ignore_ascii_case(mapped.as_str()))
             {
-                return hit.context_limits(params.long_context).1;
+                return hit.context_limits().1;
             }
         }
-        context_limits(id, params.long_context).1
+        context_limits(id).1
     };
     let mut add = |id: &str, limit: u64| {
         windows
@@ -565,22 +564,17 @@ pub fn uninstall_claude_config(target_path: &Path) -> Result<bool, CliError> {
 pub fn build_offline_codex_catalog_bytes_with_mode(
     discovered: &[DiscoveredModel],
     primary_model: &str,
-    long_context: bool,
     tool_mode: Option<&str>,
 ) -> Result<Vec<u8>, CliError> {
     let available: Vec<_> = discovered
         .iter()
         .map(DiscoveredModel::to_available_model)
         .collect();
-    let mut catalog = build_codex_model_catalog_with_tool_mode(
-        &available,
-        primary_model,
-        long_context,
-        tool_mode,
-    );
+    let mut catalog =
+        build_codex_model_catalog_with_tool_mode(&available, primary_model, tool_mode);
     for entry in &mut catalog.models {
         if let Some(model) = discovered.iter().find(|m| m.id == entry.slug) {
-            let (window, compact) = model.context_limits(long_context);
+            let (window, compact) = model.context_limits();
             entry.context_window = i64::try_from(window).unwrap_or(i64::MAX);
             entry.max_context_window = entry.context_window;
             entry.auto_compact_token_limit = i64::try_from(compact).unwrap_or(i64::MAX);
@@ -1054,13 +1048,6 @@ pub async fn execute_config_sync(
     } else {
         Vec::new()
     };
-    let long_context = if let Some(t) = &live_target {
-        infer_live_long_context(&discovered_models, t.managed_long_context)
-    } else {
-        default_serve
-            .long_context
-            .unwrap_or(state_paths.read_settings()?.long_context)
-    };
     let fast_model = resolve_fast_model(
         args.fast_model.as_deref(),
         &primary_model,
@@ -1076,7 +1063,6 @@ pub async fn execute_config_sync(
             fast_model: fast_model.clone(),
             no_bypass: args.no_bypass,
             no_code_mode: args.no_code_mode,
-            long_context,
             discovered_models: discovered_models.clone(),
         };
         let rendered = write_or_update_claude_config(&claude_path, &sync_params, args.print)?;
@@ -1110,7 +1096,6 @@ pub async fn execute_config_sync(
                 Err(_) => build_offline_codex_catalog_bytes_with_mode(
                     &discovered_models,
                     &primary_model,
-                    long_context,
                     requested_tool_mode,
                 )?,
             }
@@ -1118,7 +1103,6 @@ pub async fn execute_config_sync(
             build_offline_codex_catalog_bytes_with_mode(
                 &discovered_models,
                 &primary_model,
-                long_context,
                 requested_tool_mode,
             )?
         };
@@ -1396,7 +1380,6 @@ mod tests {
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: false,
             no_code_mode: false,
-            long_context: false,
             discovered_models: vec![DiscoveredModel {
                 id: "gemini-4-carbon-high".to_owned(),
                 display_name: "Gemini 4 Carbon (High)".to_owned(),
@@ -1476,7 +1459,6 @@ mod tests {
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
             no_code_mode: false,
-            long_context: false,
             discovered_models: Vec::new(),
         };
 
@@ -1508,8 +1490,8 @@ mod tests {
     #[test]
     fn context_policy_tracks_live_models_and_limits_shared_claude_aliases() {
         let models: Vec<DiscoveredModel> = serde_json::from_value(json!([
-            {"id": "gemini-4-carbon-high", "context_window": 1000000, "auto_compact_token_limit": 850000},
-            {"id": "gemini-3.8-flash-low", "context_window": 1000000, "auto_compact_token_limit": 850000},
+            {"id": "gemini-4-carbon-high", "context_window": 500000, "auto_compact_token_limit": 425000},
+            {"id": "gemini-3.8-flash-low", "context_window": 500000, "auto_compact_token_limit": 425000},
             {"id": "gpt-oss-120b", "context_window": 128000, "auto_compact_token_limit": 110000},
             {"id": "claude-opus-5-5", "context_window": 200000, "auto_compact_token_limit": 170000}
         ])).unwrap();
@@ -1520,14 +1502,13 @@ mod tests {
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
             no_code_mode: false,
-            long_context: false,
             discovered_models: models,
         };
         let settings = build_claude_settings_map(&params);
         assert_eq!(settings["autoCompactWindow"], 110000);
         assert_eq!(
             settings["modelSettings"]["gemini-4-carbon-high"]["autoCompactWindow"],
-            850000
+            425000
         );
         // The shared canonical ID must honor the smaller real Claude deployment.
         assert_eq!(
@@ -1546,7 +1527,6 @@ mod tests {
             &build_offline_codex_catalog_bytes_with_mode(
                 &params.discovered_models,
                 &params.primary_model,
-                false,
                 None,
             )
             .unwrap(),
@@ -1557,8 +1537,8 @@ mod tests {
             .iter()
             .find(|m| m["slug"] == params.primary_model)
             .unwrap();
-        assert_eq!(gemini["context_window"], 1000000);
-        assert_eq!(gemini["auto_compact_token_limit"], 850000);
+        assert_eq!(gemini["context_window"], 500000);
+        assert_eq!(gemini["auto_compact_token_limit"], 425000);
         assert_eq!(gemini["truncation_policy"]["limit"], 80000);
         assert_eq!(gemini["tool_mode"], "code_mode");
         let gpt_oss = catalog_models
@@ -1570,7 +1550,7 @@ mod tests {
             "id": "gemini-4-carbon-high", "context_window": 1000000
         }))
         .unwrap();
-        assert_eq!(legacy.context_limits(false), (500000, 425000));
+        assert_eq!(legacy.context_limits(), (500000, 425000));
 
         // Standard 500k live catalog containing both Gemini 4 Carbon (500k / 425k) and real
         // `claude-sonnet-4-6` (200k / 170k) keeps 425k on Gemini + `claude-opus-5-5` without
@@ -1588,10 +1568,8 @@ mod tests {
             fast_model: "gemini-4-hydrogen-low".to_owned(),
             no_bypass: true,
             no_code_mode: false,
-            long_context: infer_live_long_context(&live_500k_models, None),
             discovered_models: live_500k_models,
         };
-        assert!(!live_500k_params.long_context);
         let live_500k_settings = build_claude_settings_map(&live_500k_params);
         assert_eq!(
             live_500k_settings["modelSettings"]["gemini-4-carbon-high"]["autoCompactWindow"],
@@ -1659,31 +1637,29 @@ mod tests {
             450000
         );
 
-        // Alias primary models (`gemini-4-carbon`) on a `--long-context` gateway must resolve
-        // against the live catalog instead of clamping canonical aliases back down to 425k.
+        // Alias primary models (`gemini-4-neon`) resolve against the live catalog entries.
         let alias_models: Vec<DiscoveredModel> = serde_json::from_value(json!([
-            {"id": "gemini-4-carbon-high", "context_window": 1000000, "auto_compact_token_limit": 850000},
-            {"id": "gemini-3.8-flash-low", "context_window": 1000000, "auto_compact_token_limit": 850000}
+            {"id": "gemini-4-neon-high", "context_window": 500000, "auto_compact_token_limit": 425000},
+            {"id": "gemini-3.8-flash-low", "context_window": 500000, "auto_compact_token_limit": 425000}
         ]))
         .unwrap();
         let alias_params = HarnessSyncParams {
             gateway_base_url: "http://127.0.0.1:8787".to_owned(),
             api_key: "local-agy".to_owned(),
-            primary_model: "gemini-4-carbon".to_owned(),
+            primary_model: "gemini-4-neon".to_owned(),
             fast_model: "gemini-3.8-flash-low".to_owned(),
             no_bypass: true,
             no_code_mode: false,
-            long_context: infer_live_long_context(&alias_models, None),
             discovered_models: alias_models,
         };
         let alias_settings = build_claude_settings_map(&alias_params);
         assert_eq!(
-            alias_settings["modelSettings"]["gemini-4-carbon"]["autoCompactWindow"],
-            850000
+            alias_settings["modelSettings"]["gemini-4-neon"]["autoCompactWindow"],
+            425000
         );
         assert_eq!(
             alias_settings["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"],
-            850000
+            425000
         );
     }
 

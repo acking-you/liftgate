@@ -73,19 +73,11 @@ impl DesktopApp {
                 p,
                 tr(lang, "可用模型总数", "DISCOVERED MODELS"),
                 format!("{} / {}", filtered.len(), report.models.len()),
-                if report.long_context {
-                    format!(
-                        "{}/v1/models · {}",
-                        report.gateway_url,
-                        tr(lang, "1M 长上下文", "1M Extended")
-                    )
-                } else {
-                    format!(
-                        "{}/v1/models · {}",
-                        report.gateway_url,
-                        tr(lang, "500k 标准窗口", "500k Standard")
-                    )
-                },
+                format!(
+                    "{}/v1/models · {}",
+                    report.gateway_url,
+                    tr(lang, "500k 标准窗口", "500k Standard")
+                ),
             ))
             .child(kpi_card(
                 p,
@@ -186,7 +178,7 @@ impl DesktopApp {
                         let is_default = m.id == report.default_model;
                         let is_fast = m.id == report.fast_model;
                         let is_title = m.id == report.title_model;
-                        let (ctx_win, compact_lim) = m.context_limits(report.long_context);
+                        let (ctx_win, compact_lim) = m.context_limits();
                         let id_copy = m.id.clone();
                         let id_def = m.id.clone();
                         let id_title = m.id.clone();

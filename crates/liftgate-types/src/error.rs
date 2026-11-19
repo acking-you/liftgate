@@ -1,4 +1,46 @@
+use std::fmt::Write as _;
+
 use thiserror::Error;
+
+/// Specific syntax or range failure when parsing a [`crate::config::ProxyUrl`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ProxyUrlError {
+    #[error("proxy address must not be empty")]
+    Empty,
+
+    #[error("proxy address must not contain whitespace or control characters")]
+    WhitespaceOrControl,
+
+    #[error("port number must be an integer between 1 and 65535")]
+    InvalidPort,
+
+    #[error("scheme must be http://, https://, socks5://, or socks5h://")]
+    UnsupportedScheme,
+
+    #[error("proxy URL must not contain a URL path")]
+    ContainsPath,
+
+    #[error("missing URL scheme (expected e.g. http://127.0.0.1:7890)")]
+    MissingScheme,
+
+    #[error("proxy credentials before `@` must not be empty")]
+    EmptyCredentials,
+
+    #[error("proxy host must not be empty")]
+    EmptyHost,
+
+    #[error("unclosed IPv6 bracket in proxy host")]
+    UnclosedIpv6Bracket,
+
+    #[error("IPv6 proxy host must not be empty")]
+    EmptyIpv6Host,
+
+    #[error("unexpected characters after IPv6 host bracket")]
+    UnexpectedAfterIpv6Bracket,
+
+    #[error("IPv6 proxy host must be enclosed in brackets (e.g. [::1]:7890)")]
+    UnbracketedIpv6Host,
+}
 
 /// Validation failures for wire, configuration, and identifier invariants.
 #[derive(Debug, Error)]
@@ -24,8 +66,12 @@ pub enum ValidationError {
     #[error("invalid data URL for base64 image input")]
     InvalidImageDataUrl,
 
-    #[error("invalid proxy URL `{value}`: {reason}")]
-    InvalidProxyUrl { value: String, reason: &'static str },
+    #[error("invalid proxy URL `{value}`")]
+    InvalidProxyUrl {
+        value: String,
+        #[source]
+        source: ProxyUrlError,
+    },
 }
 
 /// Protocol normalization and payload decoding errors.
@@ -73,4 +119,20 @@ impl ProtocolError {
             | Self::Validation { .. } => None,
         }
     }
+}
+
+/// Formats `err` together with its full [`std::error::Error::source`] chain separated by `": "`.
+///
+/// Because `thiserror` `#[error("...")]` templates do not repeat `#[source]` / `#[from]`
+/// messages, single-line human-facing surfaces (CLI diagnostics, TUI toasts, desktop alerts,
+/// and local telemetry entries) use this helper to render complete context.
+#[must_use]
+pub fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut current = err.source();
+    while let Some(cause) = current {
+        let _ = write!(out, ": {cause}");
+        current = cause.source();
+    }
+    out
 }

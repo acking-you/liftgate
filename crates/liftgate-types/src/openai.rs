@@ -1338,9 +1338,8 @@ You are a coding agent running in the Codex CLI, a terminal-based coding assista
 pub fn build_codex_model_catalog(
     available: &[AvailableModel],
     default_model: &str,
-    long_context: bool,
 ) -> CodexModelCatalogResponse {
-    build_codex_model_catalog_with_tool_mode(available, default_model, long_context, None)
+    build_codex_model_catalog_with_tool_mode(available, default_model, None)
 }
 
 /// Builds a Codex `model_catalog_json` document with an optional explicit `tool_mode`
@@ -1351,7 +1350,6 @@ pub fn build_codex_model_catalog(
 pub fn build_codex_model_catalog_with_tool_mode(
     available: &[AvailableModel],
     default_model: &str,
-    long_context: bool,
     tool_mode: Option<&str>,
 ) -> CodexModelCatalogResponse {
     let resolved_tool_mode = match tool_mode.map(str::trim) {
@@ -1394,7 +1392,7 @@ pub fn build_codex_model_catalog_with_tool_mode(
         .enumerate()
         .map(|(rank, (_, _, slug, display_name))| {
             let lower = slug.to_ascii_lowercase();
-            let (window, compact) = crate::model::context_limits(slug, long_context);
+            let (window, compact) = crate::model::context_limits(slug);
             let context_window = i64::try_from(window).unwrap_or(i64::MAX);
             let auto_compact = i64::try_from(compact).unwrap_or(i64::MAX);
             let default_effort = if lower.ends_with("-xhigh") {
@@ -1585,24 +1583,13 @@ mod tests {
                 if media_type == "image/png" && data == "iVBORw0KGgoAAAANSUhEUg=="
         ));
 
-        let catalog =
-            build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high", false);
+        let catalog = build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high");
         let first = catalog.models.first().expect("non-empty catalog");
         assert_eq!(
             (first.context_window, first.auto_compact_token_limit),
             (500_000, 425_000)
         );
         assert_eq!(first.truncation_policy.limit, 80_000);
-        let experimental =
-            build_codex_model_catalog(&mock_available_models(), "gemini-4-carbon-high", true);
-        let first_long = experimental.models.first().unwrap();
-        assert_eq!(
-            (
-                first_long.context_window,
-                first_long.auto_compact_token_limit
-            ),
-            (1_000_000, 850_000)
-        );
         for tool in [
             "request_user_input_async",
             "send_user_message_async",
@@ -1624,7 +1611,6 @@ mod tests {
         let direct_cat = build_codex_model_catalog_with_tool_mode(
             &mock_available_models(),
             "gemini-4-carbon-high",
-            false,
             Some("direct"),
         );
         assert_eq!(direct_cat.models[0].tool_mode, Some("direct"));
@@ -1632,7 +1618,6 @@ mod tests {
         let cmo_cat = build_codex_model_catalog_with_tool_mode(
             &mock_available_models(),
             "gemini-4-carbon-high",
-            false,
             Some("code_mode_only"),
         );
         assert_eq!(cmo_cat.models[0].tool_mode, Some("code_mode_only"));
@@ -1767,7 +1752,7 @@ mod tests {
             },
         ];
 
-        let resp = build_codex_model_catalog(&catalog_input, "gemini-4-carbon-high", false);
+        let resp = build_codex_model_catalog(&catalog_input, "gemini-4-carbon-high");
         assert_eq!(resp.models[0].slug, "gemini-4-carbon-high");
         assert_eq!(resp.models[1].slug, "gemini-4-neon-high");
         assert_eq!(resp.models[2].slug, "gemini-4-neon-xhigh");

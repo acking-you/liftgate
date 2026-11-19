@@ -136,8 +136,8 @@ pub async fn run_serve_with_hook(
         resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
     let binary_path =
         resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
-    let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)
-        .map_err(|(path, source)| CliError::PrepareCwd { path, source })?;
+    let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
+    let spill_dir = state_paths.ensure_spill_dir()?;
 
     // Bind TCP listeners BEFORE spawning `agy acp` so port conflicts fail instantaneously
     // without leaving orphaned initialization work.
@@ -182,6 +182,7 @@ pub async fn run_serve_with_hook(
             binary_path,
             extra_args: Vec::new(),
             session_cwd,
+            spill_dir: Some(spill_dir.clone()),
             limits,
             agy_proxy: agy_proxy.clone(),
             auto_update_enabled,
@@ -216,7 +217,7 @@ pub async fn run_serve_with_hook(
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
             title_model_file: Some(state_paths.title_model_file()),
-            long_context: args.long_context.unwrap_or(settings.long_context),
+            spill_dir: Some(spill_dir),
             default_model,
             acp_mode,
             api_key,

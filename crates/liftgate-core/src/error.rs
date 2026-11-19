@@ -1,9 +1,256 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use liftgate_server::error::AcpError;
-use liftgate_types::error::ValidationError;
+use liftgate_server::{error::AcpError, platform::SessionCwdError};
+use liftgate_types::error::{ValidationError, format_error_chain};
 use thiserror::Error;
+
+/// Structured validation failure for self-upgrade CLI arguments.
+#[derive(Debug, Error)]
+pub enum UpgradeInputError {
+    #[error("refusing non-HTTPS download URL `{url}`")]
+    NonHttpsUrl { url: String },
+
+    #[error("repository `{repo}` must be in `owner/name` format")]
+    InvalidRepoFormat { repo: String },
+
+    #[error("invalid GitHub repository slug `{repo}`")]
+    InvalidRepoSlug { repo: String },
+
+    #[error("invalid release version or tag `{tag}`")]
+    InvalidReleaseTag { tag: String },
+
+    #[error("invalid target triple `{target}`")]
+    InvalidTargetTriple { target: String },
+}
+
+/// Structured network or external download-tool failure.
+#[derive(Debug, Error)]
+pub enum TransferError {
+    #[error("upstream returned HTTP {status}")]
+    HttpStatus { status: u16 },
+
+    #[error("transfer timed out")]
+    TimedOut,
+
+    #[error("failed to spawn `{tool}`")]
+    SpawnTool {
+        tool: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("`{tool}` stdout pipe was unavailable")]
+    MissingStdoutPipe { tool: &'static str },
+
+    #[error("I/O error communicating with `{tool}`")]
+    ToolIo {
+        tool: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("`{tool}` exited with {status}")]
+    ToolExitStatus {
+        tool: &'static str,
+        status: std::process::ExitStatus,
+    },
+
+    #[error("`{tool}` failed: {stderr}")]
+    ToolStderr { tool: &'static str, stderr: String },
+
+    #[error("no HTTPS download utility (`curl`, `wget`, or `fetch`) was found on PATH")]
+    NoHttpsDownloadTool,
+
+    #[error("payload exceeded {limit_mib} MiB safety limit")]
+    PayloadTooLarge { limit_mib: u64 },
+
+    #[error("invalid JSON response payload")]
+    InvalidJson {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("could not resolve latest release tag from GitHub redirect")]
+    MissingReleaseRedirectTag,
+
+    #[error("loopback HTTP {op} failed")]
+    LoopbackIo {
+        op: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("malformed HTTP response header")]
+    MalformedHttpHeader,
+
+    #[error("HTTP response header exceeded safety limit")]
+    HttpHeaderTooLarge,
+}
+
+/// Structured archive, manifest, extraction, or smoke-check failure.
+#[derive(Debug, Error)]
+pub enum ArchiveError {
+    #[error("`SHA256SUMS` for `{tag}` did not contain an entry for `{asset}`")]
+    MissingChecksumEntry { tag: String, asset: String },
+
+    #[error("malformed release manifest JSON")]
+    MalformedManifestJson {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("manifest is missing valid version, URL, or 128-character SHA-512 hex digest")]
+    InvalidManifestFields,
+
+    #[error("corrupt ZIP archive")]
+    CorruptZip {
+        #[source]
+        source: zip::result::ZipError,
+    },
+
+    #[error("failed reading ZIP entry #{index}")]
+    ZipEntry {
+        index: usize,
+        #[source]
+        source: zip::result::ZipError,
+    },
+
+    #[error("corrupt tar.gz archive")]
+    CorruptTarGz {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("corrupt tar entry")]
+    CorruptTarEntry {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("invalid tar entry path")]
+    InvalidTarEntryPath {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("decompression failed")]
+    Decompress {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("extracted binary exceeded {limit_mib} MiB safety limit")]
+    ExtractedBinaryTooLarge { limit_mib: u64 },
+
+    #[error("archive did not contain expected executable `{expected}`")]
+    MissingExecutable { expected: String },
+
+    #[error("release archive for this target does not bundle `liftgate-desktop`")]
+    MissingDesktopBundle,
+
+    #[error("staged binary `--version` smoke check timed out")]
+    SmokeCheckTimeout,
+
+    #[error("staged binary failed to execute on this host")]
+    SmokeCheckExec {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("staged binary `--version` exited with {status}: {stderr}")]
+    SmokeCheckFailed {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+
+    #[error("downloaded `agy` binary failed `--version` smoke check")]
+    AgySmokeCheckFailed,
+}
+
+/// Structured local HTTP/SSE transport failure when talking to a Liftgate daemon.
+#[derive(Debug, Error)]
+pub enum GatewayTransportError {
+    #[error("TCP socket I/O error")]
+    Io(#[from] std::io::Error),
+
+    #[error("gateway is not running")]
+    NotRunning,
+
+    #[error("request timed out")]
+    TimedOut,
+
+    #[error("incomplete HTTP response headers")]
+    IncompleteHeaders,
+
+    #[error("HTTP response headers are not valid UTF-8")]
+    NonUtf8Headers,
+
+    #[error("missing HTTP status line")]
+    MissingStatusLine,
+
+    #[error("invalid HTTP status code")]
+    InvalidStatusCode,
+
+    #[error("invalid HTTP chunk header")]
+    InvalidChunkHeader,
+
+    #[error("invalid HTTP chunk length")]
+    InvalidChunkLength,
+
+    #[error("truncated HTTP chunked response body")]
+    TruncatedChunk,
+
+    #[error("SSE stream buffer exceeded {max_bytes} bytes")]
+    SseBufferExceeded { max_bytes: usize },
+}
+
+/// Structured failure when terminating a managed background daemon.
+#[derive(Debug, Error)]
+pub enum DaemonStopError {
+    #[error("OS process termination failed")]
+    Os(#[from] std::io::Error),
+
+    #[error("process remained alive after termination signal")]
+    StillAliveAfterSignal,
+
+    #[error("PID {pid} exceeds platform `pid_t` range")]
+    PidOutOfRange { pid: u32 },
+}
+
+/// Structured failure when launching a desktop GUI harness or helper process.
+#[derive(Debug, Error)]
+pub enum DesktopLaunchError {
+    #[error("failed to locate current `liftgate` executable")]
+    LocateCurrentExe(#[source] std::io::Error),
+
+    #[error("failed to spawn `{}`", executable.display())]
+    Spawn {
+        executable: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to invoke `{}` for package `{package_family_name}`", executable.display())]
+    MsixInvoke {
+        executable: PathBuf,
+        package_family_name: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "`Invoke-CommandInDesktopPackage` (`{package_family_name}!{app_id}`) exited with {status}"
+    )]
+    MsixExitStatus {
+        package_family_name: String,
+        app_id: String,
+        status: std::process::ExitStatus,
+    },
+
+    #[error("{detail}")]
+    MsixReported { detail: String },
+}
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -30,19 +277,32 @@ pub enum CliError {
         actual: String,
     },
 
-    #[error("failed to install or update Antigravity CLI (`agy`): {detail}")]
-    AgyInstallFailed { detail: String },
+    #[error("failed to query or download Antigravity CLI (`agy`) from `{url}`")]
+    AgyNetwork {
+        url: String,
+        #[source]
+        source: TransferError,
+    },
+
+    #[error("failed to verify or unpack Antigravity CLI payload `{asset}`")]
+    AgyArchive {
+        asset: String,
+        #[source]
+        source: ArchiveError,
+    },
+
+    #[error("Antigravity upstream connectivity test failed: {detail}")]
+    AgyProxyProbeFailed { detail: String },
 
     #[error(
         "no system or environment proxy was detected; pass an explicit address such as `lg proxy 7890` or `lg proxy http://127.0.0.1:7890`"
     )]
     NoSystemProxyDetected,
 
-    #[error("failed to prepare isolated ACP session directory `{}`", path.display())]
+    #[error("failed to prepare isolated ACP session directory")]
     PrepareCwd {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        #[from]
+        source: SessionCwdError,
     },
 
     #[error("failed to initialize `agy acp` subprocess")]
@@ -83,6 +343,16 @@ pub enum CliError {
         source: serde_json::Error,
     },
 
+    #[error("configuration file `{}` exceeds {limit} byte safety limit", path.display())]
+    ConfigFileTooLarge { path: PathBuf, limit: u64 },
+
+    #[error("file `{}` is not valid UTF-8", path.display())]
+    StateUtf8 {
+        path: PathBuf,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+
     #[error(
         "another process is already listening on `{addr}` (not managed by this state directory); pass `--listen <addr>` or stop that process first"
     )]
@@ -104,14 +374,14 @@ pub enum CliError {
     DaemonStopFailed {
         pid: u32,
         #[source]
-        source: std::io::Error,
+        source: DaemonStopError,
     },
 
     #[error("gateway is not running or unreachable at `{url}`")]
     GatewayUnreachable {
         url: String,
         #[source]
-        source: std::io::Error,
+        source: GatewayTransportError,
     },
 
     #[error("gateway request `{url}` failed with HTTP {status}: {body}")]
@@ -153,8 +423,12 @@ pub enum CliError {
     )]
     DesktopAppAlreadyRunning { app: &'static str, pids: String },
 
-    #[error("failed to launch `{app}`: {detail}")]
-    DesktopAppLaunchFailed { app: &'static str, detail: String },
+    #[error("failed to launch `{app}`")]
+    DesktopAppLaunchFailed {
+        app: &'static str,
+        #[source]
+        source: DesktopLaunchError,
+    },
 
     #[error("failed to open browser for `{url}`")]
     BrowserOpen {
@@ -181,11 +455,18 @@ pub enum CliError {
     )]
     AliasTargetExists { path: PathBuf },
 
-    #[error("invalid upgrade parameter: {reason}")]
-    UpgradeInvalidInput { reason: String },
+    #[error("invalid upgrade parameter")]
+    UpgradeInvalidInput {
+        #[from]
+        source: UpgradeInputError,
+    },
 
-    #[error("failed to query or download release from `{url}`: {detail}")]
-    UpgradeNetwork { url: String, detail: String },
+    #[error("failed to query or download release from `{url}`")]
+    UpgradeNetwork {
+        url: String,
+        #[source]
+        source: TransferError,
+    },
 
     #[error("release `{tag}` has no prebuilt archive for target `{target}`")]
     UpgradeUnsupportedTarget { tag: String, target: String },
@@ -197,8 +478,12 @@ pub enum CliError {
         actual: String,
     },
 
-    #[error("failed to verify or unpack release archive `{asset}`: {detail}")]
-    UpgradeArchive { asset: String, detail: String },
+    #[error("failed to verify or unpack release archive `{asset}`")]
+    UpgradeArchive {
+        asset: String,
+        #[source]
+        source: ArchiveError,
+    },
 
     #[error("permission denied replacing `{}`", path.display())]
     UpgradePermissionDenied {
@@ -218,6 +503,14 @@ pub enum CliError {
     },
 }
 
+impl CliError {
+    /// Formats this error together with its full [`std::error::Error::source`] chain.
+    #[must_use]
+    pub fn display_chain(&self) -> String {
+        format_error_chain(self)
+    }
+}
+
 /// Returns an actionable recovery hint for `err` using `bin` as the CLI command name.
 #[must_use]
 pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
@@ -228,22 +521,12 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::NoSystemProxyDetected => Some(format!(
             "Set an explicit proxy with `{bin} proxy 7890` (or `{bin} proxy socks5://127.0.0.1:1080`), or clear with `{bin} proxy off`."
         )),
-        CliError::AgyInstallFailed { detail } => {
-            let lower = detail.to_ascii_lowercase();
-            if lower.contains("safety size bound")
-                || lower.contains("tar.gz")
-                || lower.contains("did not contain")
-                || lower.contains("smoke check")
-            {
-                Some(format!(
-                    "Verify the downloaded archive or update Liftgate with `{bin} upgrade`, then re-run `{bin} agy update --force`."
-                ))
-            } else {
-                Some(format!(
-                    "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
-                ))
-            }
-        }
+        CliError::AgyArchive { .. } => Some(format!(
+            "Verify the downloaded archive or update Liftgate with `{bin} upgrade`, then re-run `{bin} agy update --force`."
+        )),
+        CliError::AgyNetwork { .. } | CliError::AgyProxyProbeFailed { .. } => Some(format!(
+            "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
+        )),
         CliError::GatewayUnreachable { .. } => Some(format!(
             "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
         )),

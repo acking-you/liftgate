@@ -76,7 +76,6 @@ struct MockAcpBackend {
     recorded_models: Mutex<Vec<String>>,
     recorded_prompts: Mutex<Vec<RecordedPrompt>>,
     scripts: Mutex<VecDeque<MockScript>>,
-    hydration_updates: Mutex<Vec<(u64, u64)>>,
 }
 
 impl MockAcpBackend {
@@ -89,7 +88,6 @@ impl MockAcpBackend {
             recorded_models: Mutex::new(Vec::new()),
             recorded_prompts: Mutex::new(Vec::new()),
             scripts: Mutex::new(VecDeque::from(scripts)),
-            hydration_updates: Mutex::new(Vec::new()),
         }
     }
 
@@ -173,35 +171,12 @@ impl AcpBackend for MockAcpBackend {
                 AcpPromptBlock::Text { .. } => None,
             })
             .collect::<Vec<_>>();
-        let is_hydration_seed = joined.contains("[Context Hydration Segment ");
 
         self.recorded_prompts.lock().unwrap().push(RecordedPrompt {
             session_id: session_id.as_str().to_owned(),
             text_joined: joined,
             image_blocks,
         });
-
-        if is_hydration_seed {
-            let updates = self.hydration_updates.lock().unwrap().clone();
-            for (used, size) in updates {
-                let _ = updates_tx
-                    .send(SessionUpdatePayload::UsageUpdate { used, size })
-                    .await;
-            }
-            let _ = updates_tx
-                .send(SessionUpdatePayload::AgentMessageChunk {
-                    content: AcpChunkContent {
-                        content_type: "text".to_owned(),
-                        text: "OK".to_owned(),
-                    },
-                })
-                .await;
-            return Ok(PromptTurnResult {
-                stop_reason: "end_turn".to_owned(),
-                usage: mock_acp_usage(12_000, 1, 0),
-                error: None,
-            });
-        }
 
         let nonce = self
             .session_nonces
@@ -433,27 +408,18 @@ fn test_app_with_key(
     timeout_secs: u64,
     api_key: Option<&str>,
 ) -> axum::Router {
-    test_app_with_context(backend, timeout_secs, api_key, false)
-}
-
-fn test_app_with_context(
-    backend: Arc<MockAcpBackend>,
-    timeout_secs: u64,
-    api_key: Option<&str>,
-    long_context: bool,
-) -> axum::Router {
-    build_router(test_state(backend, timeout_secs, api_key, long_context))
+    build_router(test_state(backend, timeout_secs, api_key))
 }
 
 fn test_state(
     backend: Arc<MockAcpBackend>,
     timeout_secs: u64,
     api_key: Option<&str>,
-    long_context: bool,
 ) -> AppState<MockAcpBackend> {
     let limits =
         GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, timeout_secs)
             .unwrap();
+    let spill_dir = std::env::temp_dir().join("liftgate-protocol-test-spills");
 
     AppState {
         backend,
@@ -461,7 +427,7 @@ fn test_state(
         telemetry: Arc::new(TelemetryHub::new()),
         config: GatewayRuntimeConfig {
             title_model_file: None,
-            long_context,
+            spill_dir: Some(spill_dir),
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: api_key.map(Arc::<str>::from),
@@ -488,7 +454,7 @@ async fn title_model_change_applies_to_the_next_request_on_the_same_gateway() {
             .collect(),
     ));
     let path = std::env::temp_dir().join(format!("liftgate-title-{}", uuid::Uuid::new_v4()));
-    let mut state = test_state(Arc::clone(&backend), 30, None, false);
+    let mut state = test_state(Arc::clone(&backend), 30, None);
     state.config.title_model_file = Some(path.clone());
     let app = build_router(state);
     for (uri, request) in [
@@ -531,17 +497,17 @@ async fn title_model_change_applies_to_the_next_request_on_the_same_gateway() {
 }
 
 #[tokio::test]
-async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retry() {
+async fn context_policy_bounds_single_turn_inputs_and_maps_upstream_overflow_to_wire_contracts() {
     let multiline_200k: String = (1..=4_000)
         .map(|i| format!("LINE {i:04}: {}\n", "x".repeat(40)))
         .collect();
     assert!(multiline_200k.len() > 200_000);
 
-    // 1. Default mode (`long_context == false`): automatically middle-truncates oversized single-turn
-    //    inputs (preserving head + tail + structured marker) instead of failing with HTTP 400.
+    // 1. Single-turn water-fill policy automatically middle-truncates oversized single-turn
+    //    inputs (preserving head + tail + structured marker) under `MAX_ACP_PROMPT_TEXT_BYTES`.
     {
         let backend = Arc::new(MockAcpBackend::new(vec![]));
-        let app = test_app_with_context(Arc::clone(&backend), 30, None, false);
+        let app = test_app(Arc::clone(&backend), 30);
         for endpoint in ["/v1/responses", "/v1/messages"] {
             let payload = if endpoint == "/v1/responses" {
                 json!({"model":"gemini-4-carbon-high", "input": &multiline_200k})
@@ -572,17 +538,39 @@ async fn context_policy_bounds_inputs_and_stops_compacted_hydration_without_retr
             assert!(prompt.text_joined.contains("LINE 0001:"));
             assert!(prompt.text_joined.contains("LINE 4000:"));
             assert!(prompt.text_joined.contains("[Gateway truncated "));
+            assert!(
+                prompt
+                    .text_joined
+                    .contains("Full lossless content saved locally at `"),
+                "expected local spill file path in truncation notice"
+            );
+            let (_, after_prefix) = prompt
+                .text_joined
+                .split_once("Full lossless content saved locally at `")
+                .unwrap();
+            let (spilled_path, _) = after_prefix.split_once('`').unwrap();
+            assert_eq!(
+                std::fs::read_to_string(spilled_path).unwrap(),
+                multiline_200k.trim()
+            );
         }
     }
 
-    // 2. Experimental `long_context == true`: stops immediately after the first seed chunk if
-    //    upstream compacts during hydration, returning standard auto-compactable wire errors for
-    //    both OpenAI Codex (`context_length_exceeded`) and Claude Code (`prompt is too long: ...`).
+    // 2. Non-streaming HTTP 400 wire contract when upstream reports context window exceeded:
+    //    returns standard auto-compactable errors for both OpenAI Codex (`context_length_exceeded`)
+    //    and Claude Code (`prompt is too long: ...`).
     {
-        let backend = Arc::new(MockAcpBackend::new(vec![]));
-        *backend.hydration_updates.lock().unwrap() =
-            vec![(320_000, 1_048_576), (20_000, 1_048_576)];
-        let app = test_app_with_context(Arc::clone(&backend), 30, None, true);
+        let backend = Arc::new(MockAcpBackend::new(vec![
+            MockScript::RpcError {
+                code: -32603,
+                message: "Context window exceeded: maximum context length reached".to_owned(),
+            },
+            MockScript::RpcError {
+                code: -32603,
+                message: "Context window exceeded: maximum context length reached".to_owned(),
+            },
+        ]));
+        let app = test_app(Arc::clone(&backend), 30);
 
         let oai_resp = app
             .clone()
@@ -782,6 +770,15 @@ async fn oversized_tool_result_auto_truncates_head_and_tail_and_preserves_warm_s
         recorded[1]
             .text_joined
             .contains("[Gateway truncated tool output:")
+    );
+    let (_, after_prefix) = recorded[1]
+        .text_joined
+        .split_once("Full lossless content saved locally at `")
+        .expect("expected local spill file path for truncated tool output");
+    let (spilled_tool_path, _) = after_prefix.split_once('`').unwrap();
+    assert_eq!(
+        std::fs::read_to_string(spilled_tool_path).unwrap(),
+        huge_tool_output.trim()
     );
 
     // Turn 3 matched warm `sess_1` prefix hash and forwarded only the new user delta!
@@ -2909,7 +2906,7 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
             title_model_file: None,
-            long_context: false,
+            spill_dir: None,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: None,
@@ -3353,16 +3350,13 @@ async fn anthropic_streaming_coerces_raw_string_input_for_function_tool_to_valid
 }
 
 #[tokio::test]
-async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_restores_target_model()
-{
+async fn large_cold_transcript_compacts_into_bounded_single_turn_without_model_thrashing() {
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::Immediate {
-        thoughts: vec!["Synthesizing across full 380KB hydrated history".to_owned()],
-        chunks_template: vec![
-            "All needles verified: EARLY_NEEDLE_01, MID_NEEDLE_02, LATE_NEEDLE_03.".to_owned(),
-        ],
+        thoughts: vec!["Synthesizing across bounded single-turn history".to_owned()],
+        chunks_template: vec!["Verified bounded single-turn cold transcript.".to_owned()],
     }]));
 
-    let app = test_app_with_context(Arc::clone(&backend), 120, None, true);
+    let app = test_app(Arc::clone(&backend), 120);
     let req = json!({
         "model": "gemini-4-carbon-high",
         "stream": false,
@@ -3406,43 +3400,28 @@ async fn multi_chunk_flash_hydration_streams_380kb_transcript_losslessly_and_res
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(
         body["output"][1]["content"][0]["text"],
-        "All needles verified: EARLY_NEEDLE_01, MID_NEEDLE_02, LATE_NEEDLE_03."
+        "Verified bounded single-turn cold transcript."
     );
-    // OpenAI input includes uncached (100) and cached (128) tokens from the final turn,
-    // NOT the sum of intermediate Flash hydration turns (which would trigger premature /compact)!
     assert_eq!(body["usage"]["input_tokens"], 228);
 
-    // Session started on `gemini-4-hydrogen-low` for seed turns, then switched to `gemini-4-carbon-high`!
+    // Session runs directly on `gemini-4-carbon-high` with zero hidden Flash replay turns!
     let models = backend.recorded_models.lock().unwrap().clone();
-    assert_eq!(
-        models,
-        vec![
-            "gemini-4-hydrogen-low".to_owned(),
-            "gemini-4-carbon-high".to_owned(),
-        ]
-    );
+    assert_eq!(models, vec!["gemini-4-carbon-high".to_owned()]);
 
     let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].session_id, "sess_1");
     assert!(
-        prompts.len() >= 3,
-        "expected >=2 Flash seed chunks + 1 final turn, got {}",
-        prompts.len()
+        prompts[0].text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES,
+        "prompt len {} exceeded MAX_ACP_PROMPT_TEXT_BYTES",
+        prompts[0].text_joined.len()
     );
-    let mut combined = String::new();
-    for p in prompts.iter() {
-        assert_eq!(p.session_id, "sess_1");
-        assert!(
-            p.text_joined.len() <= liftgate_types::session_key::MAX_ACP_PROMPT_TEXT_BYTES,
-            "chunk len {} exceeded MAX_ACP_PROMPT_TEXT_BYTES",
-            p.text_joined.len()
-        );
-        combined.push_str(&p.text_joined);
-    }
-    assert!(!combined.contains("...[omitted"));
-    assert!(combined.contains("EARLY_NEEDLE_01"));
-    assert!(combined.contains("MID_NEEDLE_02"));
-    assert!(combined.contains("LATE_NEEDLE_03"));
-    assert!(combined.contains("Verify every needle from the conversation."));
+    assert!(prompts[0].text_joined.contains("Ready for final check."));
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("Verify every needle from the conversation.")
+    );
 }
 
 #[tokio::test]
@@ -4243,7 +4222,7 @@ async fn claude_desktop_gateway_routes_discover_safe_models_and_unwrap_route_ids
         thoughts: vec![],
         chunks_template: vec!["Hello from Claude Desktop 3P".to_owned()],
     }]));
-    let app = test_app_with_context(Arc::clone(&backend), 10, Some("desktop-key"), true);
+    let app = test_app_with_key(Arc::clone(&backend), 10, Some("desktop-key"));
 
     let unauth = app
         .clone()
@@ -4963,7 +4942,7 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
         telemetry: Arc::new(TelemetryHub::new()),
         config: GatewayRuntimeConfig {
             title_model_file: None,
-            long_context: false,
+            spill_dir: None,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: Some(Arc::from("secret-gate-key")),

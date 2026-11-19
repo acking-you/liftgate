@@ -3,6 +3,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use liftgate_types::config::ProxyUrl;
+use thiserror::Error;
+
+/// Failure preparing an isolated ACP session working directory.
+#[derive(Debug, Error)]
+pub enum SessionCwdError {
+    #[error("failed to create isolated session working directory `{}`", path.display())]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
 
 pub const CLIENT_ENV_VARS_TO_STRIP: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -231,7 +243,7 @@ fn platform_default_candidates() -> Vec<PathBuf> {
 /// to prevent cross-user permission collisions.
 pub fn prepare_isolated_session_cwd(
     explicit: Option<PathBuf>,
-) -> Result<(PathBuf, PathBuf), (PathBuf, io::Error)> {
+) -> Result<(PathBuf, PathBuf), SessionCwdError> {
     let target = explicit.unwrap_or_else(default_isolated_cwd_path);
 
     #[cfg(unix)]
@@ -241,12 +253,18 @@ pub fn prepare_isolated_session_cwd(
         builder.recursive(true).mode(0o700);
         builder
             .create(&target)
-            .map_err(|err| (target.clone(), err))?;
+            .map_err(|source| SessionCwdError::CreateDir {
+                path: target.clone(),
+                source,
+            })?;
     }
 
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(&target).map_err(|err| (target.clone(), err))?;
+        fs::create_dir_all(&target).map_err(|source| SessionCwdError::CreateDir {
+            path: target.clone(),
+            source,
+        })?;
     }
 
     let canonical = canonicalize_clean(&target);

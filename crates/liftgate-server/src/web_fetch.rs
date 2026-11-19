@@ -1,16 +1,96 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use liftgate_types::config::ProxyUrl;
+use liftgate_types::{
+    config::ProxyUrl, error::format_error_chain, session_key::truncate_head_tail_lines_with_spill,
+};
+use thiserror::Error;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::platform::configure_acp_child_env;
+use crate::{platform::configure_acp_child_env, spill_store::SpillStore};
 
 const MAX_FETCH_TIMEOUT_SECS: u64 = 20;
+const MAX_RAW_BYTES: usize = 2_097_152;
 const MAX_RAW_BYTES_STR: &str = "2097152";
-const MAX_EXTRACTED_CHARS: usize = 36_000;
+const MAX_EXTRACTED_TEXT_BYTES: usize = 48_000;
+
+/// Typed server-side `web_fetch` validation and execution errors.
+#[derive(Debug, Error)]
+pub(crate) enum WebFetchError {
+    #[error("only http:// and https:// URLs are supported")]
+    UnsupportedScheme,
+
+    #[error("invalid URL authority")]
+    InvalidAuthority,
+
+    #[error("malformed IPv6 host")]
+    MalformedIpv6Host,
+
+    #[error("missing URL host")]
+    MissingHost,
+
+    #[error("fetching loopback, private, or link-local hosts is not permitted")]
+    SsrfForbiddenHost,
+
+    #[error("domain `{host}` is in blocked_domains")]
+    BlockedDomain { host: String },
+
+    #[error("domain `{host}` is not in allowed_domains")]
+    DomainNotAllowed { host: String },
+
+    #[error("failed to invoke HTTP fetcher")]
+    SpawnFetcher {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("request timed out while fetching URL")]
+    TimedOut,
+
+    #[error("exceeded web_fetch max_uses limit ({max_uses})")]
+    MaxUsesExceeded { max_uses: usize },
+
+    #[error("turn deadline exceeded while fetching URL")]
+    TurnDeadlineExceeded,
+
+    #[error("response exceeded {max_bytes}-byte limit")]
+    ContentTooLarge { max_bytes: usize },
+
+    #[error("HTTP fetcher exited with {status}")]
+    FetcherExitStatus { status: std::process::ExitStatus },
+
+    #[error("{stderr}")]
+    FetcherStderr { stderr: String },
+
+    #[error("HTTP {status}")]
+    HttpStatus { status: u16 },
+}
+
+impl WebFetchError {
+    #[must_use]
+    pub(crate) const fn error_code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedScheme
+            | Self::InvalidAuthority
+            | Self::MalformedIpv6Host
+            | Self::MissingHost => "invalid_input",
+            Self::SsrfForbiddenHost
+            | Self::BlockedDomain { .. }
+            | Self::DomainNotAllowed { .. } => "url_not_allowed",
+            Self::MaxUsesExceeded { .. } => "max_uses_exceeded",
+            Self::ContentTooLarge { .. } => "content_too_large",
+            Self::SpawnFetcher { .. }
+            | Self::TimedOut
+            | Self::TurnDeadlineExceeded
+            | Self::FetcherExitStatus { .. }
+            | Self::FetcherStderr { .. }
+            | Self::HttpStatus { .. } => "url_not_accessible",
+        }
+    }
+}
 
 /// Outcome of a server-side `web_fetch` execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +108,17 @@ pub enum WebFetchOutcome {
     },
 }
 
+impl WebFetchOutcome {
+    #[must_use]
+    pub(crate) fn from_error(url: String, err: &WebFetchError) -> Self {
+        Self::Error {
+            url,
+            error_code: err.error_code(),
+            message: format_error_chain(err),
+        }
+    }
+}
+
 /// Validates `raw_url` against SSRF & domain policy rules, fetches the URL asynchronously,
 /// and extracts clean UTF-8 text suitable for `web_fetch_tool_result` and ACP continuation.
 pub async fn fetch_url_sanitized(
@@ -35,7 +126,7 @@ pub async fn fetch_url_sanitized(
     allowed_domains: &[String],
     blocked_domains: &[String],
 ) -> WebFetchOutcome {
-    fetch_url_sanitized_with_proxy(raw_url, allowed_domains, blocked_domains, None).await
+    fetch_url_sanitized_with_options(raw_url, allowed_domains, blocked_domains, None, None).await
 }
 
 /// Like [`fetch_url_sanitized`], honoring Liftgate's explicit `agy_proxy` policy (`None` = direct).
@@ -45,15 +136,24 @@ pub async fn fetch_url_sanitized_with_proxy(
     blocked_domains: &[String],
     agy_proxy: Option<&ProxyUrl>,
 ) -> WebFetchOutcome {
+    fetch_url_sanitized_with_options(raw_url, allowed_domains, blocked_domains, agy_proxy, None)
+        .await
+}
+
+/// Like [`fetch_url_sanitized_with_proxy`], additionally persisting the full extracted webpage
+/// text to `spill_dir` whenever head+tail truncation is required.
+pub async fn fetch_url_sanitized_with_options(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    agy_proxy: Option<&ProxyUrl>,
+    spill_dir: Option<&Path>,
+) -> WebFetchOutcome {
     let trimmed = raw_url.trim();
     let parsed = match validate_fetch_url(trimmed, allowed_domains, blocked_domains) {
         Ok(u) => u,
-        Err((code, msg)) => {
-            return WebFetchOutcome::Error {
-                url: trimmed.to_owned(),
-                error_code: code,
-                message: msg,
-            };
+        Err(err) => {
+            return WebFetchOutcome::from_error(trimmed.to_owned(), &err);
         }
     };
 
@@ -91,19 +191,14 @@ pub async fn fetch_url_sanitized_with_proxy(
 
     let output = match timeout(Duration::from_secs(MAX_FETCH_TIMEOUT_SECS), cmd.output()).await {
         Ok(Ok(out)) => out,
-        Ok(Err(err)) => {
-            return WebFetchOutcome::Error {
-                url: parsed.normalized_url,
-                error_code: "url_not_accessible",
-                message: format!("failed to invoke HTTP fetcher: {err}"),
-            };
+        Ok(Err(source)) => {
+            return WebFetchOutcome::from_error(
+                parsed.normalized_url,
+                &WebFetchError::SpawnFetcher { source },
+            );
         }
         Err(_) => {
-            return WebFetchOutcome::Error {
-                url: parsed.normalized_url,
-                error_code: "url_not_accessible",
-                message: "request timed out while fetching URL".to_owned(),
-            };
+            return WebFetchOutcome::from_error(parsed.normalized_url, &WebFetchError::TimedOut);
         }
     };
 
@@ -112,24 +207,29 @@ pub async fn fetch_url_sanitized_with_proxy(
 
     if !output.status.success() && status_code == 0 {
         let stderr_msg = String::from_utf8_lossy(&output.stderr);
-        let code = if stderr_msg.contains("Maximum file size exceeded") {
-            "content_too_large"
+        let detail = stderr_msg.trim().to_owned();
+        // `CURLE_FILESIZE_EXCEEDED` is exit status 63.
+        let err = if output.status.code() == Some(63) {
+            WebFetchError::ContentTooLarge {
+                max_bytes: MAX_RAW_BYTES,
+            }
+        } else if detail.is_empty() {
+            WebFetchError::FetcherExitStatus {
+                status: output.status,
+            }
         } else {
-            "url_not_accessible"
+            WebFetchError::FetcherStderr { stderr: detail }
         };
-        return WebFetchOutcome::Error {
-            url: parsed.normalized_url,
-            error_code: code,
-            message: stderr_msg.trim().to_owned(),
-        };
+        return WebFetchOutcome::from_error(parsed.normalized_url, &err);
     }
 
     if status_code >= 400 {
-        return WebFetchOutcome::Error {
-            url: parsed.normalized_url,
-            error_code: "url_not_accessible",
-            message: format!("HTTP {status_code}"),
-        };
+        return WebFetchOutcome::from_error(
+            parsed.normalized_url,
+            &WebFetchError::HttpStatus {
+                status: status_code,
+            },
+        );
     }
 
     let lower_ct = content_type.to_ascii_lowercase();
@@ -151,13 +251,23 @@ pub async fn fetch_url_sanitized_with_proxy(
         (None, body_part.trim().to_owned(), media)
     };
 
-    let bounded = truncate_utf8(&cleaned_text, MAX_EXTRACTED_CHARS);
+    let bounded = bound_extracted_web_text(&cleaned_text, spill_dir);
     WebFetchOutcome::Success {
         url: parsed.normalized_url,
         title,
         media_type: reported_media,
         content: bounded,
     }
+}
+
+fn bound_extracted_web_text(cleaned_text: &str, spill_dir: Option<&Path>) -> String {
+    let mut spill_store = spill_dir.map(SpillStore::new);
+    truncate_head_tail_lines_with_spill(
+        cleaned_text,
+        MAX_EXTRACTED_TEXT_BYTES,
+        "fetched web page",
+        &mut spill_store,
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,28 +280,25 @@ fn validate_fetch_url(
     raw: &str,
     allowed_domains: &[String],
     blocked_domains: &[String],
-) -> Result<ValidatedUrl, (&'static str, String)> {
+) -> Result<ValidatedUrl, WebFetchError> {
     let rest = if let Some(r) = raw.strip_prefix("https://") {
         r
     } else if let Some(r) = raw.strip_prefix("http://") {
         r
     } else {
-        return Err((
-            "invalid_input",
-            "only http:// and https:// URLs are supported".to_owned(),
-        ));
+        return Err(WebFetchError::UnsupportedScheme);
     };
 
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = rest.get(..authority_end).unwrap_or(rest);
     if authority.is_empty() || authority.contains('@') {
-        return Err(("invalid_input", "invalid URL authority".to_owned()));
+        return Err(WebFetchError::InvalidAuthority);
     }
 
     let host_raw = if let Some(bracketed) = authority.strip_prefix('[') {
         let close = bracketed
             .find(']')
-            .ok_or(("invalid_input", "malformed IPv6 host".to_owned()))?;
+            .ok_or(WebFetchError::MalformedIpv6Host)?;
         bracketed.get(..close).unwrap_or_default()
     } else {
         authority.split_once(':').map_or(authority, |(h, _)| h)
@@ -199,24 +306,18 @@ fn validate_fetch_url(
 
     let host = host_raw.trim().trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() {
-        return Err(("invalid_input", "missing URL host".to_owned()));
+        return Err(WebFetchError::MissingHost);
     }
 
     if is_ssrf_forbidden_host(&host) {
-        return Err((
-            "url_not_allowed",
-            "fetching loopback, private, or link-local hosts is not permitted".to_owned(),
-        ));
+        return Err(WebFetchError::SsrfForbiddenHost);
     }
 
     if blocked_domains
         .iter()
         .any(|d| domain_matches(&host, d.trim()))
     {
-        return Err((
-            "url_not_allowed",
-            format!("domain `{host}` is in blocked_domains"),
-        ));
+        return Err(WebFetchError::BlockedDomain { host });
     }
 
     if !allowed_domains.is_empty()
@@ -224,10 +325,7 @@ fn validate_fetch_url(
             .iter()
             .any(|d| domain_matches(&host, d.trim()))
     {
-        return Err((
-            "url_not_allowed",
-            format!("domain `{host}` is not in allowed_domains"),
-        ));
+        return Err(WebFetchError::DomainNotAllowed { host });
     }
 
     Ok(ValidatedUrl {
@@ -443,18 +541,6 @@ fn decode_basic_entities(input: &str) -> String {
         .replace("&apos;", "'")
 }
 
-fn truncate_utf8(input: &str, max_chars: usize) -> String {
-    let Some((byte_idx, _)) = input.char_indices().nth(max_chars) else {
-        return input.to_owned();
-    };
-    let Some((head, _)) = input.split_at_checked(byte_idx) else {
-        return input.to_owned();
-    };
-    let mut out = head.trim_end().to_owned();
-    out.push_str("\n\n[...content truncated...]");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +587,30 @@ mod tests {
         assert!(text.contains("Temperature:"));
         assert!(!text.contains("console.log"));
         assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn oversized_web_page_head_tail_truncates_and_spills_full_text_to_disk() {
+        let spill_dir =
+            std::env::temp_dir().join(format!("liftgate-webfetch-spill-{}", uuid::Uuid::new_v4()));
+        let large_page: String = (1..=1_500)
+            .map(|i| format!("WEB_SECTION_{i:04}: {}\n", "content_token_".repeat(4)))
+            .collect();
+        assert!(large_page.len() > MAX_EXTRACTED_TEXT_BYTES);
+
+        let bounded = bound_extracted_web_text(&large_page, Some(&spill_dir));
+        assert!(bounded.len() <= MAX_EXTRACTED_TEXT_BYTES);
+        assert!(bounded.contains("WEB_SECTION_0001:"));
+        assert!(bounded.contains("WEB_SECTION_1500:"));
+        assert!(bounded.contains("Full lossless content saved locally at `"));
+
+        let spilled_files: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().flatten().collect();
+        assert_eq!(spilled_files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(spilled_files[0].path()).unwrap(),
+            large_page
+        );
+
+        let _ = std::fs::remove_dir_all(&spill_dir);
     }
 }

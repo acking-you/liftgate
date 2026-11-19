@@ -163,6 +163,7 @@ pub struct LiveAcpConfig {
     pub binary_path: PathBuf,
     pub extra_args: Vec<String>,
     pub session_cwd: PathBuf,
+    pub spill_dir: Option<PathBuf>,
     pub limits: GatewayLimits,
     pub agy_proxy: Option<ProxyUrl>,
     pub auto_update_enabled: bool,
@@ -336,8 +337,7 @@ impl LiveAcpGeneration {
         let binary_str: Arc<str> = Arc::from(cfg.binary_path.to_string_lossy().as_ref());
         let started_at_unix_ms = unix_timestamp_ms();
 
-        let job_guard = ProcessGroupGuard::attach(&child)
-            .map_err(|source| AcpError::ProcessGroup { source })?;
+        let job_guard = ProcessGroupGuard::attach(&child)?;
 
         let stdin = child
             .stdin
@@ -989,11 +989,12 @@ impl AcpBackend for Arc<LiveAcpClient> {
         allowed_domains: &[String],
         blocked_domains: &[String],
     ) -> crate::web_fetch::WebFetchOutcome {
-        crate::web_fetch::fetch_url_sanitized_with_proxy(
+        crate::web_fetch::fetch_url_sanitized_with_options(
             url,
             allowed_domains,
             blocked_domains,
             self.cfg.agy_proxy.as_ref(),
+            self.cfg.spill_dir.as_deref(),
         )
         .await
     }

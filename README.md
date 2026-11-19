@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.2-D97757"></a>
+  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.3-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.3-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -67,6 +67,7 @@ irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.p
 ```
 
 `LIFTGATE_VERSION=v0.2.2` pins a tag, `LIFTGATE_BIN_DIR` sets the install
+`LIFTGATE_VERSION=v0.2.3` pins a tag, `LIFTGATE_BIN_DIR` sets the install
 directory, and `LIFTGATE_NO_MODIFY_PATH=1` skips updating `PATH`. Once
 installed, run `lg upgrade` anytime to update in place.
 
@@ -113,18 +114,18 @@ compiled right in).
   6. **System** — Live gateway & `agy` stderr logs, environment doctor, `lg`
      `PATH` alias & shell completions installer, and release upgrade checker.
 
-**Download the latest Desktop release — [Liftgate Desktop `v0.2.2`](https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui)**
+**Download the latest Desktop release — [Liftgate Desktop `v0.2.3`](https://github.com/acking-you/liftgate/releases/tag/v0.2.3-ui)**
 ([all Desktop releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/release-manifest.json)):
+[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/SHA256SUMS) ·
+[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/release-manifest.json)):
 
 | Platform | Installer (Recommended) | Portable Bundle |
 | --- | --- | --- |
-| **macOS (Apple Silicon · M1–M4)** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS (Intel · x86_64)** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows (x64)** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows (ARM64)** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux (x86_64 · glibc 2.35+)** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.tar.gz) |
+| **macOS (Apple Silicon · M1–M4)** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-arm64.zip) |
+| **macOS (Intel · x86_64)** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-x86_64.zip) |
+| **Windows (x64)** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-x86_64.zip) |
+| **Windows (ARM64)** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-arm64.zip) |
+| **Linux (x86_64 · glibc 2.35+)** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-x86_64.tar.gz) |
 
 > [!NOTE]
 > macOS builds are currently ad-hoc signed; if Gatekeeper blocks first launch,
@@ -189,9 +190,10 @@ well. Full command reference and SDK examples:
   ([inference-only sessions](docs/architecture.md#inference-only-sessions)).
 - **Warm sessions** — each request's history is matched to a pooled ACP
   session and only the new turn is sent ([session reuse](docs/architecture.md#session-reuse)).
-- **Conservative context defaults** — Codex and Claude Code compact within
-  model-specific windows; Flash history hydration is an explicit experimental
-  option, not a bypass of upstream compaction ([context policy](docs/usage.md#context-windows-and-long-context)).
+- **Verified context windows** — Codex and Claude Code compact cleanly within
+  empirically verified ACP session windows (`500k / 425k` for Gemini, safely
+  below Antigravity's `524,288`-token internal compaction threshold) with
+  single-turn prompts and zero synthetic replay turns ([context policy](docs/usage.md#context-windows)).
 - **Live model catalog** — `/v1/models` and a Codex catalog list every model
   your account can use, so `/model` pickers show Antigravity models
   ([Codex setup](docs/usage.md#codex-cli)).

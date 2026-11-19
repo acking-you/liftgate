@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ValidationError;
+use crate::error::{ProxyUrlError, ValidationError};
 
 pub const DEFAULT_MAX_LINE_BYTES: usize = 48 * 1024 * 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -179,13 +179,13 @@ impl ProxyUrl {
         if trimmed.is_empty() {
             return Err(ValidationError::InvalidProxyUrl {
                 value: raw_ref.to_owned(),
-                reason: "proxy address must not be empty",
+                source: ProxyUrlError::Empty,
             });
         }
         if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(ValidationError::InvalidProxyUrl {
                 value: trimmed.to_owned(),
-                reason: "proxy address must not contain whitespace or control characters",
+                source: ProxyUrlError::WhitespaceOrControl,
             });
         }
 
@@ -197,7 +197,7 @@ impl ProxyUrl {
                 .filter(|&p| p > 0)
                 .ok_or_else(|| ValidationError::InvalidProxyUrl {
                     value: trimmed.to_owned(),
-                    reason: "port number must be between 1 and 65535",
+                    source: ProxyUrlError::InvalidPort,
                 })?;
             return Ok(Self(Arc::from(format!("http://127.0.0.1:{port}"))));
         }
@@ -208,14 +208,14 @@ impl ProxyUrl {
             if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
                 return Err(ValidationError::InvalidProxyUrl {
                     value: trimmed.to_owned(),
-                    reason: "scheme must be http://, https://, socks5://, or socks5h://",
+                    source: ProxyUrlError::UnsupportedScheme,
                 });
             }
             let rest = rest_raw.strip_suffix('/').unwrap_or(rest_raw);
             if rest.contains('/') {
                 return Err(ValidationError::InvalidProxyUrl {
                     value: trimmed.to_owned(),
-                    reason: "proxy URL must not contain a URL path",
+                    source: ProxyUrlError::ContainsPath,
                 });
             }
             validate_proxy_authority(rest, trimmed)?;
@@ -225,7 +225,7 @@ impl ProxyUrl {
             if rest.contains('/') {
                 return Err(ValidationError::InvalidProxyUrl {
                     value: trimmed.to_owned(),
-                    reason: "missing URL scheme (expected e.g. http://127.0.0.1:7890)",
+                    source: ProxyUrlError::MissingScheme,
                 });
             }
             validate_proxy_authority(rest, trimmed)?;
@@ -264,7 +264,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
             if userinfo.is_empty() {
                 return Err(ValidationError::InvalidProxyUrl {
                     value: original.to_owned(),
-                    reason: "proxy credentials before '@' must not be empty",
+                    source: ProxyUrlError::EmptyCredentials,
                 });
             }
             hp
@@ -275,7 +275,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
     if host_port.is_empty() {
         return Err(ValidationError::InvalidProxyUrl {
             value: original.to_owned(),
-            reason: "proxy host must not be empty",
+            source: ProxyUrlError::EmptyHost,
         });
     }
 
@@ -283,13 +283,13 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
         let Some((ipv6_host, tail)) = after_bracket.split_once(']') else {
             return Err(ValidationError::InvalidProxyUrl {
                 value: original.to_owned(),
-                reason: "unclosed IPv6 bracket in proxy host",
+                source: ProxyUrlError::UnclosedIpv6Bracket,
             });
         };
         if ipv6_host.is_empty() {
             return Err(ValidationError::InvalidProxyUrl {
                 value: original.to_owned(),
-                reason: "IPv6 proxy host must not be empty",
+                source: ProxyUrlError::EmptyIpv6Host,
             });
         }
         let port_str = if tail.is_empty() {
@@ -299,7 +299,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
         } else {
             return Err(ValidationError::InvalidProxyUrl {
                 value: original.to_owned(),
-                reason: "unexpected characters after IPv6 host bracket",
+                source: ProxyUrlError::UnexpectedAfterIpv6Bracket,
             });
         };
         (ipv6_host, port_str)
@@ -307,7 +307,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
         if h.contains(':') {
             return Err(ValidationError::InvalidProxyUrl {
                 value: original.to_owned(),
-                reason: "IPv6 proxy host must be enclosed in brackets (e.g. [::1]:7890)",
+                source: ProxyUrlError::UnbracketedIpv6Host,
             });
         }
         (h, Some(p))
@@ -318,7 +318,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
     if host.is_empty() {
         return Err(ValidationError::InvalidProxyUrl {
             value: original.to_owned(),
-            reason: "proxy host must not be empty",
+            source: ProxyUrlError::EmptyHost,
         });
     }
     if let Some(p_str) = port_opt {
@@ -326,7 +326,7 @@ fn validate_proxy_authority(authority: &str, original: &str) -> Result<(), Valid
         if !valid_port {
             return Err(ValidationError::InvalidProxyUrl {
                 value: original.to_owned(),
-                reason: "proxy port must be a valid integer between 1 and 65535",
+                source: ProxyUrlError::InvalidPort,
             });
         }
     }
