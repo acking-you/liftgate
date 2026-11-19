@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.4] - 2026-11-19
 
 ### Fixed
 - Disable Codex CLI's built-in update prompt in Liftgate sessions launched from the CLI or desktop terminal so the installer cannot inherit the session's gateway credentials or proxy settings. Run `codex update` or `lg cx update` from a regular shell to update with its original environment.
