@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-11-19
+
+### Added
+- **Lossless local file spill (`~/.liftgate/spills/`) paired with every truncation and omission path**:
+  - Added a bounded, atomic, content-addressed `SpillStore` (`256` files / `256 MiB` retention cap, private `0o700`/`0o600` permissions on Unix, deduplicated `<slug>-<sha256_16>.<ext>` filenames) wired into every single-turn truncation, compaction, and archival omission path across `liftgate-types` and `liftgate-server`.
+  - Oversized tool outputs, pasted inputs, tool call arguments, `<developer_instructions>`, `<caller_system_instructions>`, `/compact` instructions, Code Mode TypeScript declarations, compacted `<client_tools>` / `<client_tools_update>` JSON catalogs, cold-history omitted turns and archival entries, and `web_fetch` extracted web pages now persist 100% of their original content locally before head+tail truncation and embed the exact local file path (plus omitted line ranges) directly inside the inline omission notice.
+
+### Changed
+- **Structured `thiserror` error hierarchy across workspace crates**:
+  - Replaced hand-formatted error strings (`format!`, `Result<_, String>`, ad-hoc `io::Error::new`, and error-text substring checks) across `liftgate-types`, `liftgate-server`, `liftgate-core`, `liftgate`, and `liftgate-desktop` with typed `thiserror` enums (`ProxyUrlError`, `ProcessGroupError`, `SessionCwdError`, `RequestBodyError`, `WebFetchError`, `UpgradeInputError`, `TransferError`, `ArchiveError`, `GatewayTransportError`, `DaemonStopError`, `DesktopLaunchError`, `TuiActionError`, and `FormValidationError`) that preserve full `#[source]` chains via `format_error_chain`.
+
+### Removed
+- **Removed `--long-context` (`AGY_LONG_CONTEXT`) and multi-chunk Flash seed replay (`hydration`)**:
+  - Live black-box verification against `agy acp` v1.5.11 confirmed that upstream enforces a hard post-turn auto-compaction cliff at `524,288` tokens (`50%` of `1,048,576`) on Gemini sessions and a `191,579`-byte single-turn `session/prompt` cutoff. Liftgate now exclusively uses zero-side-effect single-turn `176,000`-byte prompts paired with warm `SessionPool` reuse and `500,000 / 425,000` Gemini context limits.
+
 ## [0.2.2] - 2026-11-19
 
 ### Added

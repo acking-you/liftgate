@@ -39,7 +39,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     acp_client::AcpBackend,
-    error::{AcpError, GatewayError},
+    error::{AcpError, GatewayError, RequestBodyError},
     session_pool::SessionPool,
     telemetry::{TelemetryHub, unix_timestamp_ms},
     turn_runner::{
@@ -293,8 +293,7 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
         .into_iter()
         .map(|(model_id, display_name)| {
             let route_id = liftgate_types::model::encode_claude_desktop_route_id(&model_id);
-            let (window, _) =
-                liftgate_types::model::context_limits(&model_id, state.config.long_context);
+            let (window, _) = liftgate_types::model::context_limits(&model_id);
             let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let raw_desc = format!(
                 "{}k ctx \u{00b7} Antigravity ACP ({model_id})",
@@ -336,14 +335,8 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
     .into_response()
 }
 
-fn build_model_card(
-    id: String,
-    display_name: String,
-    created: u64,
-    long_context: bool,
-) -> ModelCard {
-    let (context_window, auto_compact_token_limit) =
-        liftgate_types::model::context_limits(&id, long_context);
+fn build_model_card(id: String, display_name: String, created: u64) -> ModelCard {
+    let (context_window, auto_compact_token_limit) = liftgate_types::model::context_limits(&id);
     let description = format!(
         "{}k ctx \u{00b7} Antigravity ACP ({id})",
         context_window / 1_000
@@ -381,18 +374,13 @@ async fn handle_list_models<B: AcpBackend>(
             } else {
                 m.name
             };
-            build_model_card(m.model_id, display, now, state.config.long_context)
+            build_model_card(m.model_id, display, now)
         })
         .collect();
 
     if data.is_empty() {
         let fallback_id = state.config.default_model.as_str().to_owned();
-        data.push(build_model_card(
-            fallback_id.clone(),
-            fallback_id,
-            now,
-            state.config.long_context,
-        ));
+        data.push(build_model_card(fallback_id.clone(), fallback_id, now));
     }
 
     let first_id = data.first().map(|m| m.id.clone());
@@ -428,12 +416,8 @@ async fn handle_codex_model_catalog<B: AcpBackend>(
     let preferred_default =
         query_param(&uri, "default_model").unwrap_or_else(|| state.config.default_model.as_str());
     let tool_mode = query_param(&uri, "tool_mode");
-    let catalog = build_codex_model_catalog_with_tool_mode(
-        &available,
-        preferred_default,
-        state.config.long_context,
-        tool_mode,
-    );
+    let catalog =
+        build_codex_model_catalog_with_tool_mode(&available, preferred_default, tool_mode);
     Json(catalog).into_response()
 }
 
@@ -456,13 +440,7 @@ async fn handle_get_model<B: AcpBackend>(
         } else {
             exact.name.clone()
         };
-        return Json(build_model_card(
-            exact.model_id.clone(),
-            display,
-            now,
-            state.config.long_context,
-        ))
-        .into_response();
+        return Json(build_model_card(exact.model_id.clone(), display, now)).into_response();
     }
 
     let resolved = liftgate_types::model::resolve_model_id(
@@ -477,12 +455,7 @@ async fn handle_get_model<B: AcpBackend>(
         .filter(|m| !m.name.is_empty())
         .map_or_else(|| resolved.as_str().to_owned(), |m| m.name.clone());
 
-    let mut card = build_model_card(
-        resolved.as_str().to_owned(),
-        display,
-        now,
-        state.config.long_context,
-    );
+    let mut card = build_model_card(resolved.as_str().to_owned(), display, now);
     card.id = model_id;
     Json(card).into_response()
 }
@@ -1847,8 +1820,8 @@ fn stream_openai_responses(
         .await;
 
         if failed_err.is_none() && !open_client_tools.is_empty() {
-            failed_err = Some(Arc::new(AcpError::UpstreamAgentTerminated {
-                detail: "upstream stream ended before closing active tool call".to_owned(),
+            failed_err = Some(Arc::new(AcpError::UnclosedToolCallStream {
+                protocol: "OpenAI Responses",
             }));
         }
 
@@ -2920,8 +2893,8 @@ fn stream_anthropic_messages(
 
         if !open_tool_blocks.is_empty() {
             let gw_err = GatewayError::SharedAcp {
-                source: Arc::new(AcpError::UpstreamAgentTerminated {
-                    detail: "upstream stream ended before closing active tool_use block".to_owned(),
+                source: Arc::new(AcpError::UnclosedToolCallStream {
+                    protocol: "Anthropic Messages",
                 }),
             };
             tracing::error!(
@@ -3329,14 +3302,10 @@ fn parse_content_length_hint(
     };
     let trimmed = raw
         .to_str()
-        .map_err(|_| GatewayError::BadJson {
-            message: "invalid Content-Length header".to_owned(),
-        })?
+        .map_err(|_| RequestBodyError::InvalidContentLength)?
         .trim();
     if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(GatewayError::BadJson {
-            message: "invalid Content-Length header".to_owned(),
-        });
+        return Err(RequestBodyError::InvalidContentLength.into());
     }
     let len = trimmed
         .parse::<usize>()
@@ -3391,15 +3360,11 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
         let next_frame =
             tokio::time::timeout_at(read_deadline, http_body_util::BodyExt::frame(&mut body))
                 .await
-                .map_err(|_| GatewayError::BadJson {
-                    message: "timed out reading HTTP request body".to_owned(),
-                })?;
+                .map_err(|_| RequestBodyError::ReadTimeout)?;
         let Some(frame_res) = next_frame else {
             break;
         };
-        let frame = frame_res.map_err(|err| GatewayError::BadJson {
-            message: format!("failed to read HTTP request body: {err}"),
-        })?;
+        let frame = frame_res.map_err(|source| RequestBodyError::ReadFrame { source })?;
         let Ok(chunk) = frame.into_data() else {
             continue;
         };
@@ -3415,9 +3380,7 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
         if let Some(exact) = exact_length_hint
             && next_len > exact
         {
-            return Err(GatewayError::BadJson {
-                message: "HTTP request body exceeded declared Content-Length".to_owned(),
-            });
+            return Err(RequestBodyError::ExceededContentLength.into());
         }
         buf.extend_from_slice(&chunk);
     }
@@ -3425,14 +3388,10 @@ async fn read_authenticated_json_body<T: serde::de::DeserializeOwned, B: AcpBack
     if let Some(exact) = header_length_hint
         && buf.len() != exact
     {
-        return Err(GatewayError::BadJson {
-            message: "HTTP request body length did not match declared Content-Length".to_owned(),
-        });
+        return Err(RequestBodyError::ContentLengthMismatch.into());
     }
 
-    serde_json::from_slice(&buf).map_err(|err| GatewayError::BadJson {
-        message: err.to_string(),
-    })
+    Ok(serde_json::from_slice(&buf).map_err(RequestBodyError::from)?)
 }
 
 const fn next_seq(seq: &mut u64) -> u64 {

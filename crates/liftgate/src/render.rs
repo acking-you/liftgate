@@ -154,7 +154,6 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             "gateway_url": report.gateway_url,
             "dashboard_url": report.dashboard_url,
             "auth_enabled": report.auth_enabled,
-            "long_context": report.long_context,
             "state_dir": report.state_dir,
             "log_file": report.log_file,
             "models_count": report.models.as_ref().map(Vec::len),
@@ -240,11 +239,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
     );
     ui::kv(
         "Context Policy",
-        if report.long_context {
-            "experimental long-context (1M Gemini / Flash hydration)"
-        } else {
-            "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)"
-        },
+        "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)",
     );
     ui::kv("Service Log", &report.log_file.display().to_string());
 
@@ -505,10 +500,9 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
             "default_model": report.default_model,
             "fast_model": report.fast_model,
             "title_model": report.title_model,
-            "long_context": report.long_context,
             "count": report.models.len(),
             "models": report.models.iter().map(|m| {
-                let (context_window, auto_compact_token_limit) = m.context_limits(report.long_context);
+                let (context_window, auto_compact_token_limit) = m.context_limits();
                 json!({
                     "id": m.id,
                     "display_name": m.display_name,
@@ -572,7 +566,7 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
 
     let mut table = ui::new_table(&["Model ID", "Display Name", "Context", "Compact At", "Role"]);
     for m in &report.models {
-        let (ctx_win, compact_at) = m.context_limits(report.long_context);
+        let (ctx_win, compact_at) = m.context_limits();
         let mut roles = Vec::new();
         if m.id == report.default_model {
             roles.push("default");
@@ -968,7 +962,7 @@ pub async fn run_proxy(state_paths: &StatePaths, args: ProxyArgs) -> Result<(), 
         if let Some(probe) = &out.connectivity_probe
             && !probe.ok
         {
-            return Err(CliError::AgyInstallFailed {
+            return Err(CliError::AgyProxyProbeFailed {
                 detail: probe
                     .error
                     .clone()
@@ -1028,7 +1022,7 @@ pub async fn run_proxy(state_paths: &StatePaths, args: ProxyArgs) -> Result<(), 
                 ),
             );
         } else {
-            return Err(CliError::AgyInstallFailed {
+            return Err(CliError::AgyProxyProbeFailed {
                 detail: probe
                     .error
                     .unwrap_or_else(|| "upstream connectivity test failed".to_owned()),

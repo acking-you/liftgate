@@ -179,10 +179,11 @@ lg claude-desktop --restore                 # manually replay rollback journals 
   arguments. Pass `--` (`lg cx -- --help`, `lg cc -- --help`) whenever you want
   verbatim raw argument forwarding.
 
-## Context windows and long context
+## Context windows
 
-Use `lg cx` or `lg cc` to load the running gateway's context policy. The default
-mode uses warm ACP sessions and client-side compaction without Flash seed turns:
+Use `lg cx` or `lg cc` to load the running gateway's context policy. Liftgate
+uses warm ACP sessions, single-turn `session/prompt` calls, and client-side
+compaction with zero background replay turns:
 
 | Model family | Declared window | Auto-compact threshold |
 | --- | --- | --- |
@@ -190,47 +191,30 @@ mode uses warm ACP sessions and client-side compaction without Flash seed turns:
 | Claude | 200,000 | 170,000 |
 | GPT-OSS | 128,000 | 110,000 |
 
-These match Antigravity's 500K ACP session context window for Gemini models
-while leaving generous output headroom before upstream compaction.
+Upstream `agy acp` enforces an internal post-turn auto-compaction threshold at
+`524,288` tokens (`50%` of the `1,048,576`-token `usage_update` window) on
+Gemini sessions; advertising `500,000 / 425,000` leaves safe output headroom so
+client `/compact` runs on the warm session before upstream compaction fires.
 Codex reads the policy per model from its catalog. Claude Code uses
 `modelSettings.autoCompactWindow` (requires v2.1.288 or later); when several
 gateway models share a canonical Claude name, the smaller threshold wins.
 That can compact sooner than the table. See the official
 [Claude context settings](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction).
 
-Every ACP prompt has a `176,000`-byte text budget. When an active turn or tool
+Every ACP `session/prompt` has a `176,000`-byte text budget (safely below
+Antigravity's `191,579`-byte single-turn truncation boundary). When an active turn or tool
 result exceeds that single-turn budget, Liftgate automatically middle-truncates
 only the oversized block(s) on clean line boundaries (preserving ~55% of the
-beginning and ~45% of the end with an explicit omitted-lines marker) while
-keeping smaller sibling tool results untouched and preserving warm `SessionPool`
-reuse on subsequent turns. Cold replays shorten older history with explicit
-archive markers when needed, and genuine context-window overflows emit standard
+beginning and ~45% of the end), atomically saves 100% of the lossless original
+payload to `~/.liftgate/spills/`, and cites the exact local file path and
+omitted line range in the marker so client agents can read any needed middle
+lines on demand—while keeping smaller sibling tool results untouched and
+preserving warm `SessionPool` reuse on subsequent turns. Cold replays, compacted
+tool catalogs, and oversized `web_fetch` pages follow the same lossless spill
+policy, and genuine context-window overflows emit standard
 auto-compactable errors (`context_length_exceeded` for Codex and `prompt is too
 long: N tokens > M maximum` for Claude Code). Client `/compact` reuses a
 matching warm session before retiring it.
-
-Long-context hydration is experimental and must be enabled explicitly:
-
-```bash
-lg start --long-context          # when the gateway is stopped
-lg restart --long-context        # enable on a running managed gateway
-lg restart --long-context=false  # return to conservative defaults
-```
-
-Alternatively set `AGY_LONG_CONTEXT=true` before starting the gateway, or add
-`"long_context": true` to `~/.liftgate/settings.json` for future starts after
-`lg stop` and `lg start`. A plain `lg restart` preserves the running daemon's
-mode; use the explicit `lg restart --long-context` or
-`lg restart --long-context=false` commands to change it. Relaunch the client; regenerate
-persisted client files with `lg config` if you use those instead of `lg cx` / `lg cc`.
-
-This mode advertises `1M / 850k` for Gemini and sends larger histories through
-bounded Flash seed turns, with extra calls and synthetic acknowledgements.
-It **cannot bypass upstream automatic compaction or guarantee a 1M retained
-conversation**. Exceeding the chunk capacity, or detecting upstream compaction
-during hydration, returns a non-retryable `400` rather than dropping segments or
-continually replaying the same history. Claude and GPT-OSS retain their smaller
-windows in this mode.
 
 ## Configure local or global client files (`liftgate config`)
 
@@ -410,7 +394,6 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
 | `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
-| `--long-context[=true\|false]` | `AGY_LONG_CONTEXT` | `false` (or `long_context` in `~/.liftgate/settings.json`) |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |

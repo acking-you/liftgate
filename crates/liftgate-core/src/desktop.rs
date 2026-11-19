@@ -46,12 +46,12 @@ use crate::cli::{
     ClaudeDesktopArgs, CodexAppArgs, DesktopMsixLaunchArgs, DesktopWatchArgs, PLACEHOLDER_API_KEY,
     normalize_optional_api_key,
 };
-use crate::client::{DiscoveredModel, infer_live_long_context};
+use crate::client::DiscoveredModel;
 use crate::config_sync::{
     build_offline_codex_catalog_bytes_with_mode, merge_isolated_codex_app_config_toml,
 };
 use crate::daemon::{configure_detached_command, ensure_gateway_ready, is_pid_alive};
-use crate::error::CliError;
+use crate::error::{CliError, DesktopLaunchError};
 use crate::harness::resolve_codex_command;
 use crate::state::{StatePaths, now_unix_ms, user_home_dir, write_file_atomic};
 
@@ -409,11 +409,9 @@ pub async fn launch_codex_app(
         Ok(bytes) => bytes,
         Err(_) => {
             let discovered = target.client.fetch_models().await.unwrap_or_default();
-            let long_context = infer_live_long_context(&discovered, target.managed_long_context);
             build_offline_codex_catalog_bytes_with_mode(
                 &discovered,
                 &primary_model,
-                long_context,
                 Some(tool_mode),
             )?
         }
@@ -603,7 +601,6 @@ pub async fn launch_claude_desktop(
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let discovered = target.client.fetch_models().await.unwrap_or_default();
-    let long_context = infer_live_long_context(&discovered, target.managed_long_context);
 
     let path_sets = resolve_claude_desktop_path_sets()?;
     let backups = snapshot_claude_desktop_path_sets(&path_sets)?;
@@ -629,13 +626,8 @@ pub async fn launch_claude_desktop(
         "{}/claude-desktop",
         target.client.base_url().trim_end_matches('/')
     );
-    let profile_doc = build_claude_desktop_3p_profile(
-        &gateway_3p_url,
-        &auth_token,
-        &primary_model,
-        &discovered,
-        long_context,
-    );
+    let profile_doc =
+        build_claude_desktop_3p_profile(&gateway_3p_url, &auth_token, &primary_model, &discovered);
     apply_claude_desktop_3p_profile(&path_sets, &profile_doc)?;
 
     let merged_no_proxy = merge_loopback_no_proxy(
@@ -835,7 +827,7 @@ fn spawn_detached_watcher(journal_path: &Path) -> Result<u32, CliError> {
     let current_exe =
         std::env::current_exe().map_err(|source| CliError::DesktopAppLaunchFailed {
             app: "liftgate watcher",
-            detail: source.to_string(),
+            source: DesktopLaunchError::LocateCurrentExe(source),
         })?;
     let mut cmd = std::process::Command::new(&current_exe);
     cmd.arg("__desktop-watch")
@@ -853,7 +845,10 @@ fn spawn_detached_watcher(journal_path: &Path) -> Result<u32, CliError> {
         .spawn()
         .map_err(|source| CliError::DesktopAppLaunchFailed {
             app: "liftgate watcher",
-            detail: format!("{}: {source}", current_exe.display()),
+            source: DesktopLaunchError::Spawn {
+                executable: current_exe,
+                source,
+            },
         })?;
     #[cfg(windows)]
     drop(_inherit_guard);
@@ -1028,7 +1023,6 @@ pub fn build_claude_desktop_3p_profile(
     api_key: &str,
     primary_model: &str,
     discovered_models: &[DiscoveredModel],
-    long_context: bool,
 ) -> Value {
     let mut ordered: Vec<(String, String)> =
         Vec::with_capacity(discovered_models.len().saturating_add(1));
@@ -1071,8 +1065,8 @@ pub fn build_claude_desktop_3p_profile(
                 .iter()
                 .find(|m| m.id.eq_ignore_ascii_case(&model_id))
                 .map_or_else(
-                    || liftgate_types::model::context_limits(&model_id, long_context),
-                    |m| m.context_limits(long_context),
+                    || liftgate_types::model::context_limits(&model_id),
+                    DiscoveredModel::context_limits,
                 );
             let supports_extended = window > liftgate_types::model::CLAUDE_DEFAULT_WINDOW;
             let mut item = json!({
@@ -1469,12 +1463,9 @@ fn read_bounded_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, CliError> {
             source,
         })?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > limit {
-        return Err(CliError::StateIo {
+        return Err(CliError::ConfigFileTooLarge {
             path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "desktop configuration file exceeds safety size limit",
-            ),
+            limit,
         });
     }
     Ok(buf)
@@ -1482,9 +1473,9 @@ fn read_bounded_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, CliError> {
 
 fn read_bounded_utf8(path: &Path, limit: u64) -> Result<String, CliError> {
     let bytes = read_bounded_bytes(path, limit)?;
-    String::from_utf8(bytes).map_err(|err| CliError::StateIo {
+    String::from_utf8(bytes).map_err(|source| CliError::StateUtf8 {
         path: path.to_path_buf(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        source,
     })
 }
 
@@ -2234,7 +2225,10 @@ async fn spawn_desktop_application(
                 .spawn()
                 .map_err(|source| CliError::DesktopAppLaunchFailed {
                     app: kind.display_name(),
-                    detail: format!("{}: {source}", executable.display()),
+                    source: DesktopLaunchError::Spawn {
+                        executable: executable.clone(),
+                        source,
+                    },
                 })?;
             #[cfg(windows)]
             drop(_inherit_guard);
@@ -2310,7 +2304,7 @@ async fn spawn_windows_msix_package(
     let current_exe =
         std::env::current_exe().map_err(|source| CliError::DesktopAppLaunchFailed {
             app: app_display_name,
-            detail: format!("failed to locate current liftgate binary: {source}"),
+            source: DesktopLaunchError::LocateCurrentExe(source),
         })?;
     let ephemeral_dir = state_paths.ensure_ephemeral_dir()?;
     let nonce = Uuid::new_v4().simple();
@@ -2385,20 +2379,27 @@ async fn spawn_windows_msix_package(
         .await
         .map_err(|source| CliError::DesktopAppLaunchFailed {
             app: app_display_name,
-            detail: format!("{} ({package_family_name}): {source}", ps_exe.display()),
+            source: DesktopLaunchError::MsixInvoke {
+                executable: ps_exe,
+                package_family_name: package_family_name.to_owned(),
+                source,
+            },
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
         return Err(CliError::DesktopAppLaunchFailed {
             app: app_display_name,
-            detail: if detail.is_empty() {
-                format!(
-                    "Invoke-CommandInDesktopPackage ({package_family_name}!{app_id}) exited with {}",
-                    output.status
-                )
+            source: if detail.is_empty() {
+                DesktopLaunchError::MsixExitStatus {
+                    package_family_name: package_family_name.to_owned(),
+                    app_id: app_id.to_owned(),
+                    status: output.status,
+                }
             } else {
-                detail.to_owned()
+                DesktopLaunchError::MsixReported {
+                    detail: detail.to_owned(),
+                }
             },
         });
     }
@@ -2410,7 +2411,7 @@ async fn spawn_windows_msix_package(
             if let Some(err_detail) = parsed.error {
                 return Err(CliError::DesktopAppLaunchFailed {
                     app: app_display_name,
-                    detail: err_detail,
+                    source: DesktopLaunchError::MsixReported { detail: err_detail },
                 });
             }
             return Ok(parsed.pid);
@@ -3239,7 +3240,6 @@ fn main() {
                 context_window: 500_000,
                 auto_compact_token_limit: 425_000,
             }],
-            false,
         );
         apply_claude_desktop_3p_profile(&path_sets, &profile).unwrap();
 

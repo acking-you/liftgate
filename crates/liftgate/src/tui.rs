@@ -30,6 +30,7 @@ use ratatui::{
         Table, TableState, Tabs, Wrap,
     },
 };
+use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
@@ -37,7 +38,7 @@ use crate::ui::{
     format_duration_secs, format_latency_ms, format_relative_ms, format_tokens, format_utc_hms,
 };
 use liftgate_core::cli::{RestartArgs, ServeArgs, TopArgs};
-use liftgate_core::client::{DiscoveredModel, GatewayClient, infer_live_long_context};
+use liftgate_core::client::{DiscoveredModel, GatewayClient};
 use liftgate_core::config_sync::resolve_fast_model;
 use liftgate_core::daemon::{
     build_authenticated_dashboard_url, ensure_gateway_ready, is_pid_alive, open_browser,
@@ -47,6 +48,17 @@ use liftgate_core::error::CliError;
 use liftgate_core::state::{StatePaths, format_connect_url, now_unix_ms, write_file_atomic};
 use liftgate_server::title_model::title_model;
 use liftgate_types::config::ModelId;
+use liftgate_types::error::format_error_chain;
+
+#[derive(Debug, Error)]
+enum TuiActionError {
+    #[error("Session {session_id} is active or already closed")]
+    SessionInactiveOrClosed { session_id: String },
+    #[error("No managed background gateway is running")]
+    NoManagedDaemon,
+    #[error(transparent)]
+    Cli(#[from] CliError),
+}
 
 static TUI_RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TUI_PANIC_HOOK_ONCE: Once = Once::new();
@@ -668,7 +680,6 @@ pub async fn run_model_picker(
         .unwrap_or(0);
     let mut table_state = TableState::default();
 
-    let long_context = infer_live_long_context(models, None);
     let chosen = loop {
         let filtered: Vec<&DiscoveredModel> = models
             .iter()
@@ -699,7 +710,6 @@ pub async fn run_model_picker(
                     &filtered,
                     current_default,
                     fast_model,
-                    long_context,
                     &mut table_state,
                 );
             })
@@ -787,7 +797,6 @@ fn draw_model_picker(
     filtered: &[&DiscoveredModel],
     current_default: &str,
     fast_model: &str,
-    long_context: bool,
     table_state: &mut TableState,
 ) {
     let area = centered_rect(92, 24, frame.area());
@@ -838,7 +847,7 @@ fn draw_model_picker(
     let rows: Vec<Row<'_>> = filtered
         .iter()
         .map(|m| {
-            let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
+            let ctx_k = format!("{}k", m.context_limits().0 / 1_000);
             let role = match (m.id == current_default, m.id == fast_model) {
                 (true, true) => "★ default · ⚡ fast",
                 (true, false) => "★ default",
@@ -1174,7 +1183,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
     let worker_refresh = refresh_tx.clone();
     tasks.spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
-            let outcome: Result<String, String> = match cmd {
+            let outcome: Result<String, TuiActionError> = match cmd {
                 TuiCommand::CloseSession(sess_id) => {
                     let daemon = worker_paths.read_daemon().ok().flatten();
                     let addr = worker_listen
@@ -1184,8 +1193,10 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                     let client = GatewayClient::new(addr, key);
                     match client.close_idle_session(&sess_id).await {
                         Ok(true) => Ok(format!("Closed idle session {sess_id}")),
-                        Ok(false) => Err(format!("Session {sess_id} is active or already closed")),
-                        Err(e) => Err(e.to_string()),
+                        Ok(false) => Err(TuiActionError::SessionInactiveOrClosed {
+                            session_id: sess_id,
+                        }),
+                        Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
                 TuiCommand::SwitchDefaultModel(model_id) => {
@@ -1195,15 +1206,15 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         api_key: worker_key.clone(),
                         ..RestartArgs::default()
                     };
-                    match restart_daemon(&worker_paths, restart_args).await {
-                        Ok(_) => Ok(format!("Switched default model to {model_id}")),
-                        Err(e) => Err(e.to_string()),
-                    }
+                    restart_daemon(&worker_paths, restart_args)
+                        .await
+                        .map(|_| format!("Switched default model to {model_id}"))
+                        .map_err(TuiActionError::Cli)
                 }
                 TuiCommand::SetTitleModel(model_id) => {
                     write_file_atomic(&worker_paths.title_model_file(), model_id.as_bytes(), false)
                         .map(|()| format!("Title model set to {model_id}"))
-                        .map_err(|e| e.to_string())
+                        .map_err(TuiActionError::Cli)
                 }
                 TuiCommand::StartOrRestartDaemon => {
                     let daemon = worker_paths.read_daemon().ok().flatten();
@@ -1235,14 +1246,14 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                             )
                         })
                     };
-                    res.map_err(|e| e.to_string())
+                    res.map_err(TuiActionError::Cli)
                 }
                 TuiCommand::StopDaemon => match stop_daemon(&worker_paths).await {
                     Ok(out) if out.stopped_pid.is_some() => {
                         Ok("Stopped background gateway".to_owned())
                     }
-                    Ok(_) => Err("No managed background gateway is running".to_owned()),
-                    Err(e) => Err(e.to_string()),
+                    Ok(_) => Err(TuiActionError::NoManagedDaemon),
+                    Err(err) => Err(TuiActionError::Cli(err)),
                 },
                 TuiCommand::OpenBrowser => {
                     let snap =
@@ -1250,7 +1261,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                             .await;
                     open_browser(&snap.dashboard_url)
                         .map(|()| format!("Opened Web UI ({})", snap.gateway_url))
-                        .map_err(|e| e.to_string())
+                        .map_err(TuiActionError::Cli)
                 }
             };
 
@@ -1259,7 +1270,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                     let _ = toast_tx.send((msg, true)).await;
                 }
                 Err(err) => {
-                    let _ = toast_tx.send((err, false)).await;
+                    let _ = toast_tx.send((format_error_chain(&err), false)).await;
                 }
             }
             let next = worker_refresh.borrow().wrapping_add(1);
@@ -2136,13 +2147,12 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 }
 
 fn draw_models_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
-    let long_context = infer_live_long_context(&app.data.models, None);
     let rows: Vec<Row<'_>> = app
         .data
         .models
         .iter()
         .map(|m| {
-            let ctx_k = format!("{}k", m.context_limits(long_context).0 / 1_000);
+            let ctx_k = format!("{}k", m.context_limits().0 / 1_000);
             let is_def = m.id == app.data.default_model;
             let is_fast = m.id == app.data.fast_model;
             let is_title = app

@@ -30,10 +30,12 @@ use liftgate_server::{
     telemetry::TelemetryHub,
 };
 use liftgate_types::config::{ProxyUrl, is_proxy_disable_keyword};
+use liftgate_types::error::format_error_chain;
 use liftgate_types::telemetry::GatewayTelemetrySnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha512};
 use tar::Archive;
+use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -47,7 +49,7 @@ use crate::cli::{
 };
 use crate::client::GatewayClient;
 use crate::daemon;
-use crate::error::CliError;
+use crate::error::{ArchiveError, CliError};
 use crate::state::{
     StatePaths, now_unix_ms, resolve_effective_agy_bin, resolve_effective_agy_proxy, user_home_dir,
 };
@@ -333,7 +335,9 @@ pub async fn probe_agy_auth(
             }
             classify_auth_probe_failure(&stdout_str, &stderr_str)
         }
-        Err(detail) => AgyAuthStatus::NetworkError { detail },
+        Err(err) => AgyAuthStatus::NetworkError {
+            detail: format_error_chain(&err),
+        },
     }
 }
 
@@ -405,13 +409,23 @@ fn classify_auth_probe_failure(stdout_text: &str, stderr_text: &str) -> AgyAuthS
     }
 }
 
+#[derive(Debug, Error)]
+enum CommandExecError {
+    #[error("failed to spawn process")]
+    Spawn(#[source] io::Error),
+
+    #[error("failed waiting for child process")]
+    Wait(#[source] io::Error),
+
+    #[error("command timed out after {secs}s")]
+    TimedOut { secs: u64 },
+}
+
 async fn run_command_bounded(
     cmd: &mut Command,
     max_wait: Duration,
-) -> Result<(bool, String, String), String> {
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("failed to spawn process: {err}"))?;
+) -> Result<(bool, String, String), CommandExecError> {
+    let mut child = cmd.spawn().map_err(CommandExecError::Spawn)?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
@@ -419,11 +433,8 @@ async fn run_command_bounded(
         let out_fut = read_pipe_bounded(stdout_pipe, MAX_CLI_CAPTURE_BYTES);
         let err_fut = read_pipe_bounded(stderr_pipe, MAX_CLI_CAPTURE_BYTES);
         let (out_bytes, err_bytes) = tokio::join!(out_fut, err_fut);
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("failed waiting for child: {e}"))?;
-        Ok::<_, String>((
+        let status = child.wait().await.map_err(CommandExecError::Wait)?;
+        Ok::<_, CommandExecError>((
             status.success(),
             String::from_utf8_lossy(&out_bytes).into_owned(),
             String::from_utf8_lossy(&err_bytes).into_owned(),
@@ -435,7 +446,16 @@ async fn run_command_bounded(
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        Err(format!("command timed out after {}s", max_wait.as_secs()))
+        Err(CommandExecError::TimedOut {
+            secs: max_wait.as_secs(),
+        })
+    }
+}
+
+fn map_agy_transfer_error(err: CliError) -> CliError {
+    match err {
+        CliError::UpgradeNetwork { url, source } => CliError::AgyNetwork { url, source },
+        other => other,
     }
 }
 
@@ -472,21 +492,21 @@ pub async fn fetch_agy_manifest(
         true,
         false,
     )
-    .await?;
+    .await
+    .map_err(map_agy_transfer_error)?;
 
     let parsed: AgyManifest =
-        serde_json::from_slice(&bytes).map_err(|err| CliError::UpgradeArchive {
+        serde_json::from_slice(&bytes).map_err(|source| CliError::AgyArchive {
             asset: format!("{platform_slug}.json"),
-            detail: format!("malformed Antigravity manifest JSON: {err}"),
+            source: ArchiveError::MalformedManifestJson { source },
         })?;
     let clean_ver = parsed.version.trim().to_owned();
     let clean_url = parsed.url.trim().to_owned();
     let clean_hash = parsed.sha512.trim().to_ascii_lowercase();
     if clean_ver.is_empty() || clean_url.is_empty() || !is_valid_sha512_hex(&clean_hash) {
-        return Err(CliError::UpgradeArchive {
+        return Err(CliError::AgyArchive {
             asset: format!("{platform_slug}.json"),
-            detail: "manifest is missing valid version, url, or 128-char sha512 hex digest"
-                .to_owned(),
+            source: ArchiveError::InvalidManifestFields,
         });
     }
     Ok(AgyManifest {
@@ -552,27 +572,33 @@ fn extract_agy_from_tar_gz_with_limit(
     dest_bin: &Path,
     max_extracted_bytes: u64,
 ) -> Result<(), CliError> {
+    let asset_name = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agy.tar.gz")
+        .to_owned();
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
         source,
     })?;
     let gz = GzDecoder::new(file);
     let mut archive = Archive::new(gz);
-    let entries = archive
-        .entries()
-        .map_err(|err| CliError::AgyInstallFailed {
-            detail: format!("failed to read .tar.gz entries: {err}"),
-        })?;
+    let entries = archive.entries().map_err(|source| CliError::AgyArchive {
+        asset: asset_name.clone(),
+        source: ArchiveError::CorruptTarGz { source },
+    })?;
 
     for entry_res in entries {
-        let entry = entry_res.map_err(|err| CliError::AgyInstallFailed {
-            detail: format!("corrupt .tar.gz entry: {err}"),
+        let entry = entry_res.map_err(|source| CliError::AgyArchive {
+            asset: asset_name.clone(),
+            source: ArchiveError::CorruptTarEntry { source },
         })?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let entry_path = entry.path().map_err(|err| CliError::AgyInstallFailed {
-            detail: format!("invalid entry path in .tar.gz: {err}"),
+        let entry_path = entry.path().map_err(|source| CliError::AgyArchive {
+            asset: asset_name.clone(),
+            source: ArchiveError::InvalidTarEntryPath { source },
         })?;
         let Some(fname) = entry_path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -583,17 +609,18 @@ fn extract_agy_from_tar_gz_with_limit(
                 source,
             })?;
             let mut bounded = entry.take(max_extracted_bytes.saturating_add(1));
-            let written = io::copy(&mut bounded, &mut out).map_err(|source| CliError::StateIo {
-                path: dest_bin.to_path_buf(),
-                source,
-            })?;
+            let written =
+                io::copy(&mut bounded, &mut out).map_err(|source| CliError::AgyArchive {
+                    asset: asset_name.clone(),
+                    source: ArchiveError::Decompress { source },
+                })?;
             if written > max_extracted_bytes {
                 let _ = fs::remove_file(dest_bin);
-                return Err(CliError::AgyInstallFailed {
-                    detail: format!(
-                        "extracted binary exceeded safety size bound ({} MiB)",
-                        max_extracted_bytes / (1024 * 1024)
-                    ),
+                return Err(CliError::AgyArchive {
+                    asset: asset_name,
+                    source: ArchiveError::ExtractedBinaryTooLarge {
+                        limit_mib: (max_extracted_bytes / (1024 * 1024)).max(1),
+                    },
                 });
             }
             out.sync_all().map_err(|source| CliError::StateIo {
@@ -604,8 +631,11 @@ fn extract_agy_from_tar_gz_with_limit(
         }
     }
 
-    Err(CliError::AgyInstallFailed {
-        detail: "archive did not contain `antigravity` or `agy` executable".to_owned(),
+    Err(CliError::AgyArchive {
+        asset: asset_name,
+        source: ArchiveError::MissingExecutable {
+            expected: "agy".to_owned(),
+        },
     })
 }
 
@@ -662,7 +692,8 @@ async fn download_and_verify_agy_staged(
         true,
         dl_ctx.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(map_agy_transfer_error)?;
 
     emit_progress(
         progress_tx,
@@ -711,13 +742,14 @@ async fn download_and_verify_agy_staged(
         TransferProgress::stage(
             TransferStage::Testing,
             "Running `agy --version` smoke check…",
-            Some(asset_name),
+            Some(asset_name.clone()),
             target_version,
         ),
     );
     if probe_agy_version(&staged_bin, proxy).await.is_none() {
-        return Err(CliError::AgyInstallFailed {
-            detail: "downloaded `agy` binary failed `--version` smoke check".to_owned(),
+        return Err(CliError::AgyArchive {
+            asset: asset_name,
+            source: ArchiveError::AgySmokeCheckFailed,
         });
     }
 
@@ -876,7 +908,7 @@ pub async fn execute_proxy(
                 ok: false,
                 latency_ms: elapsed_ms,
                 latest_agy_version: None,
-                error: Some(err.to_string()),
+                error: Some(err.display_chain()),
             },
         })
     } else {
@@ -1473,10 +1505,10 @@ pub async fn run_agy_captured(
             stderr,
             binary_path: agy_bin,
         }),
-        Err(detail) => Ok(AgyCapturedOutput {
+        Err(err) => Ok(AgyCapturedOutput {
             exit_ok: false,
             stdout: String::new(),
-            stderr: detail,
+            stderr: format_error_chain(&err),
             binary_path: agy_bin,
         }),
     }
@@ -1779,10 +1811,11 @@ pub(crate) async fn run_idle_agy_auto_updater_with_options(
                         pending_manifest = None;
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, "idle `agy` auto-update attempt failed");
+                        let detail = err.display_chain();
+                        tracing::warn!(error = %detail, "idle `agy` auto-update attempt failed");
                         live_client.record_auto_update_check(
                             Some(manifest.version),
-                            Some(format!("update failed: {err}")),
+                            Some(format!("update failed: {detail}")),
                         );
                         telemetry.notify_change();
                         pending_manifest = None;
@@ -2010,7 +2043,13 @@ mod tests {
         // Exceeding the extracted binary limit must fail closed and delete partial output.
         let out_over = temp.join("agy-over");
         let err = extract_agy_from_tar_gz_with_limit(&tar_gz_path, &out_over, 4).unwrap_err();
-        assert!(matches!(err, CliError::AgyInstallFailed { .. }));
+        assert!(matches!(
+            err,
+            CliError::AgyArchive {
+                source: ArchiveError::ExtractedBinaryTooLarge { .. },
+                ..
+            }
+        ));
         assert!(!out_over.exists());
 
         let _ = fs::remove_dir_all(&temp);
@@ -2165,6 +2204,7 @@ fn main() {{
             binary_path: active_bin.clone(),
             extra_args: Vec::new(),
             session_cwd: cwd_dir.clone(),
+            spill_dir: None,
             limits,
             agy_proxy: None,
             auto_update_enabled: true,
@@ -2184,6 +2224,7 @@ fn main() {{
                 binary_path: active_bin.clone(),
                 extra_args: Vec::new(),
                 session_cwd: cwd_dir.clone(),
+                spill_dir: None,
                 limits,
                 agy_proxy: Some(forced_proxy),
                 auto_update_enabled: true,
@@ -2210,6 +2251,7 @@ fn main() {{
                 binary_path: active_bin.clone(),
                 extra_args: Vec::new(),
                 session_cwd: cwd_dir,
+                spill_dir: None,
                 limits,
                 agy_proxy: None,
                 auto_update_enabled: true,

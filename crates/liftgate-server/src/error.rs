@@ -8,26 +8,19 @@ use axum::{
 };
 use liftgate_types::{
     anthropic::{AnthropicErrorBody, AnthropicErrorEnvelope},
-    error::ProtocolError,
+    error::{ProtocolError, format_error_chain},
     openai::{OpenAiErrorBody, OpenAiErrorEnvelope},
 };
 use thiserror::Error;
 use tokio_util::codec::LinesCodecError;
 
+use crate::job::ProcessGroupError;
+
 /// Errors originating from ACP subprocess supervision or JSON-RPC transport.
 #[derive(Debug, Error)]
 pub enum AcpError {
-    #[error(
-        "Your input exceeds the context window of this model: upstream compacted during experimental context hydration. Please compact the conversation and disable long-context before retrying."
-    )]
-    HydrationCompacted,
-
     #[error("upstream ACP model `{model}` context window exceeded: {detail}")]
-    ContextLengthExceeded {
-        model: String,
-        long_context: bool,
-        detail: String,
-    },
+    ContextLengthExceeded { model: String, detail: String },
     #[error("failed to spawn ACP subprocess `{}`", path.display())]
     SpawnProcess {
         path: PathBuf,
@@ -37,8 +30,8 @@ pub enum AcpError {
 
     #[error("failed to attach ACP subprocess to OS process group / Job Object")]
     ProcessGroup {
-        #[source]
-        source: std::io::Error,
+        #[from]
+        source: ProcessGroupError,
     },
 
     #[error("ACP subprocess missing `{stream}` pipe")]
@@ -86,6 +79,14 @@ pub enum AcpError {
     UpstreamAgentTerminated { detail: String },
 
     #[error(
+        "upstream stream truncated or corrupted in-progress `{tool}` tool call before closing tag"
+    )]
+    CorruptedToolCallStream { tool: String },
+
+    #[error("upstream stream ended before closing active `{protocol}` tool call")]
+    UnclosedToolCallStream { protocol: &'static str },
+
+    #[error(
         "upstream ACP model `{model}` returned an empty response (stop_reason={stop_reason}){}",
         format_optional_detail(detail.as_deref())
     )]
@@ -106,6 +107,34 @@ fn format_optional_detail(detail: Option<&str>) -> String {
     }
 }
 
+/// Structured validation and transport failures when reading an HTTP JSON request body.
+#[derive(Debug, Error)]
+pub enum RequestBodyError {
+    #[error("invalid Content-Length header")]
+    InvalidContentLength,
+
+    #[error("timed out reading HTTP request body")]
+    ReadTimeout,
+
+    #[error("failed to read HTTP request body")]
+    ReadFrame {
+        #[source]
+        source: axum::Error,
+    },
+
+    #[error("HTTP request body exceeded declared Content-Length")]
+    ExceededContentLength,
+
+    #[error("HTTP request body length did not match declared Content-Length")]
+    ContentLengthMismatch,
+
+    #[error("malformed JSON request body")]
+    MalformedJson {
+        #[from]
+        source: serde_json::Error,
+    },
+}
+
 /// Top-level gateway request error mapped cleanly at HTTP boundaries.
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -118,8 +147,11 @@ pub enum GatewayError {
     #[error("requested resource `{resource}` was not found")]
     NotFound { resource: String },
 
-    #[error("invalid request payload")]
-    BadJson { message: String },
+    #[error("invalid HTTP request body")]
+    InvalidBody {
+        #[from]
+        source: RequestBodyError,
+    },
 
     #[error("protocol normalization error")]
     Protocol {
@@ -147,7 +179,7 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidBody { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_status(source),
             Self::SharedAcp { source } => Self::acp_status(source),
         }
@@ -164,7 +196,7 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::BadJson { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidBody { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
             Self::Acp { source } => Self::acp_anthropic_status(source),
             Self::SharedAcp { source } => Self::acp_anthropic_status(source),
         }
@@ -172,14 +204,14 @@ impl GatewayError {
 
     const fn acp_status(source: &AcpError) -> StatusCode {
         match source {
-            AcpError::HydrationCompacted | AcpError::ContextLengthExceeded { .. } => {
-                StatusCode::BAD_REQUEST
-            }
+            AcpError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. } => {
                 StatusCode::TOO_MANY_REQUESTS
             }
             AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::CorruptedToolCallStream { .. }
+            | AcpError::UnclosedToolCallStream { .. }
             | AcpError::EmptyUpstreamResponse { .. }
             | AcpError::Cancelled
             | AcpError::SpawnProcess { .. }
@@ -195,15 +227,15 @@ impl GatewayError {
 
     const fn acp_anthropic_status(source: &AcpError) -> StatusCode {
         match source {
-            AcpError::HydrationCompacted | AcpError::ContextLengthExceeded { .. } => {
-                StatusCode::BAD_REQUEST
-            }
+            AcpError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             AcpError::TurnTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             AcpError::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
                 StatusCode::BAD_REQUEST
             }
             AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::CorruptedToolCallStream { .. }
+            | AcpError::UnclosedToolCallStream { .. }
             | AcpError::Cancelled
             | AcpError::SpawnProcess { .. }
             | AcpError::ProcessGroup { .. }
@@ -222,7 +254,7 @@ impl GatewayError {
             Self::Unauthorized => ("authentication_error", "invalid_api_key"),
             Self::PayloadTooLarge { .. } => ("invalid_request_error", "request_too_large"),
             Self::NotFound { .. } => ("not_found_error", "not_found"),
-            Self::BadJson { .. } => ("invalid_request_error", "invalid_request"),
+            Self::InvalidBody { .. } => ("invalid_request_error", "invalid_request"),
             Self::Protocol { source } => {
                 if source.context_overflow_bytes().is_some() {
                     ("invalid_request_error", "context_length_exceeded")
@@ -242,7 +274,7 @@ impl GatewayError {
             Self::Unauthorized => "authentication_error",
             Self::PayloadTooLarge { .. } => "request_too_large",
             Self::NotFound { .. } => "not_found_error",
-            Self::BadJson { .. } | Self::Protocol { .. } => "invalid_request_error",
+            Self::InvalidBody { .. } | Self::Protocol { .. } => "invalid_request_error",
             Self::Acp { source } => Self::acp_anthropic_error_type(source),
             Self::SharedAcp { source } => Self::acp_anthropic_error_type(source),
         }
@@ -250,13 +282,15 @@ impl GatewayError {
 
     const fn acp_kind(source: &AcpError) -> (&'static str, &'static str) {
         match source {
-            AcpError::HydrationCompacted | AcpError::ContextLengthExceeded { .. } => {
+            AcpError::ContextLengthExceeded { .. } => {
                 ("invalid_request_error", "context_length_exceeded")
             }
             AcpError::TurnTimeout { .. } => ("api_error", "upstream_timeout"),
             AcpError::UpstreamRateLimited { .. } => ("rate_limit_error", "rate_limit_exceeded"),
             AcpError::UpstreamQuotaExhausted { .. } => ("insufficient_quota", "insufficient_quota"),
-            AcpError::UpstreamAgentTerminated { .. } => ("api_error", "upstream_agent_error"),
+            AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::CorruptedToolCallStream { .. }
+            | AcpError::UnclosedToolCallStream { .. } => ("api_error", "upstream_agent_error"),
             AcpError::EmptyUpstreamResponse { .. } => ("api_error", "empty_upstream_response"),
             AcpError::Rpc { .. } => ("api_error", "acp_rpc_error"),
             AcpError::SpawnProcess { .. }
@@ -272,15 +306,15 @@ impl GatewayError {
 
     const fn acp_anthropic_error_type(source: &AcpError) -> &'static str {
         match source {
-            AcpError::HydrationCompacted | AcpError::ContextLengthExceeded { .. } => {
-                "invalid_request_error"
-            }
+            AcpError::ContextLengthExceeded { .. } => "invalid_request_error",
             AcpError::UpstreamRateLimited { .. } => "rate_limit_error",
             AcpError::UpstreamQuotaExhausted { .. } | AcpError::EmptyUpstreamResponse { .. } => {
                 "invalid_request_error"
             }
             AcpError::TurnTimeout { .. }
             | AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::CorruptedToolCallStream { .. }
+            | AcpError::UnclosedToolCallStream { .. }
             | AcpError::Rpc { .. }
             | AcpError::SpawnProcess { .. }
             | AcpError::ProcessGroup { .. }
@@ -310,22 +344,14 @@ impl GatewayError {
             Self::Unauthorized
             | Self::PayloadTooLarge { .. }
             | Self::NotFound { .. }
-            | Self::BadJson { .. } => None,
+            | Self::InvalidBody { .. } => None,
         }
     }
 
     fn acp_context_overflow_tokens(source: &AcpError) -> Option<(u64, u64)> {
         match source {
-            AcpError::HydrationCompacted => Some((
-                liftgate_types::model::GEMINI_DEFAULT_WINDOW + 1,
-                liftgate_types::model::GEMINI_DEFAULT_WINDOW,
-            )),
-            AcpError::ContextLengthExceeded {
-                model,
-                long_context,
-                ..
-            } => {
-                let (max_tokens, _) = liftgate_types::model::context_limits(model, *long_context);
+            AcpError::ContextLengthExceeded { model, .. } => {
+                let (max_tokens, _) = liftgate_types::model::context_limits(model);
                 Some((max_tokens + 1, max_tokens))
             }
             AcpError::SpawnProcess { .. }
@@ -340,6 +366,8 @@ impl GatewayError {
             | AcpError::UpstreamRateLimited { .. }
             | AcpError::UpstreamQuotaExhausted { .. }
             | AcpError::UpstreamAgentTerminated { .. }
+            | AcpError::CorruptedToolCallStream { .. }
+            | AcpError::UnclosedToolCallStream { .. }
             | AcpError::EmptyUpstreamResponse { .. }
             | AcpError::Cancelled => None,
         }
@@ -362,10 +390,19 @@ impl GatewayError {
                 format!("Request body exceeds maximum allowed size ({max_bytes} bytes).")
             }
             Self::NotFound { resource } => format!("Resource `{resource}` was not found."),
-            Self::BadJson { message } => format!("Malformed JSON request body: {message}"),
-            Self::Protocol { source } => source.to_string(),
-            Self::Acp { source } => source.to_string(),
-            Self::SharedAcp { source } => source.to_string(),
+            Self::InvalidBody { source } => match source {
+                RequestBodyError::MalformedJson { source: json_err } => {
+                    format!("Malformed JSON request body: {json_err}")
+                }
+                RequestBodyError::InvalidContentLength
+                | RequestBodyError::ReadTimeout
+                | RequestBodyError::ReadFrame { .. }
+                | RequestBodyError::ExceededContentLength
+                | RequestBodyError::ContentLengthMismatch => format_error_chain(source),
+            },
+            Self::Protocol { source } => format_error_chain(source),
+            Self::Acp { source } => format_error_chain(source),
+            Self::SharedAcp { source } => format_error_chain(source.as_ref()),
         }
     }
 

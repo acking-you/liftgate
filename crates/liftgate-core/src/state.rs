@@ -102,6 +102,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn spill_dir(&self) -> PathBuf {
+        self.root.join("spills")
+    }
+
+    #[must_use]
     pub fn launchers_dir(&self) -> PathBuf {
         self.root.join("launchers")
     }
@@ -122,6 +127,12 @@ impl StatePaths {
 
     pub fn ensure_ephemeral_dir(&self) -> Result<PathBuf, CliError> {
         let dir = self.ephemeral_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_spill_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.spill_dir();
         ensure_private_dir(&dir)?;
         Ok(canonicalize_clean(&dir))
     }
@@ -425,9 +436,6 @@ pub struct LiftgateSettings {
     /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
-    /// Experimental multi-turn hydration; disabled unless explicitly selected.
-    #[serde(default)]
-    pub long_context: bool,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -441,7 +449,6 @@ impl Default for LiftgateSettings {
         Self {
             agy_proxy: None,
             agy_auto_update: true,
-            long_context: false,
             agy_bin: None,
             extra: serde_json::Map::new(),
         }
@@ -519,9 +526,6 @@ pub struct DaemonState {
     pub agy_proxy: Option<String>,
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
-    /// Experimental multi-turn hydration; disabled unless explicitly selected.
-    #[serde(default)]
-    pub long_context: bool,
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
@@ -799,7 +803,6 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
-            long_context: false,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,

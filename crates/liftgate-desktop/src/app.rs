@@ -28,6 +28,7 @@ use liftgate_core::daemon::{
     open_browser,
 };
 use liftgate_core::desktop::{self, DesktopAppsStatus};
+use liftgate_core::error::CliError;
 use liftgate_core::format::format_tokens;
 use liftgate_core::harness;
 use liftgate_core::state::{
@@ -36,11 +37,65 @@ use liftgate_core::state::{
 };
 use liftgate_core::terminal::{prepare_reusable_launcher_command, spawn_in_system_terminal};
 use liftgate_core::upgrade::{self, TransferProgress, UpgradeOutcome};
+use liftgate_types::error::format_error_chain;
 use liftgate_types::telemetry::{GatewayTelemetrySnapshot, TaskProtocol};
+use thiserror::Error;
 use tokio::sync::{oneshot, watch};
 
 use crate::i18n::{NavTab, tr, window_title};
 use crate::theme::{BadgeTone, Palette, apply_staticflow_theme, is_appearance_dark, pill_badge};
+
+#[derive(Debug, Error)]
+pub(crate) enum FormValidationError {
+    #[error("invalid listen address `{raw}`")]
+    Listen {
+        raw: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    #[error("invalid UI listen address `{raw}`")]
+    UiListen {
+        raw: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    #[error("invalid max idle sessions `{raw}`")]
+    MaxIdleSessions {
+        raw: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid turn timeout seconds `{raw}`")]
+    TurnTimeoutSecs {
+        raw: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
+
+impl FormValidationError {
+    #[must_use]
+    pub(crate) fn localized_message(&self, lang: DesktopLang) -> String {
+        match self {
+            Self::Listen { raw, source } => format!(
+                "{}: `{raw}` ({source})",
+                tr(lang, "监听地址格式无效", "Invalid listen address")
+            ),
+            Self::UiListen { raw, source } => format!(
+                "{}: `{raw}` ({source})",
+                tr(lang, "面板监听地址无效", "Invalid UI listen address")
+            ),
+            Self::MaxIdleSessions { raw, source } => format!(
+                "{}: `{raw}` ({source})",
+                tr(lang, "最大空闲会话数无效", "Invalid max idle sessions")
+            ),
+            Self::TurnTimeoutSecs { raw, source } => format!(
+                "{}: `{raw}` ({source})",
+                tr(lang, "单轮超时秒数无效", "Invalid turn timeout seconds")
+            ),
+        }
+    }
+}
 
 /// Tool-bridge mode selector for Claude Code and Codex CLI launchers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +237,6 @@ pub struct DesktopApp {
     pub(crate) in_api_key: Entity<InputState>,
     pub(crate) in_max_idle_sessions: Entity<InputState>,
     pub(crate) in_turn_timeout_secs: Entity<InputState>,
-    pub(crate) cfg_long_context: bool,
     pub(crate) cfg_agy_auto_update: bool,
 
     // Live Telemetry Inspector
@@ -279,9 +333,6 @@ impl DesktopApp {
             .and_then(|d| d.api_key.clone())
             .or_else(|| defaults.api_key.clone())
             .unwrap_or_default();
-        let init_long_ctx = saved_daemon
-            .as_ref()
-            .map_or(settings.long_context, |d| d.long_context);
         let init_auto_upd = saved_daemon
             .as_ref()
             .map_or(settings.agy_auto_update, |d| d.agy_auto_update);
@@ -459,7 +510,6 @@ impl DesktopApp {
             in_api_key,
             in_max_idle_sessions,
             in_turn_timeout_secs,
-            cfg_long_context: init_long_ctx,
             cfg_agy_auto_update: init_auto_upd,
             in_task_filter,
             protocol_filter: TaskProtocolFilter::All,
@@ -829,7 +879,6 @@ impl DesktopApp {
                 default_model: def_model,
                 fast_model: fast,
                 title_model: title_mdl,
-                long_context: report.long_context,
                 models: models.clone(),
             });
         }
@@ -877,10 +926,8 @@ impl DesktopApp {
                 .update(cx, |s, cx| s.set_value(idle_str, window, cx));
             self.in_turn_timeout_secs
                 .update(cx, |s, cx| s.set_value(timeout_str, window, cx));
-            self.cfg_long_context = d.long_context;
             self.cfg_agy_auto_update = d.agy_auto_update;
         } else {
-            self.cfg_long_context = report.long_context;
             self.cfg_agy_auto_update = report.agy_auto_update_enabled;
         }
     }
@@ -956,7 +1003,10 @@ impl DesktopApp {
             .and_then(|s| s.parse::<SocketAddr>().ok())
     }
 
-    pub(crate) fn build_serve_args_from_form(&self, cx: &App) -> Result<ServeArgs, String> {
+    pub(crate) fn build_serve_args_from_form(
+        &self,
+        cx: &App,
+    ) -> Result<ServeArgs, FormValidationError> {
         let defaults = ServeArgs::default();
         let mut serve = self
             .state_paths
@@ -969,19 +1019,20 @@ impl DesktopApp {
         if listen_raw.is_empty() {
             serve.listen = defaults.listen;
         } else {
-            serve.listen = listen_raw.parse::<SocketAddr>().map_err(|e| {
-                format!(
-                    "{}: `{listen_raw}` ({e})",
-                    tr(self.lang, "监听地址格式无效", "Invalid listen address")
-                )
-            })?;
+            serve.listen =
+                listen_raw
+                    .parse::<SocketAddr>()
+                    .map_err(|source| FormValidationError::Listen {
+                        raw: listen_raw,
+                        source,
+                    })?;
         }
         serve.ui_listen = match self.read_optional_input(&self.in_ui_listen, cx) {
-            Some(ui_raw) => Some(ui_raw.parse::<SocketAddr>().map_err(|e| {
-                format!(
-                    "{}: `{ui_raw}` ({e})",
-                    tr(self.lang, "面板监听地址无效", "Invalid UI listen address")
-                )
+            Some(ui_raw) => Some(ui_raw.parse::<SocketAddr>().map_err(|source| {
+                FormValidationError::UiListen {
+                    raw: ui_raw,
+                    source,
+                }
             })?),
             None => None,
         };
@@ -994,30 +1045,25 @@ impl DesktopApp {
         serve.api_key =
             normalize_optional_api_key(self.read_optional_input(&self.in_api_key, cx).as_deref());
         if let Some(idle_raw) = self.read_optional_input(&self.in_max_idle_sessions, cx) {
-            serve.max_idle_sessions = idle_raw.parse::<usize>().map_err(|e| {
-                format!(
-                    "{}: `{idle_raw}` ({e})",
-                    tr(self.lang, "最大空闲会话数无效", "Invalid max idle sessions")
-                )
+            serve.max_idle_sessions = idle_raw.parse::<usize>().map_err(|source| {
+                FormValidationError::MaxIdleSessions {
+                    raw: idle_raw,
+                    source,
+                }
             })?;
         } else {
             serve.max_idle_sessions = defaults.max_idle_sessions;
         }
         if let Some(timeout_raw) = self.read_optional_input(&self.in_turn_timeout_secs, cx) {
-            serve.turn_timeout_secs = timeout_raw.parse::<u64>().map_err(|e| {
-                format!(
-                    "{}: `{timeout_raw}` ({e})",
-                    tr(
-                        self.lang,
-                        "单轮超时秒数无效",
-                        "Invalid turn timeout seconds"
-                    )
-                )
+            serve.turn_timeout_secs = timeout_raw.parse::<u64>().map_err(|source| {
+                FormValidationError::TurnTimeoutSecs {
+                    raw: timeout_raw,
+                    source,
+                }
             })?;
         } else {
             serve.turn_timeout_secs = defaults.turn_timeout_secs;
         }
-        serve.long_context = Some(self.cfg_long_context);
         serve.agy_auto_update = Some(self.cfg_agy_auto_update);
         serve.no_agy_auto_update = !self.cfg_agy_auto_update;
         Ok(serve)
@@ -1034,11 +1080,11 @@ impl DesktopApp {
         }
         let serve = match self.build_serve_args_from_form(cx) {
             Ok(s) => s,
-            Err(msg) => {
+            Err(err) => {
                 self.set_banner(
                     BadgeTone::Err,
                     tr(self.lang, "网关参数校验失败", "Invalid Gateway Parameters"),
-                    msg,
+                    err.localized_message(self.lang),
                 );
                 cx.notify();
                 return;
@@ -1055,9 +1101,6 @@ impl DesktopApp {
 
         rt.spawn(async move {
             if let Ok(mut settings) = state_paths.read_settings() {
-                if let Some(lc) = serve.long_context {
-                    settings.long_context = lc;
-                }
                 if let Some(au) = serve.agy_auto_update {
                     settings.agy_auto_update = au;
                 }
@@ -1107,7 +1150,7 @@ impl DesktopApp {
                             app.set_banner(
                                 BadgeTone::Err,
                                 tr(app.lang, "启动网关失败", "Failed to Start Gateway"),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1172,7 +1215,7 @@ impl DesktopApp {
                             app.set_banner(
                                 BadgeTone::Err,
                                 tr(app.lang, "停止网关失败", "Failed to Stop Gateway"),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1223,7 +1266,7 @@ impl DesktopApp {
                         Err(err) => app.set_banner(
                             BadgeTone::Err,
                             tr(app.lang, "打开面板失败", "Failed to Open Dashboard"),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     app.refresh_gateway_status(None, cx);
@@ -1299,7 +1342,7 @@ impl DesktopApp {
                                 "切换默认模型失败",
                                 "Failed to Switch Default Model",
                             ),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     if let Ok(rep) = status_res {
@@ -1344,7 +1387,7 @@ impl DesktopApp {
                         "设置会话标题模型失败",
                         "Failed to Set Title Model",
                     ),
-                    err.to_string(),
+                    err.display_chain(),
                 );
             }
         }
@@ -1392,7 +1435,7 @@ impl DesktopApp {
                         Err(err) => app.set_banner(
                             BadgeTone::Err,
                             tr(app.lang, "关闭会话失败", "Failed to Evict Session"),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     app.refresh_gateway_status(None, cx);
@@ -1525,7 +1568,7 @@ impl DesktopApp {
                                     "启动 Claude Code 失败",
                                     "Failed to Launch Claude Code",
                                 ),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1604,7 +1647,7 @@ impl DesktopApp {
                                     "启动 Codex CLI 失败",
                                     "Failed to Launch Codex CLI",
                                 ),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1681,7 +1724,7 @@ impl DesktopApp {
                                     "启动 Codex App 失败",
                                     "Failed to Launch Codex App",
                                 ),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1759,7 +1802,7 @@ impl DesktopApp {
                                     "Claude Desktop 操作失败",
                                     "Claude Desktop Action Failed",
                                 ),
-                                err.to_string(),
+                                err.display_chain(),
                             );
                         }
                     }
@@ -1871,11 +1914,12 @@ impl DesktopApp {
                             );
                         }
                         Err(err) => {
-                            app.config_preview_output = format!("ERROR: {err}");
+                            let detail = err.display_chain();
+                            app.config_preview_output = format!("ERROR: {detail}");
                             app.set_banner(
                                 BadgeTone::Err,
                                 tr(app.lang, "配置同步失败", "Config Sync Failed"),
-                                err.to_string(),
+                                detail,
                             );
                         }
                     }
@@ -1944,7 +1988,7 @@ impl DesktopApp {
                                 app.set_banner(
                                     BadgeTone::Err,
                                     tr(app.lang, "获取模型列表失败", "Failed to Fetch Models"),
-                                    err.to_string(),
+                                    err.display_chain(),
                                 );
                             }
                         }
@@ -2011,7 +2055,7 @@ impl DesktopApp {
                         Err(err) => app.set_banner(
                             BadgeTone::Err,
                             tr(app.lang, "检查 AGY 状态失败", "Failed to Inspect AGY"),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     cx.notify();
@@ -2054,7 +2098,7 @@ impl DesktopApp {
         let (prog_tx, mut prog_rx) = watch::channel(init_prog);
 
         rt.spawn(async move {
-            let msg_res: Result<String, String> = if installed_already {
+            let msg_res: Result<String, CliError> = if installed_already {
                 agy_manager::execute_agy_update_with_progress(
                     &state_paths,
                     None,
@@ -2079,7 +2123,6 @@ impl DesktopApp {
                         o.daemon_restarted
                     )
                 })
-                .map_err(|e| e.to_string())
             } else {
                 agy_manager::execute_agy_install_with_progress(
                     &state_paths,
@@ -2105,7 +2148,6 @@ impl DesktopApp {
                         o.dir_in_path
                     )
                 })
-                .map_err(|e| e.to_string())
             };
             let fresh_status = agy_manager::inspect_agy_status(
                 &state_paths,
@@ -2164,11 +2206,12 @@ impl DesktopApp {
                             );
                         }
                         Err(err) => {
-                            app.agy_terminal_output = format!("ERROR: {err}");
+                            let detail = err.display_chain();
+                            app.agy_terminal_output = format!("ERROR: {detail}");
                             app.set_banner(
                                 BadgeTone::Err,
                                 tr(app.lang, "AGY 安装/更新失败", "AGY Install / Update Failed"),
-                                err,
+                                detail,
                             );
                         }
                     }
@@ -2226,7 +2269,7 @@ impl DesktopApp {
                                 "拉起 AGY 登录失败",
                                 "Failed to Launch AGY Sign-In",
                             ),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     cx.notify();
@@ -2290,7 +2333,7 @@ impl DesktopApp {
                                 "更新自动升级设置失败",
                                 "Failed to Update Auto-Update",
                             ),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     app.refresh_gateway_status(None, cx);
@@ -2336,7 +2379,7 @@ impl DesktopApp {
                 Err(err) => self.set_banner(
                     BadgeTone::Err,
                     tr(self.lang, "执行 agy 失败", "Failed to Run agy"),
-                    err.to_string(),
+                    err.display_chain(),
                 ),
             }
             cx.notify();
@@ -2374,11 +2417,12 @@ impl DesktopApp {
                             app.agy_terminal_output = combined;
                         }
                         Err(err) => {
-                            app.agy_terminal_output = format!("$ {cmd_display}\nERROR: {err}");
+                            let detail = err.display_chain();
+                            app.agy_terminal_output = format!("$ {cmd_display}\nERROR: {detail}");
                             app.set_banner(
                                 BadgeTone::Err,
                                 tr(app.lang, "执行 agy 命令失败", "agy Command Failed"),
-                                err.to_string(),
+                                detail,
                             );
                         }
                     }
@@ -2488,7 +2532,7 @@ impl DesktopApp {
                                 app.set_banner(
                                     BadgeTone::Err,
                                     tr(app.lang, "代理设置失败", "Proxy Operation Failed"),
-                                    err.to_string(),
+                                    err.display_chain(),
                                 );
                             }
                         }
@@ -2526,7 +2570,7 @@ impl DesktopApp {
             Err(err) => self.set_banner(
                 BadgeTone::Err,
                 tr(self.lang, "清空日志失败", "Failed to Clear Log"),
-                err.to_string(),
+                err.display_chain(),
             ),
         }
         cx.notify();
@@ -2550,7 +2594,7 @@ impl DesktopApp {
             Err(err) => self.set_banner(
                 BadgeTone::Err,
                 tr(self.lang, "打开目录失败", "Failed to Open Directory"),
-                err.to_string(),
+                format_error_chain(&err),
             ),
         }
         cx.notify();
@@ -2595,7 +2639,7 @@ impl DesktopApp {
                         Err(err) => app.set_banner(
                             BadgeTone::Err,
                             tr(app.lang, "环境诊断失败", "Doctor Check Failed"),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     cx.notify();
@@ -2635,7 +2679,7 @@ impl DesktopApp {
                 self.set_banner(
                     BadgeTone::Err,
                     tr(self.lang, "CLI 别名设置失败", "CLI Alias Operation Failed"),
-                    err.to_string(),
+                    err.display_chain(),
                 );
             }
         }
@@ -2736,7 +2780,7 @@ impl DesktopApp {
                         Err(err) => app.set_banner(
                             BadgeTone::Err,
                             tr(app.lang, "自升级失败", "Self-Upgrade Failed"),
-                            err.to_string(),
+                            err.display_chain(),
                         ),
                     }
                     app.refresh_gateway_status(None, cx);

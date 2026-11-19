@@ -6,10 +6,14 @@ use crate::config::ModelId;
 /// from the reversibly encoded Antigravity ACP model identifier.
 pub const CLAUDE_DESKTOP_ROUTE_MARKER: &str = "-lg--";
 
+/// Verified upstream `agy acp` uncompacted session ceiling for `gemini-*` models.
+///
+/// Although `agy acp` reports `usage_update.size = 1,048,576`, it triggers forced internal
+/// post-turn context summarization as soon as `used` crosses `524,288` tokens (`50%` of 1 Mi).
+/// Declaring `500,000` with a `425,000` auto-compaction threshold lets Codex and Claude Code
+/// compact cleanly on warm sessions before upstream summarization ever fires.
 pub const GEMINI_DEFAULT_WINDOW: u64 = 500_000;
 pub const GEMINI_DEFAULT_COMPACT_LIMIT: u64 = 425_000;
-pub const GEMINI_LONG_WINDOW: u64 = 1_000_000;
-pub const GEMINI_LONG_COMPACT_LIMIT: u64 = 850_000;
 pub const CLAUDE_DEFAULT_WINDOW: u64 = 200_000;
 pub const CLAUDE_DEFAULT_COMPACT_LIMIT: u64 = 170_000;
 pub const GPT_OSS_DEFAULT_WINDOW: u64 = 128_000;
@@ -19,11 +23,6 @@ const _: () = {
     assert!(
         GEMINI_DEFAULT_WINDOW > GEMINI_DEFAULT_COMPACT_LIMIT,
         "default Gemini window must exceed its auto-compaction threshold"
-    );
-    assert!(
-        GEMINI_LONG_WINDOW > GEMINI_LONG_COMPACT_LIMIT
-            && GEMINI_LONG_COMPACT_LIMIT > GEMINI_DEFAULT_WINDOW,
-        "experimental Gemini long-context limits must exceed default limits"
     );
     assert!(
         CLAUDE_DEFAULT_WINDOW > CLAUDE_DEFAULT_COMPACT_LIMIT,
@@ -36,30 +35,15 @@ const _: () = {
     );
 };
 
-/// Returns `true` when a discovered Gemini model's advertised limits come from a gateway
-/// running with experimental `--long-context` (`1M / 850k`) rather than the standard 500k
-/// window (`500k / 425k`) or a legacy server.
-#[must_use]
-pub const fn is_gemini_long_context(context_window: u64, auto_compact_token_limit: u64) -> bool {
-    auto_compact_token_limit > GEMINI_DEFAULT_WINDOW
-        && auto_compact_token_limit <= context_window
-        && context_window <= GEMINI_LONG_WINDOW
-}
-
 /// Advertised context window and client compaction threshold for the ACP transport.
-/// The experimental Gemini window does not disable upstream automatic compaction.
 #[must_use]
-pub fn context_limits(model_id: &str, long_context: bool) -> (u64, u64) {
+pub fn context_limits(model_id: &str) -> (u64, u64) {
     let trimmed = model_id.trim();
     if trimmed
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("gemini-"))
     {
-        if long_context {
-            (GEMINI_LONG_WINDOW, GEMINI_LONG_COMPACT_LIMIT)
-        } else {
-            (GEMINI_DEFAULT_WINDOW, GEMINI_DEFAULT_COMPACT_LIMIT)
-        }
+        (GEMINI_DEFAULT_WINDOW, GEMINI_DEFAULT_COMPACT_LIMIT)
     } else if trimmed
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("gpt-oss"))
@@ -716,23 +700,9 @@ mod tests {
 
     #[test]
     fn gemini_default_context_window_is_500k_with_425k_auto_compact() {
-        assert_eq!(
-            context_limits("gemini-4-carbon-high", false),
-            (500_000, 425_000)
-        );
-        assert_eq!(
-            context_limits("gemini-4-carbon-high", true),
-            (1_000_000, 850_000)
-        );
-        assert_eq!(
-            context_limits("claude-sonnet-5-5-high", false),
-            (200_000, 170_000)
-        );
-        assert_eq!(context_limits("gpt-oss-120b", false), (128_000, 110_000));
-        assert!(!is_gemini_long_context(500_000, 425_000));
-        assert!(!is_gemini_long_context(280_000, 245_000));
-        assert!(!is_gemini_long_context(1_000_000, 0));
-        assert!(is_gemini_long_context(1_000_000, 850_000));
+        assert_eq!(context_limits("gemini-4-carbon-high"), (500_000, 425_000));
+        assert_eq!(context_limits("claude-sonnet-5-5-high"), (200_000, 170_000));
+        assert_eq!(context_limits("gpt-oss-120b"), (128_000, 110_000));
     }
 
     #[test]
@@ -769,16 +739,9 @@ mod tests {
         ];
         let default = ModelId::try_new("gemini-4-neon-high").expect("valid default");
 
+        assert_eq!(context_limits("gemini-4-neon-xhigh"), (500_000, 425_000));
         assert_eq!(
-            context_limits("gemini-4-neon-xhigh", false),
-            (500_000, 425_000)
-        );
-        assert_eq!(
-            context_limits("gemini-4-neon-xhigh", true),
-            (1_000_000, 850_000)
-        );
-        assert_eq!(
-            context_limits("gemini-pro-orchestrator-neon", false),
+            context_limits("gemini-pro-orchestrator-neon"),
             (500_000, 425_000)
         );
 

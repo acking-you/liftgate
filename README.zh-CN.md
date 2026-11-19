@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.2-D97757"></a>
+  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.3-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.3-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#许可证"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-支持环境变量自定义：`LIFTGATE_VERSION=v0.2.2` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
+支持环境变量自定义：`LIFTGATE_VERSION=v0.2.3` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
 
 <details>
 <summary>其它 CLI 安装方式（<code>cargo binstall</code>、手动下载、源码编译）</summary>
@@ -88,18 +88,18 @@ cargo install --path crates/liftgate --locked
   5. **`agy` 与代理（`agy` & Proxy）** — 官方 `agy` SHA-512 下载安装与更新、Google 交互式登录、HTTP/SOCKS5 代理注入与连通性探测、后台空闲自动热更新开关。
   6. **系统（System）** — 网关与 `agy` 实时日志流、环境全项自检（Doctor）、`lg` 命令别名与 Shell 补全安装、版本升级检测。
 
-**下载最新桌面端版本 — [Liftgate Desktop `v0.2.2`](https://github.com/acking-you/liftgate/releases/tag/v0.2.2-ui)**
+**下载最新桌面端版本 — [Liftgate Desktop `v0.2.3`](https://github.com/acking-you/liftgate/releases/tag/v0.2.3-ui)**
 （[全部桌面端版本](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/release-manifest.json)）：
+[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/SHA256SUMS) ·
+[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/release-manifest.json)）：
 
 | 平台 | 安装包（推荐） | 免安装便携包 |
 | --- | --- | --- |
-| **macOS（Apple Silicon · M1–M4）** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS（Intel · x86_64）** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows（x64）** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows（ARM64）** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux（x86_64 · glibc 2.35+）** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.2-ui/liftgate-desktop-linux-x86_64.tar.gz) |
+| **macOS（Apple Silicon · M1–M4）** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-arm64.zip) |
+| **macOS（Intel · x86_64）** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-macos-x86_64.zip) |
+| **Windows（x64）** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-x86_64.zip) |
+| **Windows（ARM64）** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-windows-arm64.zip) |
+| **Linux（x86_64 · glibc 2.35+）** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.3-ui/liftgate-desktop-linux-x86_64.tar.gz) |
 
 > [!NOTE]
 > 当前 macOS 安装包采用 ad-hoc 签名；首次拖入 `/Applications` 打开若遇到 Gatekeeper 拦截，执行一次 `xattr -cr /Applications/Liftgate.app` 即可。也可通过源码安装：`cargo install --path crates/liftgate-desktop --locked`。
@@ -146,7 +146,7 @@ lg down                  # 优雅停止后台网关服务
 - **两套标准 API**：OpenAI Responses 与 Anthropic Messages，支持流式输出、工具调用、思考过程、图片与 Token 计数（[API](docs/api.md)）。
 - **工具留在你的智能体里**：ACP 会话运行在空目录且不挂任何 MCP 服务，文件编辑与命令执行仍由 Codex 或 Claude Code 完成；联网搜索与防 SSRF 的网页抓取由网关处理（[纯推理会话](docs/architecture.md#inference-only-sessions)）。
 - **会话预热复用**：按每次请求的历史匹配池中已预热的 ACP 会话，只发送本轮新增内容（[会话复用](docs/architecture.md#session-reuse)）。
-- **稳妥的上下文默认配置**：Codex 与 Claude Code 按模型窗口提前压缩；Flash 历史分块预灌仅作为显式实验选项，不能绕过上游自动压缩（[上下文策略](docs/usage.zh-CN.md#上下文窗口与超长上下文选项)）。
+- **实测校准的上下文窗口**：Codex 与 Claude Code 在上游 `agy acp` 强制内部压缩线（Gemini `524,288` token）前按 `500k / 425k` 稳妥触发客户端 `/compact`，纯单轮请求配合热会话复用，零后台重放副作用（[上下文策略](docs/usage.zh-CN.md#上下文窗口与单轮预算)）。
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **拒绝静默降级与 Flash 快车道**：上游 `429` 限流立即返回，绝不暗中偷换模型；标题、摘要与 Auto Mode 分类走独立的 Flash 会话，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
 - **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。

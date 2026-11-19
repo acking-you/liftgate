@@ -124,9 +124,9 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 - 默认开启全自动免确认模式（Codex 传 `--dangerously-bypass-approvals-and-sandbox`，Claude Code 传 `--dangerously-skip-permissions`）；加 `--no-bypass`（或显式传入权限/沙箱参数）即可保留常规权限确认。
 - 原生子命令与选项无需额外写 `--`：本地管理/查询类子命令（如 `lg cx queue|archive|delete|mcp|plugin|features|-V`、`lg cx resume --help`、`lg cc logs|attach|stop|rm|mcp|plugin|purge|-v`、`lg cc agents --json`）会保持原生子命令位置并直接离线秒开（无需拉起网关）；Liftgate 自身参数（`-m`、`--no-bypass`、`--no-code-mode`、`--code-mode-only` 等）放在原生子命令前或后均可识别。如需完全禁用别名转换并原样透传参数（如查看完整原生帮助 `lg cx -- --help` / `lg cc -- --help`），显式加上 `--` 即可。
 
-## 上下文窗口与超长上下文选项
+## 上下文窗口与单轮预算
 
-推荐通过 `lg cx` 或 `lg cc` 读取运行中网关的上下文策略。默认复用热 ACP 会话，由客户端提前压缩，不插入 Flash 预灌回合：
+推荐通过 `lg cx` 或 `lg cc` 读取运行中网关的上下文策略。Liftgate 采用纯单轮 `session/prompt` 配合热 ACP 会话复用，由客户端提前触发压缩，不插入任何后台重放或合成预灌回合：
 
 | 模型系列 | 声明窗口 | 自动压缩阈值 |
 | --- | --- | --- |
@@ -134,21 +134,9 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 | Claude | 200,000 | 170,000 |
 | GPT-OSS | 128,000 | 110,000 |
 
-默认窗口对齐上游 Antigravity 的 500K ACP 会话容量，并为输出与客户端主动压缩预留充足余量。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
+实测上游 `agy acp` 在 Gemini 会话达到 `524,288` token（`1,048,576` `usage_update` 窗口的 `50%`）时会立即在轮末触发内部自动摘要压缩；将客户端窗口设为 `500,000 / 425,000` 可在上游清栈前稳妥在热会话上完成客户端 `/compact`。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
 
-每次 ACP 请求有 `176,000` 字节的单轮文本预算。当某次工具调用输出或单轮输入超出预算时，Liftgate 会按水位线分配算法仅对超长块做按行对齐的首尾保留中间截断（保留约 55% 开头与 45% 结尾，并插入明确省略行号范围的提示标记），保持同轮其它小工具输出完整无损，且不影响后续轮次的 `SessionPool` 热会话前缀命中。冷启动回放会在必要时带标记缩减旧历史；真正发生上下文窗口溢出时，网关会返回客户端标准可自动触发压缩的错误格式（Codex 为 `context_length_exceeded`，Claude Code 为 `prompt is too long: N tokens > M maximum`）。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
-
-超长上下文是需要显式开启的实验功能：
-
-```bash
-lg start --long-context          # 网关尚未运行时开启
-lg restart --long-context        # 已运行的托管网关切换到实验模式
-lg restart --long-context=false  # 恢复稳妥默认模式
-```
-
-也可在启动网关前设置 `AGY_LONG_CONTEXT=true`，或在 `~/.liftgate/settings.json` 添加 `"long_context": true`，用于 `lg stop` 后的下一次 `lg start`。裸 `lg restart` 会保留当前守护进程的模式；已有服务应明确执行 `lg restart --long-context` 或 `lg restart --long-context=false` 切换。随后重新打开客户端；使用持久配置文件时，再执行 `lg config` 更新文件。
-
-实验模式为 Gemini 声明 `1M / 850k`，通过有数量和大小上限的 Flash 回合预灌较长历史，会增加调用并产生合成确认消息。它**不能绕过上游自动压缩，也不保证保留 1M 对话**。超过分片容量，或在预灌过程中检测到上游压缩时，返回不可重试的 `400`，避免掉段或重复重放。Claude 与 GPT-OSS 在此模式下仍保持较小窗口。
+每次 ACP `session/prompt` 有 `176,000` 字节的单轮文本预算（留有安全余量，低于上游单轮 `191,579` 字节的截断边界）。当任何工具调用输出、单轮输入、系统指令、工具 Schema、冷历史归档或 `web_fetch` 网页内容发生截断或省略时，Liftgate 都会先将 100% 原始无损内容原子落盘到 `~/.liftgate/spills/`，再按水位线分配算法仅对超长块做按行对齐的首尾保留中间截断（保留约 55% 开头与 45% 结尾），并在省略提示中精确附带本地文件路径与省略行号范围以便客户端工具按需读取，同时保持同轮其它小工具输出完整无损、不影响后续轮次的 `SessionPool` 热会话前缀命中。真正发生上下文窗口溢出时，网关会返回客户端标准可自动触发压缩的错误格式（Codex 为 `context_length_exceeded`，Claude Code 为 `prompt is too long: N tokens > M maximum`）。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
 
 ## 快捷生成本地或全局配置文件（`liftgate config`）
 
@@ -290,7 +278,6 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--agy-bin` | `AGY_BIN` | 从 `PATH` 或标准安装位置查找 |
 | `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
-| `--long-context[=true\|false]` | `AGY_LONG_CONTEXT` | `false`（或读取 `~/.liftgate/settings.json` 中的 `long_context`） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |

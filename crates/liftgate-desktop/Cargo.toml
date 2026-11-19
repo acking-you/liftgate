@@ -17,6 +17,7 @@ liftgate-types = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 gpui-kit = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

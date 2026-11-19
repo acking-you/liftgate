@@ -20,11 +20,9 @@ use crate::cli::{
     AliasArgs, Cli, DoctorArgs, ModelsArgs, RestartArgs, ServeArgs, StatusArgs, UiArgs,
     normalize_optional_api_key,
 };
-use crate::client::{
-    DiscoveredModel, GatewayClient, infer_live_long_context, percent_encode_query_component,
-};
+use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
 use crate::config_sync::resolve_fast_model;
-use crate::error::CliError;
+use crate::error::{CliError, DaemonStopError, GatewayTransportError};
 use crate::harness::{resolve_claude_command, resolve_codex_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
@@ -40,7 +38,6 @@ pub struct ActiveGatewayTarget {
     pub dashboard_url: String,
     pub default_model: String,
     pub api_key: Option<String>,
-    pub managed_long_context: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,7 +68,6 @@ pub async fn start_daemon_with_exe(
     force_restart: bool,
 ) -> Result<DaemonStartOutcome, CliError> {
     let settings = state_paths.read_settings()?;
-    let long_context = serve.long_context.unwrap_or(settings.long_context);
     let effective_proxy = resolve_effective_agy_proxy(serve.agy_proxy.as_deref(), &settings)?;
     let effective_auto_update = resolve_effective_agy_auto_update(
         serve.agy_auto_update,
@@ -107,7 +103,6 @@ pub async fn start_daemon_with_exe(
                 && existing.api_key == requested_key
                 && existing.agy_proxy.as_deref() == effective_proxy.as_ref().map(ProxyUrl::as_str)
                 && existing.agy_auto_update == effective_auto_update
-                && existing.long_context == long_context
                 && existing.max_line_bytes == serve.max_line_bytes
                 && existing.max_body_bytes == serve.max_body_bytes
                 && existing.channel_capacity == serve.channel_capacity
@@ -185,7 +180,6 @@ pub async fn start_daemon_with_exe(
         } else {
             "false"
         })
-        .arg(format!("--long-context={long_context}"))
         .arg("--default-model")
         .arg(&serve.default_model)
         .arg("--acp-mode")
@@ -271,7 +265,6 @@ pub async fn start_daemon_with_exe(
         ui_dir: serve.ui_dir,
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
         agy_auto_update: effective_auto_update,
-        long_context,
         max_line_bytes: serve.max_line_bytes,
         max_body_bytes: serve.max_body_bytes,
         channel_capacity: serve.channel_capacity,
@@ -340,10 +333,7 @@ pub async fn stop_daemon(state_paths: &StatePaths) -> Result<StopOutcome, CliErr
             if is_pid_alive(pid) {
                 return Err(CliError::DaemonStopFailed {
                     pid,
-                    source: io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "process remained alive after termination signal",
-                    ),
+                    source: DaemonStopError::StillAliveAfterSignal,
                 });
             }
         }
@@ -370,7 +360,6 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         } else {
             old.acp_mode.clone()
         },
-        long_context: Some(old.long_context),
         api_key: old.api_key.clone(),
         agy_bin: old.agy_bin.clone(),
         acp_cwd: old.acp_cwd.clone(),
@@ -417,9 +406,6 @@ pub async fn restart_daemon(
     }
     if let Some(au) = args.agy_auto_update {
         serve.agy_auto_update = Some(au);
-    }
-    if let Some(long_context) = args.long_context {
-        serve.long_context = Some(long_context);
     }
     if args.no_agy_auto_update {
         serve.no_agy_auto_update = true;
@@ -481,7 +467,6 @@ pub async fn ensure_gateway_ready(
                 dashboard_url: dash_url,
                 default_model: preferred_model.unwrap_or(model_fallback).to_owned(),
                 api_key: key,
-                managed_long_context: matching_daemon.map(|d| d.long_context),
                 client,
             });
         }
@@ -491,7 +476,7 @@ pub async fn ensure_gateway_ready(
         if !auto_start || conflicting_managed_daemon {
             return Err(CliError::GatewayUnreachable {
                 url: format!("{}/healthz", client.base_url()),
-                source: io::Error::new(io::ErrorKind::ConnectionRefused, "gateway is not running"),
+                source: GatewayTransportError::NotRunning,
             });
         }
         let mut serve = ServeArgs {
@@ -508,7 +493,6 @@ pub async fn ensure_gateway_ready(
             dashboard_url: format!("{}/", daemon.dashboard_base_url()),
             default_model: daemon.default_model,
             api_key: daemon.api_key,
-            managed_long_context: Some(daemon.long_context),
             client,
         });
     }
@@ -525,7 +509,6 @@ pub async fn ensure_gateway_ready(
                     daemon.default_model
                 },
                 api_key: key,
-                managed_long_context: Some(daemon.long_context),
                 client,
             });
         }
@@ -545,7 +528,6 @@ pub async fn ensure_gateway_ready(
                 .unwrap_or(&default_serve.default_model)
                 .to_owned(),
             api_key: fallback_key,
-            managed_long_context: None,
             client: fallback_client,
         });
     }
@@ -553,7 +535,7 @@ pub async fn ensure_gateway_ready(
     if !auto_start {
         return Err(CliError::GatewayUnreachable {
             url: format!("{}/healthz", fallback_client.base_url()),
-            source: io::Error::new(io::ErrorKind::ConnectionRefused, "gateway is not running"),
+            source: GatewayTransportError::NotRunning,
         });
     }
 
@@ -570,7 +552,6 @@ pub async fn ensure_gateway_ready(
         dashboard_url: format!("{}/", daemon.dashboard_base_url()),
         default_model: daemon.default_model,
         api_key: daemon.api_key,
-        managed_long_context: Some(daemon.long_context),
         client,
     })
 }
@@ -614,7 +595,6 @@ pub struct GatewayStatusReport {
     pub dashboard_url: String,
     pub authenticated_dashboard_url: String,
     pub auth_enabled: bool,
-    pub long_context: bool,
     pub state_dir: PathBuf,
     pub log_file: PathBuf,
     pub models: Option<Vec<DiscoveredModel>>,
@@ -687,18 +667,6 @@ pub async fn inspect_gateway_status(
             t.acp_process.auto_update_enabled
         });
 
-    let effective_long_context = if healthy {
-        infer_live_long_context(
-            models.as_deref().unwrap_or_default(),
-            daemon
-                .as_ref()
-                .filter(|_| managed_alive)
-                .map(|d| d.long_context),
-        )
-    } else {
-        state_paths.read_settings()?.long_context
-    };
-
     let active_daemon = daemon.filter(|_| managed_alive);
     let pid = active_daemon.as_ref().map(|d| d.pid);
     Ok(GatewayStatusReport {
@@ -711,7 +679,6 @@ pub async fn inspect_gateway_status(
         dashboard_url,
         authenticated_dashboard_url,
         auth_enabled: api_key.is_some(),
-        long_context: effective_long_context,
         state_dir: state_paths.root().to_path_buf(),
         log_file: state_paths.log_file(),
         models,
@@ -781,7 +748,6 @@ pub struct ModelsReport {
     pub default_model: String,
     pub fast_model: String,
     pub title_model: String,
-    pub long_context: bool,
     pub models: Vec<DiscoveredModel>,
 }
 
@@ -816,13 +782,11 @@ pub async fn inspect_models(
             .await
             .as_str()
             .to_owned();
-    let long_context = infer_live_long_context(&models, target.managed_long_context);
     Ok(ModelsReport {
         gateway_url: target.client.base_url().to_owned(),
         default_model: target.default_model,
         fast_model,
         title_model,
-        long_context,
         models,
     })
 }
@@ -1047,7 +1011,7 @@ pub async fn inspect_doctor(
                     name: "ACP Auth/Models",
                     status: "error",
                     tone: ReportTone::Err,
-                    detail: err.to_string(),
+                    detail: err.display_chain(),
                 });
             }
         }
@@ -1737,14 +1701,17 @@ fn terminate_pid_fallback(pid: u32) -> Result<(), CliError> {
             if handle.is_null() {
                 return Err(CliError::DaemonStopFailed {
                     pid,
-                    source: io::Error::last_os_error(),
+                    source: DaemonStopError::Os(io::Error::last_os_error()),
                 });
             }
             let ok = TerminateProcess(handle, 1);
             let err = io::Error::last_os_error();
             let _ = CloseHandle(handle);
             if ok == 0 && is_pid_alive(pid) {
-                return Err(CliError::DaemonStopFailed { pid, source: err });
+                return Err(CliError::DaemonStopFailed {
+                    pid,
+                    source: DaemonStopError::Os(err),
+                });
             }
         }
         Ok(())
@@ -1754,14 +1721,17 @@ fn terminate_pid_fallback(pid: u32) -> Result<(), CliError> {
     {
         let raw_pid = i32::try_from(pid).map_err(|_| CliError::DaemonStopFailed {
             pid,
-            source: io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds i32"),
+            source: DaemonStopError::PidOutOfRange { pid },
         })?;
         // SAFETY: Sends SIGTERM to verified `liftgate` process.
         let rc = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
         if rc != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(CliError::DaemonStopFailed { pid, source: err });
+                return Err(CliError::DaemonStopFailed {
+                    pid,
+                    source: DaemonStopError::Os(err),
+                });
             }
         }
         Ok(())
@@ -1821,7 +1791,6 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
-            long_context: false,
             max_line_bytes: liftgate_types::config::DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: liftgate_types::config::DEFAULT_MAX_BODY_BYTES,
             channel_capacity: liftgate_types::config::DEFAULT_CHANNEL_CAPACITY,
@@ -1860,7 +1829,6 @@ mod tests {
             ui_dir: Some(PathBuf::from("/srv/ui")),
             agy_proxy: None,
             agy_auto_update: false,
-            long_context: true,
             max_line_bytes: 67_108_864,
             max_body_bytes: 33_554_432,
             channel_capacity: 512,
@@ -1878,7 +1846,6 @@ mod tests {
         assert_eq!(restored.max_line_bytes, 67_108_864);
         assert_eq!(restored.max_idle_sessions, 32);
         assert_eq!(restored.turn_timeout_secs, 3600);
-        assert_eq!(restored.long_context, Some(true));
     }
 
     #[test]
@@ -1967,7 +1934,6 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
-            long_context: false,
             max_line_bytes: 33_554_432,
             max_body_bytes: 16_777_216,
             channel_capacity: 256,

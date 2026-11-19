@@ -57,39 +57,35 @@ tools changed, or `session/set_model` if effort/model changed). Local `/compact`
 summarization turns match the warm coding session via a dialogue hash and retire
 it cleanly afterward.
 
-The default mode sends one ACP prompt per client step, with a `176,000`-byte
-text budget below the observed upstream single-turn truncation boundary. It
-does not insert seed turns. Oversized tool outputs or single-turn inputs
-are automatically middle-truncated across line boundaries using water-filling
-Head+Tail preservation (~55% head, ~45% tail, with an explicit omitted-lines
-marker) while leaving smaller sibling tool results untouched and keeping the
-canonical `SessionPool` prefix hash intact for subsequent warm turns. Cold
-replays trim older history with explicit archive markers when needed.
+Liftgate sends exactly one ACP prompt per client step, with a `176,000`-byte
+text budget below Antigravity's `191,579`-byte single-turn `session/prompt`
+truncation boundary and zero synthetic replay turns. Whenever any payload
+(tool output, pasted log, tool call arguments, developer/system instructions,
+client tool schemas, cold-history turns, or `web_fetch` page) requires
+truncation or omission, `SpillStore` atomically writes 100% of the lossless
+original content to a content-addressed file under `~/.liftgate/spills/`
+before applying water-filling Head+Tail line truncation (~55% head, ~45% tail)
+and embeds the exact local file path and omitted line range in the notice,
+while leaving smaller sibling tool results untouched and keeping the canonical
+`SessionPool` prefix hash intact for subsequent warm turns.
 
-When a genuine context-window overflow occurs (such as upstream context-length
-rejection or compaction during `--long-context` hydration), Liftgate returns the
+When a genuine context-window overflow occurs, Liftgate returns the
 standard reactive-compaction wire format expected by each client (`code:
 "context_length_exceeded"` / `param: "input"` on OpenAI `/v1/responses` and
 `prompt is too long: N tokens > M maximum` on Anthropic `/v1/messages`, across
 both HTTP `400` and SSE failure frames).
 
-Model metadata and generated client settings use conservative context and
-auto-compact limits: Gemini `500k / 425k`, Claude `200k / 170k`, and GPT-OSS
+Model metadata and generated client settings use empirically verified context
+and auto-compact limits: Gemini `500k / 425k`, Claude `200k / 170k`, and GPT-OSS
 `128k / 110k`. Codex uses per-model catalog entries, and Claude Code uses
 per-model `autoCompactWindow` settings. Canonical Claude aliases shared by
-several gateway models take the smallest limit. These settings aim to trigger
-client compaction cleanly within Antigravity's 500k session window;
-they do not change that upstream policy.
-
-Only explicit `--long-context` enables hydration and Gemini's experimental
-`1M / 850k` metadata. Histories are split across bounded seed turns on the fast model in the
-same ACP session before switching to the requested model. This introduces
-synthetic acknowledgements and extra calls, and cannot preserve more history
-than upstream compaction permits. Inputs beyond the bounded chunk capacity
-return `400`. If `UsageUpdate` detects compaction during hydration, the request
-fails with a non-retryable `400` and the session is retired, preventing a replay
-loop. Post-turn compaction during ordinary inference retires the session after
-delivering the current response. See [context configuration](usage.md#context-windows-and-long-context).
+several gateway models take the smallest limit. Upstream `agy acp` enforces an
+internal post-turn auto-compaction cliff at `524,288` tokens (`50%` of the
+`1,048,576`-token `usage_update` window) on Gemini sessions; keeping the
+client window at `500k / 425k` triggers client `/compact` cleanly on the warm
+session before upstream compaction wipes context. If `UsageUpdate` still
+detects post-turn upstream compaction, Liftgate delivers the current response
+and retires the session afterward. See [context configuration](usage.md#context-windows).
 
 ### Streaming
 

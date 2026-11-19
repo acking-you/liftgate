@@ -90,13 +90,6 @@ impl DesktopApp {
                         ))
                         .child(pill_badge(p, BadgeTone::Neutral, pid_text))
                         .child(pill_badge(p, BadgeTone::Info, format!("agy {agy_ver}")))
-                        .children(self.cfg_long_context.then(|| {
-                            pill_badge(
-                                p,
-                                BadgeTone::Warn,
-                                tr(lang, "1M 长上下文", "1M LONG CONTEXT"),
-                            )
-                        }))
                         .children(self.sse_connected.then(|| {
                             pill_badge(p, BadgeTone::Ok, tr(lang, "SSE 实时连接", "SSE LIVE"))
                         })),
@@ -386,20 +379,6 @@ impl DesktopApp {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(
-                        Switch::new("ov-sw-long-ctx")
-                            .small()
-                            .checked(self.cfg_long_context)
-                            .label(tr(
-                                lang,
-                                "启用 1M 长上下文窗口 (--long-context)",
-                                "1M Long Context (--long-context)",
-                            ))
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.cfg_long_context = *checked;
-                                cx.notify();
-                            })),
-                    )
                     .child(
                         Switch::new("ov-sw-auto-upd")
                             .small()

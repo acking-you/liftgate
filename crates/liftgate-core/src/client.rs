@@ -1,16 +1,17 @@
 use std::fmt::Write as _;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use liftgate_server::routes::ADMIN_SHUTDOWN_HEADER;
-use liftgate_types::{acp::AvailableModel, telemetry::GatewayTelemetrySnapshot};
+use liftgate_types::{
+    acp::AvailableModel, model::GEMINI_DEFAULT_WINDOW, telemetry::GatewayTelemetrySnapshot,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
-use crate::error::CliError;
+use crate::error::{CliError, GatewayTransportError};
 use crate::state::format_connect_url;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
@@ -31,14 +32,14 @@ pub struct DiscoveredModel {
 impl DiscoveredModel {
     /// Uses the live gateway's complete context policy, or a conservative fallback for old servers.
     #[must_use]
-    pub fn context_limits(&self, long_context: bool) -> (u64, u64) {
+    pub fn context_limits(&self) -> (u64, u64) {
         if self.auto_compact_token_limit >= 100_000
             && self.auto_compact_token_limit <= self.context_window
-            && self.context_window <= 1_000_000
+            && self.context_window <= GEMINI_DEFAULT_WINDOW
         {
             (self.context_window, self.auto_compact_token_limit)
         } else {
-            liftgate_types::model::context_limits(&self.id, long_context)
+            liftgate_types::model::context_limits(&self.id)
         }
     }
 
@@ -52,41 +53,6 @@ impl DiscoveredModel {
                 self.display_name.clone()
             },
         }
-    }
-}
-
-/// Infers whether a running gateway has experimental `--long-context` active from its `/v1/models`
-/// catalog, falling back to `managed_fallback` only when no Gemini model has reported yet.
-///
-/// Legacy gateways that omit `auto_compact_token_limit` (`0`) always resolve to `false` so
-/// local preferences never promote an older server into experimental 1M limits.
-#[must_use]
-pub fn infer_live_long_context(
-    discovered: &[DiscoveredModel],
-    managed_fallback: Option<bool>,
-) -> bool {
-    let mut saw_gemini = false;
-    for model in discovered {
-        if !model
-            .id
-            .trim()
-            .get(..7)
-            .is_some_and(|p| p.eq_ignore_ascii_case("gemini-"))
-        {
-            continue;
-        }
-        saw_gemini = true;
-        if liftgate_types::model::is_gemini_long_context(
-            model.context_window,
-            model.auto_compact_token_limit,
-        ) {
-            return true;
-        }
-    }
-    if saw_gemini {
-        false
-    } else {
-        managed_fallback.unwrap_or(false)
     }
 }
 
@@ -271,13 +237,13 @@ impl GatewayClient {
                 Ok(Err(source)) => {
                     return Err(CliError::GatewayUnreachable {
                         url: full_url,
-                        source,
+                        source: GatewayTransportError::Io(source),
                     });
                 }
                 Err(_) => {
                     return Err(CliError::GatewayUnreachable {
                         url: full_url,
-                        source: io::Error::new(io::ErrorKind::TimedOut, "SSE connect timed out"),
+                        source: GatewayTransportError::TimedOut,
                     });
                 }
             };
@@ -286,7 +252,7 @@ impl GatewayClient {
             .await
             .map_err(|source| CliError::GatewayUnreachable {
                 url: full_url.clone(),
-                source,
+                source: GatewayTransportError::Io(source),
             })?;
 
         let mut decoder = IncrementalSseDecoder::new();
@@ -302,7 +268,7 @@ impl GatewayClient {
                 read_res = stream.read(&mut read_buf) => {
                     let n = read_res.map_err(|source| CliError::GatewayUnreachable {
                         url: full_url.clone(),
-                        source,
+                        source: GatewayTransportError::Io(source),
                     })?;
                     if n == 0 {
                         break;
@@ -401,7 +367,7 @@ impl GatewayClient {
             }),
             Err(_) => Err(CliError::GatewayUnreachable {
                 url: full_url,
-                source: io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"),
+                source: GatewayTransportError::TimedOut,
             }),
         }
     }
@@ -420,28 +386,24 @@ pub fn percent_encode_query_component(input: &str) -> String {
     out
 }
 
-fn parse_http_response(raw: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), GatewayTransportError> {
     let Some(header_end) = find_double_crlf(raw) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "incomplete HTTP response headers",
-        ));
+        return Err(GatewayTransportError::IncompleteHeaders);
     };
     let header_bytes = raw.get(..header_end).unwrap_or_default();
     let body_bytes = raw.get(header_end + 4..).unwrap_or_default();
-    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 HTTP response headers")
-    })?;
+    let header_str =
+        std::str::from_utf8(header_bytes).map_err(|_| GatewayTransportError::NonUtf8Headers)?;
 
     let mut lines = header_str.split("\r\n");
     let status_line = lines
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status line"))?;
+        .ok_or(GatewayTransportError::MissingStatusLine)?;
     let status_code = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status code"))?;
+        .ok_or(GatewayTransportError::InvalidStatusCode)?;
 
     let is_chunked = lines.any(|line| {
         line.split_once(':').is_some_and(|(k, v)| {
@@ -462,23 +424,20 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn decode_chunked_body(mut rest: &[u8]) -> io::Result<Vec<u8>> {
+fn decode_chunked_body(mut rest: &[u8]) -> Result<Vec<u8>, GatewayTransportError> {
     let mut out = Vec::new();
     while let Some(crlf) = rest.windows(2).position(|w| w == b"\r\n") {
         let size_line = std::str::from_utf8(rest.get(..crlf).unwrap_or_default())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk header"))?;
+            .map_err(|_| GatewayTransportError::InvalidChunkHeader)?;
         let hex_part = size_line.split(';').next().unwrap_or_default().trim();
         let chunk_len = usize::from_str_radix(hex_part, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk length"))?;
+            .map_err(|_| GatewayTransportError::InvalidChunkLength)?;
         rest = rest.get(crlf + 2..).unwrap_or_default();
         if chunk_len == 0 {
             break;
         }
         let Some(chunk_data) = rest.get(..chunk_len) else {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated HTTP chunk",
-            ));
+            return Err(GatewayTransportError::TruncatedChunk);
         };
         out.extend_from_slice(chunk_data);
         rest = rest.get(chunk_len + 2..).unwrap_or_default();
@@ -512,7 +471,9 @@ impl IncrementalSseDecoder {
         if self.raw_buf.len().saturating_add(incoming.len()) > MAX_SSE_BUFFER_BYTES {
             return Err(CliError::GatewayUnreachable {
                 url: url.to_owned(),
-                source: io::Error::new(io::ErrorKind::InvalidData, "SSE raw buffer exceeded 4 MiB"),
+                source: GatewayTransportError::SseBufferExceeded {
+                    max_bytes: MAX_SSE_BUFFER_BYTES,
+                },
             });
         }
         self.raw_buf.extend_from_slice(incoming);
@@ -525,7 +486,7 @@ impl IncrementalSseDecoder {
             let header_str =
                 std::str::from_utf8(header_bytes).map_err(|_| CliError::GatewayUnreachable {
                     url: url.to_owned(),
-                    source: io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 SSE headers"),
+                    source: GatewayTransportError::NonUtf8Headers,
                 })?;
             let mut lines = header_str.split("\r\n");
             let status = lines
@@ -556,19 +517,13 @@ impl IncrementalSseDecoder {
                 let size_str = std::str::from_utf8(self.raw_buf.get(..crlf).unwrap_or_default())
                     .map_err(|_| CliError::GatewayUnreachable {
                         url: url.to_owned(),
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid SSE chunk header",
-                        ),
+                        source: GatewayTransportError::InvalidChunkHeader,
                     })?;
                 let hex_part = size_str.split(';').next().unwrap_or_default().trim();
                 let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|_| {
                     CliError::GatewayUnreachable {
                         url: url.to_owned(),
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid SSE chunk length",
-                        ),
+                        source: GatewayTransportError::InvalidChunkLength,
                     }
                 })?;
                 if chunk_len == 0 {
@@ -586,10 +541,9 @@ impl IncrementalSseDecoder {
                 if self.sse_buf.len().saturating_add(chunk_len) > MAX_SSE_BUFFER_BYTES {
                     return Err(CliError::GatewayUnreachable {
                         url: url.to_owned(),
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "SSE payload exceeded 4 MiB",
-                        ),
+                        source: GatewayTransportError::SseBufferExceeded {
+                            max_bytes: MAX_SSE_BUFFER_BYTES,
+                        },
                     });
                 }
                 if let Some(payload) = self.raw_buf.get(crlf + 2..crlf + 2 + chunk_len) {
@@ -601,10 +555,9 @@ impl IncrementalSseDecoder {
             if self.sse_buf.len().saturating_add(self.raw_buf.len()) > MAX_SSE_BUFFER_BYTES {
                 return Err(CliError::GatewayUnreachable {
                     url: url.to_owned(),
-                    source: io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "SSE payload exceeded 4 MiB",
-                    ),
+                    source: GatewayTransportError::SseBufferExceeded {
+                        max_bytes: MAX_SSE_BUFFER_BYTES,
+                    },
                 });
             }
             self.sse_buf.append(&mut self.raw_buf);
@@ -680,46 +633,37 @@ mod tests {
     }
 
     #[test]
-    fn infers_live_long_context_without_promoting_legacy_gateways() {
-        let default_500k = vec![DiscoveredModel {
+    fn discovered_model_clamps_legacy_1m_windows_to_safe_500k_policy() {
+        let default_500k = DiscoveredModel {
             id: "gemini-4-carbon-high".to_owned(),
             display_name: String::new(),
             context_window: 500_000,
             auto_compact_token_limit: 425_000,
-        }];
-        assert!(!infer_live_long_context(&default_500k, Some(true)));
+        };
+        assert_eq!(default_500k.context_limits(), (500_000, 425_000));
 
-        let default_v013 = vec![DiscoveredModel {
-            id: "gemini-4-carbon-high".to_owned(),
-            display_name: String::new(),
-            context_window: 280_000,
-            auto_compact_token_limit: 245_000,
-        }];
-        assert!(!infer_live_long_context(&default_v013, Some(true)));
-
-        let experimental_v013 = vec![DiscoveredModel {
+        let legacy_1m = DiscoveredModel {
             id: "gemini-4-carbon-high".to_owned(),
             display_name: String::new(),
             context_window: 1_000_000,
             auto_compact_token_limit: 850_000,
-        }];
-        assert!(infer_live_long_context(&experimental_v013, None));
+        };
+        assert_eq!(legacy_1m.context_limits(), (500_000, 425_000));
 
-        let legacy_v012 = vec![DiscoveredModel {
+        let legacy_zero_compact = DiscoveredModel {
             id: "gemini-4-carbon-high".to_owned(),
             display_name: String::new(),
             context_window: 1_000_000,
             auto_compact_token_limit: 0,
-        }];
-        assert!(!infer_live_long_context(&legacy_v012, Some(true)));
+        };
+        assert_eq!(legacy_zero_compact.context_limits(), (500_000, 425_000));
 
-        let non_gemini_only = vec![DiscoveredModel {
+        let claude = DiscoveredModel {
             id: "claude-sonnet-5-5-high".to_owned(),
             display_name: String::new(),
             context_window: 200_000,
             auto_compact_token_limit: 170_000,
-        }];
-        assert!(infer_live_long_context(&non_gemini_only, Some(true)));
-        assert!(!infer_live_long_context(&non_gemini_only, None));
+        };
+        assert_eq!(claude.context_limits(), (200_000, 170_000));
     }
 }
