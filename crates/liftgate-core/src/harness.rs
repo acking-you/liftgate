@@ -52,11 +52,17 @@ enum CodexInvocationKind {
     /// Local/session-store/IPC/help/version invocation (`queue`, `archive`, `delete`, `mcp`,
     /// `plugin`, `features`, `completion`, `sandbox`, `--help`, `-V`, etc.) executed directly.
     DirectPassthrough,
-    /// Gateway-backed subcommand (`agents`, `review`, `doctor`, `debug`, `app-server`, etc.)
+    /// Run the native updater with the caller's environment unchanged.
+    NativeUpdate,
+    /// Gateway-backed subcommand (`review`, `doctor`, `debug`, `app-server`, etc.)
     /// configured solely via `-c` overrides without `--dangerously-bypass-approvals-and-sandbox`.
     GatewayConfigOnly,
-    /// Interactive or `exec` / `resume` / `fork` agent session.
-    AgentSession,
+    /// Interactive agents overview, with the same config flags as other gateway subcommands.
+    AgentsView,
+    /// Start, resume, or fork an interactive session.
+    InteractiveSession,
+    /// Run an agent session non-interactively.
+    ExecSession,
 }
 
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
@@ -354,7 +360,10 @@ async fn build_codex_invocation(
             .as_deref(),
     );
 
-    if invocation == CodexInvocationKind::DirectPassthrough {
+    if matches!(
+        invocation,
+        CodexInvocationKind::DirectPassthrough | CodexInvocationKind::NativeUpdate
+    ) {
         let mut full_args: Vec<OsString> = resolved_cmd
             .prefix_args
             .iter()
@@ -367,10 +376,14 @@ async fn build_codex_invocation(
                 program: resolved_cmd.program,
                 args: full_args,
                 cwd,
-                env_set: vec![
-                    ("NO_PROXY".to_owned(), no_proxy.clone()),
-                    ("no_proxy".to_owned(), no_proxy),
-                ],
+                env_set: if invocation == CodexInvocationKind::NativeUpdate {
+                    Vec::new()
+                } else {
+                    vec![
+                        ("NO_PROXY".to_owned(), no_proxy.clone()),
+                        ("no_proxy".to_owned(), no_proxy),
+                    ]
+                },
                 env_remove: Vec::new(),
                 cleanup_files: Vec::new(),
                 hold_open_on_exit: hold_open,
@@ -463,12 +476,12 @@ async fn build_codex_invocation(
         out.push(OsString::from(expr));
     };
     match invocation {
-        CodexInvocationKind::AgentSession => {
+        CodexInvocationKind::InteractiveSession | CodexInvocationKind::ExecSession => {
             if !args.no_bypass && !has_explicit_approval {
                 full_args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
             }
         }
-        CodexInvocationKind::GatewayConfigOnly => {
+        CodexInvocationKind::AgentsView | CodexInvocationKind::GatewayConfigOnly => {
             if !args.no_bypass && !has_explicit_approval {
                 push_cfg(&mut full_args, "approval_policy='never'".to_owned());
                 push_cfg(
@@ -477,7 +490,7 @@ async fn build_codex_invocation(
                 );
             }
         }
-        CodexInvocationKind::DirectPassthrough => {}
+        CodexInvocationKind::DirectPassthrough | CodexInvocationKind::NativeUpdate => {}
     }
     let toml_primary = toml_inline_string(&primary_model);
     let toml_catalog = toml_inline_string(&catalog_slash);
@@ -529,7 +542,22 @@ async fn build_codex_invocation(
             push_cfg(&mut full_args, "features.code_mode_only=true".to_owned());
         }
     }
-    full_args.extend(args.passthrough_args.iter().map(OsString::from));
+    if matches!(
+        invocation,
+        CodexInvocationKind::InteractiveSession | CodexInvocationKind::AgentsView
+    ) {
+        let (options, positional_tail) = args
+            .passthrough_args
+            .split_at(slice_before_double_dash(&args.passthrough_args).len());
+        full_args.extend(options.iter().map(OsString::from));
+        push_cfg(
+            &mut full_args,
+            "check_for_update_on_startup=false".to_owned(),
+        );
+        full_args.extend(positional_tail.iter().map(OsString::from));
+    } else {
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+    }
 
     Ok((
         TerminalLaunchSpec {
@@ -661,6 +689,10 @@ fn classify_claude_invocation(passthrough_args: &[String]) -> ClaudeInvocationKi
 
 fn classify_codex_invocation(passthrough_args: &[String]) -> CodexInvocationKind {
     let pre_dd = slice_before_double_dash(passthrough_args);
+    let subcommand = find_codex_root_subcommand(pre_dd);
+    if matches!(subcommand, Some(("update", _))) {
+        return CodexInvocationKind::NativeUpdate;
+    }
     if pre_dd
         .iter()
         .any(|a| matches!(a.as_str(), "-h" | "--help" | "-V" | "--version"))
@@ -668,13 +700,13 @@ fn classify_codex_invocation(passthrough_args: &[String]) -> CodexInvocationKind
         return CodexInvocationKind::DirectPassthrough;
     }
 
-    let Some((sub, sub_idx)) = find_codex_root_subcommand(pre_dd) else {
-        return CodexInvocationKind::AgentSession;
+    let Some((sub, sub_idx)) = subcommand else {
+        return CodexInvocationKind::InteractiveSession;
     };
 
     match sub {
         "help" | "completion" | "queue" | "archive" | "unarchive" | "delete" | "mcp" | "plugin"
-        | "features" | "login" | "logout" | "update" | "apply" | "a" | "cloud" | "sandbox"
+        | "features" | "login" | "logout" | "apply" | "a" | "cloud" | "sandbox"
         | "migrate-rollouts" | "migrate-nfs-db" | "app" => CodexInvocationKind::DirectPassthrough,
         "app-server" => {
             if matches!(
@@ -686,18 +718,18 @@ fn classify_codex_invocation(passthrough_args: &[String]) -> CodexInvocationKind
                 CodexInvocationKind::GatewayConfigOnly
             }
         }
-        "agents" | "review" | "doctor" | "debug" | "remote-control" | "exec-server" => {
+        "agents" => CodexInvocationKind::AgentsView,
+        "review" | "doctor" | "debug" | "remote-control" | "exec-server" => {
             CodexInvocationKind::GatewayConfigOnly
         }
         "exec" | "e" => {
             if pre_dd.get(sub_idx + 1).map(String::as_str) == Some("help") {
                 CodexInvocationKind::DirectPassthrough
             } else {
-                CodexInvocationKind::AgentSession
+                CodexInvocationKind::ExecSession
             }
         }
-        "resume" | "fork" => CodexInvocationKind::AgentSession,
-        _ => CodexInvocationKind::AgentSession,
+        _ => CodexInvocationKind::InteractiveSession,
     }
 }
 
@@ -1281,30 +1313,34 @@ mod tests {
 
         assert_eq!(
             classify_codex_invocation(&strs(&[])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::InteractiveSession
         );
         assert_eq!(
             classify_codex_invocation(&strs(&["explain architecture"])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::InteractiveSession
         );
         assert_eq!(
             classify_codex_invocation(&strs(&["resume", "--last"])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::InteractiveSession
         );
         assert_eq!(
             classify_codex_invocation(&strs(&["-C", "../other", "resume", "--all"])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::InteractiveSession
         );
         assert_eq!(
             classify_codex_invocation(&strs(&["fork", "--last"])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::InteractiveSession
         );
         assert_eq!(
             classify_codex_invocation(&strs(&["exec", "resume", "--last", "test"])),
-            CodexInvocationKind::AgentSession
+            CodexInvocationKind::ExecSession
         );
 
-        for sub in ["agents", "review", "doctor", "debug"] {
+        assert_eq!(
+            classify_codex_invocation(&strs(&["agents"])),
+            CodexInvocationKind::AgentsView
+        );
+        for sub in ["review", "doctor", "debug"] {
             assert_eq!(
                 classify_codex_invocation(&strs(&[sub])),
                 CodexInvocationKind::GatewayConfigOnly,
@@ -1364,5 +1400,98 @@ mod tests {
             &strs(&["-c", "model = 'gemini-3.8-flash-low'", "resume"]),
             "model"
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_session_disables_updates_after_passthrough_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let state_paths = StatePaths::resolve(Some(
+            std::env::temp_dir().join(format!("liftgate-codex-{}", uuid::Uuid::new_v4())),
+        ))?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let args = CodexArgs {
+            listen: Some(listener.local_addr()?),
+            api_key: Some("test-gateway-key".into()),
+            codex_bin: Some(std::env::current_exe()?),
+            passthrough_args: [
+                "resume",
+                "-c",
+                "check_for_update_on_startup=true",
+                "--",
+                "-prompt",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            ..CodexArgs::default_interactive()
+        };
+        let serve_gateway = async {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).await?;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (spec, served) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                prepare_codex_terminal_spec(&state_paths, &args, None, false),
+                serve_gateway,
+            )
+        })
+        .await?;
+        let spec = spec?;
+        served?;
+        std::fs::remove_dir_all(state_paths.root())?;
+
+        let command = command_from_terminal_spec(&spec);
+        let command = command.as_std();
+        let argv = command.get_args().collect::<Vec<_>>();
+        assert!(
+            argv.ends_with(
+                &[
+                    "resume",
+                    "-c",
+                    "check_for_update_on_startup=true",
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "--",
+                    "-prompt"
+                ]
+                .map(std::ffi::OsStr::new)
+            )
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "AGY_GATEWAY_API_KEY" && value == Some(std::ffi::OsStr::new("test-gateway-key"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_update_uses_the_native_environment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state_paths =
+            StatePaths::resolve(Some(PathBuf::from("unused-codex-update-test-state")))?;
+        let args = CodexArgs {
+            codex_bin: Some(std::env::current_exe()?),
+            passthrough_args: vec!["update".to_owned()],
+            ..CodexArgs::default_interactive()
+        };
+        let (spec, catalog) = build_codex_invocation(&state_paths, &args, None, false).await?;
+        let command = command_from_terminal_spec(&spec);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["update"].map(std::ffi::OsStr::new)
+        );
+        assert_eq!(command.as_std().get_envs().count(), 0);
+        assert!(catalog.is_none());
+        Ok(())
     }
 }

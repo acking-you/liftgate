@@ -78,6 +78,7 @@ Native Codex CLI Commands & Session Examples:
   lg cx resume <ID_OR_NAME>       Resume a specific session (optional trailing prompt)
   lg cx fork [--last | <ID>]      Fork a previous session into a new thread
   lg cx agents                    Open Agent Command Center to browse & switch sessions
+  lg cx update                    Run the native Codex updater from a regular shell
   lg cx exec \"run cargo test\"     Run non-interactively (`lg cx exec resume --last \"...\"`)
   lg cx review --uncommitted      Run a non-interactive code review via Liftgate
   lg cx archive | unarchive | delete <SESSION>
