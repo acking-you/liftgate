@@ -237,6 +237,7 @@ pub fn print_serve_ready_banner(
     full_ui_embedded: bool,
     agy_proxy_display: Option<&str>,
     agy_auto_update: bool,
+    vision_offload: bool,
 ) {
     if !stderr().is_terminal() {
         return;
@@ -261,9 +262,10 @@ pub fn print_serve_ready_banner(
         (
             "AGY Policy",
             format!(
-                "proxy={} · idle-auto-update={}",
+                "proxy={} · idle-auto-update={} · vision-offload={}",
                 agy_proxy_display.unwrap_or("none"),
-                if agy_auto_update { "on" } else { "off" }
+                if agy_auto_update { "on" } else { "off" },
+                if vision_offload { "on" } else { "off" }
             ),
         ),
         (

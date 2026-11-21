@@ -114,7 +114,7 @@ TAG=""
 if [ -n "$VERSION" ]; then
   case "$VERSION" in
     *-ui)
-      err "'$VERSION' is a Liftgate Desktop GUI tag; omit '-ui' for the CLI or download desktop installers from ${BASE_URL}/releases/tag/${VERSION}"
+      err "'$VERSION' is not a CLI release tag; omit '-ui' (e.g. '${VERSION%-ui}')"
       ;;
     v* | V*)
       TAG="v${VERSION#?}"

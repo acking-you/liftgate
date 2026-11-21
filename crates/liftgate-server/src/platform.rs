@@ -291,13 +291,27 @@ pub fn canonicalize_clean(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Non-interactive git and third-party Antigravity plugin hygiene variables injected into every
+/// supervised `agy` subprocess so hooks never hang on interactive prompts/pagers or spawn
+/// detached background plugin auto-updaters (`agy-fast`, npm update-notifier) inside gateway turns.
+pub const ACP_CHILD_ISOLATION_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_PAGER", "cat"),
+    ("AGY_FAST_AUTO_UPDATE", "off"),
+    ("NO_UPDATE_NOTIFIER", "1"),
+];
+
 /// Scrubs gateway-client variables from an `agy` subprocess (`tokio::process::Command`),
-/// ensures loopback addresses bypass proxies, and enforces Liftgate's explicit proxy policy:
+/// disables interactive prompts/plugin updaters, ensures loopback addresses bypass proxies, and
+/// enforces Liftgate's explicit proxy policy:
 /// - `Some(proxy)`: forcibly injects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
 /// - `None` (default): clears outbound proxy variables so `agy` connects directly with no proxy.
 pub fn configure_acp_child_env(cmd: &mut tokio::process::Command, agy_proxy: Option<&ProxyUrl>) {
     for key in CLIENT_ENV_VARS_TO_STRIP {
         cmd.env_remove(key);
+    }
+    for &(key, val) in ACP_CHILD_ISOLATION_ENV {
+        cmd.env(key, val);
     }
 
     let merged_no_proxy = merge_loopback_no_proxy(
@@ -325,6 +339,9 @@ pub fn configure_acp_child_env(cmd: &mut tokio::process::Command, agy_proxy: Opt
 pub fn configure_acp_std_child_env(cmd: &mut std::process::Command, agy_proxy: Option<&ProxyUrl>) {
     for key in CLIENT_ENV_VARS_TO_STRIP {
         cmd.env_remove(key);
+    }
+    for &(key, val) in ACP_CHILD_ISOLATION_ENV {
+        cmd.env(key, val);
     }
 
     let merged_no_proxy = merge_loopback_no_proxy(
@@ -613,5 +630,38 @@ mod tests {
             expanded,
             format!("100% {path_val}/bin/%DEFINITELY_MISSING_VAR_XYZ_999%/%%tail%unclosed")
         );
+    }
+
+    #[test]
+    fn configures_acp_child_env_isolation_and_proxy_cleanly() {
+        let mut cmd = std::process::Command::new("agy");
+        configure_acp_std_child_env(&mut cmd, None);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("AGY_FAST_AUTO_UPDATE").and_then(Option::as_deref),
+            Some("off")
+        );
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").and_then(Option::as_deref),
+            Some("0")
+        );
+        assert_eq!(
+            envs.get("GIT_PAGER").and_then(Option::as_deref),
+            Some("cat")
+        );
+        assert_eq!(
+            envs.get("NO_UPDATE_NOTIFIER").and_then(Option::as_deref),
+            Some("1")
+        );
+        assert_eq!(envs.get("ANTHROPIC_BASE_URL"), Some(&None));
+        assert_eq!(envs.get("HTTPS_PROXY"), Some(&None));
     }
 }

@@ -7,13 +7,18 @@ use liftgate_types::{
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
-    telemetry::{SessionPoolTelemetry, SessionSlotState, SessionSummary},
+    telemetry::{PromptCacheWarmth, SessionPoolTelemetry, SessionSlotState, SessionSummary},
 };
 
 use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
 
 const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
 const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default maximum idle age (`45 minutes`) before an untouched `--process-per-session` ACP
+/// worker is closed by the background reaper to reclaim resident child memory once upstream
+/// prompt caches have long expired.
+pub const DEFAULT_MAX_IDLE_SESSION_AGE_MS: u64 = 45 * 60 * 1_000;
 
 /// Cached metadata for an idle ACP session awaiting a multi-turn continuation.
 #[derive(Clone, Debug)]
@@ -60,6 +65,7 @@ struct ActiveLeaseMeta {
     model_id: ModelId,
     turn_count: u64,
     message_count: usize,
+    last_context_used: u64,
     created_at_unix_ms: u64,
     last_active_unix_ms: u64,
     last_response_id: Option<String>,
@@ -339,9 +345,56 @@ impl SessionPool {
             .map(|entry| entry.raw_json.clone())
     }
 
+    /// Closes and evicts idle sessions whose `last_active_unix_ms` is at least `max_idle_age_ms`
+    /// behind `now_unix_ms`, returning the number of reaped sessions.
+    pub fn reap_expired_idle_sessions<B: AcpBackend>(
+        &self,
+        now_unix_ms: u64,
+        max_idle_age_ms: u64,
+        backend: &B,
+    ) -> usize {
+        if max_idle_age_ms == 0 {
+            return 0;
+        }
+        let expired = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut reaped = Vec::new();
+            let mut kept = VecDeque::with_capacity(guard.idle_sessions.len());
+            while let Some(entry) = guard.idle_sessions.pop_front() {
+                if now_unix_ms.saturating_sub(entry.last_active_unix_ms) >= max_idle_age_ms {
+                    guard.retained_idle_bytes = guard
+                        .retained_idle_bytes
+                        .saturating_sub(entry.retained_bytes);
+                    guard.total_sessions_closed_or_evicted += 1;
+                    reaped.push(entry);
+                } else {
+                    kept.push_back(entry);
+                }
+            }
+            guard.idle_sessions = kept;
+            reaped
+        };
+
+        let count = expired.len();
+        for old in expired {
+            backend.abort_session_nonblocking(&old.session_id);
+        }
+        count
+    }
+
     /// Captures a telemetry snapshot of all running and cached ACP sessions.
     #[must_use]
     pub fn snapshot(&self) -> SessionPoolTelemetry {
+        self.snapshot_at(unix_timestamp_ms())
+    }
+
+    /// Captures a telemetry snapshot using an explicit `now_unix_ms` clock for deterministic
+    /// KV-cache warmth classification in tests and live telemetry.
+    #[must_use]
+    pub fn snapshot_at(&self, now_unix_ms: u64) -> SessionPoolTelemetry {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -354,8 +407,14 @@ impl SessionPool {
                 session_id: sid.clone(),
                 model_id: meta.model_id.as_str().to_owned(),
                 state: SessionSlotState::Running,
+                cache_warmth: PromptCacheWarmth::classify(
+                    SessionSlotState::Running,
+                    meta.last_active_unix_ms,
+                    now_unix_ms,
+                ),
                 turn_count: meta.turn_count,
                 message_count: meta.message_count,
+                last_context_tokens: meta.last_context_used,
                 created_at_unix_ms: meta.created_at_unix_ms,
                 last_active_unix_ms: meta.last_active_unix_ms,
                 last_response_id: meta.last_response_id.clone(),
@@ -366,8 +425,14 @@ impl SessionPool {
                 session_id: idle.session_id.as_str().to_owned(),
                 model_id: idle.model_id.as_str().to_owned(),
                 state: SessionSlotState::Idle,
+                cache_warmth: PromptCacheWarmth::classify(
+                    SessionSlotState::Idle,
+                    idle.last_active_unix_ms,
+                    now_unix_ms,
+                ),
                 turn_count: idle.turn_count,
                 message_count: idle.message_count,
+                last_context_tokens: idle.last_context_used,
                 created_at_unix_ms: idle.created_at_unix_ms,
                 last_active_unix_ms: idle.last_active_unix_ms,
                 last_response_id: idle.last_response_id.clone(),
@@ -602,6 +667,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 model_id: model_id.clone(),
                 turn_count: 1,
                 message_count: initial_message_count,
+                last_context_used: 0,
                 created_at_unix_ms: now_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: None,
@@ -637,6 +703,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 model_id: cached.model_id.clone(),
                 turn_count: next_turn,
                 message_count: new_message_count,
+                last_context_used: cached.last_context_used,
                 created_at_unix_ms: cached.created_at_unix_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: cached.last_response_id.clone(),

@@ -6,7 +6,7 @@
 
 ## 准备工作
 
-- **全局安装 `lg` / `liftgate`**（或直接从 [桌面端 Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) 下载独立的原生 GPUI 应用 **Liftgate Desktop**）：
+- **全局安装 `lg` / `liftgate`**：
   ```bash
   # macOS / Linux / FreeBSD
   curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh
@@ -278,6 +278,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--agy-bin` | `AGY_BIN` | 从 `PATH` 或标准安装位置查找 |
 | `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
+| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true`（或读取 `~/.liftgate/settings.json` 中的 `vision_offload`，亦可在 Web 面板与 `lg top` 按 `v` 实时切换） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |

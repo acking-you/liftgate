@@ -988,13 +988,13 @@ pub fn build_session_system_append_with_sink<S: TruncationSpillSink>(
     out.push_str("<api_gateway_bridge_rules>\n");
     out.push_str(&format!(
         "You are serving an external API harness via a structured protocol gateway.\n\
-         - NEVER invoke your internal host workspace tools (`read_file`, `write_file`, `edit_file`, \
+         - NEVER invoke internal host or plugin MCP tools (`read_file`, `write_file`, `edit_file`, \
          `run_command`, `manage_task`, `ask_question`, `invoke_subagent`, `define_subagent`, \
-         `manage_subagents`, `run_workflow`, `swarm`, `schedule`, `send_message`).\n\
-         - Ignore any internal ACP host directory such as `liftgate-empty-cwd`; it is only an \
-         inert gateway sandbox folder. External `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, \
-         `Grep`, `Glob`, etc.) execute directly in the caller's actual workspace directory described \
-         in `<developer_instructions>`, `<caller_system_instructions>`, and caller environment blocks.\n\
+         `manage_subagents`, `run_workflow`, `swarm`, `schedule`, `send_message`, `call_mcp_tool`, \
+         `mcp_*`).\n\
+         - Ignore internal ACP host folders (`liftgate-*`) and any host plugin rules/snapshots; \
+         external `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, etc.) run in \
+         the caller's real workspace from `<developer_instructions>` and `<caller_system_instructions>`.\n\
          - CRITICAL: NEVER emit any native tool/function call (not even an empty one) for external \
          `<client_tools>` (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, \
          `Agent`, `REPL`, `exec`, `wait`, `apply_patch`, etc.) or after writing XML tool blocks; doing so triggers a \
@@ -1089,13 +1089,13 @@ fn append_xml_invocation_bridge_rules(
     has_custom_tools: bool,
 ) {
     out.push_str(
-        "- Whenever you want to invoke one or more XML-bridged tools below (including parallel calls \
-         in a single turn), optionally write a brief one-sentence status note before the first XML \
-         block, then emit one XML block per tool call in this EXACT format (no XML attributes, \
-         NEVER wrap the tag in backticks/code fences, and JSON-escape all `\\`, `\"`, and `\\n` inside strings), \
-         and END YOUR TURN IMMEDIATELY with ZERO trailing text, explanation, or native \
-         function calls after the final closing tag — NEVER guess, fabricate, or simulate tool \
-         outputs or future turns before the caller returns `[Client Tool Result ...]`:\n",
+        "- Batch independent read-only searches, ranged reads, or checks as parallel XML blocks in ONE turn \
+         (avoid serial single-tool turns), and never retry identical rejected arguments.\n\
+         - To invoke XML-bridged tools below, optionally write a brief one-sentence status note before the \
+         first XML block, emit one XML block per call in this EXACT format (no XML attributes, \
+         NEVER wrap in backticks/code fences, JSON-escape `\\`, `\"`, `\\n` inside strings), \
+         and END YOUR TURN IMMEDIATELY with ZERO trailing text or native function calls after the \
+         final closing tag — NEVER fabricate tool outputs before `[Client Tool Result ...]`:\n",
     );
     out.push_str(open_tag);
     out.push('\n');
@@ -2199,7 +2199,8 @@ fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
         for part in &mut msg.parts {
             if let CanonicalPart::ToolResult { output, .. } = part {
                 let cleaned = strip_billing_noise(output);
-                result_lens.push(cleaned.trim().len());
+                let scrubbed = scrub_terminal_control_noise(cleaned.trim());
+                result_lens.push(scrubbed.trim().len());
                 output.clear();
             }
         }
@@ -2221,14 +2222,20 @@ fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                 for part in &mut msg.parts {
                     if let CanonicalPart::ToolResult { output, .. } = part {
                         let cleaned = strip_billing_noise(output);
-                        let trimmed = cleaned.trim();
+                        let raw_trimmed = cleaned.trim();
+                        let scrubbed = scrub_terminal_control_noise(raw_trimmed);
+                        let trimmed = scrubbed.trim();
                         if trimmed.len() > cap {
-                            *output = truncate_head_tail_lines_with_spill(
+                            *output = truncate_head_tail_lines_from_source(
                                 trimmed,
+                                raw_trimmed,
+                                None,
                                 cap,
                                 "tool output",
                                 spill,
                             );
+                        } else if matches!(scrubbed, std::borrow::Cow::Owned(_)) {
+                            *output = trimmed.to_owned();
                         }
                     }
                 }
@@ -2343,7 +2350,8 @@ fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                     call_id, output, ..
                 } => {
                     let cleaned = strip_billing_noise(output);
-                    variable_lens.push(cleaned.trim().len());
+                    let scrubbed = scrub_terminal_control_noise(cleaned.trim());
+                    variable_lens.push(scrubbed.trim().len());
                     fixed_overhead = fixed_overhead.saturating_add(call_id.len() + 80);
                 }
                 CanonicalPart::ToolCall {
@@ -2398,14 +2406,20 @@ fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                 }
                 CanonicalPart::ToolResult { output, .. } => {
                     let cleaned = strip_billing_noise(output);
-                    let trimmed = cleaned.trim();
+                    let raw_trimmed = cleaned.trim();
+                    let scrubbed = scrub_terminal_control_noise(raw_trimmed);
+                    let trimmed = scrubbed.trim();
                     if trimmed.len() > universal_cap {
-                        *output = truncate_head_tail_lines_with_spill(
+                        *output = truncate_head_tail_lines_from_source(
                             trimmed,
+                            raw_trimmed,
+                            None,
                             universal_cap,
                             "tool output",
                             spill,
                         );
+                    } else if matches!(scrubbed, std::borrow::Cow::Owned(_)) {
+                        *output = trimmed.to_owned();
                     }
                 }
                 CanonicalPart::ToolCall {
@@ -2878,35 +2892,291 @@ pub fn truncate_head_tail_lines_with_spill<S: TruncationSpillSink>(
     truncate_head_tail_lines_from_source(input, input, None, max_bytes, kind_label, spill)
 }
 
-fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
-    input: &str,
-    full_source_for_spill: &str,
-    pre_spilled_path: Option<&str>,
-    max_bytes: usize,
-    kind_label: &str,
-    spill: &mut S,
-) -> String {
-    if input.len() <= max_bytes {
-        return input.to_owned();
-    }
-    let spilled_path = pre_spilled_path
-        .map(str::to_owned)
-        .or_else(|| spill.spill_truncated_content(kind_label, full_source_for_spill));
-
-    let path_extra = spilled_path.as_deref().map_or(0, |p| p.len() * 2 + 160);
-    let marker_reserve = 380usize.saturating_add(path_extra);
-    if max_bytes <= marker_reserve.saturating_add(64) {
-        return truncate_middle_utf8_bytes_pre_spilled(
-            input,
-            max_bytes,
-            11,
-            20,
-            spilled_path.as_deref(),
-        );
+/// Strips terminal ANSI escape sequences (`CSI`, `OSC`, `DCS`, 2-byte `ESC`), backspace
+/// overstrikes, and line-local carriage-return (`\r`) progress-bar overwrites while preserving
+/// `\r\n` / `\r\r\n` line endings and UTF-8 integrity. Returns `Cow::Borrowed` with zero
+/// allocation when no terminal control noise is present.
+#[must_use]
+pub fn scrub_terminal_control_noise(input: &str) -> std::borrow::Cow<'_, str> {
+    if !has_terminal_control_noise(input) {
+        return std::borrow::Cow::Borrowed(input);
     }
 
+    let mut out = String::with_capacity(input.len());
+    let mut line_start = 0usize;
+    let mut pending_cr = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek().copied() {
+                Some('[') => {
+                    let _ = chars.next();
+                    let mut csi_param = String::new();
+                    while let Some(&b) = chars.peek() {
+                        if ('\x20'..='\x3f').contains(&b) {
+                            if csi_param.len() < 8 {
+                                csi_param.push(b);
+                            }
+                            let _ = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(&final_ch) = chars.peek()
+                        && ('\x40'..='\x7e').contains(&final_ch)
+                    {
+                        let _ = chars.next();
+                        if final_ch == 'K'
+                            && (csi_param == "2"
+                                || (pending_cr && (csi_param.is_empty() || csi_param == "0")))
+                        {
+                            out.truncate(line_start);
+                            pending_cr = false;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let _ = chars.next();
+                    while let Some(osc_ch) = chars.next() {
+                        if osc_ch == '\x07' {
+                            break;
+                        }
+                        if osc_ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some('P' | 'X' | '^' | '_') => {
+                    let _ = chars.next();
+                    while let Some(st_ch) = chars.next() {
+                        if st_ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some('(' | ')') => {
+                    let _ = chars.next();
+                    let _ = chars.next();
+                }
+                Some(esc_next) if ('\x40'..='\x5f').contains(&esc_next) => {
+                    let _ = chars.next();
+                }
+                _ => {}
+            },
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                    pending_cr = false;
+                    out.push('\n');
+                    line_start = out.len();
+                } else {
+                    pending_cr = true;
+                }
+            }
+            '\n' => {
+                pending_cr = false;
+                out.push('\n');
+                line_start = out.len();
+            }
+            '\x08' => {
+                if !pending_cr && out.len() > line_start {
+                    let _ = out.pop();
+                }
+            }
+            other => {
+                if pending_cr {
+                    out.truncate(line_start);
+                    pending_cr = false;
+                }
+                out.push(other);
+            }
+        }
+    }
+
+    std::borrow::Cow::Owned(out)
+}
+
+fn has_terminal_control_noise(input: &str) -> bool {
+    let mut iter = input.as_bytes().iter().copied().peekable();
+    while let Some(b) = iter.next() {
+        if b == 0x1b || b == 0x08 {
+            return true;
+        }
+        if b == b'\r' && iter.peek().copied() != Some(b'\n') {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    let n_bytes = needle_lower.as_bytes();
+    if n_bytes.is_empty() {
+        return true;
+    }
+    let h_bytes = haystack.as_bytes();
+    if h_bytes.len() < n_bytes.len() {
+        return false;
+    }
+    h_bytes
+        .windows(n_bytes.len())
+        .any(|win| win.eq_ignore_ascii_case(n_bytes))
+}
+
+fn is_diagnostic_noise_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if contains_ascii_case_insensitive(trimmed, "[error] to see the full stack trace")
+        || contains_ascii_case_insensitive(trimmed, "[error] re-run maven")
+        || contains_ascii_case_insensitive(trimmed, "[error] for more information")
+        || contains_ascii_case_insensitive(trimmed, "-> [help 1]")
+    {
+        return true;
+    }
+    let is_json_info = trimmed.starts_with('{')
+        && (contains_ascii_case_insensitive(trimmed, "\"level\":10")
+            || contains_ascii_case_insensitive(trimmed, "\"level\":20")
+            || contains_ascii_case_insensitive(trimmed, "\"level\":30")
+            || contains_ascii_case_insensitive(trimmed, "\"level\":\"info\"")
+            || contains_ascii_case_insensitive(trimmed, "\"level\":\"debug\"")
+            || contains_ascii_case_insensitive(trimmed, "\"level\":\"trace\""));
+    if is_json_info {
+        return !contains_ascii_case_insensitive(trimmed, "error")
+            && !contains_ascii_case_insensitive(trimmed, "exception")
+            && !contains_ascii_case_insensitive(trimmed, "fatal");
+    }
+    false
+}
+
+fn classify_diagnostic_context_lines(line: &str) -> Option<usize> {
+    if is_diagnostic_noise_line(line) {
+        return None;
+    }
+    let trimmed = line.trim();
+    const ROOT_CAUSE_MARKERS: &[&str] = &[
+        "caused by:",
+        "panicked at",
+        "application failed to start",
+        "compilation error",
+        "traceback (most recent call last)",
+        "failures:",
+        "failed tests",
+    ];
+    if ROOT_CAUSE_MARKERS
+        .iter()
+        .any(|m| contains_ascii_case_insensitive(trimmed, m))
+    {
+        return Some(5);
+    }
+
+    const ERROR_MARKERS: &[&str] = &[
+        "error:",
+        "error[",
+        "fatal:",
+        "fatal error:",
+        "npm err!",
+        "--- fail:",
+        "[  failed  ]",
+        "build failed",
+        "compilation failed",
+        "undefined reference to",
+        "assertion failed",
+        "assertionerror",
+        "syntaxerror:",
+        "typeerror:",
+        "referenceerror:",
+    ];
+    if ERROR_MARKERS
+        .iter()
+        .any(|m| contains_ascii_case_insensitive(trimmed, m))
+    {
+        return Some(3);
+    }
+    if (contains_ascii_case_insensitive(trimmed, "test ")
+        && trimmed
+            .get(trimmed.len().saturating_sub(10)..)
+            .is_some_and(|tail| contains_ascii_case_insensitive(tail, "... failed")))
+        || trimmed
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("failed "))
+    {
+        return Some(3);
+    }
+    None
+}
+
+/// Scans an omitted middle slice of a tool output for compiler/test/runtime failure root causes,
+/// returning a bounded line-numbered excerpt when high-signal diagnostics would otherwise be lost.
+fn extract_omitted_diagnostic_excerpt(
+    omitted_slice: &str,
+    first_omitted_line: usize,
+    max_excerpt_bytes: usize,
+) -> Option<String> {
+    if max_excerpt_bytes < 160 {
+        return None;
+    }
+    let lines: Vec<&str> = omitted_slice.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut keep = vec![false; lines.len()];
+    let mut matched_any = false;
+    for (idx, &line) in lines.iter().enumerate() {
+        if let Some(after) = classify_diagnostic_context_lines(line) {
+            matched_any = true;
+            let from = idx.saturating_sub(1);
+            let to = (idx + after).min(lines.len().saturating_sub(1));
+            for slot in keep.get_mut(from..=to).into_iter().flatten() {
+                *slot = true;
+            }
+        }
+    }
+    if !matched_any {
+        return None;
+    }
+
+    let mut out = String::with_capacity(max_excerpt_bytes.min(1_024));
+    let mut prev_idx: Option<usize> = None;
+    for (idx, (&is_kept, &raw_line)) in keep.iter().zip(lines.iter()).enumerate() {
+        if !is_kept || is_diagnostic_noise_line(raw_line) {
+            continue;
+        }
+        if let Some(prev) = prev_idx
+            && idx > prev + 1
+        {
+            let gap = "  ...\n";
+            if out.len() + gap.len() > max_excerpt_bytes {
+                break;
+            }
+            out.push_str(gap);
+        }
+        let line_no = first_omitted_line + idx;
+        let trimmed = raw_line.trim_end();
+        let clamped = if trimmed.len() > 260 {
+            let cut = floor_utf8_boundary(trimmed, 257);
+            format!("{}...", trimmed.get(..cut).unwrap_or(""))
+        } else {
+            trimmed.to_owned()
+        };
+        let formatted = format!("  L{line_no}: {clamped}\n");
+        if out.len() + formatted.len() > max_excerpt_bytes {
+            break;
+        }
+        out.push_str(&formatted);
+        prev_idx = Some(idx);
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn slice_head_tail_on_lines(input: &str, usable: usize) -> (&str, &str, &str) {
     let total_bytes = input.len();
-    let usable = max_bytes.saturating_sub(marker_reserve);
     let head_budget = usable.saturating_mul(11) / 20;
     let tail_budget = usable.saturating_sub(head_budget);
 
@@ -2938,9 +3208,73 @@ fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
         .trim_start_matches(['\r', '\n']);
     let omitted_end = total_bytes.saturating_sub(tail.len()).max(head.len());
     let omitted_slice = input.get(head.len()..omitted_end).unwrap_or("");
+    (head, omitted_slice, tail)
+}
+
+fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
+    input: &str,
+    full_source_for_spill: &str,
+    pre_spilled_path: Option<&str>,
+    max_bytes: usize,
+    kind_label: &str,
+    spill: &mut S,
+) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    let spilled_path = pre_spilled_path
+        .map(str::to_owned)
+        .or_else(|| spill.spill_truncated_content(kind_label, full_source_for_spill));
+
+    let path_extra = spilled_path.as_deref().map_or(0, |p| p.len() * 2 + 160);
+    let marker_reserve = 380usize.saturating_add(path_extra);
+    if max_bytes <= marker_reserve.saturating_add(64) {
+        return truncate_middle_utf8_bytes_pre_spilled(
+            input,
+            max_bytes,
+            11,
+            20,
+            spilled_path.as_deref(),
+        );
+    }
+
+    let total_bytes = input.len();
+    let usable = max_bytes.saturating_sub(marker_reserve);
+    let (mut head, mut omitted_slice, mut tail) = slice_head_tail_on_lines(input, usable);
+
+    // For oversized tool outputs, rescue buried compiler/test failure lines from the omitted
+    // middle so the model sees root-cause diagnostics inline without an extra file-read turn.
+    let mut diag_excerpt: Option<String> = None;
+    if matches!(kind_label, "tool output" | "archival tool output")
+        && usable >= 2_400
+        && omitted_slice.contains('\n')
+    {
+        let probe_first_line = if head.is_empty() {
+            1
+        } else {
+            head.bytes().filter(|&b| b == b'\n').count() + 2
+        };
+        let diag_cap = (usable / 5).min(4_096);
+        if extract_omitted_diagnostic_excerpt(omitted_slice, probe_first_line, diag_cap).is_some() {
+            let shrunk_usable = usable.saturating_sub(diag_cap.saturating_add(96));
+            let (h2, om2, t2) = slice_head_tail_on_lines(input, shrunk_usable);
+            let first_line_2 = if h2.is_empty() {
+                1
+            } else {
+                h2.bytes().filter(|&b| b == b'\n').count() + 2
+            };
+            if let Some(excerpt) = extract_omitted_diagnostic_excerpt(om2, first_line_2, diag_cap) {
+                head = h2;
+                omitted_slice = om2;
+                tail = t2;
+                diag_excerpt = Some(excerpt);
+            }
+        }
+    }
+
     let omitted_bytes = omitted_slice.len();
 
-    let notice = if omitted_slice.contains('\n') {
+    let mut notice = if omitted_slice.contains('\n') {
         let total_lines = count_logical_lines(input);
         let head_lines = if head.is_empty() {
             0
@@ -2969,6 +3303,11 @@ fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
             "\n... [Gateway truncated {kind_label}: {total_bytes} bytes total; omitted middle {omitted_bytes} bytes to fit single-turn limit. Beginning and end are preserved intact.] ...\n"
         )
     };
+    if let Some(excerpt) = diag_excerpt {
+        notice.push_str("[Diagnostics extracted from omitted middle:]\n");
+        notice.push_str(&excerpt);
+        notice.push_str("[End extracted diagnostics]\n");
+    }
 
     let mut out = String::with_capacity(head.len() + notice.len() + tail.len());
     out.push_str(head);
@@ -3170,15 +3509,18 @@ fn render_parts_into<S: TruncationSpillSink>(
                     text_acc.push('\n');
                 }
                 let cleaned_output = strip_billing_noise(output);
-                let trimmed_output = cleaned_output.trim();
+                let raw_trimmed = cleaned_output.trim();
+                let scrubbed = scrub_terminal_control_noise(raw_trimmed);
+                let trimmed_output = scrubbed.trim();
                 let rendered_output = if trimmed_output.len() > limits.max_tool_result_bytes {
-                    truncate_middle_utf8_bytes_with_spill(
+                    let spilled =
+                        spill.spill_truncated_content("archival tool output", raw_trimmed);
+                    truncate_middle_utf8_bytes_pre_spilled(
                         trimmed_output,
                         limits.max_tool_result_bytes,
                         13,
                         20,
-                        "archival tool output",
-                        spill,
+                        spilled.as_deref(),
                     )
                 } else {
                     trimmed_output.to_owned()
@@ -4156,5 +4498,102 @@ mod tests {
             .expect("expected spilled client tools catalog json");
         assert!(catalog_entry.1.contains(&"detail ".repeat(200)));
         assert!(catalog_entry.1.contains(&"column docs ".repeat(40)));
+    }
+
+    #[test]
+    fn scrub_terminal_control_noise_handles_ansi_progress_bars_and_conpty_crlf() {
+        let clean = "line one\r\nline two\nplain utf8 中文 🚀";
+        assert!(matches!(
+            scrub_terminal_control_noise(clean),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let noisy = "\x1b[32mDownloading\x1b[0m 10%...\r\x1b[2KDownloading 65%...\r\x1b[32mFinished\x1b[0m in 1.2s\r\r\n\x1b]0;term-title\x07ab\x08c trailing\r";
+        let scrubbed = scrub_terminal_control_noise(noisy);
+        assert_eq!(scrubbed, "Finished in 1.2s\nac trailing");
+    }
+
+    #[test]
+    fn truncated_tool_output_rescues_buried_root_cause_diagnostics_and_spills_raw_original() {
+        let mut sink = MemorySpillSink::new("/tmp/liftgate-spills");
+        let mut lines = Vec::new();
+        for idx in 1..=300 {
+            lines.push(format!(
+                "{{\"level\":30,\"msg\":\"info startup trace line {idx} padding {}\"}}",
+                "a".repeat(60)
+            ));
+        }
+        lines.push("error[E0308]: mismatched types in crates/app/src/lib.rs:42:9".to_owned());
+        lines.push("  expected `Result<Config, AppError>`, found `Option<Config>`".to_owned());
+        lines.push("Caused by: invalid downstream schema binding".to_owned());
+        for idx in 304..=620 {
+            lines.push(format!(
+                "compiling unrelated downstream crate step {idx} {}",
+                "b".repeat(60)
+            ));
+        }
+        let raw_log = format!("\x1b[31m{}\x1b[0m", lines.join("\n"));
+
+        let msg = CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::ToolResult {
+                call_id: "call_build".to_owned(),
+                output: raw_log.clone(),
+                is_error: true,
+            }],
+        };
+        let blocks = render_smart_bounded_active_slice(
+            std::slice::from_ref(&msg),
+            "1122",
+            12_000,
+            &mut sink,
+        );
+        let rendered = match blocks.first() {
+            Some(AcpPromptBlock::Text { text }) => text,
+            _ => panic!("expected text block"),
+        };
+        assert!(rendered.len() <= 12_000);
+        assert!(!rendered.contains("\x1b[31m"));
+        let (_, after_diag_open) = rendered
+            .split_once("[Diagnostics extracted from omitted middle:]\n")
+            .expect("expected extracted diagnostics header");
+        let (diag_section, _) = after_diag_open
+            .split_once("[End extracted diagnostics]")
+            .expect("expected extracted diagnostics footer");
+        assert!(diag_section.contains("error[E0308]: mismatched types"));
+        assert!(diag_section.contains("Caused by: invalid downstream schema binding"));
+        assert!(!diag_section.contains("\"level\":30"));
+
+        let expected_spill = format!(
+            "/tmp/liftgate-spills/{}",
+            format_content_addressed_spill_filename("tool output", raw_log.trim())
+        );
+        assert_eq!(
+            sink.files().get(&expected_spill).map(String::as_str),
+            Some(raw_log.trim()),
+            "spill store must retain 100% raw un-scrubbed ANSI content"
+        );
+    }
+
+    #[test]
+    fn bridge_rules_forbid_host_plugin_mcp_tools_and_guide_parallel_batching() {
+        let tool = CanonicalToolSpec {
+            name: "Read".to_owned(),
+            description: Some("Read file".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json:
+                    "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}}}"
+                        .to_owned(),
+            },
+        };
+        let append = build_session_system_append(
+            None,
+            std::slice::from_ref(&tool),
+            WebToolBridgeConfig::default(),
+            "abcd",
+        );
+        assert!(append.contains("call_mcp_tool"));
+        assert!(append.contains("mcp_*"));
+        assert!(append.contains("Batch independent read-only searches"));
     }
 }

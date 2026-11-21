@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use liftgate_types::{
@@ -116,6 +119,8 @@ pub struct GatewayRuntimeConfig {
     pub acp_mode: AcpModeId,
     pub api_key: Option<Arc<str>>,
     pub limits: GatewayLimits,
+    /// Live runtime toggle for `>=150k`-token ephemeral vision sub-session offload (`true` by default).
+    pub vision_offload: Arc<AtomicBool>,
 }
 
 /// Prepares an ACP session (reusing a matching multi-turn session when available, or creating
@@ -404,15 +409,20 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     let (events_tx, events_rx) = mpsc::channel::<TurnEvent>(cap);
 
     let worker_resp_id = response_id.clone();
+    let acp_mode = cfg.acp_mode.clone();
+    let vision_offload_enabled = cfg.vision_offload.load(Ordering::Relaxed);
     let worker = tokio::spawn(run_turn_pipeline(
         backend,
         lease,
+        session_reused,
+        vision_offload_enabled,
         task_guard,
         prompt_blocks,
         base_messages,
         req,
         web_cfg,
         active_model,
+        acp_mode,
         retire_after_turn,
         worker_resp_id,
         deadline,
@@ -430,6 +440,304 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         _cancel_guard: cancel_guard,
         _worker: worker,
     })
+}
+
+/// Context occupancy threshold (`150,000` tokens) at and above which sending raw multimodal
+/// `Image` blocks into a warm ACP session invalidates upstream prompt caches and triggers a
+/// 3–7x TTFT cliff (`40–97s/turn`). Warm sessions at or above this threshold inspect incoming
+/// images in a zero-history ephemeral ACP sub-session and forward a structured text-only report.
+pub const LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS: u64 = 150_000;
+
+const VISION_SUBSESSION_SYSTEM_APPEND: &str = "<vision_subagent_rules>\n\
+You are an isolated visual inspection sub-session assisting an active coding session.\n\
+- NEVER invoke any tools (`read_file`, `write_file`, `edit_file`, `run_command`, `search_web`, `call_mcp_tool`, `mcp_*`) and NEVER emit XML tool blocks.\n\
+- Inspect every attached image thoroughly against the caller context excerpt and respond in concise, exhaustive plain text covering: (1) exact visible text, numbers, labels, and error messages (verbatim OCR); (2) UI layout, component states, colors, alignment, or visual defects; (3) any file paths, stack traces, selectors, or structural relationships shown.\n\
+</vision_subagent_rules>\n";
+
+struct EphemeralVisionSessionGuard<B: AcpBackend> {
+    session_id: liftgate_types::config::SessionId,
+    backend: Arc<B>,
+    armed: bool,
+}
+
+impl<B: AcpBackend> EphemeralVisionSessionGuard<B> {
+    async fn close_gracefully(mut self) {
+        self.armed = false;
+        let _ = self.backend.close_session(&self.session_id).await;
+    }
+}
+
+impl<B: AcpBackend> Drop for EphemeralVisionSessionGuard<B> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.backend.abort_session_nonblocking(&self.session_id);
+        }
+    }
+}
+
+enum VisionOffloadOutcome {
+    Replaced {
+        text_blocks: Vec<AcpPromptBlock>,
+        usage: AcpUsage,
+        image_count: usize,
+    },
+    FallbackOriginal,
+    RateLimited(AcpError),
+    Cancelled,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper borrows existing turn state without extra heap wrapper"
+)]
+async fn offload_images_via_ephemeral_session<B: AcpBackend>(
+    backend: &Arc<B>,
+    prompt_blocks: &[AcpPromptBlock],
+    active_model: &ModelId,
+    acp_mode: &AcpModeId,
+    deadline: Instant,
+    channel_cap: usize,
+    spill_store: &mut Option<SpillStore>,
+    cancel: &CancellationToken,
+) -> VisionOffloadOutcome {
+    let mut image_blocks = Vec::new();
+    let mut context_text = String::new();
+    for block in prompt_blocks {
+        match block {
+            AcpPromptBlock::Image { data, mime_type } => {
+                image_blocks.push((mime_type.clone(), data.clone()));
+            }
+            AcpPromptBlock::Text { text } => {
+                if !text.trim().is_empty() {
+                    if !context_text.is_empty() && !context_text.ends_with('\n') {
+                        context_text.push('\n');
+                    }
+                    context_text.push_str(text.trim());
+                }
+            }
+        }
+    }
+    let image_count = image_blocks.len();
+    if image_count == 0 {
+        return VisionOffloadOutcome::FallbackOriginal;
+    }
+
+    let created = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return VisionOffloadOutcome::Cancelled,
+        res = timeout_at(deadline, backend.create_session(VISION_SUBSESSION_SYSTEM_APPEND)) => {
+            match res {
+                Ok(Ok(c)) => c,
+                Ok(Err(err)) => {
+                    let upgraded = upgrade_acp_error(err, active_model);
+                    if matches!(upgraded, AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. }) {
+                        return VisionOffloadOutcome::RateLimited(upgraded);
+                    }
+                    tracing::warn!(error = ?upgraded, "ephemeral vision sub-session creation failed; falling back to inline image prompt");
+                    return VisionOffloadOutcome::FallbackOriginal;
+                }
+                Err(_) => return VisionOffloadOutcome::FallbackOriginal,
+            }
+        }
+    };
+
+    let guard = EphemeralVisionSessionGuard {
+        session_id: created.session_id.clone(),
+        backend: Arc::clone(backend),
+        armed: true,
+    };
+
+    let setup_ok = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return VisionOffloadOutcome::Cancelled,
+        res = async {
+            timeout_at(deadline, backend.set_session_model(&created.session_id, active_model)).await.ok()?.ok()?;
+            timeout_at(deadline, backend.set_session_mode(&created.session_id, acp_mode)).await.ok()?.ok()
+        } => res.is_some(),
+    };
+    if !setup_ok {
+        return VisionOffloadOutcome::FallbackOriginal;
+    }
+
+    let bounded_excerpt = liftgate_types::session_key::truncate_head_tail_lines(
+        &context_text,
+        4_096,
+        "caller context excerpt",
+    );
+    let mut vision_prompt = Vec::with_capacity(image_count + 1);
+    vision_prompt.push(AcpPromptBlock::Text {
+        text: format!(
+            "<caller_turn_context_excerpt>\n{bounded_excerpt}\n</caller_turn_context_excerpt>\n\
+             Inspect the {image_count} attached image(s) in detail and provide a complete plain-text visual inspection report:"
+        ),
+    });
+    for (mime_type, data) in image_blocks {
+        vision_prompt.push(AcpPromptBlock::Image { data, mime_type });
+    }
+
+    let (v_tx, mut v_rx) = mpsc::channel::<SessionUpdatePayload>(channel_cap);
+    let prompt_backend = Arc::clone(backend);
+    let vision_sid = created.session_id.clone();
+    let mut prompt_fut = std::pin::pin!(async move {
+        timeout_at(
+            deadline,
+            prompt_backend.start_prompt(&vision_sid, &vision_prompt, v_tx),
+        )
+        .await
+    });
+
+    let mut banner_filter = AcpBannerFilter::new();
+    let mut filter_chunk = String::new();
+    let mut report_text = String::new();
+    let mut prompt_done: Option<Result<PromptTurnResult, AcpError>> = None;
+    let mut fatal_sig: Option<(UpstreamBannerSignal, String)> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return VisionOffloadOutcome::Cancelled,
+            maybe_upd = v_rx.recv() => {
+                match maybe_upd {
+                    Some(SessionUpdatePayload::AgentMessageChunk { content }) => {
+                        filter_chunk.clear();
+                        banner_filter.feed(&content.text, &mut filter_chunk);
+                        report_text.push_str(&filter_chunk);
+                        if let Some(sig_pair) = banner_filter.take_signal() {
+                            fatal_sig = Some(sig_pair);
+                            break;
+                        }
+                    }
+                    Some(SessionUpdatePayload::Error { message, error }) => {
+                        let detail = format_update_error_detail(&message, error.as_deref());
+                        if !detail.is_empty() {
+                            let sig = classify_upstream_error_text(&detail)
+                                .unwrap_or(UpstreamBannerSignal::FatalAgentError);
+                            fatal_sig = Some((sig, detail));
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if prompt_done.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            res = &mut prompt_fut, if prompt_done.is_none() => {
+                prompt_done = Some(match res {
+                    Ok(inner) => inner,
+                    Err(_) => Err(AcpError::Cancelled),
+                });
+            }
+        }
+    }
+
+    if fatal_sig.is_none() {
+        while let Ok(upd) = v_rx.try_recv() {
+            if let SessionUpdatePayload::AgentMessageChunk { content } = upd {
+                filter_chunk.clear();
+                banner_filter.feed(&content.text, &mut filter_chunk);
+                report_text.push_str(&filter_chunk);
+            }
+        }
+        filter_chunk.clear();
+        banner_filter.finish(&mut filter_chunk);
+        report_text.push_str(&filter_chunk);
+        if fatal_sig.is_none() {
+            fatal_sig = banner_filter.take_signal();
+        }
+    }
+
+    if let Some((
+        sig @ (UpstreamBannerSignal::RateLimited | UpstreamBannerSignal::QuotaExhausted),
+        detail,
+    )) = fatal_sig
+    {
+        return VisionOffloadOutcome::RateLimited(signal_to_acp_error(sig, active_model, detail));
+    }
+
+    let turn_res = match prompt_done {
+        Some(Ok(r)) => r,
+        Some(Err(err)) => {
+            let upgraded = upgrade_acp_error(err, active_model);
+            if matches!(
+                upgraded,
+                AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. }
+            ) {
+                return VisionOffloadOutcome::RateLimited(upgraded);
+            }
+            tracing::warn!(error = ?upgraded, "ephemeral vision sub-session prompt failed; falling back to inline image prompt");
+            return VisionOffloadOutcome::FallbackOriginal;
+        }
+        None => return VisionOffloadOutcome::FallbackOriginal,
+    };
+
+    let trimmed_report = report_text.trim();
+    if trimmed_report.is_empty() {
+        return VisionOffloadOutcome::FallbackOriginal;
+    }
+
+    guard.close_gracefully().await;
+
+    let bounded_report = if trimmed_report.len() > 24_000 {
+        truncate_head_tail_lines_with_spill(
+            trimmed_report,
+            24_000,
+            "ephemeral vision inspection",
+            spill_store,
+        )
+    } else {
+        trimmed_report.to_owned()
+    };
+
+    let mut merged = String::with_capacity(context_text.len() + bounded_report.len() + 256);
+    let mut img_idx = 0usize;
+    for block in prompt_blocks {
+        match block {
+            AcpPromptBlock::Text { text } => {
+                if !merged.is_empty() && !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push_str(text);
+            }
+            AcpPromptBlock::Image { mime_type, .. } => {
+                img_idx += 1;
+                if !merged.is_empty() && !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push_str(&format!(
+                    "[Attached Image #{img_idx} ({mime_type}) — inspected in isolated sub-session below to preserve >150k session prompt cache]\n"
+                ));
+            }
+        }
+    }
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&format!(
+        "<ephemeral_vision_inspection images=\"{image_count}\">\n{bounded_report}\n</ephemeral_vision_inspection>\n"
+    ));
+    if merged.len() > MAX_ACP_PROMPT_TEXT_BYTES {
+        merged = truncate_head_tail_lines_with_spill(
+            &merged,
+            MAX_ACP_PROMPT_TEXT_BYTES,
+            "vision-augmented prompt",
+            spill_store,
+        );
+    }
+
+    tracing::info!(
+        images = image_count,
+        report_bytes = bounded_report.len(),
+        "offloaded multimodal image inspection to ephemeral zero-history ACP session to preserve >=150k warm prompt cache"
+    );
+
+    VisionOffloadOutcome::Replaced {
+        text_blocks: vec![AcpPromptBlock::Text { text: merged }],
+        usage: turn_res.usage,
+        image_count,
+    }
 }
 
 const TRANSCRIPT_RUNAWAY_MARKERS: [&str; 8] = [
@@ -543,12 +851,15 @@ impl TurnStreamState {
 async fn run_turn_pipeline<B: AcpBackend>(
     backend: Arc<B>,
     initial_lease: SessionLeaseGuard<B>,
+    session_reused: bool,
+    vision_offload_enabled: bool,
     task_guard: ActiveTaskGuard,
     prompt_blocks: Vec<AcpPromptBlock>,
     mut full_messages: Vec<CanonicalMessage>,
     req: NormalizedTurnRequest,
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
+    acp_mode: AcpModeId,
     retire_after_turn: bool,
     response_id: String,
     deadline: Instant,
@@ -568,14 +879,56 @@ async fn run_turn_pipeline<B: AcpBackend>(
     let mut cumulative_usage = AcpUsage::default();
     let mut context_usage: AcpUsage;
     let mut final_stop_reason = "end_turn".to_owned();
-    let outbound_prompt_bytes: usize = prompt_blocks
+    let mut current_prompt_blocks = prompt_blocks;
+
+    if vision_offload_enabled
+        && session_reused
+        && initial_context_used >= LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS
+        && current_prompt_blocks
+            .iter()
+            .any(|b| matches!(b, AcpPromptBlock::Image { .. }))
+    {
+        match offload_images_via_ephemeral_session(
+            &backend,
+            &current_prompt_blocks,
+            &active_model,
+            &acp_mode,
+            deadline,
+            channel_cap,
+            &mut spill_store,
+            &cancel,
+        )
+        .await
+        {
+            VisionOffloadOutcome::Replaced {
+                text_blocks,
+                usage,
+                image_count,
+            } => {
+                accumulate_usage(&mut cumulative_usage, usage);
+                task_guard.record_vision_offload(image_count);
+                current_prompt_blocks = text_blocks;
+            }
+            VisionOffloadOutcome::FallbackOriginal => {}
+            VisionOffloadOutcome::RateLimited(err) => {
+                if let Some(old_lease) = lease.take() {
+                    old_lease.finish_ephemeral();
+                }
+                task_guard.fail(format_error_chain(&err));
+                let _ = events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+                return;
+            }
+            VisionOffloadOutcome::Cancelled => return,
+        }
+    }
+
+    let outbound_prompt_bytes: usize = current_prompt_blocks
         .iter()
         .map(|b| match b {
             AcpPromptBlock::Text { text } => text.len(),
             AcpPromptBlock::Image { .. } => 8_192,
         })
         .sum();
-    let mut current_prompt_blocks = prompt_blocks;
     let mut state = TurnStreamState::new(initial_context_used);
     let mut last_step_started_ms: u64;
     let mut last_suppressed_banners: Vec<String>;
@@ -1769,13 +2122,23 @@ fn normalize_emitted_tool_arguments(
         return arguments;
     }
 
-    if !is_raw_input
-        && matches!(
-            serde_json::from_str::<serde_json::Value>(&arguments),
-            Ok(serde_json::Value::Object(_))
-        )
-    {
-        return arguments;
+    if !is_raw_input {
+        let trimmed = arguments.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return "{}".to_owned();
+        }
+        if let Ok(serde_json::Value::Object(mut map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            if let Some(spec) = matched_spec
+                && let CanonicalToolKind::Function { parameters_json } = &spec.kind
+                && coerce_stringified_container_fields(&mut map, parameters_json)
+                && let Ok(reserialized) = serde_json::to_string(&serde_json::Value::Object(map))
+            {
+                return reserialized;
+            }
+            return arguments;
+        }
     }
 
     let fallback_key = matched_spec
@@ -1790,6 +2153,113 @@ fn normalize_emitted_tool_arguments(
     let mut map = serde_json::Map::with_capacity(1);
     map.insert(fallback_key, serde_json::Value::String(arguments));
     serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_owned())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectedJsonContainer {
+    Array,
+    Object,
+}
+
+fn schema_declares_container(prop_schema: &serde_json::Value) -> Option<ExpectedJsonContainer> {
+    if let Some(ty) = prop_schema.get("type") {
+        match ty {
+            serde_json::Value::String(s) => match s.as_str() {
+                "array" => return Some(ExpectedJsonContainer::Array),
+                "object" => return Some(ExpectedJsonContainer::Object),
+                _ => {}
+            },
+            serde_json::Value::Array(arr) => {
+                let has_string = arr.iter().any(|v| v.as_str() == Some("string"));
+                if !has_string {
+                    if arr.iter().any(|v| v.as_str() == Some("array")) {
+                        return Some(ExpectedJsonContainer::Array);
+                    }
+                    if arr.iter().any(|v| v.as_str() == Some("object")) {
+                        return Some(ExpectedJsonContainer::Object);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for union_key in ["anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(branches)) = prop_schema.get(union_key) {
+            let allows_string = branches
+                .iter()
+                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("string"));
+            if !allows_string {
+                for branch in branches {
+                    if let Some(kind) = schema_declares_container(branch) {
+                        return Some(kind);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Unwraps JSON-stringified `array` or `object` fields (e.g. `"edits": "[{\"path\":\"a.rs\"}]"`
+/// emitted by Gemini/Antigravity on nested tool calls) ONLY when the client tool's JSON Schema
+/// explicitly declares that property as an `array` or `object` (and not a `string`).
+fn coerce_stringified_container_fields(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    parameters_json: &str,
+) -> bool {
+    let has_candidate = map.values().any(|v| {
+        v.as_str().is_some_and(|s| {
+            let t = s.trim();
+            (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'))
+        })
+    });
+    if !has_candidate {
+        return false;
+    }
+
+    let Ok(schema) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
+        return false;
+    };
+    let Some(props) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+
+    let mut mutated = false;
+    for (prop_name, prop_schema) in props {
+        let Some(expected) = schema_declares_container(prop_schema) else {
+            continue;
+        };
+        let Some(slot) = map.get_mut(prop_name) else {
+            continue;
+        };
+        let Some(raw_str) = slot.as_str() else {
+            continue;
+        };
+        let trimmed = raw_str.trim();
+        match expected {
+            ExpectedJsonContainer::Array if trimmed.starts_with('[') && trimmed.ends_with(']') => {
+                if let Ok(parsed @ serde_json::Value::Array(_)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                {
+                    *slot = parsed;
+                    mutated = true;
+                }
+            }
+            ExpectedJsonContainer::Object if trimmed.starts_with('{') && trimmed.ends_with('}') => {
+                if let Ok(parsed @ serde_json::Value::Object(_)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                {
+                    *slot = parsed;
+                    mutated = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    mutated
 }
 
 fn single_required_string_param(parameters_json: &str) -> Option<String> {
@@ -2620,5 +3090,53 @@ mod tests {
         );
         assert!(f5.take_transient_retry());
         assert_eq!(f5.take_signal(), None);
+    }
+
+    #[test]
+    fn normalizes_null_args_and_coerces_stringified_array_and_object_fields_by_schema() {
+        use liftgate_types::canonical::CanonicalToolSpec;
+
+        let spec = CanonicalToolSpec {
+            name: "apply_edits".to_owned(),
+            description: Some("Batch edit files".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "edits": { "type": "array" },
+                        "options": { "type": ["object", "null"] },
+                        "literal_json_text": { "type": "string" }
+                    },
+                    "required": ["edits"]
+                })
+                .to_string(),
+            },
+        };
+
+        assert_eq!(
+            normalize_emitted_tool_arguments("null".to_owned(), false, false, Some(&spec)),
+            "{}"
+        );
+        assert_eq!(
+            normalize_emitted_tool_arguments(String::new(), false, false, Some(&spec)),
+            "{}"
+        );
+
+        let stringified = serde_json::json!({
+            "edits": "[{\"path\":\"src/lib.rs\",\"target\":\"old\",\"replacement\":\"new\"}]",
+            "options": "{\"dryRun\":true}",
+            "literal_json_text": "[1, 2, 3]"
+        })
+        .to_string();
+        let normalized = normalize_emitted_tool_arguments(stringified, false, false, Some(&spec));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&normalized).expect("must remain valid json object");
+        assert!(parsed["edits"].is_array());
+        assert_eq!(parsed["edits"][0]["path"], "src/lib.rs");
+        assert_eq!(parsed["options"]["dryRun"], true);
+        assert_eq!(
+            parsed["literal_json_text"], "[1, 2, 3]",
+            "string-typed schema properties must never be coerced into arrays"
+        );
     }
 }

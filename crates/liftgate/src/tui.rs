@@ -972,6 +972,7 @@ struct PolledData {
 
 enum TuiCommand {
     CloseSession(String),
+    ToggleVisionOffload,
     SwitchDefaultModel(String),
     SetTitleModel(String),
     StartOrRestartDaemon,
@@ -1199,6 +1200,33 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
+                TuiCommand::ToggleVisionOffload => {
+                    let daemon = worker_paths.read_daemon().ok().flatten();
+                    let addr = worker_listen
+                        .or_else(|| daemon.as_ref().map(|d| d.listen))
+                        .unwrap_or_else(|| ServeArgs::default().listen);
+                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
+                    let client = GatewayClient::new(addr, key);
+                    match client.set_vision_offload(None).await {
+                        Ok(enabled) => {
+                            if let Ok(mut settings) = worker_paths.read_settings() {
+                                settings.vision_offload = enabled;
+                                let _ = worker_paths.write_settings(&settings);
+                            }
+                            if let Some(mut d) = daemon
+                                && d.listen == addr
+                            {
+                                d.vision_offload = enabled;
+                                let _ = worker_paths.write_daemon(&d);
+                            }
+                            Ok(format!(
+                                "Vision offload (>=150k ephemeral sub-session): {}",
+                                if enabled { "ON" } else { "OFF" }
+                            ))
+                        }
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
+                }
                 TuiCommand::SwitchDefaultModel(model_id) => {
                     let restart_args = RestartArgs {
                         listen: worker_listen,
@@ -1375,6 +1403,9 @@ fn handle_top_key(
             app.set_toast("Stopping background gateway...", true);
             let _ = cmd_tx.try_send(TuiCommand::StopDaemon);
         }
+        KeyCode::Char('v') => {
+            let _ = cmd_tx.try_send(TuiCommand::ToggleVisionOffload);
+        }
         KeyCode::Char('o') => {
             let _ = cmd_tx.try_send(TuiCommand::OpenBrowser);
         }
@@ -1527,6 +1558,11 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .as_ref()
             .and_then(|t| t.acp_process.pid)
             .map_or_else(|| "—".to_owned(), |p| p.to_string());
+        let vision_on = app
+            .data
+            .telemetry
+            .as_ref()
+            .is_none_or(|t| t.vision_offload_enabled);
         spans.extend([
             Span::styled(
                 " ● ONLINE ",
@@ -1551,6 +1587,17 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 &app.data.default_model,
                 Style::default()
                     .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   vision ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if vision_on { "on" } else { "off" },
+                Style::default()
+                    .fg(if vision_on {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("   {pulse}"), Style::default().fg(Color::Cyan)),
@@ -1981,19 +2028,27 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     if let Some(&bottom_pane) = panes.get(1) {
         let detail_lines = if let Some(selected) = turns.get(app.turn_idx) {
             let sess_id = selected.session_id.as_deref().unwrap_or("ephemeral");
+            let vision_note = if selected.vision_offloaded_images > 0 {
+                format!(" · vision_offload={}", selected.vision_offloaded_images)
+            } else {
+                String::new()
+            };
             let tools_summary = if selected.client_tool_calls.is_empty() {
                 format!(
-                    "web_search={} · web_fetch={}",
+                    "web_search={} · web_fetch={}{vision_note}",
                     selected.native_web_searches, selected.native_web_fetches
                 )
             } else {
                 format!(
-                    "{} (web_search={} · web_fetch={})",
+                    "{} (web_search={} · web_fetch={}{vision_note})",
                     selected.client_tool_calls.join(", "),
                     selected.native_web_searches,
                     selected.native_web_fetches
                 )
             };
+            let ttft_label = selected
+                .ttft_ms
+                .map_or_else(|| "—".to_owned(), format_latency_ms);
             let preview = if let Some(err) = &selected.error_message {
                 Line::from(vec![
                     Span::styled(
@@ -2017,6 +2072,8 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Span::styled(&selected.task_id, Style::default().fg(Color::Cyan)),
                     Span::styled("   Session: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(sess_id, Style::default().fg(Color::Green)),
+                    Span::styled("   TTFT: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(ttft_label, Style::default().fg(Color::Cyan)),
                     Span::styled("   Stop: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         selected.stop_reason.as_deref().unwrap_or("in-progress"),
@@ -2077,14 +2134,30 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 SessionSlotState::Running => ("● LEASED", Color::Cyan),
                 SessionSlotState::Idle => ("✓ IDLE", Color::Green),
             };
+            let (kv_label, kv_color) = match s.cache_warmth {
+                liftgate_types::telemetry::PromptCacheWarmth::Active => ("● ACTIVE", Color::Cyan),
+                liftgate_types::telemetry::PromptCacheWarmth::Hot => ("★ HOT", Color::Green),
+                liftgate_types::telemetry::PromptCacheWarmth::Warm => ("◐ WARM", Color::Yellow),
+                liftgate_types::telemetry::PromptCacheWarmth::Cold
+                | liftgate_types::telemetry::PromptCacheWarmth::Unknown => {
+                    ("· COLD", Color::DarkGray)
+                }
+            };
+            let ctx_label = if s.last_context_tokens > 0 {
+                format_tokens(s.last_context_tokens)
+            } else {
+                "—".to_owned()
+            };
             Row::new(vec![
                 Cell::from(s.session_id.clone()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(st_label)
                     .style(Style::default().fg(st_color).add_modifier(Modifier::BOLD)),
+                Cell::from(kv_label)
+                    .style(Style::default().fg(kv_color).add_modifier(Modifier::BOLD)),
                 Cell::from(s.model_id.clone()),
+                Cell::from(ctx_label),
                 Cell::from(s.turn_count.to_string()),
                 Cell::from(s.message_count.to_string()),
-                Cell::from(format_relative_ms(s.created_at_unix_ms, now_ms)),
                 Cell::from(format_relative_ms(s.last_active_unix_ms, now_ms)),
             ])
         })
@@ -2098,12 +2171,13 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(26),
-            Constraint::Length(11),
-            Constraint::Percentage(26),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Percentage(24),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Percentage(24),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Length(12),
         ],
     )
@@ -2111,10 +2185,11 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         Row::new(vec![
             "SESSION ID",
             "STATE",
+            "KV CACHE",
             "MODEL",
+            "CTX",
             "TURNS",
             "MSGS",
-            "CREATED",
             "LAST ACTIVE",
         ])
         .style(
@@ -2469,6 +2544,15 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle `agy acp` stderr vs `gateway.log` (Logs tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  v                      ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle >=150k ephemeral vision sub-session offload"),
         ]),
         Line::from(vec![
             Span::styled(

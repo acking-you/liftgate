@@ -95,11 +95,13 @@ impl TelemetryHub {
             started_at_unix_ms: now_ms,
             finished_at_unix_ms: None,
             elapsed_ms: 0,
+            ttft_ms: None,
             thought_chars: 0,
             output_chars: 0,
             client_tool_calls: Vec::new(),
             native_web_searches: 0,
             native_web_fetches: 0,
+            vision_offloaded_images: 0,
             prompt_preview,
             output_preview: String::new(),
             stop_reason: None,
@@ -157,6 +159,15 @@ impl TelemetryHub {
     }
 }
 
+fn stamp_ttft_if_first(task: &mut TaskSnapshot, now_ms: u64) -> bool {
+    if task.ttft_ms.is_none() {
+        task.ttft_ms = Some(now_ms.saturating_sub(task.started_at_unix_ms));
+        true
+    } else {
+        false
+    }
+}
+
 /// RAII tracker for an in-flight gateway turn.
 pub struct ActiveTaskGuard {
     hub: Arc<TelemetryHub>,
@@ -180,17 +191,36 @@ impl ActiveTaskGuard {
         self.hub.notify_change();
     }
 
+    pub fn record_vision_offload(&self, image_count: usize) {
+        if image_count == 0 {
+            return;
+        }
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                task.vision_offloaded_images =
+                    task.vision_offloaded_images.saturating_add(image_count);
+            }
+        }
+        self.hub.notify_change();
+    }
+
     pub fn record_thought(&self, delta_chars: usize) {
+        let now_ms = unix_timestamp_ms();
         let should_notify = {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let first_ttft = stamp_ttft_if_first(task, now_ms);
                 let phase_changed = task.phase != TaskPhase::Thinking;
                 task.phase = TaskPhase::Thinking;
                 task.thought_chars = task.thought_chars.saturating_add(delta_chars);
-                phase_changed
+                phase_changed || first_ttft
             } else {
                 false
             }
@@ -201,12 +231,14 @@ impl ActiveTaskGuard {
     }
 
     pub fn record_web_search(&self) {
+        let now_ms = unix_timestamp_ms();
         {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let _ = stamp_ttft_if_first(task, now_ms);
                 task.phase = TaskPhase::SearchingWeb;
                 task.native_web_searches = task.native_web_searches.saturating_add(1);
             }
@@ -215,12 +247,14 @@ impl ActiveTaskGuard {
     }
 
     pub fn record_web_fetch(&self) {
+        let now_ms = unix_timestamp_ms();
         {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let _ = stamp_ttft_if_first(task, now_ms);
                 task.phase = TaskPhase::FetchingWeb;
                 task.native_web_fetches = task.native_web_fetches.saturating_add(1);
             }
@@ -229,17 +263,19 @@ impl ActiveTaskGuard {
     }
 
     pub fn record_text(&self, delta: &str) {
+        let now_ms = unix_timestamp_ms();
         let should_notify = {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let first_ttft = stamp_ttft_if_first(task, now_ms);
                 let phase_changed = task.phase != TaskPhase::StreamingText;
                 task.phase = TaskPhase::StreamingText;
                 task.output_chars = task.output_chars.saturating_add(delta.chars().count());
                 append_preview_bounded(&mut task.output_preview, delta, MAX_OUTPUT_PREVIEW_CHARS);
-                phase_changed
+                phase_changed || first_ttft
             } else {
                 false
             }
@@ -250,12 +286,14 @@ impl ActiveTaskGuard {
     }
 
     pub fn record_client_tool(&self, tool_name: &str) {
+        let now_ms = unix_timestamp_ms();
         {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let _ = stamp_ttft_if_first(task, now_ms);
                 task.phase = TaskPhase::CallingClientTool;
                 task.client_tool_calls.push(tool_name.to_owned());
             }

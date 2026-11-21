@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.4-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.4-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#许可证"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -25,7 +24,7 @@
 
 Liftgate 在本机把 Google Antigravity 接到标准 OpenAI Responses 与 Anthropic Messages API 后面。Codex CLI、Codex App、Claude Code、Claude Desktop 或你自己的 SDK 代码无需任何改动，每一轮对话都严格通过官方 `agy acp` 协议在本地转发与流式应答。
 
-既可以在终端使用 **`lg`** / **`liftgate`**（CLI 与全屏实时 TUI），也可以直接安装跨平台原生 GPUI 桌面应用 [**Liftgate Desktop**](#liftgate-desktop)（macOS / Windows / Linux）。
+在终端使用 **`lg`** / **`liftgate`**（CLI、全屏实时 TUI 与内嵌 Web 监控面板）即可一键完成安装、网关守护与零污染拉起智能体。
 
 ## 支持的客户端
 
@@ -42,8 +41,6 @@ Liftgate 在本机把 Google Antigravity 接到标准 OpenAI Responses 与 Anthr
 
 ## 安装与下载
 
-### CLI 命令行（`lg` + `liftgate` 一键安装）
-
 一条命令自动识别系统与 CPU 架构，从[最新 CLI Release](https://github.com/acking-you/liftgate/releases/latest) 下载预编译发行包（已内嵌 Web 监控面板）、校验 `SHA256SUMS`、原子安装 `lg` 与 `liftgate` 并写入 `PATH`：
 
 **macOS / Linux / FreeBSD**
@@ -58,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-支持环境变量自定义：`LIFTGATE_VERSION=v0.2.4` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
+支持环境变量自定义：`LIFTGATE_VERSION=v0.2.5` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
 
 <details>
 <summary>其它 CLI 安装方式（<code>cargo binstall</code>、手动下载、源码编译）</summary>
@@ -75,38 +72,9 @@ cargo install --path crates/liftgate --locked
 
 </details>
 
-### Liftgate Desktop
-
-**Liftgate Desktop**（`liftgate-desktop`）是基于 `gpui-kit` 构建的原生跨平台 GPUI 桌面控制中心——无 Electron/WebView 运行时开销，也无需单独安装外部 CLI（内置无头网关守护模式与内嵌 React Web 面板）。
-
-- **Warm Editorial 暖调亮/暗双色主题 + 中英双语界面**：首次启动默认自动跟随当前系统深浅色外观与系统语言，侧边栏支持一键实时切换。
-- **6 大工作区 100% 覆盖 CLI 全部能力**：
-  1. **概览（Overview）** — 一键启停与无损重启本地网关、修改监听端口与并发容量限制、实时查看健康与运行状态。
-  2. **遥测（Telemetry）** — SSE 实时请求流、Token 吞吐统计、预热 ACP 会话池检视与单会话一键驱逐。
-  3. **启动器（Launchers）** — 零副作用一键启动（或复制可复用独立命令）**Codex CLI**、**Claude Code**、**Codex App** 与 **Claude Desktop**，以及项目级/全局 `~/.codex` 与 `~/.claude` 配置同步。
-  4. **模型（Models）** — 实时检索账号可用 Antigravity 模型目录，一键热切换默认模型与会话标题模型。
-  5. **`agy` 与代理（`agy` & Proxy）** — 官方 `agy` SHA-512 下载安装与更新、Google 交互式登录、HTTP/SOCKS5 代理注入与连通性探测、后台空闲自动热更新开关。
-  6. **系统（System）** — 网关与 `agy` 实时日志流、环境全项自检（Doctor）、`lg` 命令别名与 Shell 补全安装、版本升级检测。
-
-**下载最新桌面端版本 — [Liftgate Desktop `v0.2.4`](https://github.com/acking-you/liftgate/releases/tag/v0.2.4-ui)**
-（[全部桌面端版本](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/release-manifest.json)）：
-
-| 平台 | 安装包（推荐） | 免安装便携包 |
-| --- | --- | --- |
-| **macOS（Apple Silicon · M1–M4）** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS（Intel · x86_64）** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows（x64）** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows（ARM64）** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux（x86_64 · glibc 2.35+）** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-x86_64.tar.gz) |
-
-> [!NOTE]
-> 当前 macOS 安装包采用 ad-hoc 签名；首次拖入 `/Applications` 打开若遇到 Gatekeeper 拦截，执行一次 `xattr -cr /Applications/Liftgate.app` 即可。也可通过源码安装：`cargo install --path crates/liftgate-desktop --locked`。
-
 ## 快速开始
 
-安装好 **`lg`**（与 `liftgate` 完全等价）后——或直接在 **Liftgate Desktop** 的 **`agy` 与代理** 与 **启动器** 页签中点击操作——即可完成 `agy` 安装、登录并零污染拉起智能体：
+安装好 **`lg`**（与 `liftgate` 完全等价）后，即可完成 `agy` 安装、登录并零污染拉起智能体：
 
 ```bash
 # 1. 首次准备官方 Antigravity CLI 并登录
@@ -132,7 +100,7 @@ lg top                   # 打开全屏实时终端仪表盘（实时请求、�
 lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
 lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板
 lg st                    # 查看健康状态、PID、会话池、Token 统计与进行中轮次
-lg cfg -g                # 无损合并 ~/.claude 与 ~/.codex 全局配置（--uninstall 卸载）
+lg cfg -g                # 无损合并 ~/.claude & ~/.codex 全局配置（--uninstall 卸载）
 lg upgrade               # 检查 GitHub Releases（--check）并自动校验升级 `lg` + `liftgate`
 lg down                  # 优雅停止后台网关服务
 ```
@@ -150,7 +118,6 @@ lg down                  # 优雅停止后台网关服务
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **拒绝静默降级与 Flash 快车道**：上游 `429` 限流立即返回，绝不暗中偷换模型；标题、摘要与 Auto Mode 分类走独立的 Flash 会话，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
 - **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
-- **原生 GPUI 独立桌面端**：跨平台 `liftgate-desktop` 桌面控制中心，采用 Warm Editorial 亮/暗双色主题与中英双语界面（[前往下载](#liftgate-desktop)）。
 
 ## 工作原理
 

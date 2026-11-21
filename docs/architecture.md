@@ -34,14 +34,23 @@ into the prompt as `<developer_instructions>` blocks rather than ACP's
 system-prompt extension, which avoids upstream `429`s on large harness prompts
 and keeps session hashes stable. Billing headers (`cch=...`) are stripped from prompts, while volatile
 reminders (timestamps, token budgets, context-window counters) are preserved for
-the model and normalized only during session hashing. Multimodal images inside
-both user turns and tool outputs (`view_image`, `Read`) become native ACP image
-blocks.
+the model and normalized only during session hashing. Tool outputs scrub ANSI
+escape sequences and carriage-return progress-bar overwrites on the wire while
+persisting raw unmodified bytes on spill, and schema-aware argument coercion
+unwraps JSON-stringified `array` / `object` tool fields and `null` envelopes.
+Multimodal images inside both user turns and tool outputs (`view_image`, `Read`)
+become native ACP image blocks on fresh or `<150k`-token sessions, and
+automatically offload to a zero-history ephemeral ACP sub-session on warm
+`>=150k`-token coding sessions so upstream prompt caches are never invalidated
+by mid-session screenshots.
 
 ### Inference-only sessions
 
 Each ACP session runs in its own `agy acp --process-per-session --include-default-customizations=false`
-process, inside an isolated empty directory and with `mcpServers: []`. `agy`
+process, inside an isolated empty directory, with `mcpServers: []`, non-interactive
+git/updater environment isolation (`GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`,
+`AGY_FAST_AUTO_UPDATE=off`, `NO_UPDATE_NOTIFIER=1`), and explicit bridge rules
+prohibiting internal host or plugin MCP tools (`call_mcp_tool`, `mcp_*`). `agy`
 therefore has nothing to edit or execute: it only reasons. Tool calls go back to the
 client, so Codex or Claude Code keeps running file edits and shell commands
 under its own permissions. Liftgate itself serves `web_search` and an
@@ -51,7 +60,9 @@ SSRF-safe `web_fetch` that refuses private, loopback and link-local addresses.
 
 HTTP clients resend the whole conversation every turn. Liftgate hashes the
 normalized message prefix and looks it up in `SessionPool`, a bounded LRU of
-warm ACP sessions (`--max-idle-sessions`, default 64). On a hit it sends only
+warm ACP sessions (`--max-idle-sessions`, default 64, with KV-cache warmth
+telemetry across `<60s` hot / `1–5m` warm / `>=5m` cold tiers and a 45-minute
+idle worker reaper). On a hit it sends only
 the new turn or tool results (plus an incremental `<client_tools_update>` if
 tools changed, or `session/set_model` if effort/model changed). Local `/compact`
 summarization turns match the warm coding session via a dialogue hash and retire
@@ -64,7 +75,9 @@ truncation boundary and zero synthetic replay turns. Whenever any payload
 client tool schemas, cold-history turns, or `web_fetch` page) requires
 truncation or omission, `SpillStore` atomically writes 100% of the lossless
 original content to a content-addressed file under `~/.liftgate/spills/`
-before applying water-filling Head+Tail line truncation (~55% head, ~45% tail)
+before applying water-filling Head+Tail line truncation (~55% head, ~45% tail,
+plus inline extraction of buried compiler/test failure diagnostics from omitted
+middle sections on tool outputs)
 and embeds the exact local file path and omitted line range in the notice,
 while leaving smaller sibling tool results untouched and keeping the canonical
 `SessionPool` prefix hash intact for subsequent warm turns.
@@ -121,8 +134,7 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | `crates/liftgate-server` | HTTP/SSE routes, ACP transport, `SessionPool`, process supervision, `web_fetch`, telemetry |
 | `crates/liftgate-core` | shared control-plane library: daemon lifecycle, embedded `web/dist` assets, HTTP/SSE client, `agy` & proxy manager, zero-side-effect CLI/GUI launchers, system terminal spawner, non-destructive `config` sync, and verified self-upgrade |
 | `crates/liftgate` | the `liftgate` / `lg` CLI and interactive `ratatui` TUI binaries |
-| `crates/liftgate-desktop` | standalone native GPUI desktop control center (`gpui-kit`) with Warm Editorial Light/Dark themes, `中文`/`EN` switch, 100% CLI capability parity, and built-in headless `serve` / `__desktop-watch` daemon modes |
 | `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release builds via `crates/liftgate-core/build.rs` |
 | `run-gateway.{sh,ps1,cmd}` | build and run the gateway |
 
-Dependencies point one way: `{liftgate, liftgate-desktop}` → `liftgate-core` → `liftgate-server` → `liftgate-types`.
+Dependencies point one way: `liftgate` → `liftgate-core` → `liftgate-server` → `liftgate-types`.

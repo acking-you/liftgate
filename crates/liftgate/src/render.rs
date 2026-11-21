@@ -163,6 +163,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 "version": report.agy_version,
                 "proxy": report.agy_proxy_display,
                 "auto_update_enabled": report.agy_auto_update_enabled,
+                "vision_offload_enabled": report.vision_offload_enabled,
                 "latest_known_version": report.telemetry.as_ref().and_then(|t| t.acp_process.latest_known_version.clone()),
                 "auto_update_note": report.telemetry.as_ref().and_then(|t| t.acp_process.auto_update_note.clone()),
             },
@@ -238,6 +239,14 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         ),
     );
     ui::kv(
+        "Vision Offload",
+        if report.vision_offload_enabled {
+            "enabled (>=150k ephemeral sub-session)"
+        } else {
+            "disabled"
+        },
+    );
+    ui::kv(
         "Context Policy",
         "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)",
     );
@@ -280,8 +289,25 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             snap.session_pool.max_idle_sessions,
             8,
         );
+        let mut hot_idle = 0usize;
+        let mut warm_idle = 0usize;
+        let mut cold_idle = 0usize;
+        for sess in &snap.session_pool.sessions {
+            match sess.cache_warmth {
+                liftgate_types::telemetry::PromptCacheWarmth::Hot => hot_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Warm => warm_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Cold => cold_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Active
+                | liftgate_types::telemetry::PromptCacheWarmth::Unknown => {}
+            }
+        }
+        let cache_breakdown = if snap.session_pool.idle_cached_sessions > 0 {
+            format!(" [kv: {hot_idle} hot, {warm_idle} warm, {cold_idle} cold]")
+        } else {
+            String::new()
+        };
         let pool_detail = format!(
-            "{pool_bar}  {} active · {}/{} idle  (reused {}, created {}, evicted {})",
+            "{pool_bar}  {} active · {}/{} idle{cache_breakdown}  (reused {}, created {}, evicted {})",
             snap.session_pool.active_leased_sessions,
             snap.session_pool.idle_cached_sessions,
             snap.session_pool.max_idle_sessions,

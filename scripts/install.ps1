@@ -66,7 +66,8 @@ Usage:
   $tag = ''
   if ($rawVersion) {
     if ($rawVersion -like '*-ui') {
-      throw "'$rawVersion' is a Liftgate Desktop GUI tag; omit '-ui' for the CLI or download desktop installers from $baseUrl/releases/tag/$rawVersion"
+      $suggested = $rawVersion.Substring(0, $rawVersion.Length - 3)
+      throw "'$rawVersion' is not a CLI release tag; omit '-ui' (e.g. '$suggested')"
     }
     $tag = if ($rawVersion -match '^[vV](.+)$') { "v$($Matches[1])" } else { "v$rawVersion" }
     if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
@@ -119,8 +120,8 @@ Usage:
       $cmd = Get-Command $cmdName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
       if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
         $candDir = Split-Path -Parent $cmd.Source
-        # Skip Inno Setup desktop installer directories so uninstalling Liftgate Desktop
-        # never removes standalone CLI binaries or vice versa.
+        # Skip Inno Setup installer directories so packaged uninstallation never
+        # removes standalone CLI binaries or vice versa.
         if (Test-Path -LiteralPath (Join-Path $candDir 'unins000.exe')) {
           continue
         }

@@ -8,9 +8,7 @@ client at it. Every address below assumes the default
 
 ## Before you start
 
-- **Liftgate (`lg` / `liftgate`)**, installed in one command (or as the
-  standalone **Liftgate Desktop** GPUI app from
-  [Desktop Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop)):
+- **Liftgate (`lg` / `liftgate`)**, installed in one command:
   ```bash
   # macOS / Linux / FreeBSD
   curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh
@@ -394,6 +392,7 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
 | `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
+| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true` (or `vision_offload` in `~/.liftgate/settings.json`; also live-toggleable in Web UI & `lg top`) |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |

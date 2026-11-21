@@ -99,24 +99,6 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Install Linux GUI system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libfontconfig1-dev \
-            libfreetype-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libxcb1-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libwayland-dev \
-            libvulkan-dev
-
       - name: Cache Rust dependencies
         uses: actions/cache@v6
         with:
@@ -217,27 +199,22 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install desktop-file-utils and PyYAML
+      - name: Install PyYAML
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends desktop-file-utils python3-yaml
+          sudo apt-get install -y --no-install-recommends python3-yaml
 
-      - name: Validate workflow YAML, packaging assets, and shell syntax
+      - name: Validate workflow YAML and shell syntax
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import pathlib, plistlib, yaml
+          import pathlib, yaml
           for wf in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
               data = yaml.safe_load(wf.read_text(encoding='utf-8'))
               assert isinstance(data, dict) and 'jobs' in data, f'Invalid workflow: {wf}'
               print(f'Validated {wf}')
-          for plist in sorted(pathlib.Path('packaging/macos').glob('*')):
-              plistlib.loads(plist.read_bytes())
-              print(f'Validated {plist}')
           PY
           sh -n scripts/install.sh
-          bash -n scripts/release/package_linux_desktop.sh
-          desktop-file-validate packaging/linux/liftgate-desktop.desktop
 
-      - name: Run release packaging unit tests
+      - name: Run release installer unit tests
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
