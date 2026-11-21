@@ -132,6 +132,7 @@ export interface AvailableModel {
 export interface GatewayTelemetrySnapshot {
   generated_at_unix_ms: number;
   gateway_version: string;
+  vision_offload_enabled?: boolean;
   acp_process: AcpProcessTelemetry;
   session_pool: SessionPoolTelemetry;
   metrics: GatewayMetricsSummary;

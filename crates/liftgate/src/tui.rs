@@ -972,6 +972,7 @@ struct PolledData {
 
 enum TuiCommand {
     CloseSession(String),
+    ToggleVisionOffload,
     SwitchDefaultModel(String),
     SetTitleModel(String),
     StartOrRestartDaemon,
@@ -1199,6 +1200,33 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
+                TuiCommand::ToggleVisionOffload => {
+                    let daemon = worker_paths.read_daemon().ok().flatten();
+                    let addr = worker_listen
+                        .or_else(|| daemon.as_ref().map(|d| d.listen))
+                        .unwrap_or_else(|| ServeArgs::default().listen);
+                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
+                    let client = GatewayClient::new(addr, key);
+                    match client.set_vision_offload(None).await {
+                        Ok(enabled) => {
+                            if let Ok(mut settings) = worker_paths.read_settings() {
+                                settings.vision_offload = enabled;
+                                let _ = worker_paths.write_settings(&settings);
+                            }
+                            if let Some(mut d) = daemon
+                                && d.listen == addr
+                            {
+                                d.vision_offload = enabled;
+                                let _ = worker_paths.write_daemon(&d);
+                            }
+                            Ok(format!(
+                                "Vision offload (>=150k ephemeral sub-session): {}",
+                                if enabled { "ON" } else { "OFF" }
+                            ))
+                        }
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
+                }
                 TuiCommand::SwitchDefaultModel(model_id) => {
                     let restart_args = RestartArgs {
                         listen: worker_listen,
@@ -1375,6 +1403,9 @@ fn handle_top_key(
             app.set_toast("Stopping background gateway...", true);
             let _ = cmd_tx.try_send(TuiCommand::StopDaemon);
         }
+        KeyCode::Char('v') => {
+            let _ = cmd_tx.try_send(TuiCommand::ToggleVisionOffload);
+        }
         KeyCode::Char('o') => {
             let _ = cmd_tx.try_send(TuiCommand::OpenBrowser);
         }
@@ -1527,6 +1558,11 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .as_ref()
             .and_then(|t| t.acp_process.pid)
             .map_or_else(|| "—".to_owned(), |p| p.to_string());
+        let vision_on = app
+            .data
+            .telemetry
+            .as_ref()
+            .is_none_or(|t| t.vision_offload_enabled);
         spans.extend([
             Span::styled(
                 " ● ONLINE ",
@@ -1551,6 +1587,17 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 &app.data.default_model,
                 Style::default()
                     .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   vision ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if vision_on { "on" } else { "off" },
+                Style::default()
+                    .fg(if vision_on {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("   {pulse}"), Style::default().fg(Color::Cyan)),
@@ -2497,6 +2544,15 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle `agy acp` stderr vs `gateway.log` (Logs tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  v                      ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle >=150k ephemeral vision sub-session offload"),
         ]),
         Line::from(vec![
             Span::styled(

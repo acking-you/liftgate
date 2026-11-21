@@ -163,6 +163,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 "version": report.agy_version,
                 "proxy": report.agy_proxy_display,
                 "auto_update_enabled": report.agy_auto_update_enabled,
+                "vision_offload_enabled": report.vision_offload_enabled,
                 "latest_known_version": report.telemetry.as_ref().and_then(|t| t.acp_process.latest_known_version.clone()),
                 "auto_update_note": report.telemetry.as_ref().and_then(|t| t.acp_process.auto_update_note.clone()),
             },
@@ -236,6 +237,14 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 "disabled"
             }
         ),
+    );
+    ui::kv(
+        "Vision Offload",
+        if report.vision_offload_enabled {
+            "enabled (>=150k ephemeral sub-session)"
+        } else {
+            "disabled"
+        },
     );
     ui::kv(
         "Context Policy",

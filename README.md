@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-`LIFTGATE_VERSION=v0.2.4` pins a tag, `LIFTGATE_BIN_DIR` sets the install
+`LIFTGATE_VERSION=v0.2.5` pins a tag, `LIFTGATE_BIN_DIR` sets the install
 directory, and `LIFTGATE_NO_MODIFY_PATH=1` skips updating `PATH`. Once
 installed, run `lg upgrade` anytime to update in place.
 

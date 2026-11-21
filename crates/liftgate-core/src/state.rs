@@ -240,6 +240,9 @@ pub struct LiftgateSettings {
     /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
+    /// Offload incoming `Image` blocks on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
+    #[serde(default = "default_true")]
+    pub vision_offload: bool,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -253,6 +256,7 @@ impl Default for LiftgateSettings {
         Self {
             agy_proxy: None,
             agy_auto_update: true,
+            vision_offload: true,
             agy_bin: None,
             extra: serde_json::Map::new(),
         }
@@ -286,6 +290,22 @@ pub const fn resolve_effective_agy_auto_update(
         explicit
     } else {
         settings.agy_auto_update
+    }
+}
+
+/// Resolves the effective `>=150k`-token ephemeral vision sub-session offload toggle (`true` by default).
+#[must_use]
+pub const fn resolve_effective_vision_offload(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.vision_offload
     }
 }
 
@@ -330,6 +350,8 @@ pub struct DaemonState {
     pub agy_proxy: Option<String>,
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
+    #[serde(default = "default_true")]
+    pub vision_offload: bool,
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
@@ -607,6 +629,7 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
+            vision_offload: true,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -622,6 +645,7 @@ mod tests {
         assert_eq!(loaded.pid, 4242);
         assert_eq!(loaded.dashboard_base_url(), "http://127.0.0.1:5173");
         assert!(loaded.agy_auto_update);
+        assert!(loaded.vision_offload);
         assert!(loaded.agy_proxy.is_none());
 
         paths.remove_daemon().unwrap();
@@ -630,10 +654,12 @@ mod tests {
         let defaults = paths.read_settings().unwrap();
         assert!(defaults.agy_proxy.is_none());
         assert!(defaults.agy_auto_update);
+        assert!(defaults.vision_offload);
 
         let mut updated = defaults;
         updated.agy_proxy = Some(ProxyUrl::try_new("7890").unwrap());
         updated.agy_auto_update = false;
+        updated.vision_offload = false;
         paths.write_settings(&updated).unwrap();
         let reloaded = paths.read_settings().unwrap();
         assert_eq!(
@@ -641,6 +667,7 @@ mod tests {
             Some("http://127.0.0.1:7890")
         );
         assert!(!reloaded.agy_auto_update);
+        assert!(!reloaded.vision_offload);
         let _ = fs::remove_dir_all(&temp_root);
     }
 }

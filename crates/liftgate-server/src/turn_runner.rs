@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use liftgate_types::{
@@ -116,6 +119,8 @@ pub struct GatewayRuntimeConfig {
     pub acp_mode: AcpModeId,
     pub api_key: Option<Arc<str>>,
     pub limits: GatewayLimits,
+    /// Live runtime toggle for `>=150k`-token ephemeral vision sub-session offload (`true` by default).
+    pub vision_offload: Arc<AtomicBool>,
 }
 
 /// Prepares an ACP session (reusing a matching multi-turn session when available, or creating
@@ -405,10 +410,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
 
     let worker_resp_id = response_id.clone();
     let acp_mode = cfg.acp_mode.clone();
+    let vision_offload_enabled = cfg.vision_offload.load(Ordering::Relaxed);
     let worker = tokio::spawn(run_turn_pipeline(
         backend,
         lease,
         session_reused,
+        vision_offload_enabled,
         task_guard,
         prompt_blocks,
         base_messages,
@@ -845,6 +852,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     backend: Arc<B>,
     initial_lease: SessionLeaseGuard<B>,
     session_reused: bool,
+    vision_offload_enabled: bool,
     task_guard: ActiveTaskGuard,
     prompt_blocks: Vec<AcpPromptBlock>,
     mut full_messages: Vec<CanonicalMessage>,
@@ -873,7 +881,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
     let mut final_stop_reason = "end_turn".to_owned();
     let mut current_prompt_blocks = prompt_blocks;
 
-    if session_reused
+    if vision_offload_enabled
+        && session_reused
         && initial_context_used >= LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS
         && current_prompt_blocks
             .iter()

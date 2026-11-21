@@ -152,6 +152,7 @@ export function App(): React.JSX.Element {
     updateConnectionConfig,
     refreshSnapshot,
     closeIdleSession,
+    toggleVisionOffload,
   } = useGatewayTelemetry();
 
   const [protocolFilter, setProtocolFilter] = useState<"all" | TaskProtocol>("all");
@@ -485,6 +486,32 @@ export function App(): React.JSX.Element {
                     {acp.latest_known_version ? ` · 上游 v${acp.latest_known_version}` : ""}
                     {acp.auto_update_note ? ` (${acp.auto_update_note})` : ""}
                   </code>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 md:col-span-2">
+                  <div>
+                    <span className="text-muted-foreground">
+                      长上下文多模态子会话卸载 (&gt;=150k Vision Offload):{" "}
+                    </span>
+                    <Badge
+                      variant={(snapshot?.vision_offload_enabled ?? true) ? "success" : "secondary"}
+                      className="ml-1"
+                    >
+                      {(snapshot?.vision_offload_enabled ?? true) ? "已开启 (默认)" : "已关闭"}
+                    </Badge>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2.5 text-xs"
+                    onClick={() => {
+                      const current = snapshot?.vision_offload_enabled ?? true;
+                      void toggleVisionOffload(!current);
+                    }}
+                  >
+                    {(snapshot?.vision_offload_enabled ?? true)
+                      ? "关闭子会话卸载"
+                      : "开启子会话卸载"}
+                  </Button>
                 </div>
               </div>
             )}

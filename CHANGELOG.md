@@ -2,11 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.5] - 2026-11-21
 
 ### Added
-- **Ephemeral vision sub-session offload for `>=150k`-token warm coding sessions**:
-  - When a warm `SessionPool` session has accumulated `>= 150,000` context tokens and an incoming turn carries `Image` blocks (such as UI screenshots or `Read`/`view_image` tool outputs), Liftgate now inspects the images inside a zero-history ephemeral ACP sub-session on the requested model and forwards a structured plain-text `<ephemeral_vision_inspection>` report to the primary coding session while keeping `SessionPool` prefix hashes 100% intact for subsequent turns, avoiding multimodal upstream prompt-cache invalidation and TTFT cliffs.
+- **Configurable ephemeral vision sub-session offload for `>=150k`-token warm coding sessions (enabled by default)**:
+  - When `vision_offload` is enabled (`true` by default, configurable via `--vision-offload <true|false>` / `--no-vision-offload`, `AGY_VISION_OFFLOAD`, `vision_offload` in `~/.liftgate/settings.json`, or live zero-restart toggle via `POST /api/telemetry/vision-offload`, Web Dashboard, and `v` in `lg top`), warm `SessionPool` sessions with `>= 150,000` context tokens inspect incoming `Image` blocks inside a zero-history ephemeral ACP sub-session on the requested model and forward a structured plain-text `<ephemeral_vision_inspection>` report to the primary coding session while keeping `SessionPool` prefix hashes 100% intact across subsequent turns.
 - **KV-cache warmth classification, per-turn TTFT telemetry, and stale idle worker reaping**:
   - Added `PromptCacheWarmth` (`active`, `hot` `<60s`, `warm` `1–5m`, `cold` `>=5m`), per-session `last_context_tokens`, per-turn `ttft_ms`, and `vision_offloaded_images` across `/api/telemetry/snapshot`, SSE telemetry events, `lg st`, `lg top`, and the embedded Web dashboard, plus a periodic 45-minute idle `agy acp` worker reaper (`DEFAULT_MAX_IDLE_SESSION_AGE_MS`).
 - **Terminal control scrubbing & root-cause diagnostic extraction on tool outputs**:

@@ -55,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/in
 irm https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.ps1 | iex
 ```
 
-支持环境变量自定义：`LIFTGATE_VERSION=v0.2.4` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
+支持环境变量自定义：`LIFTGATE_VERSION=v0.2.5` 指定版本标签、`LIFTGATE_BIN_DIR` 指定安装目录、`LIFTGATE_NO_MODIFY_PATH=1` 跳过修改 `PATH`。安装后随时运行 `lg upgrade` 即可原地校验升级。
 
 <details>
 <summary>其它 CLI 安装方式（<code>cargo binstall</code>、手动下载、源码编译）</summary>

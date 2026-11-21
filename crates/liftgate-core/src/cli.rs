@@ -300,6 +300,14 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
 
+    /// Offload incoming images on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
+    #[arg(long, env = "AGY_VISION_OFFLOAD")]
+    pub vision_offload: Option<bool>,
+
+    /// Disable `>=150k`-token ephemeral vision sub-session offload for this server run.
+    #[arg(long, conflicts_with = "vision_offload")]
+    pub no_vision_offload: bool,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -364,6 +372,13 @@ impl Default for ServeArgs {
                 _ => None,
             }
         });
+        let vision_offload = std::env::var("AGY_VISION_OFFLOAD").ok().and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        });
 
         Self {
             listen,
@@ -377,6 +392,8 @@ impl Default for ServeArgs {
             agy_proxy,
             agy_auto_update,
             no_agy_auto_update: false,
+            vision_offload,
+            no_vision_offload: false,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -438,6 +455,14 @@ pub struct RestartArgs {
     /// Disable background idle `agy` auto-update.
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
+
+    /// Override `>=150k`-token ephemeral vision sub-session offload (`true` or `false`).
+    #[arg(long)]
+    pub vision_offload: Option<bool>,
+
+    /// Disable `>=150k`-token ephemeral vision sub-session offload.
+    #[arg(long, conflicts_with = "vision_offload")]
+    pub no_vision_offload: bool,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]
@@ -1718,6 +1743,7 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--ui-dir",
         "--agy-proxy",
         "--agy-auto-update",
+        "--vision-offload",
         "--max-line-bytes",
         "--max-body-bytes",
         "--channel-capacity",
@@ -1765,10 +1791,23 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.serve.listen.port(), 9123);
         assert_eq!(cli.serve.default_model, "gemini-3.8-pro-high");
-        let start = parse_strs(&["lg", "start", "--force"]);
-        assert!(matches!(start.command, Some(Commands::Start(s)) if s.force));
-        let restart = parse_strs(&["lg", "restart", "--no-agy-auto-update"]);
-        assert!(matches!(restart.command, Some(Commands::Restart(s)) if s.no_agy_auto_update));
+        assert!(!cli.serve.no_vision_offload);
+        let start = parse_strs(&["lg", "start", "--force", "--no-vision-offload"]);
+        assert!(matches!(
+            start.command,
+            Some(Commands::Start(s)) if s.force && s.serve.no_vision_offload
+        ));
+        let restart = parse_strs(&[
+            "lg",
+            "restart",
+            "--no-agy-auto-update",
+            "--vision-offload",
+            "false",
+        ]);
+        assert!(matches!(
+            restart.command,
+            Some(Commands::Restart(s)) if s.no_agy_auto_update && s.vision_offload == Some(false)
+        ));
     }
 
     #[test]

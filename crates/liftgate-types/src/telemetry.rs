@@ -204,11 +204,17 @@ pub struct GatewayMetricsSummary {
     pub total_cached_tokens: u64,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Top-level observability payload served over `GET /api/telemetry/snapshot` and SSE.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GatewayTelemetrySnapshot {
     pub generated_at_unix_ms: u64,
     pub gateway_version: Cow<'static, str>,
+    #[serde(default = "default_true")]
+    pub vision_offload_enabled: bool,
     pub acp_process: AcpProcessTelemetry,
     pub session_pool: SessionPoolTelemetry,
     pub metrics: GatewayMetricsSummary,

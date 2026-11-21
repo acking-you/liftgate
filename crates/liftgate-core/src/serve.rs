@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use liftgate_server::{
@@ -19,7 +19,7 @@ use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
 use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
-    resolve_effective_agy_proxy,
+    resolve_effective_agy_proxy, resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -40,6 +40,7 @@ pub struct ServeReadyInfo {
     pub full_ui_embedded: bool,
     pub agy_proxy_display: Option<String>,
     pub agy_auto_update: bool,
+    pub vision_offload: bool,
 }
 
 mod generated {
@@ -134,6 +135,8 @@ pub async fn run_serve_with_hook(
     let agy_proxy = resolve_effective_agy_proxy(args.agy_proxy.as_deref(), &settings)?;
     let auto_update_enabled =
         resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
+    let vision_offload_enabled =
+        resolve_effective_vision_offload(args.vision_offload, args.no_vision_offload, &settings);
     let binary_path =
         resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
@@ -174,6 +177,7 @@ pub async fn run_serve_with_hook(
             .as_deref()
             .unwrap_or("none"),
         agy_auto_update = auto_update_enabled,
+        vision_offload = vision_offload_enabled,
         "starting liftgate"
     );
 
@@ -222,6 +226,7 @@ pub async fn run_serve_with_hook(
             acp_mode,
             api_key,
             limits,
+            vision_offload: Arc::new(AtomicBool::new(vision_offload_enabled)),
         },
         ui_dist_dir: ui_dist_dir.clone(),
         embedded_ui,
@@ -322,6 +327,7 @@ pub async fn run_serve_with_hook(
         full_ui_embedded: full_bundle_embedded,
         agy_proxy_display: proxy_banner,
         agy_auto_update: auto_update_enabled,
+        vision_offload: vision_offload_enabled,
     };
     if let Some(cb) = on_ready {
         cb(&ready_info);

@@ -93,6 +93,7 @@ export interface GatewayTelemetryState {
   updateConnectionConfig: (nextBaseUrl: string, nextApiKey: string) => void;
   refreshSnapshot: () => Promise<void>;
   closeIdleSession: (sessionId: string) => Promise<boolean>;
+  toggleVisionOffload: (enabled?: boolean) => Promise<boolean | null>;
 }
 
 export function useGatewayTelemetry(): GatewayTelemetryState {
@@ -163,6 +164,26 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
       const body = (await resp.json()) as { closed?: boolean };
       await refreshSnapshot();
       return Boolean(body.closed);
+    },
+    [authHeaders, buildUrl, refreshSnapshot],
+  );
+
+  const toggleVisionOffload = useCallback(
+    async (enabled?: boolean): Promise<boolean | null> => {
+      const query =
+        typeof enabled === "boolean" ? `?enabled=${enabled ? "true" : "false"}` : "";
+      const resp = await fetch(buildUrl(`/api/telemetry/vision-offload${query}`), {
+        method: "POST",
+        headers: authHeaders,
+      });
+      if (!resp.ok) {
+        return null;
+      }
+      const body = (await resp.json()) as { vision_offload_enabled?: boolean };
+      await refreshSnapshot();
+      return typeof body.vision_offload_enabled === "boolean"
+        ? body.vision_offload_enabled
+        : null;
     },
     [authHeaders, buildUrl, refreshSnapshot],
   );
@@ -242,5 +263,6 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     updateConnectionConfig,
     refreshSnapshot,
     closeIdleSession,
+    toggleVisionOffload,
   };
 }

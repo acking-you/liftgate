@@ -27,7 +27,8 @@ use crate::harness::{resolve_claude_command, resolve_codex_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
-    resolve_effective_agy_bin, resolve_effective_agy_proxy, write_file_atomic,
+    resolve_effective_agy_bin, resolve_effective_agy_proxy, resolve_effective_vision_offload,
+    write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -74,6 +75,8 @@ pub async fn start_daemon_with_exe(
         serve.no_agy_auto_update,
         &settings,
     );
+    let effective_vision_offload =
+        resolve_effective_vision_offload(serve.vision_offload, serve.no_vision_offload, &settings);
     let _ = ModelId::try_new(&serve.default_model)?;
     let _ = AcpModeId::try_new(&serve.acp_mode)?;
     let _ = GatewayLimits::try_new(
@@ -103,6 +106,7 @@ pub async fn start_daemon_with_exe(
                 && existing.api_key == requested_key
                 && existing.agy_proxy.as_deref() == effective_proxy.as_ref().map(ProxyUrl::as_str)
                 && existing.agy_auto_update == effective_auto_update
+                && existing.vision_offload == effective_vision_offload
                 && existing.max_line_bytes == serve.max_line_bytes
                 && existing.max_body_bytes == serve.max_body_bytes
                 && existing.channel_capacity == serve.channel_capacity
@@ -176,6 +180,12 @@ pub async fn start_daemon_with_exe(
         .arg(effective_proxy.as_ref().map_or("off", ProxyUrl::as_str))
         .arg("--agy-auto-update")
         .arg(if effective_auto_update {
+            "true"
+        } else {
+            "false"
+        })
+        .arg("--vision-offload")
+        .arg(if effective_vision_offload {
             "true"
         } else {
             "false"
@@ -265,6 +275,7 @@ pub async fn start_daemon_with_exe(
         ui_dir: serve.ui_dir,
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
         agy_auto_update: effective_auto_update,
+        vision_offload: effective_vision_offload,
         max_line_bytes: serve.max_line_bytes,
         max_body_bytes: serve.max_body_bytes,
         channel_capacity: serve.channel_capacity,
@@ -364,6 +375,7 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         agy_bin: old.agy_bin.clone(),
         acp_cwd: old.acp_cwd.clone(),
         ui_dir: old.ui_dir.clone(),
+        vision_offload: Some(old.vision_offload),
         max_line_bytes: old.max_line_bytes,
         max_body_bytes: old.max_body_bytes,
         channel_capacity: old.channel_capacity,
@@ -409,6 +421,14 @@ pub async fn restart_daemon(
     }
     if args.no_agy_auto_update {
         serve.no_agy_auto_update = true;
+    }
+    if let Some(vo) = args.vision_offload {
+        serve.vision_offload = Some(vo);
+        serve.no_vision_offload = false;
+    }
+    if args.no_vision_offload {
+        serve.vision_offload = None;
+        serve.no_vision_offload = true;
     }
 
     let outcome = start_daemon(state_paths, serve, true).await?;
@@ -602,6 +622,7 @@ pub struct GatewayStatusReport {
     pub agy_version: Option<String>,
     pub agy_proxy_display: Option<String>,
     pub agy_auto_update_enabled: bool,
+    pub vision_offload_enabled: bool,
     pub telemetry: Option<GatewayTelemetrySnapshot>,
 }
 
@@ -666,6 +687,14 @@ pub async fn inspect_gateway_status(
         .map_or(local_agy.auto_update_enabled, |t| {
             t.acp_process.auto_update_enabled
         });
+    let settings = state_paths.read_settings().unwrap_or_default();
+    let effective_vision_offload = telemetry.as_ref().map_or(
+        daemon
+            .as_ref()
+            .filter(|_| managed_alive)
+            .map_or(settings.vision_offload, |d| d.vision_offload),
+        |t| t.vision_offload_enabled,
+    );
 
     let active_daemon = daemon.filter(|_| managed_alive);
     let pid = active_daemon.as_ref().map(|d| d.pid);
@@ -686,6 +715,7 @@ pub async fn inspect_gateway_status(
         agy_version: effective_version,
         agy_proxy_display: effective_proxy_display,
         agy_auto_update_enabled: effective_auto_update,
+        vision_offload_enabled: effective_vision_offload,
         telemetry,
     })
 }
@@ -1763,6 +1793,7 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
+            vision_offload: true,
             max_line_bytes: liftgate_types::config::DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: liftgate_types::config::DEFAULT_MAX_BODY_BYTES,
             channel_capacity: liftgate_types::config::DEFAULT_CHANNEL_CAPACITY,
@@ -1801,6 +1832,7 @@ mod tests {
             ui_dir: Some(PathBuf::from("/srv/ui")),
             agy_proxy: None,
             agy_auto_update: false,
+            vision_offload: false,
             max_line_bytes: 67_108_864,
             max_body_bytes: 33_554_432,
             channel_capacity: 512,
@@ -1815,6 +1847,7 @@ mod tests {
         assert_eq!(restored.agy_bin, Some(PathBuf::from("/opt/custom/agy")));
         assert_eq!(restored.acp_cwd, Some(PathBuf::from("/tmp/acp-work")));
         assert_eq!(restored.ui_dir, Some(PathBuf::from("/srv/ui")));
+        assert_eq!(restored.vision_offload, Some(false));
         assert_eq!(restored.max_line_bytes, 67_108_864);
         assert_eq!(restored.max_idle_sessions, 32);
         assert_eq!(restored.turn_timeout_secs, 3600);
@@ -1906,6 +1939,7 @@ mod tests {
             ui_dir: None,
             agy_proxy: None,
             agy_auto_update: true,
+            vision_offload: true,
             max_line_bytes: 33_554_432,
             max_body_bytes: 16_777_216,
             channel_capacity: 256,
