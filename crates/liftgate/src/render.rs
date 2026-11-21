@@ -346,6 +346,36 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             Cell::new(traffic_detail),
         ]);
 
+        let ct = &snap.cache_telemetry;
+        let (cache_status_label, cache_tone) = match ct.total_cache_hit_rate_bps {
+            Some(bps) => {
+                let tone = if bps >= ct.low_cache_threshold_bps {
+                    Tone::Ok
+                } else {
+                    Tone::Warn
+                };
+                (format!("{}.{:02}% hit", bps / 100, bps % 100), tone)
+            }
+            None => ("no turns".to_owned(), Tone::Muted),
+        };
+        let warm_str = match ct.warm_cache_hit_rate_bps {
+            Some(bps) => format!("{}.{:02}%", bps / 100, bps % 100),
+            None => "—".to_owned(),
+        };
+        let cache_detail = format!(
+            "warm {warm_str} · cached {} / prompt {} · low-hit stored {}/{} (<{}%)",
+            ui::format_tokens(ct.total_cached_read_tokens),
+            ui::format_tokens(ct.total_prompt_tokens),
+            ct.stored_low_cache_count,
+            ct.max_low_cache_records,
+            ct.low_cache_threshold_bps / 100,
+        );
+        table.add_row(vec![
+            ui::accent_cell("Prompt Cache"),
+            ui::status_cell(&cache_status_label, cache_tone),
+            Cell::new(cache_detail),
+        ]);
+
         if let Some(list) = &report.models {
             let model_tone = if list.len() > 1 { Tone::Ok } else { Tone::Warn };
             table.add_row(vec![

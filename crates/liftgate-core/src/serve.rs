@@ -8,7 +8,7 @@ use liftgate_server::{
     platform::{canonicalize_clean, prepare_isolated_session_cwd, wait_for_shutdown_signal},
     routes::{AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router, serve_router},
     session_pool::SessionPool,
-    telemetry::TelemetryHub,
+    telemetry::{CacheTelemetryConfig, TelemetryHub},
     turn_runner::GatewayRuntimeConfig,
 };
 use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId};
@@ -19,7 +19,8 @@ use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
 use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
-    resolve_effective_agy_proxy, resolve_effective_vision_offload,
+    resolve_effective_agy_proxy, resolve_effective_low_cache_threshold_bps,
+    resolve_effective_max_low_cache_records, resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -137,6 +138,10 @@ pub async fn run_serve_with_hook(
         resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
     let vision_offload_enabled =
         resolve_effective_vision_offload(args.vision_offload, args.no_vision_offload, &settings);
+    let max_low_cache_records =
+        resolve_effective_max_low_cache_records(args.max_low_cache_records, &settings)?;
+    let low_cache_threshold_bps =
+        resolve_effective_low_cache_threshold_bps(args.low_cache_threshold_pct, &settings)?;
     let binary_path =
         resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
@@ -178,6 +183,8 @@ pub async fn run_serve_with_hook(
             .unwrap_or("none"),
         agy_auto_update = auto_update_enabled,
         vision_offload = vision_offload_enabled,
+        max_low_cache_records = max_low_cache_records.get(),
+        low_cache_threshold_bps = low_cache_threshold_bps.get(),
         "starting liftgate"
     );
 
@@ -195,7 +202,12 @@ pub async fn run_serve_with_hook(
     );
 
     let pool = Arc::new(SessionPool::new(limits));
-    let telemetry = Arc::new(TelemetryHub::new());
+    let telemetry = Arc::new(TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(state_paths.cache_telemetry_file()),
+        settings_path: Some(state_paths.settings_file()),
+        max_low_cache_records,
+        low_cache_threshold_bps,
+    }));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();
     let api_key = normalize_optional_api_key(args.api_key.as_deref()).map(Arc::<str>::from);

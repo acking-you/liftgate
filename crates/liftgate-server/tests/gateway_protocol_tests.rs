@@ -15,15 +15,17 @@ use liftgate_server::{
     error::AcpError,
     routes::{ADMIN_SHUTDOWN_HEADER, AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router},
     session_pool::SessionPool,
-    telemetry::TelemetryHub,
+    telemetry::{CacheTelemetryConfig, TelemetryHub},
     turn_runner::GatewayRuntimeConfig,
 };
 use liftgate_types::{
     acp::{
-        AcpChunkContent, AcpPromptBlock, AvailableModel, ModelsCatalog, ModesCatalog,
+        AcpChunkContent, AcpPromptBlock, AcpUsage, AvailableModel, ModelsCatalog, ModesCatalog,
         PromptTurnResult, SessionNewResult, SessionUpdatePayload,
     },
-    config::{AcpModeId, GatewayLimits, ModelId, SessionId},
+    config::{
+        AcpModeId, CacheHitThresholdBps, GatewayLimits, LowCacheRecordLimit, ModelId, SessionId,
+    },
     test_support::{mock_acp_usage, mock_available_models},
 };
 use serde_json::{Value, json, value::RawValue};
@@ -35,6 +37,10 @@ enum MockScript {
     Immediate {
         thoughts: Vec<String>,
         chunks_template: Vec<String>,
+    },
+    ImmediateWithExactUsage {
+        usage: AcpUsage,
+        reply: String,
     },
     ImmediateWithUsage {
         usage_updates: Vec<(u64, u64)>,
@@ -226,6 +232,22 @@ impl AcpBackend for MockAcpBackend {
                 Ok(PromptTurnResult {
                     stop_reason: "end_turn".to_owned(),
                     usage: mock_acp_usage(100, 25, 10),
+                    error: None,
+                })
+            }
+            MockScript::ImmediateWithExactUsage { usage, reply } => {
+                let hydrated = reply.replace("{NONCE}", &nonce);
+                let _ = updates_tx
+                    .send(SessionUpdatePayload::AgentMessageChunk {
+                        content: AcpChunkContent {
+                            content_type: "text".to_owned(),
+                            text: hydrated,
+                        },
+                    })
+                    .await;
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage,
                     error: None,
                 })
             }
@@ -5385,7 +5407,7 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
     }
 
     // Verify telemetry recorded `vision_offloaded_images == 1` and `ttft_ms`
-    let (_metrics, _active, recent) = state.telemetry.snapshot_tasks();
+    let (_metrics, _cache, _active, recent) = state.telemetry.snapshot_tasks();
     assert_eq!(recent[0].vision_offloaded_images, 1);
     assert!(recent[0].ttft_ms.is_some());
 
@@ -5582,4 +5604,262 @@ async fn session_pool_classifies_cache_warmth_and_reaps_expired_idle_sessions() 
         backend.aborted_count.load(Ordering::SeqCst),
         aborted_before + 1
     );
+}
+
+#[tokio::test]
+async fn cache_hit_rates_and_bounded_low_cache_records_persist_and_reconfigure_atomically() {
+    use liftgate_types::telemetry::{LowCacheHitReason, LowCacheHitsResponse};
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "liftgate-cache-persist-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let persist_path = tmp_dir.join("cache-telemetry.json");
+    let settings_path = tmp_dir.join("settings.json");
+
+    let scripts = vec![
+        // Turn 1: Cold session start -> 0 / 1_000 (0.00% < 50% -> recorded as ColdSessionStart)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 50,
+                thought_tokens: 0,
+                total_tokens: 1_050,
+            },
+            reply: "Reply 1".to_owned(),
+        },
+        // Turn 2: Warm session reused -> 1_800 / 2_000 (90.00% >= 50% -> NOT low-hit)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 200,
+                cached_read_tokens: 1_800,
+                cached_write_tokens: 0,
+                output_tokens: 60,
+                thought_tokens: 0,
+                total_tokens: 2_060,
+            },
+            reply: "Reply 2".to_owned(),
+        },
+        // Turn 3: Warm session reused, upstream KV cache expired -> 0 / 2_000 (0.00% < 50% -> WarmCacheMiss)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 2_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 40,
+                thought_tokens: 0,
+                total_tokens: 2_040,
+            },
+            reply: "Reply 3".to_owned(),
+        },
+        // Turn 4: Warm session reused, partial prefix hit -> 500 / 2_000 (25.00% < 50% -> WarmPartialHit)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_500,
+                cached_read_tokens: 500,
+                cached_write_tokens: 0,
+                output_tokens: 45,
+                thought_tokens: 0,
+                total_tokens: 2_045,
+            },
+            reply: "Reply 4".to_owned(),
+        },
+        // Turn 5: Fresh cold session -> 0 / 1_000 (0.00% < 50% -> ColdSessionStart; evicts Turn 1 under cap=3)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 30,
+                thought_tokens: 0,
+                total_tokens: 1_030,
+            },
+            reply: "Reply 5".to_owned(),
+        },
+    ];
+
+    let backend = Arc::new(MockAcpBackend::new(scripts));
+    let mut state = test_state(Arc::clone(&backend), 30, None);
+    state.telemetry = Arc::new(TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(persist_path.clone()),
+        settings_path: Some(settings_path.clone()),
+        max_low_cache_records: LowCacheRecordLimit::try_new(3).unwrap(),
+        low_cache_threshold_bps: CacheHitThresholdBps::try_from_percent(50).unwrap(),
+    }));
+    let app = build_router(state.clone());
+
+    let mut prev_id: Option<String> = None;
+    for idx in 1..=4 {
+        let mut payload = json!({
+            "model": "gemini-4-carbon-high",
+            "stream": false,
+            "input": format!("Chain turn {idx}"),
+        });
+        if let Some(pid) = &prev_id {
+            payload["previous_response_id"] = json!(pid);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        prev_id = Some(body["id"].as_str().unwrap().to_owned());
+    }
+
+    // Turn 5 without previous_response_id -> new cold session
+    let resp5 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": "Fresh cold turn 5",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp5.status(), StatusCode::OK);
+
+    // Total prompt = 1000 + 2000 + 2000 + 2000 + 1000 = 8_000; cached_read = 2_300 -> 28.75% (2_875 bps)
+    // Warm prompt = 2000 + 2000 + 2000 = 6_000; warm cached_read = 2_300 -> 38.33% (3_833 bps)
+    let low_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/low-cache-hits")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(low_resp.status(), StatusCode::OK);
+    let low_bytes = low_resp.into_body().collect().await.unwrap().to_bytes();
+    let low_data: LowCacheHitsResponse = serde_json::from_slice(&low_bytes).unwrap();
+
+    assert_eq!(low_data.summary.total_prompt_tokens, 8_000);
+    assert_eq!(low_data.summary.total_cached_read_tokens, 2_300);
+    assert_eq!(low_data.summary.total_cache_hit_rate_bps, Some(2_875));
+    assert_eq!(low_data.summary.warm_prompt_tokens, 6_000);
+    assert_eq!(low_data.summary.warm_cached_read_tokens, 2_300);
+    assert_eq!(low_data.summary.warm_cache_hit_rate_bps, Some(3_833));
+    assert_eq!(low_data.summary.evaluated_turns, 5);
+    assert_eq!(low_data.summary.warm_evaluated_turns, 3);
+    assert_eq!(low_data.summary.total_low_cache_turns, 4);
+    assert_eq!(low_data.summary.stored_low_cache_count, 3);
+    assert_eq!(low_data.records.len(), 3);
+
+    // Newest-first order: Turn 5 (ColdSessionStart), Turn 4 (WarmPartialHit), Turn 3 (WarmCacheMiss)
+    assert_eq!(
+        low_data.records[0].reason,
+        LowCacheHitReason::ColdSessionStart
+    );
+    assert_eq!(low_data.records[0].prompt_preview, "Fresh cold turn 5");
+    assert_eq!(
+        low_data.records[1].reason,
+        LowCacheHitReason::WarmPartialHit
+    );
+    assert_eq!(low_data.records[1].cache_hit_rate_bps, 2_500);
+    assert_eq!(low_data.records[2].reason, LowCacheHitReason::WarmCacheMiss);
+    assert_eq!(low_data.records[2].cache_hit_rate_bps, 0);
+
+    // Verify durable disk persistence across TelemetryHub restart!
+    assert!(persist_path.is_file());
+    let reloaded_hub = TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(persist_path.clone()),
+        settings_path: Some(settings_path.clone()),
+        max_low_cache_records: LowCacheRecordLimit::try_new(3).unwrap(),
+        low_cache_threshold_bps: CacheHitThresholdBps::try_from_percent(50).unwrap(),
+    });
+    let reloaded = reloaded_hub.low_cache_hits();
+    assert_eq!(reloaded.summary.total_cache_hit_rate_bps, Some(2_875));
+    assert_eq!(reloaded.summary.warm_cache_hit_rate_bps, Some(3_833));
+    assert_eq!(reloaded.records.len(), 3);
+    assert_eq!(reloaded.records[0].prompt_preview, "Fresh cold turn 5");
+
+    // Reject out-of-range limit (> 50_000) with 400 Bad Request
+    let bad_cfg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/cache-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "max_low_cache_records": 99_999 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_cfg.status(), StatusCode::BAD_REQUEST);
+
+    // Live resize max_low_cache_records -> 2 and threshold -> 65%, verifying immediate trim & settings.json sync
+    let update_cfg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/cache-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "max_low_cache_records": 2,
+                        "low_cache_threshold_pct": 65,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_cfg.status(), StatusCode::OK);
+    let after_trim = state.telemetry.low_cache_hits();
+    assert_eq!(after_trim.summary.max_low_cache_records, 2);
+    assert_eq!(after_trim.summary.low_cache_threshold_bps, 6_500);
+    assert_eq!(after_trim.records.len(), 2);
+
+    let saved_settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(saved_settings["max_low_cache_records"], json!(2));
+    assert_eq!(saved_settings["low_cache_threshold_bps"], json!(6_500));
+
+    // Clear low-cache records while preserving cumulative totals
+    let clear_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/low-cache-hits/clear")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_resp.status(), StatusCode::OK);
+    let after_clear = state.telemetry.low_cache_hits();
+    assert!(after_clear.records.is_empty());
+    assert_eq!(after_clear.summary.total_cache_hit_rate_bps, Some(2_875));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

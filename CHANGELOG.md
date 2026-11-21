@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Prompt cache hit rate calculation & configurable persisted low-cache-hit audit store (`~/.liftgate/cache-telemetry.json`)**:
+  - Computes per-turn, per-session, warm-continuation, and cumulative overall prompt cache hit rates (`cachedReadTokens / (inputTokens + cachedReadTokens + cachedWriteTokens)` in integer basis points) across `GatewayTelemetrySnapshot`, `GET /api/telemetry/low-cache-hits`, `lg st`, and the Web Dashboard.
+  - Atomically persists turns whose prompt cache hit rate falls below threshold (`50%` by default, configurable via `--low-cache-threshold-pct` / `AGY_LOW_CACHE_THRESHOLD_PCT` or live `POST /api/telemetry/cache-config`) into a bounded ring buffer capped at `1,000` records by default (`--max-low-cache-records` / `AGY_MAX_LOW_CACHE_RECORDS`, `0..=50,000`, live-resizable and clearable from the Web UI), tagged with root-cause classifications (`warm_cache_miss`, `warm_partial_hit`, `cold_session_start`).
+
+### Changed
+- **StaticFlow Warm Editorial Web Dashboard redesign**:
+  - Redesigned the embedded React observability workbench (`web/`) to match the StaticFlow (`ackingliu.top`) Warm Parchment & Obsidian design system (`Source Serif 4` display headings, `Inter` UI controls, `JetBrains Mono` tabular metrics, terracotta `#C96442` / `#D97757` & sage `#5A7A4F` / `#8FAF7F` accents, 1px hairline surfaces, collapsible sidebar + mobile drawer, interactive SVG cache trend chart, and sun-to-crescent circular `ViewTransition` theme switch).
+
 ## [0.2.5] - 2026-11-21
 
 ### Added

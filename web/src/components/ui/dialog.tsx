@@ -15,7 +15,7 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-50 bg-black/75 backdrop-blur-xs",
+      "fixed inset-0 z-50 bg-[rgba(20,20,19,0.46)] backdrop-blur-[3px]",
       className,
     )}
     {...props}
@@ -32,15 +32,15 @@ const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-2xl translate-x-[-50%] translate-y-[-50%] gap-4 border bg-card p-6 shadow-xl rounded-xl max-h-[88vh] overflow-y-auto",
+        "fixed left-[50%] top-[50%] z-50 grid w-[calc(100vw-24px)] max-w-2xl translate-x-[-50%] translate-y-[-50%] gap-4 rounded-[12px] border border-[var(--border-strong)] bg-[var(--surface)] p-6 text-[var(--text)] shadow-[var(--shadow-overlay)] max-h-[88vh] overflow-y-auto focus:outline-none",
         className,
       )}
       {...props}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none cursor-pointer">
+      <DialogPrimitive.Close className="sf-btn sf-btn--ghost sf-btn--icon absolute right-3.5 top-3.5 rounded-full">
         <X className="h-4 w-4" />
-        <span className="sr-only">Close</span>
+        <span className="sr-only">关闭</span>
       </DialogPrimitive.Close>
     </DialogPrimitive.Content>
   </DialogPortal>
@@ -53,7 +53,7 @@ function DialogHeader({
 }: React.HTMLAttributes<HTMLDivElement>): React.JSX.Element {
   return (
     <div
-      className={cn("flex flex-col space-y-1.5 text-left", className)}
+      className={cn("flex flex-col space-y-1.5 pr-8 text-left", className)}
       {...props}
     />
   );
@@ -65,7 +65,10 @@ const DialogTitle = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Title
     ref={ref}
-    className={cn("text-lg font-semibold leading-none tracking-tight", className)}
+    className={cn(
+      "font-serif text-[1.2rem] font-normal leading-snug tracking-[-0.015em] text-[var(--text)]",
+      className,
+    )}
     {...props}
   />
 ));
@@ -77,7 +80,7 @@ const DialogDescription = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description
     ref={ref}
-    className={cn("text-sm text-muted-foreground", className)}
+    className={cn("text-[13px] text-[var(--muted)]", className)}
     {...props}
   />
 ));

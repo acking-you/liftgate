@@ -1413,6 +1413,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 post_turn_dialogue_hash: dialogue_hash,
                 declared_tools: req.client_tools,
                 last_context_used: committed_context_used,
+                turn_prompt_tokens: cumulative_usage.total_prompt_tokens(),
+                turn_cached_read_tokens: cumulative_usage.cached_read_tokens,
                 message_count,
                 last_response_id: Some(response_id),
                 accumulated_messages: retained_messages,

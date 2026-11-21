@@ -45,6 +45,9 @@ export interface SessionSummary {
   turn_count: number;
   message_count: number;
   last_context_tokens?: number;
+  total_prompt_tokens?: number;
+  total_cached_read_tokens?: number;
+  cache_hit_rate_bps?: number | null;
   created_at_unix_ms: number;
   last_active_unix_ms: number;
   last_response_id: string | null;
@@ -108,6 +111,57 @@ export interface TaskSnapshot {
   stop_reason: string | null;
   error_message: string | null;
   usage: AcpUsage | null;
+  cache_hit_rate_bps?: number | null;
+}
+
+export type LowCacheHitReason =
+  | "warm_cache_miss"
+  | "warm_partial_hit"
+  | "cold_session_start"
+  | "unknown";
+
+export interface LowCacheHitRecord {
+  task_id: string;
+  recorded_at_unix_ms: number;
+  protocol: TaskProtocol;
+  requested_model: string;
+  resolved_model: string;
+  session_id: string | null;
+  session_reused: boolean;
+  reason: LowCacheHitReason;
+  cache_hit_rate_bps: number;
+  input_uncached_tokens: number;
+  cached_read_tokens: number;
+  cached_write_tokens: number;
+  total_prompt_tokens: number;
+  output_tokens: number;
+  elapsed_ms: number;
+  ttft_ms?: number | null;
+  prompt_preview: string;
+}
+
+export interface CacheTelemetrySummary {
+  revision: number;
+  max_low_cache_records: number;
+  low_cache_threshold_bps: number;
+  persisted_path: string | null;
+  total_prompt_tokens: number;
+  total_uncached_input_tokens: number;
+  total_cached_read_tokens: number;
+  total_cached_write_tokens: number;
+  total_cache_hit_rate_bps: number | null;
+  warm_prompt_tokens: number;
+  warm_cached_read_tokens: number;
+  warm_cache_hit_rate_bps: number | null;
+  evaluated_turns: number;
+  warm_evaluated_turns: number;
+  total_low_cache_turns: number;
+  stored_low_cache_count: number;
+}
+
+export interface LowCacheHitsResponse {
+  summary: CacheTelemetrySummary;
+  records: LowCacheHitRecord[];
 }
 
 export interface GatewayMetricsSummary {
@@ -122,6 +176,8 @@ export interface GatewayMetricsSummary {
   total_output_tokens: number;
   total_thought_tokens: number;
   total_cached_tokens: number;
+  total_cached_write_tokens?: number;
+  cache_hit_rate_bps?: number | null;
 }
 
 export interface AvailableModel {
@@ -136,6 +192,7 @@ export interface GatewayTelemetrySnapshot {
   acp_process: AcpProcessTelemetry;
   session_pool: SessionPoolTelemetry;
   metrics: GatewayMetricsSummary;
+  cache_telemetry?: CacheTelemetrySummary;
   active_tasks: TaskSnapshot[];
   recent_tasks: TaskSnapshot[];
   available_models: AvailableModel[];

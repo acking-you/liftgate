@@ -115,6 +115,12 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub last_context_tokens: u64,
+    #[serde(default)]
+    pub total_prompt_tokens: u64,
+    #[serde(default)]
+    pub total_cached_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate_bps: Option<u16>,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
     pub last_response_id: Option<String>,
@@ -186,6 +192,139 @@ pub struct TaskSnapshot {
     pub stop_reason: Option<String>,
     pub error_message: Option<String>,
     pub usage: Option<AcpUsage>,
+    #[serde(default)]
+    pub cache_hit_rate_bps: Option<u16>,
+}
+
+/// Diagnostic classification for why a completed turn experienced a low prompt cache hit rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowCacheHitReason {
+    /// Warm session was reused, yet upstream reported `0` cached read tokens (KV cache expired or busted).
+    WarmCacheMiss,
+    /// Warm session was reused, with partial prefix cache hit still below the configured threshold.
+    WarmPartialHit,
+    /// Turn created a brand-new ACP session (`!session_reused`, cold start or prefix hash miss).
+    #[default]
+    ColdSessionStart,
+    #[serde(other)]
+    Unknown,
+}
+
+impl LowCacheHitReason {
+    #[must_use]
+    pub const fn classify(session_reused: bool, cached_read_tokens: u64) -> Self {
+        if !session_reused {
+            Self::ColdSessionStart
+        } else if cached_read_tokens == 0 {
+            Self::WarmCacheMiss
+        } else {
+            Self::WarmPartialHit
+        }
+    }
+}
+
+/// Persisted diagnostic record for a turn whose prompt cache hit rate fell below threshold.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LowCacheHitRecord {
+    pub task_id: String,
+    pub recorded_at_unix_ms: u64,
+    pub protocol: TaskProtocol,
+    pub requested_model: String,
+    pub resolved_model: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_reused: bool,
+    #[serde(default)]
+    pub reason: LowCacheHitReason,
+    pub cache_hit_rate_bps: u16,
+    pub input_uncached_tokens: u64,
+    pub cached_read_tokens: u64,
+    #[serde(default)]
+    pub cached_write_tokens: u64,
+    pub total_prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
+    #[serde(default)]
+    pub prompt_preview: String,
+}
+
+const fn default_max_low_cache_records_usize() -> usize {
+    crate::config::DEFAULT_MAX_LOW_CACHE_RECORDS
+}
+
+const fn default_low_cache_threshold_bps_u16() -> u16 {
+    crate::config::DEFAULT_LOW_CACHE_THRESHOLD_BPS
+}
+
+/// Cumulative prompt-cache hit accounting and persisted low-cache-hit store summary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CacheTelemetrySummary {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default = "default_max_low_cache_records_usize")]
+    pub max_low_cache_records: usize,
+    #[serde(default = "default_low_cache_threshold_bps_u16")]
+    pub low_cache_threshold_bps: u16,
+    #[serde(default)]
+    pub persisted_path: Option<String>,
+    #[serde(default)]
+    pub total_prompt_tokens: u64,
+    #[serde(default)]
+    pub total_uncached_input_tokens: u64,
+    #[serde(default)]
+    pub total_cached_read_tokens: u64,
+    #[serde(default)]
+    pub total_cached_write_tokens: u64,
+    #[serde(default)]
+    pub total_cache_hit_rate_bps: Option<u16>,
+    #[serde(default)]
+    pub warm_prompt_tokens: u64,
+    #[serde(default)]
+    pub warm_cached_read_tokens: u64,
+    #[serde(default)]
+    pub warm_cache_hit_rate_bps: Option<u16>,
+    #[serde(default)]
+    pub evaluated_turns: u64,
+    #[serde(default)]
+    pub warm_evaluated_turns: u64,
+    #[serde(default)]
+    pub total_low_cache_turns: u64,
+    #[serde(default)]
+    pub stored_low_cache_count: usize,
+}
+
+impl Default for CacheTelemetrySummary {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            max_low_cache_records: crate::config::DEFAULT_MAX_LOW_CACHE_RECORDS,
+            low_cache_threshold_bps: crate::config::DEFAULT_LOW_CACHE_THRESHOLD_BPS,
+            persisted_path: None,
+            total_prompt_tokens: 0,
+            total_uncached_input_tokens: 0,
+            total_cached_read_tokens: 0,
+            total_cached_write_tokens: 0,
+            total_cache_hit_rate_bps: None,
+            warm_prompt_tokens: 0,
+            warm_cached_read_tokens: 0,
+            warm_cache_hit_rate_bps: None,
+            evaluated_turns: 0,
+            warm_evaluated_turns: 0,
+            total_low_cache_turns: 0,
+            stored_low_cache_count: 0,
+        }
+    }
+}
+
+/// Response payload served by `GET /api/telemetry/low-cache-hits`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LowCacheHitsResponse {
+    pub summary: CacheTelemetrySummary,
+    pub records: Vec<LowCacheHitRecord>,
 }
 
 /// Cumulative gateway throughput and token accounting counters.
@@ -202,6 +341,10 @@ pub struct GatewayMetricsSummary {
     pub total_output_tokens: u64,
     pub total_thought_tokens: u64,
     pub total_cached_tokens: u64,
+    #[serde(default)]
+    pub total_cached_write_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate_bps: Option<u16>,
 }
 
 const fn default_true() -> bool {
@@ -218,6 +361,8 @@ pub struct GatewayTelemetrySnapshot {
     pub acp_process: AcpProcessTelemetry,
     pub session_pool: SessionPoolTelemetry,
     pub metrics: GatewayMetricsSummary,
+    #[serde(default)]
+    pub cache_telemetry: CacheTelemetrySummary,
     pub active_tasks: Vec<TaskSnapshot>,
     pub recent_tasks: Vec<TaskSnapshot>,
     pub available_models: Vec<AvailableModel>,

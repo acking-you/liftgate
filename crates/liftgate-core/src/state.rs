@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
 use liftgate_types::config::{
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
-    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS, ProxyUrl,
-    is_proxy_disable_keyword,
+    CacheHitThresholdBps, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_IDLE_SESSIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES,
+    DEFAULT_TURN_TIMEOUT_SECS, LowCacheRecordLimit, ProxyUrl, is_proxy_disable_keyword,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -74,6 +74,11 @@ impl StatePaths {
     #[must_use]
     pub fn settings_file(&self) -> PathBuf {
         self.root.join("settings.json")
+    }
+
+    #[must_use]
+    pub fn cache_telemetry_file(&self) -> PathBuf {
+        self.root.join("cache-telemetry.json")
     }
 
     #[must_use]
@@ -243,6 +248,12 @@ pub struct LiftgateSettings {
     /// Offload incoming `Image` blocks on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
     #[serde(default = "default_true")]
     pub vision_offload: bool,
+    /// Maximum persisted low-cache-hit diagnostic records (`1_000` by default; `0` disables recording).
+    #[serde(default)]
+    pub max_low_cache_records: LowCacheRecordLimit,
+    /// Basis-point threshold (`5_000` = `50.00%` by default) below which a turn is recorded as low cache hit.
+    #[serde(default)]
+    pub low_cache_threshold_bps: CacheHitThresholdBps,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -257,6 +268,8 @@ impl Default for LiftgateSettings {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            max_low_cache_records: LowCacheRecordLimit::default(),
+            low_cache_threshold_bps: CacheHitThresholdBps::default(),
             agy_bin: None,
             extra: serde_json::Map::new(),
         }
@@ -309,6 +322,28 @@ pub const fn resolve_effective_vision_offload(
     }
 }
 
+/// Resolves the effective maximum retained low-cache-hit records (`CLI/env` -> `settings.json` -> `1_000`).
+pub fn resolve_effective_max_low_cache_records(
+    cli_override: Option<usize>,
+    settings: &LiftgateSettings,
+) -> Result<LowCacheRecordLimit, CliError> {
+    match cli_override {
+        Some(raw) => Ok(LowCacheRecordLimit::try_new(raw)?),
+        None => Ok(settings.max_low_cache_records),
+    }
+}
+
+/// Resolves the effective low-cache-hit basis-point threshold (`CLI/env` -> `settings.json` -> `5_000` / `50%`).
+pub fn resolve_effective_low_cache_threshold_bps(
+    cli_pct_override: Option<u8>,
+    settings: &LiftgateSettings,
+) -> Result<CacheHitThresholdBps, CliError> {
+    match cli_pct_override {
+        Some(pct) => Ok(CacheHitThresholdBps::try_from_percent(pct)?),
+        None => Ok(settings.low_cache_threshold_bps),
+    }
+}
+
 /// Resolves the `agy` executable path, consulting saved `settings.agy_bin` when not yet on `PATH`.
 #[must_use]
 pub fn resolve_effective_agy_bin(
@@ -352,6 +387,10 @@ pub struct DaemonState {
     pub agy_auto_update: bool,
     #[serde(default = "default_true")]
     pub vision_offload: bool,
+    #[serde(default)]
+    pub max_low_cache_records: LowCacheRecordLimit,
+    #[serde(default)]
+    pub low_cache_threshold_bps: CacheHitThresholdBps,
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
@@ -630,6 +669,8 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            max_low_cache_records: LowCacheRecordLimit::default(),
+            low_cache_threshold_bps: CacheHitThresholdBps::default(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,

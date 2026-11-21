@@ -308,6 +308,14 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
 
+    /// Maximum persisted low-cache-hit diagnostic records (`1000` by default; `0` disables recording).
+    #[arg(long, env = "AGY_MAX_LOW_CACHE_RECORDS")]
+    pub max_low_cache_records: Option<usize>,
+
+    /// Percentage threshold (`0..=100`, `50` by default) below which a turn's prompt cache hit rate is persisted.
+    #[arg(long, env = "AGY_LOW_CACHE_THRESHOLD_PCT")]
+    pub low_cache_threshold_pct: Option<u8>,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -379,6 +387,12 @@ impl Default for ServeArgs {
                 _ => None,
             }
         });
+        let max_low_cache_records = std::env::var("AGY_MAX_LOW_CACHE_RECORDS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        let low_cache_threshold_pct = std::env::var("AGY_LOW_CACHE_THRESHOLD_PCT")
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok());
 
         Self {
             listen,
@@ -394,6 +408,8 @@ impl Default for ServeArgs {
             no_agy_auto_update: false,
             vision_offload,
             no_vision_offload: false,
+            max_low_cache_records,
+            low_cache_threshold_pct,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -463,6 +479,14 @@ pub struct RestartArgs {
     /// Disable `>=150k`-token ephemeral vision sub-session offload.
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
+
+    /// Override maximum persisted low-cache-hit diagnostic records (`1000` by default).
+    #[arg(long)]
+    pub max_low_cache_records: Option<usize>,
+
+    /// Override percentage threshold (`0..=100`, `50` by default) for recording low cache hits.
+    #[arg(long)]
+    pub low_cache_threshold_pct: Option<u8>,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]
@@ -1744,6 +1768,8 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--agy-proxy",
         "--agy-auto-update",
         "--vision-offload",
+        "--max-low-cache-records",
+        "--low-cache-threshold-pct",
         "--max-line-bytes",
         "--max-body-bytes",
         "--channel-capacity",
