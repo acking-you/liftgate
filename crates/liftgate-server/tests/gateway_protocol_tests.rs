@@ -1374,6 +1374,14 @@ async fn models_count_tokens_and_api_key_enforcement() {
         carbon_card["description"],
         "500k ctx · Antigravity ACP (gemini-4-carbon-high)"
     );
+    assert_eq!(
+        carbon_card["chat"]["modalities"]["input"],
+        serde_json::json!(["text", "image"])
+    );
+    assert_eq!(
+        carbon_card["chat"]["modalities"]["output"],
+        serde_json::json!(["text"])
+    );
 
     // Bearer token -> 200 `/v1/codex-models` full Codex picker catalog replacement
     let codex_catalog_resp = app

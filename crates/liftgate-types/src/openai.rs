@@ -1233,6 +1233,24 @@ pub struct ModelListResponse {
     pub last_id: Option<String>,
 }
 
+/// Chat capability metadata carried on a `/v1/models` card.
+///
+/// The `chat.modalities` block mirrors the optional chat metadata that
+/// OpenAI-compatible gateways in front of Liftgate (for example Floway's
+/// `custom` upstream) read from an upstream `/models` response, so they can
+/// advertise vision support without a hardcoded model allowlist.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelChatMetadata {
+    pub modalities: ModelModalities,
+}
+
+/// Input and output modalities a model accepts.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelModalities {
+    pub input: Vec<&'static str>,
+    pub output: Vec<&'static str>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelCard {
     pub id: String,
@@ -1248,6 +1266,10 @@ pub struct ModelCard {
     pub auto_compact_token_limit: u64,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
+    /// Every Antigravity ACP model accepts text and image input and emits
+    /// text; the Codex picker catalog below makes the same claim through
+    /// `input_modalities`.
+    pub chat: ModelChatMetadata,
 }
 
 /// OpenAI Codex `model_catalog_json` container (`GET /v1/codex-models`), replacing Codex's
