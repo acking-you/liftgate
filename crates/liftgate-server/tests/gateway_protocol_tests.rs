@@ -5240,3 +5240,233 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
         "warm session restored by IdleCheckoutGuard must be reused cleanly"
     );
 }
+
+#[tokio::test]
+async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserving_prefix_hash() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1 on `sess_1`: reaches 165,000 tokens (> 150,000 threshold)
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(165_000, 1_048_576)],
+            chunks_template: vec!["Ready to inspect screenshot.".to_owned()],
+        },
+        // Turn 2 ephemeral vision sub-session (`sess_2`): receives the raw image block
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "Dialog title: 'Payment Failed', error code E-402, red button '#retry-btn'."
+                    .to_owned(),
+            ],
+        },
+        // Turn 2 primary warm session (`sess_1`): receives text-only `<ephemeral_vision_inspection>`
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(166_200, 1_048_576)],
+            chunks_template: vec!["Fix `#retry-btn` handler for E-402.".to_owned()],
+        },
+        // Turn 3 continuation on warm `sess_1`: verifies prefix hash remained 100% intact!
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(166_800, 1_048_576)],
+            chunks_template: vec!["Applied E-402 fix.".to_owned()],
+        },
+    ]));
+    let state = test_state(Arc::clone(&backend), 30, Some("secret-gate-key"));
+    let app = build_router(state.clone());
+
+    let msg_u1 = json!({ "role": "user", "content": "Help debug payment UI." });
+    let t1_req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [msg_u1]
+    });
+    let t1_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(t1_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1_resp.status(), StatusCode::OK);
+
+    // Turn 2: caller resends history + new user turn containing a base64 PNG screenshot
+    let msg_a1 = json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Ready to inspect screenshot." }]
+    });
+    let msg_u2 = json!({
+        "role": "user",
+        "content": [
+            { "type": "text", "text": "Here is the failing checkout modal screenshot:" },
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                }
+            }
+        ]
+    });
+    let t2_req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [msg_u1, msg_a1, msg_u2]
+    });
+    let t2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(t2_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2_resp.status(), StatusCode::OK);
+    let t2_body: Value =
+        serde_json::from_slice(&t2_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        t2_body["content"][0]["text"],
+        "Fix `#retry-btn` handler for E-402."
+    );
+
+    {
+        let prompts = backend.recorded_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0].session_id, "sess_1");
+        // Ephemeral vision sub-session (`sess_2`) received the raw PNG image
+        assert_eq!(prompts[1].session_id, "sess_2");
+        assert_eq!(prompts[1].image_blocks.len(), 1);
+        assert_eq!(prompts[1].image_blocks[0].0, "image/png");
+        // Warm 165k session (`sess_1`) received ZERO raw images and got the text report instead
+        assert_eq!(prompts[2].session_id, "sess_1");
+        assert!(
+            prompts[2].image_blocks.is_empty(),
+            "warm >=150k session must receive zero raw image blocks"
+        );
+        assert!(
+            prompts[2]
+                .text_joined
+                .contains("<ephemeral_vision_inspection images=\"1\">")
+        );
+        assert!(prompts[2].text_joined.contains("error code E-402"));
+    }
+
+    // Verify telemetry recorded `vision_offloaded_images == 1` and `ttft_ms`
+    let (_metrics, _active, recent) = state.telemetry.snapshot_tasks();
+    assert_eq!(recent[0].vision_offloaded_images, 1);
+    assert!(recent[0].ttft_ms.is_some());
+
+    // Turn 3: verify prefix hash on `sess_1` still matches seamlessly on subsequent coding turns!
+    let msg_a2 = json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Fix `#retry-btn` handler for E-402." }]
+    });
+    let msg_u3 = json!({ "role": "user", "content": "Apply the fix now." });
+    let t3_req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [msg_u1, msg_a1, msg_u2, msg_a2, msg_u3]
+    });
+    let t3_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "secret-gate-key")
+                .header("content-type", "application/json")
+                .body(Body::from(t3_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3_resp.status(), StatusCode::OK);
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+    assert_eq!(
+        prompts[3].session_id, "sess_1",
+        "subsequent turn after vision offload must still hit warm session prefix hash"
+    );
+}
+
+#[tokio::test]
+async fn session_pool_classifies_cache_warmth_and_reaps_expired_idle_sessions() {
+    use liftgate_server::session_pool::DEFAULT_MAX_IDLE_SESSION_AGE_MS;
+    use liftgate_types::telemetry::PromptCacheWarmth;
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::ImmediateWithUsage {
+        usage_updates: vec![(42_500, 500_000)],
+        chunks_template: vec!["Warm pool check.".to_owned()],
+    }]));
+    let state = test_state(Arc::clone(&backend), 30, None);
+    let app = build_router(state.clone());
+
+    let req = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 256,
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let initial_snap = state.pool.snapshot();
+    assert_eq!(initial_snap.sessions.len(), 1);
+    let base_active_ms = initial_snap.sessions[0].last_active_unix_ms;
+    assert_eq!(initial_snap.sessions[0].last_context_tokens, 42_500);
+
+    // < 60s -> Hot
+    let hot_snap = state.pool.snapshot_at(base_active_ms + 15_000);
+    assert_eq!(hot_snap.sessions[0].cache_warmth, PromptCacheWarmth::Hot);
+
+    // 60s..300s -> Warm
+    let warm_snap = state.pool.snapshot_at(base_active_ms + 120_000);
+    assert_eq!(warm_snap.sessions[0].cache_warmth, PromptCacheWarmth::Warm);
+
+    // >= 300s -> Cold
+    let cold_snap = state.pool.snapshot_at(base_active_ms + 360_000);
+    assert_eq!(cold_snap.sessions[0].cache_warmth, PromptCacheWarmth::Cold);
+
+    // Not yet at 45m expiry -> 0 reaped
+    assert_eq!(
+        state.pool.reap_expired_idle_sessions(
+            base_active_ms + 360_000,
+            DEFAULT_MAX_IDLE_SESSION_AGE_MS,
+            &*backend,
+        ),
+        0
+    );
+    assert_eq!(state.pool.idle_and_active_counts(), (0, 1));
+
+    // Past 45m expiry -> reaped and aborted cleanly
+    let aborted_before = backend.aborted_count.load(Ordering::SeqCst);
+    assert_eq!(
+        state.pool.reap_expired_idle_sessions(
+            base_active_ms + DEFAULT_MAX_IDLE_SESSION_AGE_MS + 1,
+            DEFAULT_MAX_IDLE_SESSION_AGE_MS,
+            &*backend,
+        ),
+        1
+    );
+    assert_eq!(state.pool.idle_and_active_counts(), (0, 0));
+    assert_eq!(
+        backend.aborted_count.load(Ordering::SeqCst),
+        aborted_before + 1
+    );
+}

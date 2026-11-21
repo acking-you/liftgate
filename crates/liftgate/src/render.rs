@@ -280,8 +280,25 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             snap.session_pool.max_idle_sessions,
             8,
         );
+        let mut hot_idle = 0usize;
+        let mut warm_idle = 0usize;
+        let mut cold_idle = 0usize;
+        for sess in &snap.session_pool.sessions {
+            match sess.cache_warmth {
+                liftgate_types::telemetry::PromptCacheWarmth::Hot => hot_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Warm => warm_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Cold => cold_idle += 1,
+                liftgate_types::telemetry::PromptCacheWarmth::Active
+                | liftgate_types::telemetry::PromptCacheWarmth::Unknown => {}
+            }
+        }
+        let cache_breakdown = if snap.session_pool.idle_cached_sessions > 0 {
+            format!(" [kv: {hot_idle} hot, {warm_idle} warm, {cold_idle} cold]")
+        } else {
+            String::new()
+        };
         let pool_detail = format!(
-            "{pool_bar}  {} active · {}/{} idle  (reused {}, created {}, evicted {})",
+            "{pool_bar}  {} active · {}/{} idle{cache_breakdown}  (reused {}, created {}, evicted {})",
             snap.session_pool.active_leased_sessions,
             snap.session_pool.idle_cached_sessions,
             snap.session_pool.max_idle_sessions,

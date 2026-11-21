@@ -6,7 +6,7 @@
 
 ## 准备工作
 
-- **全局安装 `lg` / `liftgate`**（或直接从 [桌面端 Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) 下载独立的原生 GPUI 应用 **Liftgate Desktop**）：
+- **全局安装 `lg` / `liftgate`**：
   ```bash
   # macOS / Linux / FreeBSD
   curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh

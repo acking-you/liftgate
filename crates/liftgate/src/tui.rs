@@ -1981,19 +1981,27 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     if let Some(&bottom_pane) = panes.get(1) {
         let detail_lines = if let Some(selected) = turns.get(app.turn_idx) {
             let sess_id = selected.session_id.as_deref().unwrap_or("ephemeral");
+            let vision_note = if selected.vision_offloaded_images > 0 {
+                format!(" · vision_offload={}", selected.vision_offloaded_images)
+            } else {
+                String::new()
+            };
             let tools_summary = if selected.client_tool_calls.is_empty() {
                 format!(
-                    "web_search={} · web_fetch={}",
+                    "web_search={} · web_fetch={}{vision_note}",
                     selected.native_web_searches, selected.native_web_fetches
                 )
             } else {
                 format!(
-                    "{} (web_search={} · web_fetch={})",
+                    "{} (web_search={} · web_fetch={}{vision_note})",
                     selected.client_tool_calls.join(", "),
                     selected.native_web_searches,
                     selected.native_web_fetches
                 )
             };
+            let ttft_label = selected
+                .ttft_ms
+                .map_or_else(|| "—".to_owned(), format_latency_ms);
             let preview = if let Some(err) = &selected.error_message {
                 Line::from(vec![
                     Span::styled(
@@ -2017,6 +2025,8 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Span::styled(&selected.task_id, Style::default().fg(Color::Cyan)),
                     Span::styled("   Session: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(sess_id, Style::default().fg(Color::Green)),
+                    Span::styled("   TTFT: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(ttft_label, Style::default().fg(Color::Cyan)),
                     Span::styled("   Stop: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         selected.stop_reason.as_deref().unwrap_or("in-progress"),
@@ -2077,14 +2087,30 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 SessionSlotState::Running => ("● LEASED", Color::Cyan),
                 SessionSlotState::Idle => ("✓ IDLE", Color::Green),
             };
+            let (kv_label, kv_color) = match s.cache_warmth {
+                liftgate_types::telemetry::PromptCacheWarmth::Active => ("● ACTIVE", Color::Cyan),
+                liftgate_types::telemetry::PromptCacheWarmth::Hot => ("★ HOT", Color::Green),
+                liftgate_types::telemetry::PromptCacheWarmth::Warm => ("◐ WARM", Color::Yellow),
+                liftgate_types::telemetry::PromptCacheWarmth::Cold
+                | liftgate_types::telemetry::PromptCacheWarmth::Unknown => {
+                    ("· COLD", Color::DarkGray)
+                }
+            };
+            let ctx_label = if s.last_context_tokens > 0 {
+                format_tokens(s.last_context_tokens)
+            } else {
+                "—".to_owned()
+            };
             Row::new(vec![
                 Cell::from(s.session_id.clone()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(st_label)
                     .style(Style::default().fg(st_color).add_modifier(Modifier::BOLD)),
+                Cell::from(kv_label)
+                    .style(Style::default().fg(kv_color).add_modifier(Modifier::BOLD)),
                 Cell::from(s.model_id.clone()),
+                Cell::from(ctx_label),
                 Cell::from(s.turn_count.to_string()),
                 Cell::from(s.message_count.to_string()),
-                Cell::from(format_relative_ms(s.created_at_unix_ms, now_ms)),
                 Cell::from(format_relative_ms(s.last_active_unix_ms, now_ms)),
             ])
         })
@@ -2098,12 +2124,13 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(26),
-            Constraint::Length(11),
-            Constraint::Percentage(26),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Percentage(24),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Percentage(24),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Length(12),
         ],
     )
@@ -2111,10 +2138,11 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         Row::new(vec![
             "SESSION ID",
             "STATE",
+            "KV CACHE",
             "MODEL",
+            "CTX",
             "TURNS",
             "MSGS",
-            "CREATED",
             "LAST ACTIVE",
         ])
         .style(

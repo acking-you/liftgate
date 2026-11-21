@@ -35,12 +35,16 @@ export interface AcpProcessTelemetry {
 
 export type SessionSlotState = "running" | "idle";
 
+export type PromptCacheWarmth = "active" | "hot" | "warm" | "cold" | "unknown";
+
 export interface SessionSummary {
   session_id: string;
   model_id: string;
   state: SessionSlotState;
+  cache_warmth?: PromptCacheWarmth;
   turn_count: number;
   message_count: number;
+  last_context_tokens?: number;
   created_at_unix_ms: number;
   last_active_unix_ms: number;
   last_response_id: string | null;
@@ -92,11 +96,13 @@ export interface TaskSnapshot {
   started_at_unix_ms: number;
   finished_at_unix_ms: number | null;
   elapsed_ms: number;
+  ttft_ms?: number | null;
   thought_chars: number;
   output_chars: number;
   client_tool_calls: string[];
   native_web_searches: number;
   native_web_fetches: number;
+  vision_offloaded_images?: number;
   prompt_preview: string;
   output_preview: string;
   stop_reason: string | null;

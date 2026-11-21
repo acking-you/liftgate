@@ -578,10 +578,7 @@ pub async fn execute_upgrade_with_progress(
         && let Some(bundle_kind) = detect_packaged_bundle_kind(current_exe)
     {
         let release_url = match &requested_tag {
-            Some(tag) => format!(
-                "https://github.com/{}/releases/tag/{tag}-ui",
-                args.repo.trim()
-            ),
+            Some(tag) => format!("https://github.com/{}/releases/tag/{tag}", args.repo.trim()),
             None => format!("https://github.com/{}/releases", args.repo.trim()),
         };
         return Err(CliError::UpgradePackagedBundle {
@@ -784,16 +781,6 @@ pub async fn execute_upgrade_with_progress(
                 ),
             );
             let unpacked = unpack_release_binaries(&archive_path, &plan.archive_name, &stage.path)?;
-            let invoked_from_desktop = current_exe
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("liftgate-desktop"));
-            if invoked_from_desktop && unpacked.desktop_bin.is_none() {
-                return Err(CliError::UpgradeArchive {
-                    asset: plan.archive_name.clone(),
-                    source: ArchiveError::MissingDesktopBundle,
-                });
-            }
             if plan.target_triple == COMPILE_TARGET {
                 emit_progress(
                     progress_tx,
@@ -805,9 +792,6 @@ pub async fn execute_upgrade_with_progress(
                     ),
                 );
                 smoke_check_staged_binary(&unpacked.liftgate_bin).await?;
-                if let Some(desktop_bin) = &unpacked.desktop_bin {
-                    smoke_check_staged_binary(desktop_bin).await?;
-                }
             }
             Ok::<(StagedBinaries, String), CliError>((unpacked, actual_sha256))
         }
@@ -2254,7 +2238,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 struct StagedBinaries {
     liftgate_bin: PathBuf,
     lg_bin: PathBuf,
-    desktop_bin: Option<PathBuf>,
 }
 
 fn unpack_release_binaries(
@@ -2268,15 +2251,9 @@ fn unpack_release_binaries(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
     let expected_liftgate = if is_zip { "liftgate.exe" } else { "liftgate" };
     let expected_lg = if is_zip { "lg.exe" } else { "lg" };
-    let expected_desktop = if is_zip {
-        "liftgate-desktop.exe"
-    } else {
-        "liftgate-desktop"
-    };
 
     let staged_liftgate = stage_dir.join(format!("staged-{expected_liftgate}"));
     let staged_lg = stage_dir.join(format!("staged-{expected_lg}"));
-    let staged_desktop = stage_dir.join(format!("staged-{expected_desktop}"));
 
     if is_zip {
         extract_zip_binaries(
@@ -2284,10 +2261,8 @@ fn unpack_release_binaries(
             archive_name,
             expected_liftgate,
             expected_lg,
-            expected_desktop,
             &staged_liftgate,
             &staged_lg,
-            &staged_desktop,
         )?;
     } else {
         extract_targz_binaries(
@@ -2295,10 +2270,8 @@ fn unpack_release_binaries(
             archive_name,
             expected_liftgate,
             expected_lg,
-            expected_desktop,
             &staged_liftgate,
             &staged_lg,
-            &staged_desktop,
         )?;
     }
 
@@ -2321,23 +2294,16 @@ fn unpack_release_binaries(
     Ok(StagedBinaries {
         liftgate_bin: staged_liftgate,
         lg_bin: staged_lg,
-        desktop_bin: staged_desktop.is_file().then_some(staged_desktop),
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "archive extractor maps three expected binary names directly to staged paths"
-)]
 fn extract_zip_binaries(
     archive_path: &Path,
     archive_name: &str,
     expected_liftgate: &str,
     expected_lg: &str,
-    expected_desktop: &str,
     staged_liftgate: &Path,
     staged_lg: &Path,
-    staged_desktop: &Path,
 ) -> Result<(), CliError> {
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
@@ -2371,8 +2337,6 @@ fn extract_zip_binaries(
                 Some(staged_liftgate)
             } else if base_name == expected_lg {
                 Some(staged_lg)
-            } else if base_name == expected_desktop {
-                Some(staged_desktop)
             } else {
                 None
             }
@@ -2384,19 +2348,13 @@ fn extract_zip_binaries(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "archive extractor maps three expected binary names directly to staged paths"
-)]
 fn extract_targz_binaries(
     archive_path: &Path,
     archive_name: &str,
     expected_liftgate: &str,
     expected_lg: &str,
-    expected_desktop: &str,
     staged_liftgate: &Path,
     staged_lg: &Path,
-    staged_desktop: &Path,
 ) -> Result<(), CliError> {
     let file = File::open(archive_path).map_err(|source| CliError::StateIo {
         path: archive_path.to_path_buf(),
@@ -2430,8 +2388,6 @@ fn extract_targz_binaries(
             Some(staged_liftgate)
         } else if base_name == expected_lg {
             Some(staged_lg)
-        } else if base_name == expected_desktop {
-            Some(staged_desktop)
         } else {
             None
         };
@@ -2535,22 +2491,17 @@ fn plan_install_targets(
 
     let canonical_liftgate = install_dir.join(format!("liftgate{ext}"));
     let canonical_lg = install_dir.join(format!("lg{ext}"));
-    let canonical_desktop = install_dir.join(format!("liftgate-desktop{ext}"));
 
     let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
     let current_stem = current_exe
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("liftgate");
-    if current_stem.eq_ignore_ascii_case("liftgate-desktop") {
-        if let Some(desktop_src) = &staged.desktop_bin {
-            targets.push((desktop_src.clone(), current_exe.to_path_buf()));
-        }
-    } else if current_stem.eq_ignore_ascii_case("liftgate") {
+    if current_stem.eq_ignore_ascii_case("liftgate") {
         targets.push((staged.liftgate_bin.clone(), current_exe.to_path_buf()));
     } else {
         targets.push((staged.lg_bin.clone(), current_exe.to_path_buf()));
-    };
+    }
 
     let is_cargo_build_dir = install_dir
         .file_name()
@@ -2569,14 +2520,6 @@ fn plan_install_targets(
         let already_listed = targets.iter().any(|(_, p)| same_file_path(p, &candidate));
         if !already_listed && (!is_cargo_build_dir || candidate.is_file()) {
             targets.push((src.clone(), candidate));
-        }
-    }
-    if let Some(desktop_src) = &staged.desktop_bin {
-        let already_listed = targets
-            .iter()
-            .any(|(_, p)| same_file_path(p, &canonical_desktop));
-        if !already_listed && (!is_cargo_build_dir || canonical_desktop.is_file()) {
-            targets.push((desktop_src.clone(), canonical_desktop));
         }
     }
 
@@ -3037,8 +2980,8 @@ mod tests {
     }
 
     #[test]
-    fn unpack_and_plan_install_targets_bundles_desktop_binary_when_present() {
-        let temp_root = std::env::temp_dir().join(format!("lg-upgrade-desktop-{}", Uuid::new_v4()));
+    fn unpack_and_plan_install_targets_stages_cli_binaries_and_alias() {
+        let temp_root = std::env::temp_dir().join(format!("lg-upgrade-cli-{}", Uuid::new_v4()));
         let stage_dir = temp_root.join("stage");
         let bin_dir = temp_root.join("bin");
         fs::create_dir_all(&stage_dir).unwrap();
@@ -3056,9 +2999,6 @@ mod tests {
             zip.start_file("liftgate-x86_64-pc-windows-msvc/lg.exe", opts)
                 .unwrap();
             zip.write_all(b"LG-EXE").unwrap();
-            zip.start_file("liftgate-x86_64-pc-windows-msvc/liftgate-desktop.exe", opts)
-                .unwrap();
-            zip.write_all(b"DESKTOP-EXE").unwrap();
             zip.finish().unwrap();
         }
         fs::write(&archive_path, cursor.into_inner()).unwrap();
@@ -3069,13 +3009,12 @@ mod tests {
             &stage_dir,
         )
         .unwrap();
-        assert!(staged.desktop_bin.is_some());
 
-        let current_desktop = bin_dir.join("liftgate-desktop.exe");
-        fs::write(&current_desktop, b"OLD-DESKTOP").unwrap();
-        let targets = plan_install_targets(&current_desktop, &staged, "x86_64-pc-windows-msvc");
-        assert_eq!(targets.len(), 3);
-        assert!(same_file_path(&targets[0].1, &current_desktop));
+        let current_cli = bin_dir.join("liftgate.exe");
+        fs::write(&current_cli, b"OLD-CLI").unwrap();
+        let targets = plan_install_targets(&current_cli, &staged, "x86_64-pc-windows-msvc");
+        assert_eq!(targets.len(), 2);
+        assert!(same_file_path(&targets[0].1, &current_cli));
 
         let _ = fs::remove_dir_all(&temp_root);
     }
@@ -3084,7 +3023,7 @@ mod tests {
     async fn blocks_appimage_and_app_bundle_in_place_upgrade_while_allowing_check() {
         assert_eq!(
             detect_packaged_bundle_kind_with_env(
-                Path::new("/tmp/.mount_liftgaAbCdEf/usr/bin/liftgate-desktop"),
+                Path::new("/tmp/.mount_liftgaAbCdEf/usr/bin/liftgate"),
                 None,
                 None,
             ),
@@ -3092,7 +3031,7 @@ mod tests {
         );
         assert_eq!(
             detect_packaged_bundle_kind_with_env(
-                Path::new("/tmp/appimage_extracted_1234/usr/bin/liftgate-desktop"),
+                Path::new("/tmp/appimage_extracted_1234/usr/bin/liftgate"),
                 None,
                 None,
             ),
@@ -3100,7 +3039,7 @@ mod tests {
         );
         assert_eq!(
             detect_packaged_bundle_kind_with_env(
-                Path::new("/opt/squash/usr/bin/liftgate-desktop"),
+                Path::new("/opt/squash/usr/bin/liftgate"),
                 Some(OsStr::new("/home/dev/Apps/Liftgate.AppImage")),
                 Some(OsStr::new("/opt/squash")),
             ),
@@ -3116,7 +3055,7 @@ mod tests {
         );
         assert_eq!(
             detect_packaged_bundle_kind_with_env(
-                Path::new("/Applications/Liftgate.app/Contents/MacOS/liftgate-desktop"),
+                Path::new("/Applications/Liftgate.app/Contents/MacOS/liftgate"),
                 None,
                 None,
             ),
@@ -3124,7 +3063,7 @@ mod tests {
         );
         assert_eq!(
             detect_packaged_bundle_kind_with_env(
-                Path::new("/Users/dev/liftgate-aarch64-apple-darwin/liftgate-desktop"),
+                Path::new("/Users/dev/liftgate-aarch64-apple-darwin/liftgate"),
                 None,
                 None,
             ),
@@ -3134,7 +3073,7 @@ mod tests {
         let temp_root =
             std::env::temp_dir().join(format!("lg-upgrade-appimage-{}", Uuid::new_v4()));
         let state_paths = StatePaths::resolve(Some(temp_root.join("state"))).unwrap();
-        let appimage_exe = Path::new("/tmp/.mount_liftgaTest/usr/bin/liftgate-desktop");
+        let appimage_exe = Path::new("/tmp/.mount_liftgaTest/usr/bin/liftgate");
         let archive_name = if COMPILE_TARGET.contains("windows") {
             format!("liftgate-{COMPILE_TARGET}.zip")
         } else {
@@ -3177,7 +3116,7 @@ mod tests {
             CliError::UpgradePackagedBundle {
                 ref release_url,
                 ..
-            } if release_url.ends_with("/releases/tag/v0.2.0-ui")
+            } if release_url.ends_with("/releases/tag/v0.2.0")
         ));
 
         let _ = fs::remove_dir_all(&temp_root);

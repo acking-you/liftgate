@@ -830,10 +830,20 @@ export function App(): React.JSX.Element {
                                   Fetch×{task.native_web_fetches}
                                 </Badge>
                               )}
+                              {(task.vision_offloaded_images ?? 0) > 0 && (
+                                <Badge variant="success">
+                                  Vision×{task.vision_offloaded_images}
+                                </Badge>
+                              )}
                             </div>
                           </TableCell>
                           <TableCell className="text-right font-mono text-xs">
-                            {formatDurationMs(task.elapsed_ms)}
+                            <div>{formatDurationMs(task.elapsed_ms)}</div>
+                            {task.ttft_ms != null && (
+                              <div className="text-[11px] text-muted-foreground">
+                                TTFT {formatDurationMs(task.ttft_ms)}
+                              </div>
+                            )}
                           </TableCell>
                           <TableCell className="text-right font-mono text-xs">
                             {task.usage
@@ -872,11 +882,11 @@ export function App(): React.JSX.Element {
                     <TableHeader>
                       <TableRow>
                         <TableHead>Session ID</TableHead>
-                        <TableHead>状态</TableHead>
+                        <TableHead>状态 / KV 缓存</TableHead>
                         <TableHead>绑定模型</TableHead>
+                        <TableHead>上下文占用</TableHead>
                         <TableHead>已执行轮次</TableHead>
                         <TableHead>累计消息数</TableHead>
-                        <TableHead>最近 Response ID</TableHead>
                         <TableHead>最近活跃</TableHead>
                         <TableHead className="text-right">操作</TableHead>
                       </TableRow>
@@ -892,21 +902,27 @@ export function App(): React.JSX.Element {
                               <Badge variant="info" className="animate-pulse">
                                 执行中 (Leased)
                               </Badge>
+                            ) : sess.cache_warmth === "hot" ? (
+                              <Badge variant="success">热缓存 (&lt;1m)</Badge>
+                            ) : sess.cache_warmth === "warm" ? (
+                              <Badge variant="warning">温缓存 (1–5m)</Badge>
                             ) : (
-                              <Badge variant="secondary">空闲缓存 (Idle)</Badge>
+                              <Badge variant="secondary">冷驻留 (&ge;5m)</Badge>
                             )}
                           </TableCell>
                           <TableCell className="font-mono text-xs">
                             {sess.model_id}
                           </TableCell>
                           <TableCell className="font-mono text-xs">
+                            {(sess.last_context_tokens ?? 0) > 0
+                              ? formatNumber(sess.last_context_tokens ?? 0)
+                              : "-"}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
                             {sess.turn_count}
                           </TableCell>
                           <TableCell className="font-mono text-xs">
                             {sess.message_count}
-                          </TableCell>
-                          <TableCell className="font-mono text-xs text-muted-foreground">
-                            {sess.last_response_id ?? "-"}
                           </TableCell>
                           <TableCell className="font-mono text-xs text-muted-foreground">
                             {formatTimestamp(sess.last_active_unix_ms)}
@@ -1099,7 +1115,11 @@ claude`}
                   {selectedTask.protocol === "openai_responses"
                     ? "OpenAI Responses API (/v1/responses)"
                     : "Anthropic Messages API (/v1/messages)"}{" "}
-                  · 耗时 {formatDurationMs(selectedTask.elapsed_ms)}
+                  · 首字延迟{" "}
+                  {selectedTask.ttft_ms != null
+                    ? formatDurationMs(selectedTask.ttft_ms)
+                    : "-"}{" "}
+                  · 总耗时 {formatDurationMs(selectedTask.elapsed_ms)}
                 </DialogDescription>
               </DialogHeader>
 
@@ -1143,7 +1163,8 @@ claude`}
               )}
 
               {(selectedTask.native_web_searches > 0 ||
-                (selectedTask.native_web_fetches ?? 0) > 0) && (
+                (selectedTask.native_web_fetches ?? 0) > 0 ||
+                (selectedTask.vision_offloaded_images ?? 0) > 0) && (
                 <div className="flex flex-wrap gap-4 text-xs">
                   {selectedTask.native_web_searches > 0 && (
                     <span>
@@ -1158,6 +1179,14 @@ claude`}
                       <span className="text-muted-foreground">原生网页抓取: </span>
                       <span className="font-mono text-emerald-400">
                         {selectedTask.native_web_fetches} 次
+                      </span>
+                    </span>
+                  )}
+                  {(selectedTask.vision_offloaded_images ?? 0) > 0 && (
+                    <span>
+                      <span className="text-muted-foreground">长会话视觉旁路卸载: </span>
+                      <span className="font-mono text-emerald-400">
+                        {selectedTask.vision_offloaded_images} 张
                       </span>
                     </span>
                   )}

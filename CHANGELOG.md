@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Ephemeral vision sub-session offload for `>=150k`-token warm coding sessions**:
+  - When a warm `SessionPool` session has accumulated `>= 150,000` context tokens and an incoming turn carries `Image` blocks (such as UI screenshots or `Read`/`view_image` tool outputs), Liftgate now inspects the images inside a zero-history ephemeral ACP sub-session on the requested model and forwards a structured plain-text `<ephemeral_vision_inspection>` report to the primary coding session while keeping `SessionPool` prefix hashes 100% intact for subsequent turns, avoiding multimodal upstream prompt-cache invalidation and TTFT cliffs.
+- **KV-cache warmth classification, per-turn TTFT telemetry, and stale idle worker reaping**:
+  - Added `PromptCacheWarmth` (`active`, `hot` `<60s`, `warm` `1–5m`, `cold` `>=5m`), per-session `last_context_tokens`, per-turn `ttft_ms`, and `vision_offloaded_images` across `/api/telemetry/snapshot`, SSE telemetry events, `lg st`, `lg top`, and the embedded Web dashboard, plus a periodic 45-minute idle `agy acp` worker reaper (`DEFAULT_MAX_IDLE_SESSION_AGE_MS`).
+- **Terminal control scrubbing & root-cause diagnostic extraction on tool outputs**:
+  - Scrubs ANSI escape sequences (`CSI`, `OSC`, `DCS`), backspace overstrikes, and bare `\r` progress-bar overwrites (preserving `\r\n` / `\r\r\n` ConPTY line endings) when forwarding `ToolResult` payloads to `agy acp`, while keeping 100% raw original content in `~/.liftgate/spills/` and leaving `SessionPool` hashes untouched.
+  - Rescues buried compiler, test, and runtime failure diagnostics (`error[E...]`, `Caused by:`, `panicked at`, `FAILED`, etc., filtering structured info-log noise) from omitted middle sections when oversized tool outputs are head+tail truncated.
+- **Host-installed Antigravity plugin isolation, parallel read-only batching & schema-aware argument coercion**:
+  - Injects `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `AGY_FAST_AUTO_UPDATE=off`, and `NO_UPDATE_NOTIFIER=1` into supervised `agy` subprocesses, prohibits internal host/plugin MCP tools (`call_mcp_tool`, `mcp_*`) in `<api_gateway_bridge_rules>`, guides parallel read-only XML batching in single turns, normalizes `null` function arguments to `{}`, and unwraps JSON-stringified `array` / `object` fields when declared in the client tool's JSON Schema.
+
+### Removed
+- **Removed experimental GPUI desktop client (`crates/liftgate-desktop`) and desktop installer workflows**:
+  - Removed `liftgate-desktop` (`gpui-kit`), `DesktopUiPrefs`, `.github/workflows/release-ui.yml`, and OS-specific desktop packaging scripts while preserving `liftgate-core` as a clean headless Rust control plane for a future Flutter + Rust desktop client.
+
 ## [0.2.4] - 2026-11-19
 
 ### Fixed

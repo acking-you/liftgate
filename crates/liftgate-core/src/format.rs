@@ -1,4 +1,4 @@
-//! Human-friendly unit formatters shared across the CLI, TUI, and GPUI desktop client.
+//! Human-friendly unit formatters shared across the CLI and TUI.
 
 /// Formats elapsed seconds into compact human units (`42s`, `5m 12s`, `2h 09m`, `1d 04h`).
 #[must_use]

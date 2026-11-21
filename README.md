@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/acking-you/liftgate/releases/latest"><img alt="CLI release" src="https://img.shields.io/github/v/release/acking-you/liftgate?color=355ACF&label=CLI"></a>
-  <a href="https://github.com/acking-you/liftgate/releases/tag/v0.2.4-ui"><img alt="Desktop release" src="https://img.shields.io/badge/Desktop-v0.2.4-D97757"></a>
   <a href="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml"><img alt="CI" src="https://github.com/acking-you/liftgate/actions/workflows/syntax-check.yml/badge.svg"></a>
   <a href="https://www.rust-lang.org"><img alt="rust 1.100.0" src="https://img.shields.io/badge/rust-1.100.0-355ACF.svg"></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-355ACF.svg"></a>
@@ -29,9 +28,8 @@ Messages APIs on your machine. Keep using Codex CLI, Codex App, Claude Code,
 Claude Desktop, or your own SDK code unchanged — Liftgate answers them locally
 and runs every turn exclusively through the official `agy acp` interface.
 
-Run it from the terminal with **`lg`** / **`liftgate`** (CLI + full-screen TUI),
-or install [**Liftgate Desktop**](#liftgate-desktop) — a standalone native GPUI
-control center for macOS, Windows, and Linux.
+Run it from the terminal with **`lg`** / **`liftgate`** (CLI + full-screen TUI +
+embedded Web observability dashboard).
 
 ## Works with
 
@@ -48,8 +46,6 @@ Any other harness that speaks either API connects the same way
 ([API](docs/api.md)).
 
 ## Install
-
-### CLI (`lg` + `liftgate`)
 
 Install prebuilt `lg` and `liftgate` binaries (with the Web dashboard embedded
 and `SHA256SUMS` verified fail-closed) in one command:
@@ -87,56 +83,10 @@ ARM64/Intel, Windows x64/ARM64/x86, FreeBSD) are also available directly on the
 
 </details>
 
-### Liftgate Desktop
-
-**Liftgate Desktop** (`liftgate-desktop`) is a standalone native GPUI desktop
-application built on `gpui-kit` — no Electron/WebView runtime and no separate
-CLI install required (the headless gateway daemon and React web dashboard are
-compiled right in).
-
-- **Warm Editorial Light & Dark themes + `中文` / `EN` bilingual UI** — follows
-  your OS appearance and system language automatically on first launch, with
-  instant live switching in the sidebar.
-- **100% CLI parity across 6 workspaces**:
-  1. **Overview** — Start, stop, or losslessly restart the gateway daemon,
-     configure listen address & capacity limits, and inspect live health.
-  2. **Telemetry** — Real-time SSE request stream, token throughput, warm ACP
-     session pool inspector, and one-click session eviction.
-  3. **Launchers** — Zero-pollution one-click launch (and reusable command copy)
-     for **Codex CLI**, **Claude Code**, **Codex App**, and **Claude Desktop**,
-     plus `~/.codex` / `~/.claude` config sync.
-  4. **Models** — Searchable live Antigravity model catalog with instant
-     hot-switching for both default and session-title models.
-  5. **`agy` & Proxy** — Official `agy` SHA-512 install/update, interactive
-     Google sign-in, outbound HTTP/SOCKS5 proxy enforcement & connectivity
-     probe, and idle background auto-update toggle.
-  6. **System** — Live gateway & `agy` stderr logs, environment doctor, `lg`
-     `PATH` alias & shell completions installer, and release upgrade checker.
-
-**Download the latest Desktop release — [Liftgate Desktop `v0.2.4`](https://github.com/acking-you/liftgate/releases/tag/v0.2.4-ui)**
-([all Desktop releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop) ·
-[`SHA256SUMS`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/SHA256SUMS) ·
-[`release-manifest.json`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/release-manifest.json)):
-
-| Platform | Installer (Recommended) | Portable Bundle |
-| --- | --- | --- |
-| **macOS (Apple Silicon · M1–M4)** | [`liftgate-desktop-macos-arm64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-arm64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-arm64.zip) |
-| **macOS (Intel · x86_64)** | [`liftgate-desktop-macos-x86_64.dmg`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-x86_64.dmg) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-macos-x86_64.zip) |
-| **Windows (x64)** | [`liftgate-desktop-windows-x86_64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-x86_64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-x86_64.zip) |
-| **Windows (ARM64)** | [`liftgate-desktop-windows-arm64-setup.exe`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-arm64-setup.exe) | [`.zip`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-windows-arm64.zip) |
-| **Linux (x86_64 · glibc 2.35+)** | [`.AppImage`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-x86_64.AppImage) · [`.deb` (amd64)](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-amd64.deb) | [`.tar.gz`](https://github.com/acking-you/liftgate/releases/download/v0.2.4-ui/liftgate-desktop-linux-x86_64.tar.gz) |
-
-> [!NOTE]
-> macOS builds are currently ad-hoc signed; if Gatekeeper blocks first launch,
-> run `xattr -cr /Applications/Liftgate.app` once after dragging `Liftgate.app`
-> into `/Applications`. You can also build from source via
-> `cargo install --path crates/liftgate-desktop --locked`.
-
 ## Quick start
 
-Once **`lg`** (identical to `liftgate`) is installed — or directly from the
-**`agy` & Proxy** and **Launchers** tabs inside **Liftgate Desktop** — install
-the official `agy` CLI if needed, sign in, and launch your agent:
+Once **`lg`** (identical to `liftgate`) is installed, install the official
+`agy` CLI if needed, sign in, and launch your agent:
 
 ```bash
 # 1. One-time Antigravity CLI setup & sign-in
@@ -204,9 +154,6 @@ well. Full command reference and SDK examples:
   switch models and tail `agy` logs either in the browser
   (`http://127.0.0.1:8787/`) or right inside your terminal with `lg top`
   ([dashboard](docs/usage.md#dashboard)).
-- **Standalone GPUI desktop control center** — native `liftgate-desktop` app
-  for macOS, Windows, and Linux with Warm Editorial Light/Dark themes and
-  `中文` / `EN` UI ([download](#liftgate-desktop)).
 
 ## How it works
 

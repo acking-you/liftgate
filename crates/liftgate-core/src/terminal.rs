@@ -1,8 +1,8 @@
 //! Cross-platform native terminal emulator launcher for interactive CLI tools.
 //!
-//! Allows standalone GUI applications (`liftgate-desktop`) to launch interactive sessions
-//! (`claude`, `codex`, `agy acp --login`, `agy <args>`) inside an isolated native terminal
-//! window with process-scoped environment variables, without polluting global user config.
+//! Launches interactive sessions (`claude`, `codex`, `agy acp --login`, `agy <args>`) inside an
+//! isolated native terminal window with process-scoped environment variables, without polluting
+//! global user config.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

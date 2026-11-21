@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use clap::CommandFactory as _;
-use liftgate_server::platform::{canonicalize_clean, is_executable_file, split_expanded_path_var};
+use liftgate_server::platform::{canonicalize_clean, split_expanded_path_var};
 use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl};
 use liftgate_types::telemetry::GatewayTelemetrySnapshot;
 use serde::Serialize;
@@ -1105,37 +1105,9 @@ pub struct AliasStatusReport {
 }
 
 fn resolve_cli_source_exe_for_alias() -> Result<PathBuf, CliError> {
-    let current = std::env::current_exe().map_err(|source| CliError::StateIo {
+    std::env::current_exe().map_err(|source| CliError::StateIo {
         path: PathBuf::from("current_exe"),
         source,
-    })?;
-    let is_desktop = current
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("liftgate-desktop"));
-    if !is_desktop {
-        return Ok(current);
-    }
-    let cli_name = if cfg!(windows) {
-        "liftgate.exe"
-    } else {
-        "liftgate"
-    };
-    if let Some(parent) = current.parent() {
-        let sibling = parent.join(cli_name);
-        if is_executable_file(&sibling) {
-            return Ok(sibling);
-        }
-    }
-    for dir in split_expanded_path_var() {
-        let cand = dir.join(cli_name);
-        if is_executable_file(&cand) {
-            return Ok(cand);
-        }
-    }
-    Err(CliError::HarnessNotFound {
-        tool: "liftgate",
-        hint: "place `liftgate` in the same directory or PATH before installing the `lg` CLI alias",
     })
 }
 

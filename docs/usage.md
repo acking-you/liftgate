@@ -8,9 +8,7 @@ client at it. Every address below assumes the default
 
 ## Before you start
 
-- **Liftgate (`lg` / `liftgate`)**, installed in one command (or as the
-  standalone **Liftgate Desktop** GPUI app from
-  [Desktop Releases](https://github.com/acking-you/liftgate/releases?q=Liftgate+Desktop)):
+- **Liftgate (`lg` / `liftgate`)**, installed in one command:
   ```bash
   # macOS / Linux / FreeBSD
   curl -fsSL https://raw.githubusercontent.com/acking-you/liftgate/main/scripts/install.sh | sh

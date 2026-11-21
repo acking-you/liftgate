@@ -59,7 +59,6 @@ def _build_posix_tarball(target: str, version: str = "0.2.0", include_lg: bool =
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         entries = {
             f"liftgate-{target}/liftgate": f"#!/bin/sh\necho 'liftgate {version}'\n".encode("utf-8"),
-            f"liftgate-{target}/liftgate-desktop": b"#!/bin/sh\nexit 99\n",
         }
         if include_lg:
             entries[f"liftgate-{target}/lg"] = f"#!/bin/sh\necho 'lg {version}'\n".encode("utf-8")
@@ -75,7 +74,6 @@ def _build_windows_zip(target: str, include_lg: bool = True) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"liftgate-{target}/liftgate.exe", b"MZ-fake-liftgate")
-        zf.writestr(f"liftgate-{target}/liftgate-desktop.exe", b"MZ-fake-desktop")
         if include_lg:
             zf.writestr(f"liftgate-{target}/lg.exe", b"MZ-fake-lg")
     return buf.getvalue()
@@ -197,7 +195,7 @@ class PosixInstallScriptTests(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("SHA-256 mismatch", res.stderr)
 
-        # 2. Desktop `-ui` tag is rejected with guidance.
+        # 2. Legacy `-ui` tag is rejected with guidance.
         res_ui = subprocess.run(
             ["sh", str(INSTALL_SH), "--version", "v0.2.0-ui"],
             env={
@@ -213,7 +211,7 @@ class PosixInstallScriptTests(unittest.TestCase):
             errors="replace",
         )
         self.assertNotEqual(res_ui.returncode, 0)
-        self.assertIn("Desktop GUI tag", res_ui.stderr)
+        self.assertIn("omit '-ui'", res_ui.stderr)
 
         # 3. Incomplete archive missing `lg` does not clobber existing `liftgate`.
         incomplete_server = self._serve_release(target, include_lg=False)
@@ -254,7 +252,7 @@ class PosixInstallScriptTests(unittest.TestCase):
         mock_dpkg = mock_tools / "dpkg"
         mock_dpkg.write_text(
             f"#!/bin/sh\nif [ \"$1\" = \"-S\" ] && [ \"$2\" = \"{packaged_bin.resolve()}\" ]; then\n"
-            "  echo 'liftgate-desktop: /usr/bin/liftgate'\n  exit 0\nfi\nexit 1\n",
+            "  echo 'liftgate: /usr/bin/liftgate'\n  exit 0\nfi\nexit 1\n",
             encoding="utf-8",
         )
         mock_dpkg.chmod(0o755)

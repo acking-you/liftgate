@@ -58,14 +58,63 @@ pub enum SessionSlotState {
     Idle,
 }
 
+/// Empirical upstream prompt-cache warmth tier derived from elapsed idle time since a session's
+/// last completed turn (`<60s`: ~98.6% hit, `60s..300s`: cooling ~65-84% hit, `>=300s`: cold).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheWarmth {
+    /// Session currently has an in-flight turn leased.
+    Active,
+    /// Idle `< 60s` (~98.6% upstream KV cache retention).
+    Hot,
+    /// Idle `60s .. 300s` (cooling; ~65%–84% upstream KV cache retention).
+    Warm,
+    /// Idle `>= 300s` (upstream KV cache likely expired; stdio session still avoids cold replay).
+    #[default]
+    Cold,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptCacheWarmth {
+    pub const HOT_IDLE_THRESHOLD_MS: u64 = 60_000;
+    pub const WARM_IDLE_THRESHOLD_MS: u64 = 300_000;
+
+    /// Classifies upstream KV-cache warmth from session slot state and timestamps.
+    #[must_use]
+    pub const fn classify(
+        state: SessionSlotState,
+        last_active_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Self {
+        match state {
+            SessionSlotState::Running => Self::Active,
+            SessionSlotState::Idle => {
+                let idle_ms = now_unix_ms.saturating_sub(last_active_unix_ms);
+                if idle_ms < Self::HOT_IDLE_THRESHOLD_MS {
+                    Self::Hot
+                } else if idle_ms < Self::WARM_IDLE_THRESHOLD_MS {
+                    Self::Warm
+                } else {
+                    Self::Cold
+                }
+            }
+        }
+    }
+}
+
 /// Metadata summary for a single active or cached ACP session worker.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionSummary {
     pub session_id: String,
     pub model_id: String,
     pub state: SessionSlotState,
+    #[serde(default)]
+    pub cache_warmth: PromptCacheWarmth,
     pub turn_count: u64,
     pub message_count: usize,
+    #[serde(default)]
+    pub last_context_tokens: u64,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
     pub last_response_id: Option<String>,
@@ -122,12 +171,16 @@ pub struct TaskSnapshot {
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: Option<u64>,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
     pub thought_chars: usize,
     pub output_chars: usize,
     pub client_tool_calls: Vec<String>,
     pub native_web_searches: usize,
     #[serde(default)]
     pub native_web_fetches: usize,
+    #[serde(default)]
+    pub vision_offloaded_images: usize,
     pub prompt_preview: String,
     pub output_preview: String,
     pub stop_reason: Option<String>,

@@ -146,9 +146,6 @@ pub enum ArchiveError {
     #[error("archive did not contain expected executable `{expected}`")]
     MissingExecutable { expected: String },
 
-    #[error("release archive for this target does not bundle `liftgate-desktop`")]
-    MissingDesktopBundle,
-
     #[error("staged binary `--version` smoke check timed out")]
     SmokeCheckTimeout,
 

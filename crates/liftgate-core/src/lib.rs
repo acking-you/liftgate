@@ -1,4 +1,4 @@
-//! Reusable headless control plane for Liftgate (`liftgate` CLI and `liftgate-desktop` GUI).
+//! Reusable headless control plane for Liftgate (`liftgate` / `lg` CLI and future clients).
 //!
 //! Centralizes state management, gateway HTTP/SSE telemetry client, embedded web dashboard
 //! assets, background daemon supervision, Antigravity CLI (`agy`) installer/updater/auth/proxy
