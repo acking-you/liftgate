@@ -1818,6 +1818,8 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--agy-proxy",
         "--agy-auto-update",
         "--vision-offload",
+        "--mcp-tool-bridge",
+        "--low-cache-capture-payload",
         "--max-low-cache-records",
         "--low-cache-threshold-pct",
         "--max-line-bytes",
@@ -1926,6 +1928,25 @@ mod tests {
             Some(Commands::Codex(c)) => {
                 assert!(!c.code_mode && !c.code_mode_only && !c.no_code_mode);
                 assert_eq!(c.passthrough_args, vec!["exec", "cargo test"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let top_flag_codex = parse_strs(&[
+            "lg",
+            "--mcp-tool-bridge",
+            "false",
+            "--low-cache-capture-payload",
+            "false",
+            "cx",
+            "-p",
+            "quick verify",
+        ]);
+        assert_eq!(top_flag_codex.serve.mcp_tool_bridge, Some(false));
+        assert_eq!(top_flag_codex.serve.low_cache_capture_payload, Some(false));
+        match top_flag_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert_eq!(c.passthrough_args, vec!["-p", "quick verify"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }

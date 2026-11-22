@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.7] - 2026-11-23
 
 ### Added
 - **Configurable Hybrid Loopback MCP Tool Bridge + XML Coexistence for high-cache multi-step client tool loops (enabled by default)**:

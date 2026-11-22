@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -963,7 +963,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     let worker = if lease.mcp_handle().is_some() {
         tokio::spawn(run_mcp_session_driver(
             backend,
-            pool,
+            Arc::downgrade(&pool),
             lease,
             session_reused,
             vision_offload_enabled,
@@ -4267,6 +4267,8 @@ fn compute_final_mcp_step_usage(
     }
 }
 
+const MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS: u8 = 3;
+
 fn translate_incoming_mcp_call(
     incoming: IncomingMcpToolCall,
     mcp_handle: &McpSessionHandle,
@@ -4287,6 +4289,9 @@ fn translate_incoming_mcp_call(
         extract_custom_tool_input(&incoming.arguments, unwrap_key)
     } else {
         let mut args_val = incoming.arguments;
+        if args_val.is_null() {
+            args_val = serde_json::Value::Object(serde_json::Map::new());
+        }
         if let serde_json::Value::Object(ref mut map) = args_val {
             let schema_declares_tool_summary = bridged
                 .and_then(|b| b.parameters_json.as_deref())
@@ -4335,7 +4340,7 @@ fn translate_incoming_mcp_call(
 )]
 async fn run_mcp_session_driver<B: AcpBackend>(
     backend: Arc<B>,
-    pool: Arc<SessionPool>,
+    pool: Weak<SessionPool>,
     initial_lease: SessionLeaseGuard<B>,
     initial_session_reused: bool,
     vision_offload_enabled: bool,
@@ -4459,381 +4464,465 @@ async fn run_mcp_session_driver<B: AcpBackend>(
             let mut state = TurnStreamState::new(latest_context_used);
             state.peak_context_used = peak_context_used;
 
+            let mut suppressed_banners: Vec<String> = Vec::new();
+            let mut disabled_mcp_rejections: u8 = 0;
             let mut pending_mcp_incoming: Vec<IncomingMcpToolCall> = Vec::new();
             let mut prompt_outcome: Option<Result<PromptTurnResult, AcpError>> = None;
-            let mut upstream_abort: Option<(UpstreamBannerSignal, String)> = None;
-            let mut step_timed_out = false;
 
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cur_cancel.cancelled() => {
-                        while call_rx_guard.try_recv().is_ok() {}
-                        let can_recycle_warm = cur_req.auxiliary_task.is_none()
-                            && !cur_retire_after_turn
-                            && !state.tainted_session
-                            && completed_web_fetches == 0
-                            && backend.cancel_prompt_for_reuse(&session_id);
-                        if can_recycle_warm {
-                            let telemetry_hub = Arc::clone(cur_task_guard.hub());
-                            drop(cur_task_guard);
-                            let post_cancel_hash = hash_conversation_state(
-                                cur_req.system_instructions.as_deref(),
-                                &cur_req.client_tools,
-                                cur_web_cfg,
-                                cur_lease.model_id(),
-                                &cur_full_messages,
-                            );
-                            let alt_pre_cancel_hash = (cur_route_meta.delta_start_index > 0)
-                                .then(|| cur_full_messages.get(..cur_route_meta.delta_start_index))
-                                .flatten()
-                                .map(|prefix| {
-                                    hash_conversation_state(
-                                        cur_req.system_instructions.as_deref(),
-                                        &cur_req.client_tools,
-                                        cur_web_cfg,
-                                        cur_lease.model_id(),
-                                        prefix,
-                                    )
-                                });
-                            let dialogue_hash =
-                                hash_dialogue_state(cur_lease.model_id(), &cur_full_messages);
-                            let mut pending_hashes = vec![post_cancel_hash, dialogue_hash];
-                            if let Some(alt_h) = alt_pre_cancel_hash {
-                                pending_hashes.push(alt_h);
-                            }
-                            let pending_guard =
-                                cur_lease.register_pending_checkin(pending_hashes);
-                            let message_count = cur_full_messages.len();
-                            let retained_messages = if cur_req.retain_response_history {
-                                cur_full_messages
-                            } else {
-                                Vec::new()
-                            };
-                            let declared_tools = cur_req.client_tools;
-                            let step_bytes: usize = cur_outbound_blocks
-                                .iter()
-                                .map(|b| match b {
-                                    AcpPromptBlock::Text { text } => text.len(),
-                                    AcpPromptBlock::Image { .. } => 8_192,
-                                })
-                                .sum();
-                            let approx_ctx = if state.turn_peak_context_used > 0 {
-                                state.latest_context_used
-                            } else {
-                                latest_context_used.saturating_add(
-                                    u64::try_from(step_bytes / 4).unwrap_or(0),
-                                )
-                            };
-                            tokio::spawn(async move {
-                                let _pending = pending_guard;
-                                match timeout(Duration::from_secs(5), prompt_fut).await {
-                                    Ok(Ok(res)) => {
-                                        if llm_step_idx > 0 {
-                                            telemetry_hub.reconcile_cascade_usage_drift(
-                                                accounted_usage,
-                                                res.usage,
-                                                initial_session_reused,
-                                            );
-                                        }
-                                        cur_lease.reconcile_prior_cascade_tokens(
-                                            accounted_usage.total_prompt_tokens(),
-                                            accounted_usage.cached_read_tokens,
-                                        );
-                                        let final_ctx = if res.usage.total_tokens > 0 {
-                                            res.usage.total_tokens
-                                        } else {
-                                            approx_ctx
-                                        };
-                                        cur_lease.commit(CommittedSessionTurn {
-                                            post_turn_hash: post_cancel_hash,
-                                            alt_post_turn_hash: alt_pre_cancel_hash,
-                                            post_turn_dialogue_hash: dialogue_hash,
-                                            declared_tools,
-                                            last_context_used: final_ctx,
-                                            turn_prompt_tokens: res.usage.total_prompt_tokens(),
-                                            turn_cached_read_tokens: res.usage.cached_read_tokens,
-                                            message_count,
-                                            last_response_id: None,
-                                            accumulated_messages: retained_messages,
-                                        });
-                                    }
-                                    _ => {
-                                        cur_lease.finish_ephemeral();
-                                    }
+            'substep_loop: loop {
+                pending_mcp_incoming.clear();
+                let mut upstream_abort: Option<(UpstreamBannerSignal, String)> = None;
+                let mut step_timed_out = false;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cur_cancel.cancelled() => {
+                            while call_rx_guard.try_recv().is_ok() {}
+                            let can_recycle_warm = cur_req.auxiliary_task.is_none()
+                                && !cur_retire_after_turn
+                                && !state.tainted_session
+                                && completed_web_fetches == 0
+                                && backend.cancel_prompt_for_reuse(&session_id);
+                            if can_recycle_warm {
+                                let telemetry_hub = Arc::clone(cur_task_guard.hub());
+                                drop(cur_task_guard);
+                                let post_cancel_hash = hash_conversation_state(
+                                    cur_req.system_instructions.as_deref(),
+                                    &cur_req.client_tools,
+                                    cur_web_cfg,
+                                    cur_lease.model_id(),
+                                    &cur_full_messages,
+                                );
+                                let alt_pre_cancel_hash = (cur_route_meta.delta_start_index > 0)
+                                    .then(|| cur_full_messages.get(..cur_route_meta.delta_start_index))
+                                    .flatten()
+                                    .map(|prefix| {
+                                        hash_conversation_state(
+                                            cur_req.system_instructions.as_deref(),
+                                            &cur_req.client_tools,
+                                            cur_web_cfg,
+                                            cur_lease.model_id(),
+                                            prefix,
+                                        )
+                                    });
+                                let dialogue_hash =
+                                    hash_dialogue_state(cur_lease.model_id(), &cur_full_messages);
+                                let mut pending_hashes = vec![post_cancel_hash, dialogue_hash];
+                                if let Some(alt_h) = alt_pre_cancel_hash {
+                                    pending_hashes.push(alt_h);
                                 }
-                            });
-                        } else {
-                            cur_lease.finish_ephemeral();
-                        }
-                        return;
-                    }
-                    () = tokio::time::sleep_until(step_deadline) => {
-                        step_timed_out = true;
-                        break;
-                    }
-                    maybe_call = call_rx_guard.recv() => {
-                        if let Some(first_call) = maybe_call {
-                            pending_mcp_incoming.push(first_call);
-                            tokio::task::yield_now().await;
-                            tokio::task::yield_now().await;
-                            while let Ok(extra) = call_rx_guard.try_recv() {
-                                pending_mcp_incoming.push(extra);
+                                let pending_guard =
+                                    cur_lease.register_pending_checkin(pending_hashes);
+                                let message_count = cur_full_messages.len();
+                                let retained_messages = if cur_req.retain_response_history {
+                                    cur_full_messages
+                                } else {
+                                    Vec::new()
+                                };
+                                let declared_tools = cur_req.client_tools;
+                                let step_bytes: usize = cur_outbound_blocks
+                                    .iter()
+                                    .map(|b| match b {
+                                        AcpPromptBlock::Text { text } => text.len(),
+                                        AcpPromptBlock::Image { .. } => 8_192,
+                                    })
+                                    .sum();
+                                let approx_ctx = if state.turn_peak_context_used > 0 {
+                                    state.latest_context_used
+                                } else {
+                                    latest_context_used.saturating_add(
+                                        u64::try_from(step_bytes / 4).unwrap_or(0),
+                                    )
+                                };
+                                tokio::spawn(async move {
+                                    let _pending = pending_guard;
+                                    match timeout(Duration::from_secs(5), prompt_fut).await {
+                                        Ok(Ok(res)) => {
+                                            if llm_step_idx > 0 {
+                                                telemetry_hub.reconcile_cascade_usage_drift(
+                                                    accounted_usage,
+                                                    res.usage,
+                                                    initial_session_reused,
+                                                );
+                                            }
+                                            cur_lease.reconcile_prior_cascade_tokens(
+                                                accounted_usage.total_prompt_tokens(),
+                                                accounted_usage.cached_read_tokens,
+                                            );
+                                            let final_ctx = if res.usage.total_tokens > 0 {
+                                                res.usage.total_tokens
+                                            } else {
+                                                approx_ctx
+                                            };
+                                            cur_lease.commit(CommittedSessionTurn {
+                                                post_turn_hash: post_cancel_hash,
+                                                alt_post_turn_hash: alt_pre_cancel_hash,
+                                                post_turn_dialogue_hash: dialogue_hash,
+                                                declared_tools,
+                                                last_context_used: final_ctx,
+                                                turn_prompt_tokens: res.usage.total_prompt_tokens(),
+                                                turn_cached_read_tokens: res.usage.cached_read_tokens,
+                                                message_count,
+                                                last_response_id: None,
+                                                accumulated_messages: retained_messages,
+                                            });
+                                        }
+                                        _ => {
+                                            cur_lease.finish_ephemeral();
+                                        }
+                                    }
+                                });
+                            } else {
+                                cur_lease.finish_ephemeral();
                             }
+                            return;
+                        }
+                        () = tokio::time::sleep_until(step_deadline) => {
+                            step_timed_out = true;
                             break;
                         }
-                    }
-                    maybe_upd = acp_rx.recv(), if !acp_closed => {
-                        match maybe_upd {
-                            Some(upd) => {
-                                if !forward_acp_update(
-                                    upd,
-                                    &cur_req,
-                                    &cur_task_guard,
-                                    &mut banner_filter,
-                                    &mut filter_out,
-                                    &mut parser,
-                                    &mut state,
-                                    &cur_events_tx,
-                                    &cur_cancel,
-                                )
-                                .await
-                                {
-                                    cur_lease.finish_ephemeral();
-                                    return;
+                        maybe_call = call_rx_guard.recv() => {
+                            if let Some(first_call) = maybe_call {
+                                pending_mcp_incoming.push(first_call);
+                                tokio::task::yield_now().await;
+                                tokio::task::yield_now().await;
+                                while let Ok(extra) = call_rx_guard.try_recv() {
+                                    pending_mcp_incoming.push(extra);
                                 }
-                                if state.truncated_tool_abort.is_some() {
-                                    break;
-                                }
-                                if banner_filter.take_malformed_retry()
-                                    || banner_filter.take_transient_retry()
-                                {
-                                    if let Some(open_name) = state.take_open_streamed_tool_name() {
-                                        state.truncated_tool_abort = Some(open_name);
-                                        break;
-                                    }
-                                    if state.emitted_client_tool
-                                        || !state.pending_web_fetches.is_empty()
-                                    {
-                                        state.tainted_session = true;
-                                        state.halted_post_tool_runaway = true;
-                                    }
-                                }
-                                if let Some((sig, detail)) = banner_filter.take_signal() {
-                                    let no_output_yet = state.text_accumulator.is_empty()
-                                        && state.assistant_parts.is_empty()
-                                        && !state.emitted_client_tool
-                                        && state.seen_search_ids.is_empty()
-                                        && completed_web_fetches == 0;
-                                    if state.has_open_streamed_tool()
-                                        || no_output_yet
-                                        || (sig == UpstreamBannerSignal::QuotaExhausted
-                                            && !state.emitted_client_tool)
-                                    {
-                                        state.active_streaming_tool = None;
-                                        upstream_abort = Some((sig, detail));
-                                        break;
-                                    }
-                                    state.tainted_session = true;
-                                    state.halted_post_tool_runaway = true;
-                                }
-                                if state.halted_post_tool_runaway
-                                    && let Some(open_name) = state.take_open_streamed_tool_name()
-                                {
-                                    state.halted_post_tool_runaway = false;
-                                    state.truncated_tool_abort = Some(open_name);
-                                    break;
-                                }
-                                if state.halted_post_tool_runaway {
-                                    backend.cancel_prompt_nonblocking(&session_id);
-                                    prompt_outcome = match timeout(
-                                        Duration::from_millis(500),
-                                        &mut prompt_fut,
+                                break;
+                            }
+                        }
+                        maybe_upd = acp_rx.recv(), if !acp_closed => {
+                            match maybe_upd {
+                                Some(upd) => {
+                                    if !forward_acp_update(
+                                        upd,
+                                        &cur_req,
+                                        &cur_task_guard,
+                                        &mut banner_filter,
+                                        &mut filter_out,
+                                        &mut parser,
+                                        &mut state,
+                                        &cur_events_tx,
+                                        &cur_cancel,
                                     )
                                     .await
                                     {
-                                        Ok(Ok(mut res)) => {
-                                            res.stop_reason = if state.emitted_client_tool {
-                                                "tool_use".to_owned()
-                                            } else {
-                                                "end_turn".to_owned()
-                                            };
-                                            Some(Ok(res))
+                                        cur_lease.finish_ephemeral();
+                                        return;
+                                    }
+                                    if state.truncated_tool_abort.is_some() {
+                                        break;
+                                    }
+                                    if banner_filter.take_malformed_retry()
+                                        || banner_filter.take_transient_retry()
+                                    {
+                                        if let Some(open_name) = state.take_open_streamed_tool_name() {
+                                            state.truncated_tool_abort = Some(open_name);
+                                            break;
                                         }
-                                        _ => {
+                                        if state.emitted_client_tool
+                                            || !state.pending_web_fetches.is_empty()
+                                        {
                                             state.tainted_session = true;
-                                            Some(Ok(PromptTurnResult {
-                                                stop_reason: if state.emitted_client_tool {
+                                            state.halted_post_tool_runaway = true;
+                                        }
+                                    }
+                                    if let Some((sig, detail)) = banner_filter.take_signal() {
+                                        let no_output_yet = state.text_accumulator.is_empty()
+                                            && state.assistant_parts.is_empty()
+                                            && !state.emitted_client_tool
+                                            && state.seen_search_ids.is_empty()
+                                            && completed_web_fetches == 0;
+                                        if state.has_open_streamed_tool()
+                                            || no_output_yet
+                                            || (sig == UpstreamBannerSignal::QuotaExhausted
+                                                && !state.emitted_client_tool)
+                                        {
+                                            state.active_streaming_tool = None;
+                                            upstream_abort = Some((sig, detail));
+                                            break;
+                                        }
+                                        state.tainted_session = true;
+                                        state.halted_post_tool_runaway = true;
+                                    }
+                                    if state.halted_post_tool_runaway
+                                        && let Some(open_name) = state.take_open_streamed_tool_name()
+                                    {
+                                        state.halted_post_tool_runaway = false;
+                                        state.truncated_tool_abort = Some(open_name);
+                                        break;
+                                    }
+                                    if state.halted_post_tool_runaway {
+                                        backend.cancel_prompt_nonblocking(&session_id);
+                                        prompt_outcome = match timeout(
+                                            Duration::from_millis(500),
+                                            &mut prompt_fut,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(mut res)) => {
+                                                res.stop_reason = if state.emitted_client_tool {
                                                     "tool_use".to_owned()
                                                 } else {
                                                     "end_turn".to_owned()
-                                                },
-                                                usage: AcpUsage::default(),
-                                                error: None,
-                                            }))
-                                        }
-                                    };
-                                    break;
+                                                };
+                                                Some(Ok(res))
+                                            }
+                                            _ => {
+                                                state.tainted_session = true;
+                                                Some(Ok(PromptTurnResult {
+                                                    stop_reason: if state.emitted_client_tool {
+                                                        "tool_use".to_owned()
+                                                    } else {
+                                                        "end_turn".to_owned()
+                                                    },
+                                                    usage: AcpUsage::default(),
+                                                    error: None,
+                                                }))
+                                            }
+                                        };
+                                        break;
+                                    }
                                 }
-                            }
-                            None => {
-                                acp_closed = true;
-                                if prompt_outcome.is_some() {
-                                    break;
+                                None => {
+                                    acp_closed = true;
+                                    if prompt_outcome.is_some() {
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                    res = &mut prompt_fut, if prompt_outcome.is_none() => {
-                        prompt_outcome = Some(res);
-                        break;
-                    }
-                }
-            }
-
-            if !step_timed_out && upstream_abort.is_none() && !state.halted_post_tool_runaway {
-                while let Ok(upd) = acp_rx.try_recv() {
-                    if !forward_acp_update(
-                        upd,
-                        &cur_req,
-                        &cur_task_guard,
-                        &mut banner_filter,
-                        &mut filter_out,
-                        &mut parser,
-                        &mut state,
-                        &cur_events_tx,
-                        &cur_cancel,
-                    )
-                    .await
-                    {
-                        cur_lease.finish_ephemeral();
-                        return;
-                    }
-                    if state.truncated_tool_abort.is_some() {
-                        break;
-                    }
-                    if banner_filter.take_malformed_retry() || banner_filter.take_transient_retry()
-                    {
-                        if let Some(open_name) = state.take_open_streamed_tool_name() {
-                            state.truncated_tool_abort = Some(open_name);
+                        res = &mut prompt_fut, if prompt_outcome.is_none() => {
+                            prompt_outcome = Some(res);
                             break;
                         }
-                        if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                    }
+                }
+
+                if !step_timed_out && upstream_abort.is_none() && !state.halted_post_tool_runaway {
+                    while let Ok(upd) = acp_rx.try_recv() {
+                        if !forward_acp_update(
+                            upd,
+                            &cur_req,
+                            &cur_task_guard,
+                            &mut banner_filter,
+                            &mut filter_out,
+                            &mut parser,
+                            &mut state,
+                            &cur_events_tx,
+                            &cur_cancel,
+                        )
+                        .await
+                        {
+                            cur_lease.finish_ephemeral();
+                            return;
+                        }
+                        if state.truncated_tool_abort.is_some() {
+                            break;
+                        }
+                        if banner_filter.take_malformed_retry()
+                            || banner_filter.take_transient_retry()
+                        {
+                            if let Some(open_name) = state.take_open_streamed_tool_name() {
+                                state.truncated_tool_abort = Some(open_name);
+                                break;
+                            }
+                            if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
+                                state.tainted_session = true;
+                                state.halted_post_tool_runaway = true;
+                            }
+                        }
+                        if let Some((sig, detail)) = banner_filter.take_signal() {
+                            let no_output_yet = state.text_accumulator.is_empty()
+                                && state.assistant_parts.is_empty()
+                                && !state.emitted_client_tool
+                                && state.seen_search_ids.is_empty()
+                                && completed_web_fetches == 0;
+                            if state.has_open_streamed_tool()
+                                || no_output_yet
+                                || (sig == UpstreamBannerSignal::QuotaExhausted
+                                    && !state.emitted_client_tool)
+                            {
+                                state.active_streaming_tool = None;
+                                upstream_abort = Some((sig, detail));
+                                break;
+                            }
                             state.tainted_session = true;
                             state.halted_post_tool_runaway = true;
                         }
+                        if state.halted_post_tool_runaway {
+                            break;
+                        }
                     }
+                }
+
+                if !step_timed_out && upstream_abort.is_none() && !state.halted_post_tool_runaway {
+                    filter_out.clear();
+                    banner_filter.finish(&mut filter_out);
                     if let Some((sig, detail)) = banner_filter.take_signal() {
                         let no_output_yet = state.text_accumulator.is_empty()
                             && state.assistant_parts.is_empty()
                             && !state.emitted_client_tool
                             && state.seen_search_ids.is_empty()
-                            && completed_web_fetches == 0;
+                            && completed_web_fetches == 0
+                            && filter_out.trim().is_empty();
                         if state.has_open_streamed_tool()
                             || no_output_yet
                             || (sig == UpstreamBannerSignal::QuotaExhausted
-                                && !state.emitted_client_tool)
+                                && !state.emitted_client_tool
+                                && filter_out.trim().is_empty())
                         {
                             state.active_streaming_tool = None;
                             upstream_abort = Some((sig, detail));
-                            break;
                         }
+                    }
+                }
+                suppressed_banners.extend(banner_filter.take_suppressed_banners());
+
+                if step_timed_out {
+                    cur_lease.finish_ephemeral();
+                    let err = AcpError::TurnTimeout {
+                        seconds: cur_timeout_secs,
+                    };
+                    cur_task_guard.fail(format_error_chain(&err));
+                    let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+                    return;
+                }
+
+                if let Some((sig, detail)) = upstream_abort {
+                    cur_lease.finish_ephemeral();
+                    let err = signal_to_acp_error(sig, &active_model, detail);
+                    cur_task_guard.fail(format_error_chain(&err));
+                    let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+                    return;
+                }
+
+                if !state.halted_post_tool_runaway {
+                    if !filter_out.is_empty() && state.truncated_tool_abort.is_none() {
+                        state.parsed_buf.clear();
+                        parser.feed(&filter_out, &mut state.parsed_buf);
+                        if !emit_parsed_items(
+                            &cur_req,
+                            &cur_task_guard,
+                            &mut state,
+                            &cur_events_tx,
+                            &cur_cancel,
+                        )
+                        .await
+                        {
+                            cur_lease.finish_ephemeral();
+                            return;
+                        }
+                    }
+                    if state.truncated_tool_abort.is_none() {
+                        state.parsed_buf.clear();
+                        parser.finish(&mut state.parsed_buf);
+                        if !emit_parsed_items(
+                            &cur_req,
+                            &cur_task_guard,
+                            &mut state,
+                            &cur_events_tx,
+                            &cur_cancel,
+                        )
+                        .await
+                        {
+                            cur_lease.finish_ephemeral();
+                            return;
+                        }
+                    }
+                }
+
+                if let Some(aborted_tool) = state.truncated_tool_abort.take() {
+                    cur_lease.finish_ephemeral();
+                    let err = AcpError::CorruptedToolCallStream { tool: aborted_tool };
+                    cur_task_guard.fail(format_error_chain(&err));
+                    let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
+                    return;
+                }
+
+                peak_context_used = peak_context_used.max(state.peak_context_used);
+                if state.turn_peak_context_used > 0 {
+                    latest_context_used = state.latest_context_used;
+                }
+
+                if !pending_mcp_incoming.is_empty() && prompt_outcome.is_none() {
+                    let mut allowed_incoming = Vec::with_capacity(pending_mcp_incoming.len());
+                    let mut exceeded_disabled_rejection_cap = false;
+                    for incoming in pending_mcp_incoming.drain(..) {
+                        let resolved_client_name = mcp_handle
+                            .catalog()
+                            .lookup(&incoming.mcp_name)
+                            .map_or_else(|| incoming.mcp_name.clone(), |b| b.client_name.clone());
+                        let is_enabled = cur_req
+                            .client_tools
+                            .iter()
+                            .any(|t| t.name == resolved_client_name);
+                        if is_enabled {
+                            disabled_mcp_rejections = 0;
+                            allowed_incoming.push(incoming);
+                        } else {
+                            disabled_mcp_rejections = disabled_mcp_rejections.saturating_add(1);
+                            if disabled_mcp_rejections > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS {
+                                exceeded_disabled_rejection_cap = true;
+                            } else {
+                                let _ = incoming.reply_tx.send(McpToolCallReply {
+                                    content: vec![McpContentItem::Text {
+                                        text: format!(
+                                            "Tool `{resolved_client_name}` is disabled for this turn; do not call it."
+                                        ),
+                                    }],
+                                    is_error: true,
+                                });
+                            }
+                        }
+                    }
+
+                    if exceeded_disabled_rejection_cap {
+                        drop(allowed_incoming);
                         state.tainted_session = true;
                         state.halted_post_tool_runaway = true;
+                        backend.cancel_prompt_nonblocking(&session_id);
+                        prompt_outcome = match timeout(Duration::from_millis(500), &mut prompt_fut)
+                            .await
+                        {
+                            Ok(Ok(mut res)) => {
+                                res.stop_reason = if state.emitted_client_tool {
+                                    "tool_use".to_owned()
+                                } else {
+                                    "end_turn".to_owned()
+                                };
+                                if res.error.is_none() {
+                                    res.error = RawValue::from_string(
+                                        "\"model repeatedly invoked disabled MCP tool\"".to_owned(),
+                                    )
+                                    .ok();
+                                }
+                                Some(Ok(res))
+                            }
+                            _ => Some(Ok(PromptTurnResult {
+                                stop_reason: if state.emitted_client_tool {
+                                    "tool_use".to_owned()
+                                } else {
+                                    "end_turn".to_owned()
+                                },
+                                usage: AcpUsage::default(),
+                                error: RawValue::from_string(
+                                    "\"model repeatedly invoked disabled MCP tool\"".to_owned(),
+                                )
+                                .ok(),
+                            })),
+                        };
+                        break 'substep_loop;
                     }
-                    if state.halted_post_tool_runaway {
-                        break;
+
+                    if allowed_incoming.is_empty() {
+                        continue 'substep_loop;
                     }
+                    pending_mcp_incoming = allowed_incoming;
                 }
-            }
-
-            if !step_timed_out && upstream_abort.is_none() && !state.halted_post_tool_runaway {
-                filter_out.clear();
-                banner_filter.finish(&mut filter_out);
-                if let Some((sig, detail)) = banner_filter.take_signal() {
-                    let no_output_yet = state.text_accumulator.is_empty()
-                        && state.assistant_parts.is_empty()
-                        && !state.emitted_client_tool
-                        && state.seen_search_ids.is_empty()
-                        && completed_web_fetches == 0
-                        && filter_out.trim().is_empty();
-                    if state.has_open_streamed_tool()
-                        || no_output_yet
-                        || (sig == UpstreamBannerSignal::QuotaExhausted
-                            && !state.emitted_client_tool
-                            && filter_out.trim().is_empty())
-                    {
-                        state.active_streaming_tool = None;
-                        upstream_abort = Some((sig, detail));
-                    }
-                }
-            }
-            let suppressed_banners = banner_filter.take_suppressed_banners();
-
-            if step_timed_out {
-                cur_lease.finish_ephemeral();
-                let err = AcpError::TurnTimeout {
-                    seconds: cur_timeout_secs,
-                };
-                cur_task_guard.fail(format_error_chain(&err));
-                let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
-                return;
-            }
-
-            if let Some((sig, detail)) = upstream_abort {
-                cur_lease.finish_ephemeral();
-                let err = signal_to_acp_error(sig, &active_model, detail);
-                cur_task_guard.fail(format_error_chain(&err));
-                let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
-                return;
-            }
-
-            if !state.halted_post_tool_runaway {
-                if !filter_out.is_empty() && state.truncated_tool_abort.is_none() {
-                    state.parsed_buf.clear();
-                    parser.feed(&filter_out, &mut state.parsed_buf);
-                    if !emit_parsed_items(
-                        &cur_req,
-                        &cur_task_guard,
-                        &mut state,
-                        &cur_events_tx,
-                        &cur_cancel,
-                    )
-                    .await
-                    {
-                        cur_lease.finish_ephemeral();
-                        return;
-                    }
-                }
-                if state.truncated_tool_abort.is_none() {
-                    state.parsed_buf.clear();
-                    parser.finish(&mut state.parsed_buf);
-                    if !emit_parsed_items(
-                        &cur_req,
-                        &cur_task_guard,
-                        &mut state,
-                        &cur_events_tx,
-                        &cur_cancel,
-                    )
-                    .await
-                    {
-                        cur_lease.finish_ephemeral();
-                        return;
-                    }
-                }
-            }
-
-            if let Some(aborted_tool) = state.truncated_tool_abort.take() {
-                cur_lease.finish_ephemeral();
-                let err = AcpError::CorruptedToolCallStream { tool: aborted_tool };
-                cur_task_guard.fail(format_error_chain(&err));
-                let _ = cur_events_tx.send(TurnEvent::Failed(Arc::new(err))).await;
-                return;
-            }
-
-            peak_context_used = peak_context_used.max(state.peak_context_used);
-            if state.turn_peak_context_used > 0 {
-                latest_context_used = state.latest_context_used;
+                break 'substep_loop;
             }
 
             // Case A: Native MCP tool suspension (`POST /mcp/{token} tools/call` parked in-flight).
@@ -5118,7 +5207,9 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         }
                         _ = &mut prompt_fut => {
                             drop(parked_replies);
-                            pool.remove_dead_suspended(&session_id);
+                            if let Some(p) = pool.upgrade() {
+                                p.remove_dead_suspended(&session_id);
+                            }
                             return;
                         }
                     }
@@ -5219,7 +5310,25 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 &mut cur_spill_store,
                             );
                         }
-                        cur_vision_usage = cur_vision_usage.saturating_add(turn_res.usage);
+                        let step_delta = turn_res.usage.saturating_sub(accounted_usage);
+                        if llm_step_idx > 0 {
+                            let accounted_total = accounted_usage.saturating_add(step_delta);
+                            cur_task_guard.hub().reconcile_cascade_usage_drift(
+                                accounted_total,
+                                turn_res.usage,
+                                initial_session_reused,
+                            );
+                            let excess_prompt = accounted_total
+                                .total_prompt_tokens()
+                                .saturating_sub(turn_res.usage.total_prompt_tokens());
+                            let excess_cr = accounted_total
+                                .cached_read_tokens
+                                .saturating_sub(turn_res.usage.cached_read_tokens);
+                            if excess_prompt > 0 || excess_cr > 0 {
+                                cur_lease.reconcile_prior_cascade_tokens(excess_prompt, excess_cr);
+                            }
+                        }
+                        cur_vision_usage = cur_vision_usage.saturating_add(step_delta);
                         next_prompt_blocks = Some(Arc::from(vec![AcpPromptBlock::Text {
                             text: continuation_xml,
                         }]));

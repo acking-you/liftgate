@@ -378,7 +378,7 @@ pub async fn run_serve_with_hook(
     }
 
     if let Some(extra_listener) = ui_listener {
-        let ui_router = build_router(app_state);
+        let ui_router = build_router(app_state.clone());
         let mut ui_stop_rx = stop_rx.clone();
         bg_tasks.spawn(async move {
             let _ = serve_router(extra_listener, ui_router, async move {
@@ -395,28 +395,29 @@ pub async fn run_serve_with_hook(
     tokio::pin!(serve_fut);
 
     let mut drain_stop_rx = stop_rx;
-    tokio::select! {
+    let serve_res: Result<(), CliError> = tokio::select! {
         biased;
         res = &mut serve_fut => {
-            res.map_err(|source| CliError::Serve { source })?;
+            res.map_err(|source| CliError::Serve { source })
         }
         () = async {
             let _ = drain_stop_rx.wait_for(|&stop| stop).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
         } => {
             tracing::info!("graceful HTTP drain budget elapsed; closing remaining connections");
+            Ok(())
         }
-    }
+    };
 
     bg_tasks.abort_all();
     while bg_tasks.join_next().await.is_some() {}
 
     tracing::info!("shutting down ACP subprocess tree");
-    if let Ok(owned) = Arc::try_unwrap(live_client) {
-        let _ = owned.close().await;
-    }
+    live_client.shutdown().await;
+    pool.clear_for_shutdown();
+    drop(app_state);
 
-    Ok(())
+    serve_res
 }
 
 async fn wait_admin_shutdown(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {

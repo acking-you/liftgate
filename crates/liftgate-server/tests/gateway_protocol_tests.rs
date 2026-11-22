@@ -113,11 +113,28 @@ async fn post_loopback_mcp_raw(url: &str, body_bytes: &[u8]) -> (u16, Vec<u8>) {
         body_bytes.len()
     );
     stream.write_all(header.as_bytes()).await.unwrap();
-    stream.write_all(body_bytes).await.unwrap();
-    stream.flush().await.unwrap();
+    if let Err(err) = stream.write_all(body_bytes).await {
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "unexpected loopback MCP write error: {err}"
+        );
+    }
+    let _ = stream.flush().await;
 
     let mut raw_resp = Vec::new();
-    stream.read_to_end(&mut raw_resp).await.unwrap();
+    if let Err(err) = stream.read_to_end(&mut raw_resp).await {
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) && !raw_resp.is_empty(),
+            "unexpected loopback MCP read error: {err} (bytes_read={})",
+            raw_resp.len()
+        );
+    }
     let sep = raw_resp
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -8283,4 +8300,668 @@ async fn suspended_mcp_graceful_unwind_on_user_interrupt_model_switch_compact_cl
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn dropping_session_pool_with_parked_mcp_session_breaks_cycle_and_revokes_token() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 4_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "pwd" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage::default(),
+        },
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 4_200,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "ls" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let tools = json!([{
+        "name": "Bash",
+        "description": "Execute shell command",
+        "input_schema": {
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }
+    }]);
+
+    // Part 1: Dropping the sole external `Arc<SessionPool>` with a parked `SuspendedMcpEntry`
+    // must break cleanly with zero cycle and unregister `McpSessionHandle`.
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let weak_pool = Arc::downgrade(&state.pool);
+    let _mcp_server_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Park on MCP tool." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = resp.into_body().collect().await.unwrap();
+
+    let sess1_mcp_url = {
+        let servers = backend.session_mcp_servers.lock().unwrap();
+        servers
+            .iter()
+            .find(|(sid, _)| sid == "sess_1")
+            .and_then(|(_, cfgs)| cfgs.first())
+            .and_then(|c| c.url.clone())
+            .expect("sess_1 MCP capability URL")
+    };
+    let (alive_status, _) = post_loopback_mcp_json(
+        &sess1_mcp_url,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(alive_status, 200);
+
+    // Drop router (the final external owner of `Arc<SessionPool>`).
+    drop(app);
+    assert!(
+        weak_pool.upgrade().is_none(),
+        "parked run_mcp_session_driver must not hold a strong Arc<SessionPool> cycle"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let (status, _) = post_loopback_mcp_json(
+            &sess1_mcp_url,
+            &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        if status == 401 && backend.aborted_count.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for parked MCP session handle unregistration: last_status={status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Part 2: `SessionPool::clear_for_shutdown()` drains parked entries and zeroes retained bytes.
+    let state2 = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app2 = build_router(state2.clone());
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Park second session." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let _ = resp2.into_body().collect().await.unwrap();
+    assert_eq!(state2.pool.snapshot().suspended_mcp_sessions, 1);
+    assert!(state2.pool.retained_memory_bytes().0 > 0);
+
+    let sess2_mcp_url = {
+        let servers = backend.session_mcp_servers.lock().unwrap();
+        servers
+            .iter()
+            .find(|(sid, _)| sid == "sess_2")
+            .and_then(|(_, cfgs)| cfgs.first())
+            .and_then(|c| c.url.clone())
+            .expect("sess_2 MCP capability URL")
+    };
+    state2.pool.clear_for_shutdown();
+    assert_eq!(state2.pool.snapshot().suspended_mcp_sessions, 0);
+    assert_eq!(state2.pool.retained_memory_bytes().0, 0);
+
+    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let (status, _) = post_loopback_mcp_json(
+            &sess2_mcp_url,
+            &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        if status == 401 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline2,
+            "timed out waiting for clear_for_shutdown MCP unregistration"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn mcp_explicit_null_arguments_normalize_to_empty_object_across_openai_and_anthropic() {
+    let final_usage = AcpUsage {
+        input_tokens: 1_200,
+        output_tokens: 120,
+        cached_read_tokens: 800,
+        cached_write_tokens: 0,
+        thought_tokens: 0,
+        total_tokens: 2_120,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Session 1: OpenAI `/v1/responses` receiving explicit `"arguments": null`
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 1_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "GetStatus".to_owned(),
+                    arguments: Value::Null,
+                    expect_reply_substrings: vec!["ok_openai"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 1_200,
+                    thoughts: vec![],
+                    chunks_template: vec!["OpenAI status checked.".to_owned()],
+                    final_usage,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Session 2: Anthropic `/v1/messages` receiving explicit `"arguments": null`
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 1_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "GetStatus".to_owned(),
+                    arguments: Value::Null,
+                    expect_reply_substrings: vec!["ok_anthropic"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 1_200,
+                    thoughts: vec![],
+                    chunks_template: vec!["Anthropic status checked.".to_owned()],
+                    final_usage,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state);
+
+    // 1. OpenAI `/v1/responses` -> `function_call.arguments` MUST be `"{}"` (never `"null"`).
+    let oai_tools = json!([{
+        "type": "function",
+        "name": "GetStatus",
+        "description": "Zero-argument status check",
+        "parameters": { "type": "object", "properties": {} }
+    }]);
+    let oai_step1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "tools": oai_tools,
+                        "input": "Check OpenAI status."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oai_step1.status(), StatusCode::OK);
+    let oai_json1: Value =
+        serde_json::from_slice(&oai_step1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_id = oai_json1["id"].as_str().unwrap().to_owned();
+    let fc_item = oai_json1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("expected OpenAI function_call item");
+    assert_eq!(fc_item["name"], "GetStatus");
+    assert_eq!(fc_item["arguments"], "{}");
+    let call_id = fc_item["call_id"].as_str().unwrap().to_owned();
+
+    let oai_step2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "previous_response_id": resp_id,
+                        "tools": oai_tools,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": "ok_openai"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oai_step2.status(), StatusCode::OK);
+    let oai_json2: Value =
+        serde_json::from_slice(&oai_step2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        oai_json2["output"][0]["content"][0]["text"],
+        "OpenAI status checked."
+    );
+
+    // 2. Anthropic `/v1/messages` -> `tool_use.input` MUST be `{}` (never `null`).
+    let anth_tools = json!([{
+        "name": "GetStatus",
+        "description": "Zero-argument status check",
+        "input_schema": { "type": "object", "properties": {} }
+    }]);
+    let anth_step1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": anth_tools,
+                        "messages": [{ "role": "user", "content": "Check Anthropic status." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anth_step1.status(), StatusCode::OK);
+    let anth_json1: Value =
+        serde_json::from_slice(&anth_step1.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(anth_json1["stop_reason"], "tool_use");
+    let tu_block = &anth_json1["content"][0];
+    assert_eq!(tu_block["type"], "tool_use");
+    assert_eq!(tu_block["name"], "GetStatus");
+    assert_eq!(tu_block["input"], json!({}));
+    let toolu_id = tu_block["id"].as_str().unwrap().to_owned();
+
+    let anth_step2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": anth_tools,
+                        "messages": [
+                            { "role": "user", "content": "Check Anthropic status." },
+                            { "role": "assistant", "content": anth_json1["content"].clone() },
+                            {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": toolu_id,
+                                    "content": "ok_anthropic"
+                                }]
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anth_step2.status(), StatusCode::OK);
+    let anth_json2: Value =
+        serde_json::from_slice(&anth_step2.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(
+        anth_json2["content"][0]["text"],
+        "Anthropic status checked."
+    );
+}
+
+#[tokio::test]
+async fn warm_mcp_turn_rejects_disabled_or_removed_tools_with_is_error_and_completes_text() {
+    let usage_turn1 = AcpUsage {
+        input_tokens: 2_000,
+        output_tokens: 150,
+        cached_read_tokens: 1_500,
+        cached_write_tokens: 0,
+        thought_tokens: 0,
+        total_tokens: 3_650,
+    };
+    let usage_turn2 = AcpUsage {
+        input_tokens: 500,
+        output_tokens: 180,
+        cached_read_tokens: 3_500,
+        cached_write_tokens: 0,
+        thought_tokens: 0,
+        total_tokens: 4_180,
+    };
+    let usage_turn3 = AcpUsage {
+        input_tokens: 400,
+        output_tokens: 120,
+        cached_read_tokens: 4_000,
+        cached_write_tokens: 0,
+        thought_tokens: 0,
+        total_tokens: 4_520,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Prompt 1 (Turn 1 cold): both `Read` and `Edit` enabled -> `Read` executes normally.
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 1_800,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "Read".to_owned(),
+                    arguments: json!({ "file_path": "src/main.rs" }),
+                    expect_reply_substrings: vec!["fn main() {}"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 2_100,
+                    thoughts: vec![],
+                    chunks_template: vec!["Inspected src/main.rs.".to_owned()],
+                    final_usage: usage_turn1,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Prompt 2 (Turn 2 warm Plan Mode): `Edit` removed from `tools` -> calling `mcp_lg_Edit`
+        // receives immediate `isError: true` rejection and model finishes with plain text plan!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 3_900,
+                    thoughts: vec!["Attempting Edit in plan mode.".to_owned()],
+                    pre_text_templates: vec!["Plan: ".to_owned()],
+                    mcp_name: "Edit".to_owned(),
+                    arguments: json!({ "file_path": "src/main.rs", "new_str": "nope" }),
+                    expect_reply_substrings: vec![
+                        "Tool `Edit` is disabled for this turn; do not call it.",
+                    ],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 4_100,
+                    thoughts: vec![],
+                    chunks_template: vec!["propose changes without editing.".to_owned()],
+                    final_usage: usage_turn2,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Prompt 3 (Turn 3 warm `tool_choice: "none"`): ALL tools disabled -> calling `mcp_lg_Read`
+        // receives immediate `isError: true` rejection and model finishes with plain text!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 4_300,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "Read".to_owned(),
+                    arguments: json!({ "file_path": "src/main.rs" }),
+                    expect_reply_substrings: vec![
+                        "Tool `Read` is disabled for this turn; do not call it.",
+                    ],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 4_500,
+                    thoughts: vec![],
+                    chunks_template: vec!["Summary with all tools disabled.".to_owned()],
+                    final_usage: usage_turn3,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let read_tool = json!({
+        "type": "function",
+        "name": "Read",
+        "description": "Read file",
+        "parameters": {
+            "type": "object",
+            "properties": { "file_path": { "type": "string" } },
+            "required": ["file_path"]
+        }
+    });
+    let edit_tool = json!({
+        "type": "function",
+        "name": "Edit",
+        "description": "Edit file",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": { "type": "string" },
+                "new_str": { "type": "string" }
+            },
+            "required": ["file_path", "new_str"]
+        }
+    });
+
+    // Turn 1a + 1b: Cold session with `[Read, Edit]`
+    let r1a = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "tools": [read_tool.clone(), edit_tool],
+                        "input": "Read main.rs."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1a.status(), StatusCode::OK);
+    let j1a: Value =
+        serde_json::from_slice(&r1a.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_1a_id = j1a["id"].as_str().unwrap().to_owned();
+    let call_1a_id = j1a["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .unwrap()["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let r1b = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "previous_response_id": resp_1a_id,
+                        "tools": [read_tool.clone(), {
+                            "type": "function",
+                            "name": "Edit",
+                            "description": "Edit file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "file_path": { "type": "string" },
+                                    "new_str": { "type": "string" }
+                                },
+                                "required": ["file_path", "new_str"]
+                            }
+                        }],
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_1a_id,
+                            "output": "fn main() {}"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1b.status(), StatusCode::OK);
+    let j1b: Value =
+        serde_json::from_slice(&r1b.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_1b_id = j1b["id"].as_str().unwrap().to_owned();
+    assert_eq!(state.pool.snapshot().idle_cached_sessions, 1);
+
+    // Turn 2: Warm Plan Mode (`Edit` removed -> only `[Read]` passed).
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "previous_response_id": resp_1b_id,
+                        "tools": [read_tool.clone()],
+                        "input": "Enter plan mode and outline changes."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let j2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_2_id = j2["id"].as_str().unwrap().to_owned();
+    assert!(
+        !j2["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call"),
+        "removed tool `Edit` must never leak as a function_call: output={}",
+        j2["output"]
+    );
+    let msg2_text: String = j2["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().unwrap())
+        .filter_map(|c| c["text"].as_str())
+        .collect();
+    assert_eq!(msg2_text, "Plan: propose changes without editing.");
+
+    // Turn 3: Warm `tool_choice: "none"` (all tools disabled).
+    let r3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "previous_response_id": resp_2_id,
+                        "tools": [read_tool],
+                        "tool_choice": "none",
+                        "input": "Summarize without calling any tools."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let j3: Value =
+        serde_json::from_slice(&r3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        !j3["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call"),
+        "tool_choice: none must never leak a function_call: output={}",
+        j3["output"]
+    );
+    assert_eq!(
+        j3["output"][0]["content"][0]["text"],
+        "Summary with all tools disabled."
+    );
+
+    // Verify Turn 3's outbound `<client_tools_update>` explicitly forbade `mcp_lg_*` calls,
+    // and all 3 turns reused the single warm `sess_1` session!
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[2].text_joined.contains("mcp_lg_*"),
+        "expected empty-tools <client_tools_update> to forbid mcp_lg_* calls: {}",
+        prompts[2].text_joined
+    );
 }

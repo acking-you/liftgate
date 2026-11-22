@@ -403,7 +403,8 @@ fn persist_cache_file_atomic(
 }
 
 /// Atomically updates a single boolean field inside `settings.json` (creating the file if absent)
-/// while preserving all existing settings keys.
+/// while preserving all existing settings keys, and synchronizes any active sibling `daemon.json`
+/// owned by the current process (`pid == std::process::id()`).
 pub fn sync_settings_json_bool_field(settings_path: &Path, key: &str, value: bool) {
     let mut map: serde_json::Map<String, serde_json::Value> = match fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -438,6 +439,29 @@ pub fn sync_settings_json_bool_field(settings_path: &Path, key: &str, value: boo
                 error = ?err,
                 "failed to serialize updated settings.json"
             );
+        }
+    }
+
+    if let Some(parent) = settings_path.parent() {
+        let daemon_path = parent.join("daemon.json");
+        if let Ok(daemon_bytes) = fs::read(&daemon_path)
+            && let Ok(mut daemon_map) =
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&daemon_bytes)
+            && daemon_map.get("pid").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(std::process::id()))
+        {
+            daemon_map.insert(key.to_owned(), serde_json::Value::from(value));
+            if let Ok(mut daemon_json) = serde_json::to_vec_pretty(&daemon_map) {
+                daemon_json.push(b'\n');
+                if let Err(err) = write_bytes_atomic_private(&daemon_path, &daemon_json) {
+                    tracing::warn!(
+                        path = %daemon_path.display(),
+                        key,
+                        error = ?err,
+                        "failed to persist updated runtime boolean toggle to daemon.json"
+                    );
+                }
+            }
         }
     }
 }
@@ -908,13 +932,13 @@ impl TelemetryHub {
                 cs.file_state.warm_prompt_tokens =
                     adjust_u64(cs.file_state.warm_prompt_tokens, acc_prompt, auth_prompt)
                         .min(cs.file_state.total_prompt_tokens);
+                cs.file_state.warm_cached_read_tokens = adjust_u64(
+                    cs.file_state.warm_cached_read_tokens,
+                    accounted_sum.cached_read_tokens,
+                    authoritative.cached_read_tokens,
+                )
+                .min(cs.file_state.warm_prompt_tokens);
             }
-            cs.file_state.warm_cached_read_tokens = adjust_u64(
-                cs.file_state.warm_cached_read_tokens,
-                accounted_sum.cached_read_tokens,
-                authoritative.cached_read_tokens,
-            )
-            .min(cs.file_state.warm_prompt_tokens);
             cs.revision = cs.revision.saturating_add(1);
 
             let cumulative_prompt = guard
@@ -2151,5 +2175,110 @@ fn prune_orphan_payload_files(
                 let _ = fs::remove_file(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liftgate_types::telemetry::TaskProtocol;
+
+    #[test]
+    fn reconcile_cascade_usage_drift_keeps_cold_step_cached_reads_out_of_warm_totals() {
+        let hub = Arc::new(TelemetryHub::new());
+        let guard = hub.begin_task(
+            "task_cold_cascade".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &[],
+        );
+        guard.bind_session("sess_cold_1", false, "gemini-4-carbon-high");
+        let step1_est = AcpUsage {
+            input_tokens: 1_000,
+            cached_read_tokens: 0,
+            output_tokens: 50,
+            total_tokens: 1_050,
+            ..AcpUsage::default()
+        };
+        guard.complete("tool_use".to_owned(), step1_est);
+
+        let guard2 = hub.begin_task(
+            "task_warm_step2".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &[],
+        );
+        guard2.bind_session("sess_cold_1", true, "gemini-4-carbon-high");
+        let step2_est = AcpUsage {
+            input_tokens: 200,
+            cached_read_tokens: 1_050,
+            output_tokens: 80,
+            total_tokens: 1_330,
+            ..AcpUsage::default()
+        };
+        guard2.complete("end_turn".to_owned(), step2_est);
+
+        // Cold step 1 actually got a 400-token implicit upstream cache hit (`1450` vs `1050` cr).
+        let accounted = step1_est.saturating_add(step2_est);
+        let authoritative = AcpUsage {
+            input_tokens: 800,
+            cached_read_tokens: 1_450,
+            output_tokens: 130,
+            total_tokens: 2_380,
+            ..AcpUsage::default()
+        };
+        hub.reconcile_cascade_usage_drift(accounted, authoritative, false);
+
+        let summary = hub.low_cache_hits().summary;
+        assert_eq!(summary.total_prompt_tokens, 2_250);
+        assert_eq!(summary.total_cached_read_tokens, 1_450);
+        assert_eq!(summary.warm_prompt_tokens, 1_250);
+        assert_eq!(summary.warm_cached_read_tokens, 1_050);
+    }
+
+    #[test]
+    fn sync_settings_json_bool_field_updates_matching_pid_daemon_json_only() {
+        let dir = std::env::temp_dir().join(format!("liftgate-tel-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let settings_path = dir.join("settings.json");
+        let daemon_path = dir.join("daemon.json");
+
+        let matching = serde_json::json!({
+            "pid": std::process::id(),
+            "mcp_tool_bridge": true,
+            "vision_offload": true
+        });
+        fs::write(
+            &daemon_path,
+            serde_json::to_vec_pretty(&matching).expect("serialize"),
+        )
+        .expect("write daemon.json");
+
+        sync_settings_json_bool_field(&settings_path, "mcp_tool_bridge", false);
+        let synced_daemon: serde_json::Value =
+            serde_json::from_slice(&fs::read(&daemon_path).expect("read")).expect("parse");
+        assert_eq!(synced_daemon["mcp_tool_bridge"], false);
+        assert_eq!(synced_daemon["vision_offload"], true);
+
+        let foreign = serde_json::json!({
+            "pid": std::process::id().wrapping_add(99_999),
+            "mcp_tool_bridge": false
+        });
+        fs::write(
+            &daemon_path,
+            serde_json::to_vec_pretty(&foreign).expect("serialize"),
+        )
+        .expect("write foreign daemon.json");
+
+        sync_settings_json_bool_field(&settings_path, "mcp_tool_bridge", true);
+        let foreign_after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&daemon_path).expect("read")).expect("parse");
+        assert_eq!(foreign_after["mcp_tool_bridge"], false);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

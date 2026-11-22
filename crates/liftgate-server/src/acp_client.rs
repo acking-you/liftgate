@@ -829,10 +829,15 @@ impl LiveAcpClient {
         Ok(fresh)
     }
 
-    /// Gracefully shuts down background tasks and terminates the ACP process group.
-    pub async fn close(self) -> Result<(), AcpError> {
+    /// Gracefully shuts down background tasks and terminates the active ACP process group.
+    pub async fn shutdown(&self) {
         let active = self.active_gen();
         active.shutdown().await;
+    }
+
+    /// Gracefully shuts down background tasks and terminates the ACP process group.
+    pub async fn close(self) -> Result<(), AcpError> {
+        self.shutdown().await;
         Ok(())
     }
 

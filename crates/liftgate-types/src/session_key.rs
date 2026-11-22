@@ -1936,7 +1936,7 @@ pub fn build_client_tools_delta_xml_with_spill<S: TruncationSpillSink>(
     out.push_str("<client_tools_update>\n");
     if next_tools.is_empty() {
         out.push_str(&format!(
-            "External `<client_tools>` are disabled for this turn; respond in plain text without emitting any `<agy_tool_call_{tool_nonce}>` XML blocks.\n"
+            "External `<client_tools>` are disabled for this turn; respond in plain text without emitting any `<agy_tool_call_{tool_nonce}>` XML blocks or invoking any `mcp_lg_*` tool calls.\n"
         ));
         out.push_str("</client_tools_update>\n");
         return Some(out);

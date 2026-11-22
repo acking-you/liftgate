@@ -691,6 +691,35 @@ impl SessionPool {
         guard.last_activity_unix_ms
     }
 
+    /// Drains all cached idle and MCP-suspended sessions during gateway shutdown so parked
+    /// session driver tasks exit cleanly and release their capability handles.
+    pub fn clear_for_shutdown(&self) {
+        let (dropped_suspended, dropped_idle) = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let removed = guard
+                .suspended_sessions
+                .len()
+                .saturating_add(guard.idle_sessions.len());
+            guard.total_sessions_closed_or_evicted = guard
+                .total_sessions_closed_or_evicted
+                .saturating_add(removed as u64);
+            guard.retained_idle_bytes = 0;
+            (
+                std::mem::take(&mut guard.suspended_sessions),
+                std::mem::take(&mut guard.idle_sessions),
+            )
+        };
+        let had_entries = !dropped_suspended.is_empty() || !dropped_idle.is_empty();
+        drop(dropped_suspended);
+        drop(dropped_idle);
+        if had_entries {
+            self.bump_lifecycle_seq();
+        }
+    }
+
     /// Atomically drains all idle cached sessions (used before an idle `agy` binary hot-swap).
     pub fn take_all_idle_sessions(&self) -> Vec<IdleSessionEntry> {
         let mut guard = match self.inner.lock() {

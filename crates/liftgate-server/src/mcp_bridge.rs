@@ -186,9 +186,23 @@ impl McpSessionHandle {
             .bridged_pairs
             .iter()
             .fold(0usize, |acc, (c, m)| acc.saturating_add(c.len() + m.len()));
+        let wire_tools_bytes = self.catalog.wire_tools.iter().fold(0usize, |acc, wt| {
+            acc.saturating_add(std::mem::size_of::<McpWireTool>())
+                .saturating_add(wt.name.len())
+                .saturating_add(wt.description.as_deref().map_or(0, str::len))
+        });
+        let bridged_map_bytes = self.catalog.by_mcp_name.iter().fold(0usize, |acc, (k, b)| {
+            acc.saturating_add(std::mem::size_of::<McpBridgedTool>())
+                .saturating_add(k.len())
+                .saturating_add(b.mcp_name.len())
+                .saturating_add(b.client_name.len())
+                .saturating_add(b.parameters_json.as_deref().map_or(0, str::len))
+        });
         std::mem::size_of::<Self>()
             .saturating_add(self.server_config.url.as_deref().map_or(0, str::len))
             .saturating_add(pairs_bytes)
+            .saturating_add(wire_tools_bytes)
+            .saturating_add(bridged_map_bytes)
     }
 }
 
@@ -278,7 +292,8 @@ impl LoopbackMcpServer {
     /// Registers a new per-session MCP capability token (`<16-hex-slot><48-hex-secret>`) and returns
     /// an RAII [`McpSessionHandle`] whose `Drop` unregisters the endpoint.
     #[must_use]
-    pub fn register_session(&self, catalog: McpSessionCatalog) -> Arc<McpSessionHandle> {
+    pub fn register_session(&self, mut catalog: McpSessionCatalog) -> Arc<McpSessionHandle> {
+        catalog.xml_only_tools = Vec::new();
         let slot_id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
         let raw_a = Uuid::new_v4().simple().to_string();
         let raw_b = Uuid::new_v4().simple().to_string();
@@ -904,11 +919,16 @@ pub fn extract_custom_tool_input(arguments: &Value, preferred_key: Option<&str>)
                 return s.to_owned();
             }
         }
-        if map.len() == 1
-            && let Some(s) = map.values().next().and_then(Value::as_str)
+        let mut non_summary_iter = map.iter().filter(|(k, _)| k.as_str() != "toolSummary");
+        if let Some((_, val)) = non_summary_iter.next()
+            && non_summary_iter.next().is_none()
+            && let Some(s) = val.as_str()
         {
             return s.to_owned();
         }
+    }
+    if arguments.is_null() {
+        return String::new();
     }
     serde_json::to_string(arguments).unwrap_or_default()
 }
@@ -996,5 +1016,56 @@ mod tests {
         assert_eq!(strip_call_prefix("call_abc123"), "abc123");
         assert_eq!(strip_call_prefix("toolu_abc123"), "abc123");
         assert_eq!(strip_call_prefix("raw_99"), "raw_99");
+    }
+
+    #[test]
+    fn extract_custom_tool_input_ignores_tool_summary_and_null() {
+        assert_eq!(
+            extract_custom_tool_input(
+                &json!({"script": "console.log(42);", "toolSummary": "Execute JS"}),
+                None
+            ),
+            "console.log(42);"
+        );
+        assert_eq!(
+            extract_custom_tool_input(&json!({"toolSummary": "Execute JS"}), None),
+            r#"{"toolSummary":"Execute JS"}"#
+        );
+        assert_eq!(extract_custom_tool_input(&Value::Null, None), "");
+    }
+
+    #[tokio::test]
+    async fn register_session_clears_xml_overflow_and_accounts_schema_bytes() {
+        let srv = LoopbackMcpServer::bind(
+            NonZeroUsize::new(1024 * 1024).expect("nonzero"),
+            NonZeroUsize::new(16).expect("nonzero"),
+        )
+        .await
+        .expect("bind loopback MCP server");
+        let desc = "x".repeat(4_096);
+        let params = format!(
+            r#"{{"type":"object","properties":{{"q":{{"type":"string","description":"{}"}}}}}}"#,
+            "y".repeat(2_048)
+        );
+        let tools = vec![
+            CanonicalToolSpec {
+                name: "apply_patch".to_owned(),
+                description: Some("Freeform patch tool.".to_owned()),
+                kind: CanonicalToolKind::Custom { format_json: None },
+            },
+            CanonicalToolSpec {
+                name: "search_docs".to_owned(),
+                description: Some(desc.clone()),
+                kind: CanonicalToolKind::Function {
+                    parameters_json: params.clone(),
+                },
+            },
+        ];
+        let cat = partition_tools_for_mcp(&tools, &mut NoopSpillSink);
+        assert_eq!(cat.xml_only_tools.len(), 1);
+
+        let handle = srv.register_session(cat);
+        assert!(handle.catalog().xml_only_tools.is_empty());
+        assert!(handle.estimated_retained_bytes() >= desc.len() + params.len());
     }
 }
