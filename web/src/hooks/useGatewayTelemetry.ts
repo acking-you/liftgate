@@ -320,11 +320,36 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
 
       es.addEventListener("snapshot", (ev: MessageEvent<string>) => {
         if (cancelled) return;
+        setConnectionState("live");
+        setLastError(null);
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+          return;
+        }
         try {
           const parsed = JSON.parse(ev.data) as GatewayTelemetrySnapshot;
-          setSnapshot(parsed);
-          setConnectionState("live");
-          setLastError(null);
+          setSnapshot((prev) => {
+            if (
+              prev !== null &&
+              parsed.active_tasks.length === 0 &&
+              prev.active_tasks.length === 0 &&
+              parsed.metrics.total_requests === prev.metrics.total_requests &&
+              parsed.metrics.completed_requests === prev.metrics.completed_requests &&
+              parsed.metrics.failed_requests === prev.metrics.failed_requests &&
+              (parsed.cache_telemetry?.revision ?? 0) ===
+                (prev.cache_telemetry?.revision ?? 0) &&
+              parsed.vision_offload_enabled === prev.vision_offload_enabled &&
+              parsed.acp_process.connected === prev.acp_process.connected &&
+              parsed.acp_process.recent_stderr.length ===
+                prev.acp_process.recent_stderr.length &&
+              parsed.session_pool.sessions.length ===
+                prev.session_pool.sessions.length &&
+              parsed.available_models.length === prev.available_models.length &&
+              parsed.acp_process.uptime_secs - prev.acp_process.uptime_secs < 10
+            ) {
+              return prev;
+            }
+            return parsed;
+          });
         } catch (parseErr) {
           setLastError(
             parseErr instanceof Error ? parseErr.message : "Invalid SSE JSON",

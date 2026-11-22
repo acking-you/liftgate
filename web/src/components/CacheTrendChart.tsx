@@ -29,7 +29,7 @@ function formatClock(ms: number): string {
   return new Date(ms).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-export function CacheTrendChart({
+export const CacheTrendChart = React.memo(function CacheTrendChart({
   recentTasks,
   thresholdBps,
   onSelectTask,
@@ -280,4 +280,4 @@ export function CacheTrendChart({
       </div>
     </div>
   );
-}
+});
