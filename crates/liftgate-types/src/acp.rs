@@ -136,7 +136,7 @@ pub struct SessionNewParams<'a> {
     pub meta: Option<SessionNewMeta<'a>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     pub name: String,
@@ -305,6 +305,40 @@ impl AcpUsage {
     #[must_use]
     pub fn cache_hit_bps(&self) -> Option<u16> {
         compute_cache_hit_bps(self.cached_read_tokens, self.total_prompt_tokens())
+    }
+
+    /// Component-wise saturating addition across two [`AcpUsage`] snapshots.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cached_read_tokens: self
+                .cached_read_tokens
+                .saturating_add(rhs.cached_read_tokens),
+            cached_write_tokens: self
+                .cached_write_tokens
+                .saturating_add(rhs.cached_write_tokens),
+            thought_tokens: self.thought_tokens.saturating_add(rhs.thought_tokens),
+            total_tokens: self.total_tokens.saturating_add(rhs.total_tokens),
+        }
+    }
+
+    /// Component-wise saturating subtraction (`self - rhs`) across two [`AcpUsage`] snapshots.
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(rhs.output_tokens),
+            cached_read_tokens: self
+                .cached_read_tokens
+                .saturating_sub(rhs.cached_read_tokens),
+            cached_write_tokens: self
+                .cached_write_tokens
+                .saturating_sub(rhs.cached_write_tokens),
+            thought_tokens: self.thought_tokens.saturating_sub(rhs.thought_tokens),
+            total_tokens: self.total_tokens.saturating_sub(rhs.total_tokens),
+        }
     }
 }
 

@@ -164,6 +164,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 "proxy": report.agy_proxy_display,
                 "auto_update_enabled": report.agy_auto_update_enabled,
                 "vision_offload_enabled": report.vision_offload_enabled,
+                "mcp_tool_bridge_enabled": report.mcp_tool_bridge_enabled,
                 "latest_known_version": report.telemetry.as_ref().and_then(|t| t.acp_process.latest_known_version.clone()),
                 "auto_update_note": report.telemetry.as_ref().and_then(|t| t.acp_process.auto_update_note.clone()),
             },
@@ -247,6 +248,14 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         },
     );
     ui::kv(
+        "MCP Tool Bridge",
+        if report.mcp_tool_bridge_enabled {
+            "enabled (loopback MCP suspension + XML coexistence)"
+        } else {
+            "disabled (XML-only client tools)"
+        },
+    );
+    ui::kv(
         "Context Policy",
         "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)",
     );
@@ -284,11 +293,11 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             Cell::new(acp_detail),
         ]);
 
-        let pool_bar = ui::progress_bar(
-            snap.session_pool.idle_cached_sessions,
-            snap.session_pool.max_idle_sessions,
-            8,
-        );
+        let cached_total = snap
+            .session_pool
+            .idle_cached_sessions
+            .saturating_add(snap.session_pool.suspended_mcp_sessions);
+        let pool_bar = ui::progress_bar(cached_total, snap.session_pool.max_idle_sessions, 8);
         let mut hot_idle = 0usize;
         let mut warm_idle = 0usize;
         let mut cold_idle = 0usize;
@@ -301,17 +310,19 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
                 | liftgate_types::telemetry::PromptCacheWarmth::Unknown => {}
             }
         }
-        let cache_breakdown = if snap.session_pool.idle_cached_sessions > 0 {
+        let cache_breakdown = if cached_total > 0 {
             format!(" [kv: {hot_idle} hot, {warm_idle} warm, {cold_idle} cold]")
         } else {
             String::new()
         };
         let pool_detail = format!(
-            "{pool_bar}  {} active · {}/{} idle{cache_breakdown}  (reused {}, created {}, evicted {})",
+            "{pool_bar}  {} active · {} mcp-wait · {}/{} idle{cache_breakdown}  (reused {}, mcp-cont {}, created {}, evicted {})",
             snap.session_pool.active_leased_sessions,
+            snap.session_pool.suspended_mcp_sessions,
             snap.session_pool.idle_cached_sessions,
             snap.session_pool.max_idle_sessions,
             snap.session_pool.total_sessions_reused,
+            snap.session_pool.mcp_continuations,
             snap.session_pool.total_sessions_created,
             snap.session_pool.total_sessions_closed_or_evicted,
         );

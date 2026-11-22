@@ -20,8 +20,8 @@ use liftgate_server::{
 };
 use liftgate_types::{
     acp::{
-        AcpChunkContent, AcpPromptBlock, AcpUsage, AvailableModel, ModelsCatalog, ModesCatalog,
-        PromptTurnResult, SessionNewResult, SessionUpdatePayload,
+        AcpChunkContent, AcpPromptBlock, AcpUsage, AvailableModel, McpServerConfig, ModelsCatalog,
+        ModesCatalog, PromptTurnResult, SessionNewResult, SessionUpdatePayload,
     },
     config::{
         AcpModeId, CacheHitThresholdBps, GatewayLimits, LowCacheRecordLimit, ModelId, SessionId,
@@ -71,6 +71,77 @@ enum MockScript {
         cancelled_usage: AcpUsage,
         initial_updates: Vec<SessionUpdatePayload>,
     },
+    McpInteractive {
+        steps: Vec<McpMockStep>,
+        cancelled_usage: AcpUsage,
+    },
+}
+
+enum McpMockStep {
+    CallTool {
+        usage_used: u64,
+        thoughts: Vec<String>,
+        pre_text_templates: Vec<String>,
+        mcp_name: String,
+        arguments: Value,
+        expect_reply_substrings: Vec<&'static str>,
+    },
+    FinalReply {
+        usage_used: u64,
+        thoughts: Vec<String>,
+        chunks_template: Vec<String>,
+        final_usage: AcpUsage,
+    },
+}
+
+async fn post_loopback_mcp_raw(url: &str, body_bytes: &[u8]) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let rest = url
+        .strip_prefix("http://")
+        .expect("loopback MCP URL must start with http://");
+    let (host_port, path) = rest.split_once('/').map_or((rest, "/"), |(hp, p)| (hp, p));
+    let req_path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let mut stream = tokio::net::TcpStream::connect(host_port)
+        .await
+        .expect("must connect to loopback MCP listener");
+    let header = format!(
+        "POST {req_path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream.write_all(header.as_bytes()).await.unwrap();
+    stream.write_all(body_bytes).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw_resp = Vec::new();
+    stream.read_to_end(&mut raw_resp).await.unwrap();
+    let sep = raw_resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP response header separator");
+    let head_str = String::from_utf8_lossy(&raw_resp[..sep]);
+    let status = head_str
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .expect("HTTP status code");
+    let resp_body = raw_resp[sep + 4..].to_vec();
+    (status, resp_body)
+}
+
+async fn post_loopback_mcp_json(url: &str, payload: &Value) -> (u16, Option<Value>) {
+    let bytes = serde_json::to_vec(payload).unwrap();
+    let (status, resp_bytes) = post_loopback_mcp_raw(url, &bytes).await;
+    let parsed = if resp_bytes.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(&resp_bytes).unwrap())
+    };
+    (status, parsed)
 }
 
 struct RecordedPrompt {
@@ -84,7 +155,9 @@ struct MockAcpBackend {
     aborted_count: AtomicUsize,
     soft_cancel_enabled: std::sync::atomic::AtomicBool,
     soft_cancel_notify_slot: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    session_cancel_notifiers: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
     session_nonces: Mutex<Vec<(String, String)>>,
+    session_mcp_servers: Mutex<Vec<(String, Vec<McpServerConfig>)>>,
     recorded_system_appends: Mutex<Vec<String>>,
     recorded_models: Mutex<Vec<String>>,
     recorded_prompts: Mutex<Vec<RecordedPrompt>>,
@@ -98,12 +171,18 @@ impl MockAcpBackend {
             aborted_count: AtomicUsize::new(0),
             soft_cancel_enabled: std::sync::atomic::AtomicBool::new(false),
             soft_cancel_notify_slot: Mutex::new(None),
+            session_cancel_notifiers: Mutex::new(std::collections::HashMap::new()),
             session_nonces: Mutex::new(Vec::new()),
+            session_mcp_servers: Mutex::new(Vec::new()),
             recorded_system_appends: Mutex::new(Vec::new()),
             recorded_models: Mutex::new(Vec::new()),
             recorded_prompts: Mutex::new(Vec::new()),
             scripts: Mutex::new(VecDeque::from(scripts)),
         }
+    }
+
+    fn enable_soft_cancel(&self) {
+        self.soft_cancel_enabled.store(true, Ordering::SeqCst);
     }
 
     fn enable_soft_cancel_with_notify(&self, notify: Arc<tokio::sync::Notify>) {
@@ -128,6 +207,14 @@ impl AcpBackend for MockAcpBackend {
     }
 
     async fn create_session(&self, system_append: &str) -> Result<SessionNewResult, AcpError> {
+        self.create_session_with_mcp(system_append, &[]).await
+    }
+
+    async fn create_session_with_mcp(
+        &self,
+        system_append: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> Result<SessionNewResult, AcpError> {
         let n = self.next_session_num.fetch_add(1, Ordering::SeqCst);
         let sid_str = format!("sess_{n}");
         let nonce = Self::extract_nonce(system_append);
@@ -139,6 +226,14 @@ impl AcpBackend for MockAcpBackend {
             .lock()
             .unwrap()
             .push((sid_str.clone(), nonce));
+        self.session_mcp_servers
+            .lock()
+            .unwrap()
+            .push((sid_str.clone(), mcp_servers.to_vec()));
+        self.session_cancel_notifiers
+            .lock()
+            .unwrap()
+            .insert(sid_str.clone(), Arc::new(tokio::sync::Notify::new()));
 
         Ok(SessionNewResult {
             session_id: SessionId::try_new(sid_str).unwrap(),
@@ -197,6 +292,12 @@ impl AcpBackend for MockAcpBackend {
             text_joined: joined,
             image_blocks,
         });
+
+        let turn_cancel = Arc::new(tokio::sync::Notify::new());
+        self.session_cancel_notifiers
+            .lock()
+            .unwrap()
+            .insert(session_id.as_str().to_owned(), Arc::clone(&turn_cancel));
 
         let nonce = self
             .session_nonces
@@ -423,13 +524,269 @@ impl AcpBackend for MockAcpBackend {
                     error: None,
                 })
             }
+            MockScript::McpInteractive {
+                steps,
+                cancelled_usage,
+            } => {
+                let mcp_url = self
+                    .session_mcp_servers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(sid, _)| sid == session_id.as_str())
+                    .and_then(|(_, cfgs)| cfgs.first())
+                    .and_then(|cfg| cfg.url.clone())
+                    .expect("McpInteractive requires loopback MCP server URL on session/new");
+                let sess_cancel = self
+                    .session_cancel_notifiers
+                    .lock()
+                    .unwrap()
+                    .get(session_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
+
+                // Simulate exact `agy acp` v1.5.14 MCP handshake on `session/new`:
+                // 1) `server/discover` -> `-32601`
+                let (disc_status, disc_body) = post_loopback_mcp_json(
+                    &mcp_url,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "server/discover",
+                        "params": { "protocolVersion": "2026-07-28" }
+                    }),
+                )
+                .await;
+                assert_eq!(disc_status, 200);
+                assert_eq!(disc_body.unwrap()["error"]["code"], -32601);
+
+                // 2) `initialize` -> `"2025-11-25"`
+                let (init_status, init_body) = post_loopback_mcp_json(
+                    &mcp_url,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "clientInfo": { "name": "antigravity-client", "version": "1.0.0" }
+                        }
+                    }),
+                )
+                .await;
+                assert_eq!(init_status, 200);
+                assert_eq!(
+                    init_body.unwrap()["result"]["protocolVersion"],
+                    "2025-11-25"
+                );
+
+                // 3) `notifications/initialized` -> `202 Accepted`
+                let (notif_status, notif_body) = post_loopback_mcp_json(
+                    &mcp_url,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized"
+                    }),
+                )
+                .await;
+                assert_eq!(notif_status, 202);
+                assert!(notif_body.is_none());
+
+                // 4) `tools/list` -> `200 OK`
+                let (list_status, list_body) = post_loopback_mcp_json(
+                    &mcp_url,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/list",
+                        "params": {}
+                    }),
+                )
+                .await;
+                assert_eq!(list_status, 200);
+                assert!(list_body.unwrap()["result"]["tools"].is_array());
+
+                for (step_idx, step) in steps.into_iter().enumerate() {
+                    match step {
+                        McpMockStep::CallTool {
+                            usage_used,
+                            thoughts,
+                            pre_text_templates,
+                            mcp_name,
+                            arguments,
+                            expect_reply_substrings,
+                        } => {
+                            if usage_used > 0 {
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::UsageUpdate {
+                                        used: usage_used,
+                                        size: 1_048_576,
+                                    })
+                                    .await;
+                            }
+                            for th in thoughts {
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::AgentThoughtChunk {
+                                        content: AcpChunkContent {
+                                            content_type: "text".to_owned(),
+                                            text: th,
+                                        },
+                                    })
+                                    .await;
+                            }
+                            for tmpl in pre_text_templates {
+                                let hydrated = tmpl.replace("{NONCE}", &nonce);
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::AgentMessageChunk {
+                                        content: AcpChunkContent {
+                                            content_type: "text".to_owned(),
+                                            text: hydrated,
+                                        },
+                                    })
+                                    .await;
+                            }
+                            let acp_tc_id = format!("tc_mcp_{}_{}", session_id.as_str(), step_idx);
+                            let raw_args = RawValue::from_string(arguments.to_string()).unwrap();
+                            let _ = updates_tx
+                                .send(SessionUpdatePayload::ToolCall {
+                                    tool_call_id: acp_tc_id.clone(),
+                                    name: format!("mcp_lg_{mcp_name}"),
+                                    status: "in_progress".to_owned(),
+                                    kind: "other".to_owned(),
+                                    title: format!("Run {mcp_name}"),
+                                    args: None,
+                                    raw_input: Some(raw_args),
+                                })
+                                .await;
+
+                            let rpc_call_payload = json!({
+                                "jsonrpc": "2.0",
+                                "id": 100 + step_idx,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": mcp_name,
+                                    "arguments": arguments
+                                }
+                            });
+                            let call_res = tokio::select! {
+                                biased;
+                                () = sess_cancel.notified() => None,
+                                out = post_loopback_mcp_json(&mcp_url, &rpc_call_payload) => Some(out),
+                            };
+                            let Some((call_status, Some(call_json))) = call_res else {
+                                return Ok(PromptTurnResult {
+                                    stop_reason: "cancelled".to_owned(),
+                                    usage: cancelled_usage,
+                                    error: None,
+                                });
+                            };
+                            assert_eq!(call_status, 200);
+                            if call_json.get("error").is_some() {
+                                return Ok(PromptTurnResult {
+                                    stop_reason: "cancelled".to_owned(),
+                                    usage: cancelled_usage,
+                                    error: None,
+                                });
+                            }
+                            let joined_texts = call_json["result"]["content"]
+                                .as_array()
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            for needle in &expect_reply_substrings {
+                                assert!(
+                                    joined_texts.contains(needle),
+                                    "expected MCP tools/call text `{joined_texts}` to contain `{needle}`"
+                                );
+                            }
+                            let is_err = call_json["result"]["isError"].as_bool().unwrap_or(false);
+                            let _ = updates_tx
+                                .send(SessionUpdatePayload::ToolCallUpdate {
+                                    tool_call_id: acp_tc_id,
+                                    name: String::new(),
+                                    status: if is_err {
+                                        "failed".to_owned()
+                                    } else {
+                                        "completed".to_owned()
+                                    },
+                                    kind: String::new(),
+                                    title: String::new(),
+                                    args: None,
+                                    raw_input: None,
+                                })
+                                .await;
+                        }
+                        McpMockStep::FinalReply {
+                            usage_used,
+                            thoughts,
+                            chunks_template,
+                            final_usage,
+                        } => {
+                            if usage_used > 0 {
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::UsageUpdate {
+                                        used: usage_used,
+                                        size: 1_048_576,
+                                    })
+                                    .await;
+                            }
+                            for th in thoughts {
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::AgentThoughtChunk {
+                                        content: AcpChunkContent {
+                                            content_type: "text".to_owned(),
+                                            text: th,
+                                        },
+                                    })
+                                    .await;
+                            }
+                            for tmpl in chunks_template {
+                                let hydrated = tmpl.replace("{NONCE}", &nonce);
+                                let _ = updates_tx
+                                    .send(SessionUpdatePayload::AgentMessageChunk {
+                                        content: AcpChunkContent {
+                                            content_type: "text".to_owned(),
+                                            text: hydrated,
+                                        },
+                                    })
+                                    .await;
+                            }
+                            return Ok(PromptTurnResult {
+                                stop_reason: "end_turn".to_owned(),
+                                usage: final_usage,
+                                error: None,
+                            });
+                        }
+                    }
+                }
+
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage: cancelled_usage,
+                    error: None,
+                })
+            }
         }
     }
 
-    fn cancel_prompt_for_reuse(&self, _session_id: &SessionId) -> bool {
+    fn cancel_prompt_for_reuse(&self, session_id: &SessionId) -> bool {
         if self.soft_cancel_enabled.load(Ordering::SeqCst) {
             if let Some(custom) = self.soft_cancel_notify_slot.lock().unwrap().as_ref() {
                 custom.notify_one();
+            }
+            if let Some(sess_n) = self
+                .session_cancel_notifiers
+                .lock()
+                .unwrap()
+                .get(session_id.as_str())
+            {
+                sess_n.notify_waiters();
+                sess_n.notify_one();
             }
             true
         } else {
@@ -437,8 +794,17 @@ impl AcpBackend for MockAcpBackend {
         }
     }
 
-    fn abort_session_nonblocking(&self, _session_id: &SessionId) {
+    fn abort_session_nonblocking(&self, session_id: &SessionId) {
         self.aborted_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(sess_n) = self
+            .session_cancel_notifiers
+            .lock()
+            .unwrap()
+            .get(session_id.as_str())
+        {
+            sess_n.notify_waiters();
+            sess_n.notify_one();
+        }
     }
 
     async fn close_session(&self, _session_id: &SessionId) -> Result<(), AcpError> {
@@ -493,11 +859,14 @@ fn test_state(
         config: GatewayRuntimeConfig {
             title_model_file: None,
             spill_dir: Some(spill_dir),
+            settings_path: None,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: api_key.map(Arc::<str>::from),
             limits,
             vision_offload: Arc::new(AtomicBool::new(true)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
+            mcp_server: None,
         },
         ui_dist_dir: None,
         embedded_ui: &[],
@@ -2981,11 +3350,14 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
         config: GatewayRuntimeConfig {
             title_model_file: None,
             spill_dir: None,
+            settings_path: None,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: None,
             limits,
             vision_offload: Arc::new(AtomicBool::new(true)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
+            mcp_server: None,
         },
         ui_dist_dir: None,
         embedded_ui: MOCK_UI,
@@ -5017,11 +5389,14 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
         config: GatewayRuntimeConfig {
             title_model_file: None,
             spill_dir: None,
+            settings_path: None,
             default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: Some(Arc::from("secret-gate-key")),
             limits,
             vision_offload: Arc::new(AtomicBool::new(true)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
+            mcp_server: None,
         },
         ui_dist_dir: None,
         embedded_ui: &[],
@@ -6056,6 +6431,9 @@ async fn soft_cancel_preserves_warm_session_across_post_tool_thought_and_mid_tur
     assert_eq!(t2_resp.status(), StatusCode::OK);
     tokio::time::sleep(Duration::from_millis(30)).await;
     drop(t2_resp);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
 
     let t3_input = json!([
         { "role": "user", "content": "Fix a.rs" },
@@ -6397,6 +6775,1512 @@ async fn auxiliary_turns_excluded_and_low_cache_full_payload_capture_toggles_cle
         .flatten()
         .collect();
     assert!(remaining_files.is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ============================================================================
+// Hybrid Loopback MCP Tool Bridge + XML Coexistence Integration Suite
+// ============================================================================
+
+async fn test_state_with_mcp(
+    backend: Arc<MockAcpBackend>,
+    timeout_secs: u64,
+    settings_path: Option<std::path::PathBuf>,
+) -> AppState<MockAcpBackend> {
+    let limits =
+        GatewayLimits::try_new(16 * 1024 * 1024, 12 * 1024 * 1024, 64, 16, 64, timeout_secs)
+            .unwrap();
+    let mcp_srv = liftgate_server::mcp_bridge::LoopbackMcpServer::bind(
+        limits.max_body_bytes(),
+        limits.channel_capacity(),
+    )
+    .await
+    .unwrap();
+    let spill_dir = std::env::temp_dir().join("liftgate-mcp-test-spills");
+
+    AppState {
+        backend,
+        pool: Arc::new(SessionPool::new(limits)),
+        telemetry: Arc::new(TelemetryHub::new()),
+        config: GatewayRuntimeConfig {
+            title_model_file: None,
+            spill_dir: Some(spill_dir),
+            settings_path,
+            default_model: ModelId::try_new("gemini-4-carbon-high").unwrap(),
+            acp_mode: AcpModeId::try_new("auto").unwrap(),
+            api_key: None,
+            limits,
+            vision_offload: Arc::new(AtomicBool::new(true)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
+            mcp_server: Some(mcp_srv),
+        },
+        ui_dist_dir: None,
+        embedded_ui: &[],
+        admin_shutdown: None,
+    }
+}
+
+fn parse_sse_events(raw_bytes: &[u8]) -> Vec<(String, Value)> {
+    let text = String::from_utf8_lossy(raw_bytes);
+    let mut out = Vec::new();
+    for frame in text.split("\n\n") {
+        let mut ev_name = String::new();
+        let mut data_str = String::new();
+        for line in frame.lines() {
+            if let Some(rest) = line.strip_prefix("event: ") {
+                ev_name = rest.trim().to_owned();
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                data_str = rest.trim().to_owned();
+            }
+        }
+        if !ev_name.is_empty()
+            && !data_str.is_empty()
+            && let Ok(val) = serde_json::from_str::<Value>(&data_str)
+        {
+            out.push((ev_name, val));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() {
+    use liftgate_types::{
+        canonical::{CanonicalToolKind, CanonicalToolSpec},
+        session_key::NoopSpillSink,
+    };
+
+    let limits = GatewayLimits::default();
+    let srv = liftgate_server::mcp_bridge::LoopbackMcpServer::bind(
+        limits.max_body_bytes(),
+        limits.channel_capacity(),
+    )
+    .await
+    .unwrap();
+    let tools = vec![
+        CanonicalToolSpec {
+            name: "exec".to_owned(),
+            description: Some("declare const tools: { wait(): Promise<void>; };".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+        CanonicalToolSpec {
+            name: "apply_patch".to_owned(),
+            description: Some("Freeform patch.".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+    ];
+    let catalog = liftgate_server::mcp_bridge::partition_tools_for_mcp(&tools, &mut NoopSpillSink);
+    let handle = srv.register_session(catalog);
+    let url = handle.server_config().url.clone().unwrap();
+
+    // 1. Invalid / forged tokens must return 401 Unauthorized
+    let bad_url = format!(
+        "http://127.0.0.1:{}/mcp/0000000000000001deadbeefdeadbeefdeadbeef",
+        srv.port()
+    );
+    let (bad_status, _) = post_loopback_mcp_json(
+        &bad_url,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+    )
+    .await;
+    assert_eq!(bad_status, 401);
+
+    // 2. `server/discover` -> 200 OK with `-32601 Method not found`
+    let (disc_status, disc_json) = post_loopback_mcp_json(
+        &url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "protocolVersion": "2026-07-28" }
+        }),
+    )
+    .await;
+    assert_eq!(disc_status, 200);
+    assert_eq!(disc_json.unwrap()["error"]["code"], -32601);
+
+    // 3. `tools/list` exposes `exec` with `{code: string}` schema and omits freeform `apply_patch`
+    let (list_status, list_json) = post_loopback_mcp_json(
+        &url,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(list_status, 200);
+    let wire_tools = list_json.unwrap()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(wire_tools.len(), 1);
+    assert_eq!(wire_tools[0]["name"], "exec");
+    assert_eq!(
+        wire_tools[0]["inputSchema"]["properties"]["code"]["type"],
+        "string"
+    );
+
+    // 4. Dropping `McpSessionHandle` immediately revokes the capability token
+    drop(handle);
+    let (revoked_status, _) = post_loopback_mcp_json(
+        &url,
+        &json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }),
+    )
+    .await;
+    assert_eq!(revoked_status, 401);
+}
+
+#[tokio::test]
+async fn openai_responses_stateful_and_stateless_mcp_multi_step_cascade_and_parallel_siblings() {
+    let auth_sum_1 = AcpUsage {
+        input_tokens: 10_400,
+        output_tokens: 600,
+        cached_read_tokens: 19_200,
+        cached_write_tokens: 0,
+        thought_tokens: 180,
+        total_tokens: 30_200,
+    };
+    let auth_sum_2 = AcpUsage {
+        input_tokens: 8_500,
+        output_tokens: 300,
+        cached_read_tokens: 7_900,
+        cached_write_tokens: 0,
+        thought_tokens: 80,
+        total_tokens: 16_700,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Session 1: Stateful `previous_response_id` streaming SSE cascade with 2 parallel sibling
+        // pops (`U_2 == 0` on second sibling!) + 1 follow-up tool + final reply inside ONE `start_prompt`!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 9_800,
+                    thoughts: vec!["Inspecting Cargo.toml and src/lib.rs in parallel.".to_owned()],
+                    pre_text_templates: vec![],
+                    mcp_name: "Read".to_owned(),
+                    arguments: json!({
+                        "file_path": "Cargo.toml",
+                        "toolSummary": "Read Cargo.toml"
+                    }),
+                    expect_reply_substrings: vec!["edition = \"2024\""],
+                },
+                // Sequential sibling #2 (`maxConcurrent = 1`: `usage_used == 0`, zero LLM call!)
+                McpMockStep::CallTool {
+                    usage_used: 0,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "Read".to_owned(),
+                    arguments: json!({
+                        "file_path": "src/lib.rs",
+                        "toolSummary": "Read src/lib.rs"
+                    }),
+                    expect_reply_substrings: vec!["pub mod mcp_bridge;"],
+                },
+                // Step 3: LLM sees both files (`usage_used = 10_900`) and runs `Bash`
+                McpMockStep::CallTool {
+                    usage_used: 10_900,
+                    thoughts: vec!["Running unit tests now.".to_owned()],
+                    pre_text_templates: vec![],
+                    mcp_name: "Bash".to_owned(),
+                    arguments: json!({ "command": "cargo test --locked" }),
+                    expect_reply_substrings: vec!["test result: ok. 42 passed"],
+                },
+                // Step 4: Final answer (`usage_used = 11_800`)
+                McpMockStep::FinalReply {
+                    usage_used: 11_800,
+                    thoughts: vec!["All checks green.".to_owned()],
+                    chunks_template: vec!["Workspace verified cleanly.".to_owned()],
+                    final_usage: auth_sum_1,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Session 2: Stateless `store: false` full-input replay non-streaming cascade
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 8_200,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "Read".to_owned(),
+                    arguments: json!({ "file_path": "README.md" }),
+                    expect_reply_substrings: vec!["# Liftgate"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 8_900,
+                    thoughts: vec![],
+                    chunks_template: vec!["Stateless MCP continuation succeeded.".to_owned()],
+                    final_usage: auth_sum_2,
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let tools_json = json!([
+        {
+            "type": "function",
+            "name": "Read",
+            "description": "Read file contents",
+            "parameters": {
+                "type": "object",
+                "properties": { "file_path": { "type": "string" } },
+                "required": ["file_path"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "Bash",
+            "description": "Execute shell command",
+            "parameters": {
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }
+        }
+    ]);
+
+    // --- Part A: Stateful SSE streaming across 4 HTTP requests inside 1 `start_prompt` ---
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "instructions": "Inspect workspace and run tests.",
+                        "tools": tools_json,
+                        "input": "Check Cargo.toml and src/lib.rs, then run tests."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r1_events = parse_sse_events(&r1.into_body().collect().await.unwrap().to_bytes());
+    let r1_done = &r1_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_1 = r1_done["id"].as_str().unwrap().to_owned();
+    let fc_1 = r1_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected Read #1 function_call");
+    assert_eq!(fc_1["name"], "Read");
+    // Injected `toolSummary` must be stripped!
+    let fc_1_args: Value = serde_json::from_str(fc_1["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(fc_1_args, json!({ "file_path": "Cargo.toml" }));
+    assert_eq!(r1_done["usage"]["input_tokens_details"]["cached_tokens"], 0);
+
+    // Pool must hold 1 `Suspended` session right now!
+    let snap_mid = state.pool.snapshot();
+    assert_eq!(snap_mid.suspended_mcp_sessions, 1);
+    assert_eq!(snap_mid.idle_cached_sessions, 0);
+    assert_eq!(
+        snap_mid.sessions[0].state,
+        liftgate_types::telemetry::SessionSlotState::Suspended
+    );
+
+    // HTTP Request 2: Send `function_call_output` for Read #1 -> immediately pops sibling Read #2 (`U_2 == 0`)!
+    let call_id_1 = fc_1["call_id"].as_str().unwrap();
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_1,
+                        "tools": tools_json,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_1,
+                            "output": "[package]\nname = \"liftgate\"\nedition = \"2024\"\n"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let r2_events = parse_sse_events(&r2.into_body().collect().await.unwrap().to_bytes());
+    let r2_done = &r2_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_2 = r2_done["id"].as_str().unwrap().to_owned();
+    let fc_2 = r2_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected sibling Read #2");
+    assert_eq!(fc_2["name"], "Read");
+    let fc_2_args: Value = serde_json::from_str(fc_2["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(fc_2_args, json!({ "file_path": "src/lib.rs" }));
+    assert_eq!(r2_done["usage"]["output_tokens"], 0);
+
+    // HTTP Request 3: Send `function_call_output` for Read #2 -> LLM emits `Bash` (`cached_tokens > 0`)!
+    let call_id_2 = fc_2["call_id"].as_str().unwrap();
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_id_2,
+                        "tools": tools_json,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_2,
+                            "output": "pub mod mcp_bridge;\n"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let r3_json: Value =
+        serde_json::from_slice(&r3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_id_3 = r3_json["id"].as_str().unwrap().to_owned();
+    assert!(
+        r3_json["usage"]["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+            > 5_000
+    );
+    let fc_3 = r3_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .unwrap();
+    assert_eq!(fc_3["name"], "Bash");
+
+    // HTTP Request 4: Send `function_call_output` for `Bash` -> Final prose answer completes `start_prompt`!
+    let call_id_3 = fc_3["call_id"].as_str().unwrap();
+    let r4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_id_3,
+                        "tools": tools_json,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_3,
+                            "output": "\u{1b}[32mtest result: ok. 42 passed\u{1b}[0m\n"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+    let r4_json: Value =
+        serde_json::from_slice(&r4.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let msg_text = r4_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(msg_text, "Workspace verified cleanly.");
+
+    // ALL 4 HTTP requests ran inside ONE `start_prompt` RPC with ZERO token drift!
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
+    let snap_after_part_a = state.pool.snapshot();
+    assert_eq!(snap_after_part_a.suspended_mcp_sessions, 0);
+    assert_eq!(snap_after_part_a.idle_cached_sessions, 1);
+    assert_eq!(snap_after_part_a.mcp_continuations, 3);
+    assert_eq!(snap_after_part_a.total_sessions_created, 1);
+
+    let (metrics_a, _, _, _) = state.telemetry.snapshot_tasks();
+    assert_eq!(metrics_a.total_input_tokens, auth_sum_1.input_tokens);
+    assert_eq!(metrics_a.total_output_tokens, auth_sum_1.output_tokens);
+    assert_eq!(metrics_a.total_cached_tokens, auth_sum_1.cached_read_tokens);
+    assert_eq!(metrics_a.total_thought_tokens, auth_sum_1.thought_tokens);
+
+    // --- Part B: Stateless (`store: false`, no `previous_response_id`) full-input replay ---
+    let s1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": false,
+                        "instructions": "Read README statelessly.",
+                        "tools": tools_json,
+                        "input": [{ "role": "user", "content": "Read README.md" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s1.status(), StatusCode::OK);
+    let s1_json: Value =
+        serde_json::from_slice(&s1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let s1_fc = s1_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .unwrap();
+    let s1_call_id = s1_fc["call_id"].as_str().unwrap();
+
+    let s2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": false,
+                        "instructions": "Read README statelessly.",
+                        "tools": tools_json,
+                        "input": [
+                            { "role": "user", "content": "Read README.md" },
+                            {
+                                "type": "function_call",
+                                "call_id": s1_call_id,
+                                "name": "Read",
+                                "arguments": s1_fc["arguments"]
+                            },
+                            {
+                                "type": "function_call_output",
+                                "call_id": s1_call_id,
+                                "output": "# Liftgate\nFast ACP gateway.\n"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s2.status(), StatusCode::OK);
+    let s2_json: Value =
+        serde_json::from_slice(&s2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        s2_json["output"][0]["content"][0]["text"],
+        "Stateless MCP continuation succeeded."
+    );
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 2);
+    assert_eq!(state.pool.snapshot().mcp_continuations, 4);
+}
+
+#[tokio::test]
+async fn anthropic_messages_streaming_and_nonstreaming_mcp_tool_cascade_preserves_toolu_ids() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 7_400,
+                thoughts: vec!["Checking git status first.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "git status --short" }),
+                expect_reply_substrings: vec![
+                    "M crates/liftgate-server/src/lib.rs",
+                    "<user_followup_message>",
+                    "Also summarize in one sentence.",
+                ],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 8_100,
+                thoughts: vec!["Clean single-file diff.".to_owned()],
+                chunks_template: vec!["Only `lib.rs` is modified.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 7_900,
+                    output_tokens: 240,
+                    cached_read_tokens: 5_100,
+                    cached_write_tokens: 0,
+                    thought_tokens: 90,
+                    total_tokens: 13_240,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let anth_tools = json!([{
+        "name": "Bash",
+        "description": "Execute shell command",
+        "input_schema": {
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }
+    }]);
+
+    // Step 1: Streaming Anthropic `/v1/messages` -> emits `toolu_<suffix>` + `stop_reason: "tool_use"`
+    let m1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 4096,
+                        "stream": true,
+                        "thinking": { "type": "enabled", "budget_tokens": 2048 },
+                        "system": "You are Claude Code.\nx-anthropic-billing-header: cc_version=2.1.90; cch=11111;",
+                        "tools": anth_tools,
+                        "messages": [{ "role": "user", "content": "Check git status." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m1.status(), StatusCode::OK);
+    let m1_events = parse_sse_events(&m1.into_body().collect().await.unwrap().to_bytes());
+    let tool_start = m1_events
+        .iter()
+        .find(|(ev, d)| ev == "content_block_start" && d["content_block"]["type"] == "tool_use")
+        .expect("expected tool_use content_block_start");
+    let toolu_id = tool_start.1["content_block"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(toolu_id.starts_with("toolu_"));
+    assert_eq!(tool_start.1["content_block"]["name"], "Bash");
+    let msg_delta = m1_events
+        .iter()
+        .find(|(ev, _)| ev == "message_delta")
+        .unwrap();
+    assert_eq!(msg_delta.1["delta"]["stop_reason"], "tool_use");
+
+    // Step 2: Non-streaming Anthropic `/v1/messages` with changing `cch=` billing header + `tool_result` + follow-up text!
+    let m2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "thinking": { "type": "enabled", "budget_tokens": 2048 },
+                        "system": "You are Claude Code.\nx-anthropic-billing-header: cc_version=2.1.90; cch=99999;",
+                        "tools": anth_tools,
+                        "messages": [
+                            { "role": "user", "content": "Check git status." },
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    { "type": "thinking", "thinking": "Checking git status first.", "signature": "agy_thought_v1" },
+                                    { "type": "tool_use", "id": toolu_id, "name": "Bash", "input": { "command": "git status --short" } }
+                                ]
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    { "type": "tool_result", "tool_use_id": toolu_id, "content": " M crates/liftgate-server/src/lib.rs\n" },
+                                    { "type": "text", "text": "Also summarize in one sentence." }
+                                ]
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m2.status(), StatusCode::OK);
+    let m2_json: Value =
+        serde_json::from_slice(&m2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(m2_json["stop_reason"], "end_turn");
+    let text_block = m2_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "text")
+        .unwrap();
+    assert_eq!(text_block["text"], "Only `lib.rs` is modified.");
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
+    assert_eq!(state.pool.snapshot().mcp_continuations, 1);
+}
+
+#[tokio::test]
+async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic_tools_update() {
+    let raw_js_code =
+        "const res = await tools.Read({ file_path: 'src/main.rs' });\nreturn res.slice(0, 64);";
+    let raw_patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-fn old() {}\n+fn new_fn() {}\n*** End Patch";
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Prompt 1: Step 1 calls native `mcp_lg_exec` (`Custom`), Step 2 receives `<client_tools_update>`
+        // and calls native `mcp_lg_wait` (`Function`), Step 3 emits freeform XML `apply_patch` (`Custom`)!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 11_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "exec".to_owned(),
+                    arguments: json!({
+                        "code": raw_js_code,
+                        "toolSummary": "Execute CodeMode script"
+                    }),
+                    expect_reply_substrings: vec![
+                        "cell_42 running",
+                        "<client_tools_update>",
+                        "mcp__slack__post_message",
+                    ],
+                },
+                McpMockStep::CallTool {
+                    usage_used: 12_100,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "wait".to_owned(),
+                    arguments: json!({ "cell_id": "cell_42" }),
+                    expect_reply_substrings: vec!["fn old() {}"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 13_000,
+                    thoughts: vec![],
+                    chunks_template: vec![format!(
+                        "<agy_tool_call_{{NONCE}} name=\"apply_patch\">{raw_patch}</agy_tool_call_{{NONCE}}>"
+                    )],
+                    final_usage: AcpUsage {
+                        input_tokens: 11_800,
+                        output_tokens: 450,
+                        cached_read_tokens: 23_850,
+                        cached_write_tokens: 0,
+                        thought_tokens: 0,
+                        total_tokens: 36_100,
+                    },
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Prompt 2: Warm continuation after XML `apply_patch` result -> can still call native `mcp_lg_exec`
+        // AND complete cleanly!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 14_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "exec".to_owned(),
+                    arguments: json!({ "code": "return 'verified';" }),
+                    expect_reply_substrings: vec!["verified"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 14_500,
+                    thoughts: vec![],
+                    chunks_template: vec![
+                        "CodeMode + apply_patch coexistence complete.".to_owned(),
+                    ],
+                    final_usage: AcpUsage {
+                        input_tokens: 2_100,
+                        output_tokens: 180,
+                        cached_read_tokens: 26_200,
+                        cached_write_tokens: 0,
+                        thought_tokens: 0,
+                        total_tokens: 28_480,
+                    },
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let initial_tools = json!([
+        {
+            "type": "custom",
+            "name": "exec",
+            "description": "Execute JavaScript in Code Mode.\ndeclare const tools: {\n  Read(args: { file_path: string }): Promise<string>;\n};"
+        },
+        {
+            "type": "function",
+            "name": "wait",
+            "description": "Wait on a running Code Mode cell.",
+            "parameters": {
+                "type": "object",
+                "properties": { "cell_id": { "type": "string" } },
+                "required": ["cell_id"]
+            }
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a V4A freeform patch.",
+            "format": { "type": "grammar", "syntax": "lark", "definition": "start: /.+/" }
+        }
+    ]);
+
+    // Step 1: Model invokes `mcp_lg_exec` -> OpenAI response must emit `custom_tool_call` with raw JS `input`!
+    let t1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "tools": initial_tools,
+                        "input": "Update src/main.rs using CodeMode and apply_patch."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1.status(), StatusCode::OK);
+    let t1_json: Value =
+        serde_json::from_slice(&t1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_1 = t1_json["id"].as_str().unwrap().to_owned();
+    let ctc_exec = &t1_json["output"][0];
+    assert_eq!(ctc_exec["type"], "custom_tool_call");
+    assert_eq!(ctc_exec["name"], "exec");
+    assert_eq!(ctc_exec["input"], raw_js_code);
+    let exec_call_id = ctc_exec["call_id"].as_str().unwrap();
+
+    // Verify `system_append` instructed native `mcp_lg_*` AND `<client_tools>` XML ONLY for `apply_patch`
+    // (moving `exec` and `wait` onto the native loopback MCP server)!
+    {
+        let appends = backend.recorded_system_appends.lock().unwrap();
+        assert!(appends[0].contains("mcp_lg_*"));
+        assert!(
+            appends[0].contains("\"name\":\"apply_patch\"") || appends[0].contains("apply_patch")
+        );
+        assert!(!appends[0].contains("\"name\":\"exec\""));
+        assert!(!appends[0].contains("\"name\":\"wait\""));
+    }
+
+    // Step 2: Client returns `custom_tool_call_output` AND dynamically adds `mcp__slack__post_message`!
+    let mut expanded_tools = initial_tools.as_array().unwrap().clone();
+    expanded_tools.push(json!({
+        "type": "function",
+        "name": "mcp__slack__post_message",
+        "description": "Post Slack notification",
+        "parameters": {
+            "type": "object",
+            "properties": { "channel": { "type": "string" } },
+            "required": ["channel"]
+        }
+    }));
+    let t2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_1,
+                        "tools": expanded_tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": exec_call_id,
+                            "output": "cell_42 running"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2.status(), StatusCode::OK);
+    let t2_json: Value =
+        serde_json::from_slice(&t2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_2 = t2_json["id"].as_str().unwrap().to_owned();
+    let fc_wait = &t2_json["output"][0];
+    assert_eq!(fc_wait["type"], "function_call");
+    assert_eq!(fc_wait["name"], "wait");
+    let wait_call_id = fc_wait["call_id"].as_str().unwrap();
+
+    // Step 3: Client returns `wait` output -> model emits freeform `<agy_tool_call>` `apply_patch`!
+    let t3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_2,
+                        "tools": expanded_tools,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": wait_call_id,
+                            "output": "fn old() {}"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3.status(), StatusCode::OK);
+    let t3_json: Value =
+        serde_json::from_slice(&t3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_3 = t3_json["id"].as_str().unwrap().to_owned();
+    let ctc_patch = &t3_json["output"][0];
+    assert_eq!(ctc_patch["type"], "custom_tool_call");
+    assert_eq!(ctc_patch["name"], "apply_patch");
+    assert_eq!(ctc_patch["input"], raw_patch);
+    let patch_call_id = ctc_patch["call_id"].as_str().unwrap();
+
+    // Session is now `Idle` (still retaining `mcp_handle`!) after only 1 `start_prompt`!
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
+    assert_eq!(state.pool.snapshot().idle_cached_sessions, 1);
+
+    // Step 4 & 5: Client returns `apply_patch` output -> warm session starts Prompt 2, suspends on `exec`, and finishes!
+    let t4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_3,
+                        "tools": expanded_tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": patch_call_id,
+                            "output": "Success. Updated the following files:\nM src/main.rs"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t4.status(), StatusCode::OK);
+    let t4_json: Value =
+        serde_json::from_slice(&t4.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_4 = t4_json["id"].as_str().unwrap().to_owned();
+    let exec2_id = t4_json["output"][0]["call_id"].as_str().unwrap();
+
+    let t5 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_4,
+                        "tools": expanded_tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": exec2_id,
+                            "output": "verified"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t5.status(), StatusCode::OK);
+    let t5_json: Value =
+        serde_json::from_slice(&t5.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        t5_json["output"][0]["content"][0]["text"],
+        "CodeMode + apply_patch coexistence complete."
+    );
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 2);
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+}
+
+#[tokio::test]
+async fn suspended_mcp_graceful_unwind_on_user_interrupt_model_switch_compact_close_and_runtime_toggle()
+ {
+    let tmp_dir =
+        std::env::temp_dir().join(format!("liftgate-mcp-unwind-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let settings_path = tmp_dir.join("settings.json");
+    let subtest_e_cancel = Arc::new(tokio::sync::Notify::new());
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // 1. Subtest A: Suspends on `Bash`, then unwound on `Esc` user interrupt (no `ToolResult`)
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 6_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "sleep 60" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage {
+                input_tokens: 5_900,
+                output_tokens: 100,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+                total_tokens: 6_000,
+            },
+        },
+        // Warm prompt on same `sess_1` after `Esc` interrupt -> suspends on `Read` for Subtest B (model switch)!
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 6_800,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Read".to_owned(),
+                arguments: json!({ "file_path": "AGENTS.md" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage {
+                input_tokens: 800,
+                output_tokens: 90,
+                cached_read_tokens: 5_910,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+                total_tokens: 6_800,
+            },
+        },
+        // Warm prompt on same `sess_1` after model switch (`claude-opus-4-6-thinking`) -> suspends on `Read` for Subtest C (`/compact`)!
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 7_500,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Read".to_owned(),
+                arguments: json!({ "file_path": "Cargo.toml" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage {
+                input_tokens: 700,
+                output_tokens: 80,
+                cached_read_tokens: 6_720,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+                total_tokens: 7_500,
+            },
+        },
+        // Warm `/compact` summarization turn on same `sess_1` (retires `sess_1` on completion!)
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["<summary>Compacted conversation summary.</summary>".to_owned()],
+        },
+        // 2. Subtest D1 (`sess_2`): Suspends on `Bash`, then manually closed via `POST /api/telemetry/sessions/sess_2/close`
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::CallTool {
+                usage_used: 5_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "echo hold" }),
+                expect_reply_substrings: vec![],
+            }],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // 3. Subtest D2 (`sess_3`): Runtime toggle `POST /api/telemetry/mcp-tool-bridge` -> pure XML!
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        // 4. Subtest E (`sess_4`): Streaming SSE client disconnect mid-MCP-turn cleanly soft-cancels & releases active lease!
+        MockScript::SoftCancellableHang {
+            cancel_rx: Arc::clone(&subtest_e_cancel),
+            cancelled_usage: AcpUsage {
+                input_tokens: 4_000,
+                output_tokens: 40,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                thought_tokens: 20,
+                total_tokens: 4_060,
+            },
+            initial_updates: vec![SessionUpdatePayload::AgentMessageChunk {
+                content: AcpChunkContent {
+                    content_type: "text".to_owned(),
+                    text: "Starting MCP streaming step...".to_owned(),
+                },
+            }],
+        },
+    ]));
+    backend.enable_soft_cancel();
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, Some(settings_path.clone())).await;
+    let app = build_router(state.clone());
+
+    let tools = json!([
+        {
+            "name": "Bash",
+            "description": "Run shell command",
+            "input_schema": {
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }
+        },
+        {
+            "name": "Read",
+            "description": "Read file",
+            "input_schema": {
+                "type": "object",
+                "properties": { "file_path": { "type": "string" } },
+                "required": ["file_path"]
+            }
+        }
+    ]);
+
+    // --- Subtest A: User `Esc` interrupt (discards assistant `tool_use` and sends replacement user prompt) ---
+    let a1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "system": "Coding assistant.",
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Run a slow command." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(a1.status(), StatusCode::OK);
+    assert_eq!(state.pool.snapshot().suspended_mcp_sessions, 1);
+
+    // User presses Esc while `sleep 60` runs -> harness discards assistant turn and sends `[user_1, user_2]`!
+    let a2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "system": "Coding assistant.",
+                        "tools": tools,
+                        "messages": [
+                            { "role": "user", "content": "Run a slow command." },
+                            { "role": "user", "content": "Actually read AGENTS.md instead." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(a2.status(), StatusCode::OK);
+    let a2_json: Value =
+        serde_json::from_slice(&a2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let read_toolu_id = a2_json["content"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(a2_json["content"][0]["name"], "Read");
+    // Unwound and reused `sess_1` (zero new sessions created)!
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    assert_eq!(
+        backend.recorded_prompts.lock().unwrap()[1].session_id,
+        "sess_1"
+    );
+
+    // --- Subtest B: Mid-suspension model switch (`gemini-4-carbon-high` -> `claude-opus-4-6-thinking`) ---
+    let b1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 2048,
+                        "thinking": { "type": "enabled", "budget_tokens": 1024 },
+                        "system": "Coding assistant.",
+                        "tools": tools,
+                        "messages": [
+                            { "role": "user", "content": "Run a slow command." },
+                            { "role": "user", "content": "Actually read AGENTS.md instead." },
+                            {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": read_toolu_id,
+                                    "name": "Read",
+                                    "input": { "file_path": "AGENTS.md" }
+                                }]
+                            },
+                            {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": read_toolu_id,
+                                    "content": "# Repository Guidelines\n"
+                                }]
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(b1.status(), StatusCode::OK);
+    let b1_json: Value =
+        serde_json::from_slice(&b1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let cargo_toolu_id = b1_json["content"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    assert!(
+        backend
+            .recorded_models
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("claude-opus-5-5-high"))
+    );
+
+    // --- Subtest C: `/compact` summarization while `sess_1` is suspended on `Read(Cargo.toml)` ---
+    let c1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 2048,
+                        "system": "You are a helpful AI assistant tasked with summarizing conversations.",
+                        "messages": [
+                            { "role": "user", "content": "Run a slow command." },
+                            { "role": "user", "content": "Actually read AGENTS.md instead." },
+                            {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": read_toolu_id,
+                                    "name": "Read",
+                                    "input": { "file_path": "AGENTS.md" }
+                                }]
+                            },
+                            {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": read_toolu_id,
+                                    "content": "# Repository Guidelines\n"
+                                }]
+                            },
+                            {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": cargo_toolu_id,
+                                    "name": "Read",
+                                    "input": { "file_path": "Cargo.toml" }
+                                }]
+                            },
+                            {
+                                "role": "user",
+                                "content": "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions."
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(c1.status(), StatusCode::OK);
+    let c1_json: Value =
+        serde_json::from_slice(&c1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        c1_json["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Compacted conversation summary")
+    );
+    // Compaction reused `sess_1` and then retired it!
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    assert_eq!(state.pool.snapshot().suspended_mcp_sessions, 0);
+    assert_eq!(state.pool.snapshot().idle_cached_sessions, 0);
+
+    // --- Subtest D: Manual close of `Suspended` session + runtime toggle `/api/telemetry/mcp-tool-bridge` ---
+    let d1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Hold suspended." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d1.status(), StatusCode::OK);
+
+    // Check `/api/telemetry/snapshot` JSON contract (`mcp_tool_bridge_enabled: true`, `state: "suspended"`)
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap_json: Value =
+        serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(snap_json["mcp_tool_bridge_enabled"], true);
+    assert_eq!(snap_json["session_pool"]["suspended_mcp_sessions"], 1);
+    assert_eq!(
+        snap_json["session_pool"]["sessions"][0]["state"],
+        "suspended"
+    );
+    let susp_sid = snap_json["session_pool"]["sessions"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Manually close the `Suspended` session via `/api/telemetry/sessions/{id}/close`
+    let close_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/telemetry/sessions/{susp_sid}/close"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close_resp.status(), StatusCode::OK);
+    let close_json: Value =
+        serde_json::from_slice(&close_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(close_json["closed"], true);
+    assert_eq!(state.pool.snapshot().suspended_mcp_sessions, 0);
+
+    // Toggle MCP Tool Bridge OFF at runtime and verify `settings.json` persistence + pure XML fallback!
+    let toggle_off = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/mcp-tool-bridge")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_off.status(), StatusCode::OK);
+    let toggle_json: Value =
+        serde_json::from_slice(&toggle_off.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(toggle_json["mcp_tool_bridge_enabled"], false);
+    let persisted_settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(persisted_settings["mcp_tool_bridge"], false);
+
+    let xml_turn = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Run pwd in XML mode." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(xml_turn.status(), StatusCode::OK);
+    let xml_json: Value =
+        serde_json::from_slice(&xml_turn.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(xml_json["stop_reason"], "tool_use");
+    assert_eq!(xml_json["content"][0]["name"], "Bash");
+    // Session 3 must have been created with `mcp_servers == []`!
+    {
+        let recorded_mcp = backend.session_mcp_servers.lock().unwrap();
+        assert!(
+            recorded_mcp
+                .iter()
+                .find(|(sid, _)| sid == "sess_3")
+                .unwrap()
+                .1
+                .is_empty()
+        );
+    }
+
+    // --- Subtest E: Toggle MCP Tool Bridge back ON and drop an in-flight SSE stream (client disconnect) ---
+    let toggle_on = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/mcp-tool-bridge?enabled=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_on.status(), StatusCode::OK);
+    backend.enable_soft_cancel_with_notify(subtest_e_cancel);
+
+    let sse_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "max_tokens": 1024,
+                        "tools": tools,
+                        "messages": [{ "role": "user", "content": "Stream and disconnect." }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_body = sse_resp.into_body();
+    // Wait until the first SSE data frame arrives (proving `sess_4` MCP driver is actively mid-turn)
+    let first_frame = sse_body.frame().await.expect("first SSE frame").unwrap();
+    assert!(!first_frame.into_data().unwrap().is_empty());
+    // Simulate client disconnect by dropping the SSE body stream!
+    drop(sse_body);
+
+    // Driver must immediately cancel and release its active lease cleanly (zero leaked active sessions)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snap = state.pool.snapshot();
+        if snap.active_leased_sessions == 0 {
+            assert_eq!(snap.idle_cached_sessions, 2);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for disconnected MCP SSE turn to release active session lease: snap={snap:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

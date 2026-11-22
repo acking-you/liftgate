@@ -14,11 +14,11 @@ use liftgate_types::{
         ACP_PROTOCOL_VERSION, AcpPromptBlock, AntigravityNewMeta, AvailableModel,
         ClientCapabilities, ClientInfo, FsCapabilities, IncomingRpcFrame, InitializeParams,
         InitializeResult, JsonRpcErrorPayload, JsonRpcNotification, JsonRpcRequest,
-        JsonRpcResponseOut, PermissionOutcome, PromptTurnResult, RequestPermissionParams,
-        RequestPermissionResult, SessionCancelParams, SessionCloseParams, SessionNewMeta,
-        SessionNewParams, SessionNewResult, SessionPromptParams, SessionSetModeParams,
-        SessionSetModelParams, SessionUpdateNotification, SessionUpdatePayload,
-        SystemPromptAppendMeta,
+        JsonRpcResponseOut, McpServerConfig, PermissionOutcome, PromptTurnResult,
+        RequestPermissionParams, RequestPermissionResult, SessionCancelParams, SessionCloseParams,
+        SessionNewMeta, SessionNewParams, SessionNewResult, SessionPromptParams,
+        SessionSetModeParams, SessionSetModelParams, SessionUpdateNotification,
+        SessionUpdatePayload, SystemPromptAppendMeta,
     },
     config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl, SessionId},
     telemetry::{AcpProcessTelemetry, StderrLogEntry},
@@ -62,6 +62,16 @@ pub trait AcpBackend: Send + Sync + 'static {
         &self,
         system_append: &str,
     ) -> impl Future<Output = Result<SessionNewResult, AcpError>> + Send;
+
+    /// Creates a new isolated ACP session wired to optional loopback MCP servers (`mcpServers`).
+    fn create_session_with_mcp(
+        &self,
+        system_append: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> impl Future<Output = Result<SessionNewResult, AcpError>> + Send {
+        let _ = mcp_servers;
+        self.create_session(system_append)
+    }
 
     fn set_session_model(
         &self,
@@ -527,6 +537,7 @@ impl LiveAcpGeneration {
     async fn create_session_once(
         &self,
         system_append: &str,
+        mcp_servers: &[McpServerConfig],
         models_tx: &watch::Sender<Arc<[AvailableModel]>>,
     ) -> Result<SessionNewResult, AcpError> {
         let meta = if system_append.trim().is_empty() {
@@ -546,7 +557,7 @@ impl LiveAcpGeneration {
                 "session/new",
                 SessionNewParams {
                     cwd: &self.inner.session_cwd,
-                    mcp_servers: &[],
+                    mcp_servers,
                     meta,
                 },
             )
@@ -593,7 +604,7 @@ impl LiveAcpClient {
         // requires interactive login first, log a clear hint instead of failing gateway startup.
         match client
             .active_gen()
-            .create_session_once("", &client.models_tx)
+            .create_session_once("", &[], &client.models_tx)
             .await
         {
             Ok(probe_session) => {
@@ -694,6 +705,7 @@ impl LiveAcpClient {
         if !is_still_idle()
             || self.active_activity_counts() != (0, 0)
             || pool.idle_and_active_counts().0 > 0
+            || pool.suspended_count() > 0
         {
             return Ok(None);
         }
@@ -706,6 +718,7 @@ impl LiveAcpClient {
         if !is_still_idle()
             || self.active_activity_counts() != (0, 0)
             || pool.idle_and_active_counts().0 > 0
+            || pool.suspended_count() > 0
         {
             return Ok(None);
         }
@@ -738,7 +751,7 @@ impl LiveAcpClient {
             Ok(fresh_raw) => {
                 swap_guard.commit();
                 let fresh = Arc::new(fresh_raw);
-                if let Ok(probe) = fresh.create_session_once("", &self.models_tx).await {
+                if let Ok(probe) = fresh.create_session_once("", &[], &self.models_tx).await {
                     let _: Result<serde::de::IgnoredAny, AcpError> = fresh
                         .inner
                         .call_rpc(
@@ -826,17 +839,18 @@ impl LiveAcpClient {
     async fn create_session_resilient(
         &self,
         system_append: &str,
+        mcp_servers: &[McpServerConfig],
     ) -> Result<SessionNewResult, AcpError> {
         let current = self.active_gen();
         match current
-            .create_session_once(system_append, &self.models_tx)
+            .create_session_once(system_append, mcp_servers, &self.models_tx)
             .await
         {
             Ok(res) => Ok(res),
             Err(err) if should_respawn_on_session_new_error(&err) => {
                 let fresh = self.respawn_if_still_on(current.id).await?;
                 fresh
-                    .create_session_once(system_append, &self.models_tx)
+                    .create_session_once(system_append, mcp_servers, &self.models_tx)
                     .await
             }
             Err(err) => Err(err),
@@ -875,14 +889,23 @@ impl AcpBackend for Arc<LiveAcpClient> {
         if !existing.is_empty() {
             return existing;
         }
-        if let Ok(probe) = self.create_session_resilient("").await {
+        if let Ok(probe) = self.create_session_resilient("", &[]).await {
             let _ = self.close_session_inner(&probe.session_id).await;
         }
         self.available_models()
     }
 
     async fn create_session(&self, system_append: &str) -> Result<SessionNewResult, AcpError> {
-        self.create_session_resilient(system_append).await
+        self.create_session_resilient(system_append, &[]).await
+    }
+
+    async fn create_session_with_mcp(
+        &self,
+        system_append: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> Result<SessionNewResult, AcpError> {
+        self.create_session_resilient(system_append, mcp_servers)
+            .await
     }
 
     async fn set_session_model(

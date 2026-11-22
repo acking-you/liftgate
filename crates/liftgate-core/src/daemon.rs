@@ -29,7 +29,8 @@ use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
     resolve_effective_agy_bin, resolve_effective_agy_proxy,
     resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
-    resolve_effective_max_low_cache_records, resolve_effective_vision_offload, write_file_atomic,
+    resolve_effective_max_low_cache_records, resolve_effective_mcp_tool_bridge,
+    resolve_effective_vision_offload, write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -78,6 +79,11 @@ pub async fn start_daemon_with_exe(
     );
     let effective_vision_offload =
         resolve_effective_vision_offload(serve.vision_offload, serve.no_vision_offload, &settings);
+    let effective_mcp_tool_bridge = resolve_effective_mcp_tool_bridge(
+        serve.mcp_tool_bridge,
+        serve.no_mcp_tool_bridge,
+        &settings,
+    );
     let effective_max_low_cache_records =
         resolve_effective_max_low_cache_records(serve.max_low_cache_records, &settings)?;
     let effective_low_cache_threshold_bps =
@@ -117,6 +123,7 @@ pub async fn start_daemon_with_exe(
                 && existing.agy_proxy.as_deref() == effective_proxy.as_ref().map(ProxyUrl::as_str)
                 && existing.agy_auto_update == effective_auto_update
                 && existing.vision_offload == effective_vision_offload
+                && existing.mcp_tool_bridge == effective_mcp_tool_bridge
                 && existing.max_low_cache_records == effective_max_low_cache_records
                 && existing.low_cache_threshold_bps == effective_low_cache_threshold_bps
                 && existing.capture_low_cache_request_details
@@ -200,6 +207,12 @@ pub async fn start_daemon_with_exe(
         })
         .arg("--vision-offload")
         .arg(if effective_vision_offload {
+            "true"
+        } else {
+            "false"
+        })
+        .arg("--mcp-tool-bridge")
+        .arg(if effective_mcp_tool_bridge {
             "true"
         } else {
             "false"
@@ -300,6 +313,7 @@ pub async fn start_daemon_with_exe(
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
         agy_auto_update: effective_auto_update,
         vision_offload: effective_vision_offload,
+        mcp_tool_bridge: effective_mcp_tool_bridge,
         max_low_cache_records: effective_max_low_cache_records,
         low_cache_threshold_bps: effective_low_cache_threshold_bps,
         capture_low_cache_request_details: effective_low_cache_capture_payload,
@@ -403,6 +417,7 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         acp_cwd: old.acp_cwd.clone(),
         ui_dir: old.ui_dir.clone(),
         vision_offload: Some(old.vision_offload),
+        mcp_tool_bridge: Some(old.mcp_tool_bridge),
         max_low_cache_records: Some(old.max_low_cache_records.get()),
         low_cache_threshold_pct: Some(
             u8::try_from(old.low_cache_threshold_bps.get() / 100).unwrap_or(50),
@@ -461,6 +476,14 @@ pub async fn restart_daemon(
     if args.no_vision_offload {
         serve.vision_offload = None;
         serve.no_vision_offload = true;
+    }
+    if let Some(mb) = args.mcp_tool_bridge {
+        serve.mcp_tool_bridge = Some(mb);
+        serve.no_mcp_tool_bridge = false;
+    }
+    if args.no_mcp_tool_bridge {
+        serve.mcp_tool_bridge = None;
+        serve.no_mcp_tool_bridge = true;
     }
     if let Some(cap) = args.max_low_cache_records {
         serve.max_low_cache_records = Some(cap);
@@ -669,6 +692,7 @@ pub struct GatewayStatusReport {
     pub agy_proxy_display: Option<String>,
     pub agy_auto_update_enabled: bool,
     pub vision_offload_enabled: bool,
+    pub mcp_tool_bridge_enabled: bool,
     pub telemetry: Option<GatewayTelemetrySnapshot>,
 }
 
@@ -741,6 +765,13 @@ pub async fn inspect_gateway_status(
             .map_or(settings.vision_offload, |d| d.vision_offload),
         |t| t.vision_offload_enabled,
     );
+    let effective_mcp_tool_bridge = telemetry.as_ref().map_or(
+        daemon
+            .as_ref()
+            .filter(|_| managed_alive)
+            .map_or(settings.mcp_tool_bridge, |d| d.mcp_tool_bridge),
+        |t| t.mcp_tool_bridge_enabled,
+    );
 
     let active_daemon = daemon.filter(|_| managed_alive);
     let pid = active_daemon.as_ref().map(|d| d.pid);
@@ -762,6 +793,7 @@ pub async fn inspect_gateway_status(
         agy_proxy_display: effective_proxy_display,
         agy_auto_update_enabled: effective_auto_update,
         vision_offload_enabled: effective_vision_offload,
+        mcp_tool_bridge_enabled: effective_mcp_tool_bridge,
         telemetry,
     })
 }
@@ -1840,6 +1872,7 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            mcp_tool_bridge: true,
             max_low_cache_records: liftgate_types::config::LowCacheRecordLimit::default(),
             low_cache_threshold_bps: liftgate_types::config::CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
@@ -1882,6 +1915,7 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: false,
             vision_offload: false,
+            mcp_tool_bridge: false,
             max_low_cache_records: liftgate_types::config::LowCacheRecordLimit::try_new(250)
                 .unwrap(),
             low_cache_threshold_bps:
@@ -1902,6 +1936,7 @@ mod tests {
         assert_eq!(restored.acp_cwd, Some(PathBuf::from("/tmp/acp-work")));
         assert_eq!(restored.ui_dir, Some(PathBuf::from("/srv/ui")));
         assert_eq!(restored.vision_offload, Some(false));
+        assert_eq!(restored.mcp_tool_bridge, Some(false));
         assert_eq!(restored.max_low_cache_records, Some(250));
         assert_eq!(restored.low_cache_threshold_pct, Some(40));
         assert_eq!(restored.low_cache_capture_payload, Some(false));
@@ -1964,7 +1999,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
@@ -1997,6 +2032,7 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            mcp_tool_bridge: true,
             max_low_cache_records: liftgate_types::config::LowCacheRecordLimit::default(),
             low_cache_threshold_bps: liftgate_types::config::CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
@@ -2014,15 +2050,35 @@ mod tests {
 
         let serve = ServeArgs {
             listen: addr,
+            default_model: "claude-opus-4-6-thinking".to_owned(),
+            acp_mode: "agent".to_owned(),
+            max_line_bytes: 33_554_432,
+            max_body_bytes: 16_777_216,
+            channel_capacity: 256,
+            max_idle_sessions: 16,
+            max_stored_responses: 64,
+            turn_timeout_secs: 1800,
             agy_bin: Some(temp.join("missing-agy-binary")),
             ..ServeArgs::default()
         };
-        let outcome = start_daemon_with_exe(&state_paths, None, serve, false)
+        let outcome = start_daemon_with_exe(&state_paths, None, serve.clone(), false)
             .await
             .unwrap();
         assert!(outcome.already_running);
+        assert!(outcome.config_matches);
         assert_eq!(outcome.daemon.listen, addr);
         assert_eq!(outcome.live_model_count, 1);
+
+        let mut mismatched_serve = serve;
+        mismatched_serve.no_mcp_tool_bridge = true;
+        let mismatch_outcome = start_daemon_with_exe(&state_paths, None, mismatched_serve, false)
+            .await
+            .unwrap();
+        assert!(mismatch_outcome.already_running);
+        assert!(
+            !mismatch_outcome.config_matches,
+            "toggling --no-mcp-tool-bridge must be detected by config_matches"
+        );
 
         server_task.abort();
         let _ = fs::remove_dir_all(&temp);

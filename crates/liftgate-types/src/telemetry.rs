@@ -56,6 +56,7 @@ pub struct AcpProcessTelemetry {
 #[serde(rename_all = "snake_case")]
 pub enum SessionSlotState {
     Running,
+    Suspended,
     Idle,
 }
 
@@ -90,7 +91,7 @@ impl PromptCacheWarmth {
     ) -> Self {
         match state {
             SessionSlotState::Running => Self::Active,
-            SessionSlotState::Idle => {
+            SessionSlotState::Suspended | SessionSlotState::Idle => {
                 let idle_ms = now_unix_ms.saturating_sub(last_active_unix_ms);
                 if idle_ms < Self::HOT_IDLE_THRESHOLD_MS {
                     Self::Hot
@@ -131,12 +132,16 @@ pub struct SessionSummary {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionPoolTelemetry {
     pub active_leased_sessions: usize,
+    #[serde(default)]
+    pub suspended_mcp_sessions: usize,
     pub idle_cached_sessions: usize,
     pub max_idle_sessions: usize,
     pub stored_responses: usize,
     pub max_stored_responses: usize,
     pub total_sessions_created: u64,
     pub total_sessions_reused: u64,
+    #[serde(default)]
+    pub mcp_continuations: u64,
     pub total_sessions_closed_or_evicted: u64,
     pub sessions: Vec<SessionSummary>,
 }
@@ -290,6 +295,8 @@ impl LowCacheDiagnosticCause {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LowCacheRoutingStrategy {
+    /// Resumed a live parked `session/prompt` cascade directly over loopback MCP `tools/call`.
+    McpSuspendedContinuation,
     /// Matched warm session via OpenAI `previous_response_id`.
     PreviousResponseId,
     /// Matched warm session via deterministic conversation prefix SHA-256 hash.
@@ -697,6 +704,8 @@ pub struct GatewayTelemetrySnapshot {
     pub gateway_version: Cow<'static, str>,
     #[serde(default = "default_true")]
     pub vision_offload_enabled: bool,
+    #[serde(default = "default_true")]
+    pub mcp_tool_bridge_enabled: bool,
     pub acp_process: AcpProcessTelemetry,
     pub session_pool: SessionPoolTelemetry,
     pub metrics: GatewayMetricsSummary,

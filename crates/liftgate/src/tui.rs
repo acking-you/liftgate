@@ -324,9 +324,11 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
         active_sessions: snap
             .as_ref()
             .map_or(0, |s| s.session_pool.active_leased_sessions),
-        idle_sessions: snap
-            .as_ref()
-            .map_or(0, |s| s.session_pool.idle_cached_sessions),
+        idle_sessions: snap.as_ref().map_or(0, |s| {
+            s.session_pool
+                .idle_cached_sessions
+                .saturating_add(s.session_pool.suspended_mcp_sessions)
+        }),
         total_requests: snap.as_ref().map_or(0, |s| s.metrics.total_requests),
         total_tokens: snap.as_ref().map_or(0, |s| {
             s.metrics
@@ -973,6 +975,7 @@ struct PolledData {
 enum TuiCommand {
     CloseSession(String),
     ToggleVisionOffload,
+    ToggleMcpToolBridge,
     SwitchDefaultModel(String),
     SetTitleModel(String),
     StartOrRestartDaemon,
@@ -1193,7 +1196,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                     let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
                     let client = GatewayClient::new(addr, key);
                     match client.close_idle_session(&sess_id).await {
-                        Ok(true) => Ok(format!("Closed idle session {sess_id}")),
+                        Ok(true) => Ok(format!("Closed session {sess_id}")),
                         Ok(false) => Err(TuiActionError::SessionInactiveOrClosed {
                             session_id: sess_id,
                         }),
@@ -1221,6 +1224,33 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                             }
                             Ok(format!(
                                 "Vision offload (>=150k ephemeral sub-session): {}",
+                                if enabled { "ON" } else { "OFF" }
+                            ))
+                        }
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
+                }
+                TuiCommand::ToggleMcpToolBridge => {
+                    let daemon = worker_paths.read_daemon().ok().flatten();
+                    let addr = worker_listen
+                        .or_else(|| daemon.as_ref().map(|d| d.listen))
+                        .unwrap_or_else(|| ServeArgs::default().listen);
+                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
+                    let client = GatewayClient::new(addr, key);
+                    match client.set_mcp_tool_bridge(None).await {
+                        Ok(enabled) => {
+                            if let Ok(mut settings) = worker_paths.read_settings() {
+                                settings.mcp_tool_bridge = enabled;
+                                let _ = worker_paths.write_settings(&settings);
+                            }
+                            if let Some(mut d) = daemon
+                                && d.listen == addr
+                            {
+                                d.mcp_tool_bridge = enabled;
+                                let _ = worker_paths.write_daemon(&d);
+                            }
+                            Ok(format!(
+                                "MCP Tool Bridge (loopback suspension): {}",
                                 if enabled { "ON" } else { "OFF" }
                             ))
                         }
@@ -1406,6 +1436,9 @@ fn handle_top_key(
         KeyCode::Char('v') => {
             let _ = cmd_tx.try_send(TuiCommand::ToggleVisionOffload);
         }
+        KeyCode::Char('b') => {
+            let _ = cmd_tx.try_send(TuiCommand::ToggleMcpToolBridge);
+        }
         KeyCode::Char('o') => {
             let _ = cmd_tx.try_send(TuiCommand::OpenBrowser);
         }
@@ -1455,7 +1488,10 @@ fn handle_top_key(
             if let Some(snap) = &app.data.telemetry
                 && let Some(sess) = snap.session_pool.sessions.get(app.session_idx)
             {
-                if sess.state == SessionSlotState::Idle {
+                if matches!(
+                    sess.state,
+                    SessionSlotState::Idle | SessionSlotState::Suspended
+                ) {
                     let _ = cmd_tx.try_send(TuiCommand::CloseSession(sess.session_id.clone()));
                 } else {
                     app.set_toast("Cannot evict an actively leased session", false);
@@ -1563,6 +1599,11 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .telemetry
             .as_ref()
             .is_none_or(|t| t.vision_offload_enabled);
+        let mcp_on = app
+            .data
+            .telemetry
+            .as_ref()
+            .is_none_or(|t| t.mcp_tool_bridge_enabled);
         spans.extend([
             Span::styled(
                 " ● ONLINE ",
@@ -1594,6 +1635,17 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 if vision_on { "on" } else { "off" },
                 Style::default()
                     .fg(if vision_on {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   mcp ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if mcp_on { "on" } else { "off" },
+                Style::default()
+                    .fg(if mcp_on {
                         Color::Green
                     } else {
                         Color::DarkGray
@@ -1757,15 +1809,18 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 
     // 3. Session Pool & Reuse Hit Rate Gauge
     if let Some(&c2) = cols.get(2) {
-        let (act, idle, max_idle, created, reused) = snap.map_or((0, 0, 64, 0, 0), |s| {
-            (
-                s.session_pool.active_leased_sessions,
-                s.session_pool.idle_cached_sessions,
-                s.session_pool.max_idle_sessions,
-                s.session_pool.total_sessions_created,
-                s.session_pool.total_sessions_reused,
-            )
-        });
+        let (act, susp, idle, max_idle, created, reused, mcp_cont) =
+            snap.map_or((0, 0, 0, 64, 0, 0, 0), |s| {
+                (
+                    s.session_pool.active_leased_sessions,
+                    s.session_pool.suspended_mcp_sessions,
+                    s.session_pool.idle_cached_sessions,
+                    s.session_pool.max_idle_sessions,
+                    s.session_pool.total_sessions_created,
+                    s.session_pool.total_sessions_reused,
+                    s.session_pool.mcp_continuations,
+                )
+            });
         let total_acq = created.saturating_add(reused);
         let hit_pct = reused
             .saturating_mul(100)
@@ -1786,9 +1841,20 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" leased · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" act · ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{idle}/{max_idle}"),
+                        format!("{susp}"),
+                        Style::default()
+                            .fg(if susp > 0 {
+                                Color::Magenta
+                            } else {
+                                Color::DarkGray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" mcp · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", idle.saturating_add(susp), max_idle),
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
@@ -1796,7 +1862,7 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Span::styled(" warm", Style::default().fg(Color::DarkGray)),
                 ]),
                 Line::from(Span::styled(
-                    format!("Reused {reused} · Created {created}"),
+                    format!("Reused {reused} (mcp {mcp_cont}) · New {created}"),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]);
@@ -2160,6 +2226,7 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         .map(|s| {
             let (st_label, st_color) = match s.state {
                 SessionSlotState::Running => ("● LEASED", Color::Cyan),
+                SessionSlotState::Suspended => ("⏸ MCP WAIT", Color::Magenta),
                 SessionSlotState::Idle => ("✓ IDLE", Color::Green),
             };
             let (kv_label, kv_color) = match s.cache_warmth {
@@ -2199,10 +2266,10 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(24),
+            Constraint::Percentage(23),
+            Constraint::Length(12),
             Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Percentage(24),
+            Constraint::Percentage(23),
             Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Length(7),
@@ -2232,7 +2299,7 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " Pooled `agy acp` Sessions  (press [x] to close selected idle session) ",
+                " Pooled `agy acp` Sessions  (press [x] to close selected idle/suspended session) ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -2507,7 +2574,7 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 }
 
 fn draw_help_modal(frame: &mut Frame<'_>) {
-    let area = centered_rect(68, 16, frame.area());
+    let area = centered_rect(68, 17, frame.area());
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from(vec![
@@ -2581,6 +2648,15 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle >=150k ephemeral vision sub-session offload"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  b                      ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle Hybrid Loopback MCP Tool Bridge"),
         ]),
         Line::from(vec![
             Span::styled(

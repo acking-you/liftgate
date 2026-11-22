@@ -248,6 +248,9 @@ pub struct LiftgateSettings {
     /// Offload incoming `Image` blocks on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
     #[serde(default = "default_true")]
     pub vision_offload: bool,
+    /// Expose client tools over a loopback HTTP MCP bridge for native `session/prompt` tool suspension (`true` by default).
+    #[serde(default = "default_true")]
+    pub mcp_tool_bridge: bool,
     /// Maximum persisted low-cache-hit diagnostic records (`1_000` by default; `0` disables recording).
     #[serde(default)]
     pub max_low_cache_records: LowCacheRecordLimit,
@@ -271,6 +274,7 @@ impl Default for LiftgateSettings {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            mcp_tool_bridge: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
@@ -323,6 +327,22 @@ pub const fn resolve_effective_vision_offload(
         explicit
     } else {
         settings.vision_offload
+    }
+}
+
+/// Resolves the effective Hybrid Loopback MCP Tool Bridge toggle (`true` by default).
+#[must_use]
+pub const fn resolve_effective_mcp_tool_bridge(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.mcp_tool_bridge
     }
 }
 
@@ -407,6 +427,8 @@ pub struct DaemonState {
     pub agy_auto_update: bool,
     #[serde(default = "default_true")]
     pub vision_offload: bool,
+    #[serde(default = "default_true")]
+    pub mcp_tool_bridge: bool,
     #[serde(default)]
     pub max_low_cache_records: LowCacheRecordLimit,
     #[serde(default)]
@@ -691,6 +713,7 @@ mod tests {
             agy_proxy: None,
             agy_auto_update: true,
             vision_offload: true,
+            mcp_tool_bridge: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
@@ -710,6 +733,7 @@ mod tests {
         assert_eq!(loaded.dashboard_base_url(), "http://127.0.0.1:5173");
         assert!(loaded.agy_auto_update);
         assert!(loaded.vision_offload);
+        assert!(loaded.mcp_tool_bridge);
         assert!(loaded.agy_proxy.is_none());
 
         paths.remove_daemon().unwrap();
@@ -719,11 +743,20 @@ mod tests {
         assert!(defaults.agy_proxy.is_none());
         assert!(defaults.agy_auto_update);
         assert!(defaults.vision_offload);
+        assert!(defaults.mcp_tool_bridge);
+        assert!(resolve_effective_mcp_tool_bridge(None, false, &defaults));
+        assert!(!resolve_effective_mcp_tool_bridge(None, true, &defaults));
+        assert!(!resolve_effective_mcp_tool_bridge(
+            Some(false),
+            false,
+            &defaults
+        ));
 
         let mut updated = defaults;
         updated.agy_proxy = Some(ProxyUrl::try_new("7890").unwrap());
         updated.agy_auto_update = false;
         updated.vision_offload = false;
+        updated.mcp_tool_bridge = false;
         paths.write_settings(&updated).unwrap();
         let reloaded = paths.read_settings().unwrap();
         assert_eq!(
@@ -732,6 +765,13 @@ mod tests {
         );
         assert!(!reloaded.agy_auto_update);
         assert!(!reloaded.vision_offload);
+        assert!(!reloaded.mcp_tool_bridge);
+        assert!(!resolve_effective_mcp_tool_bridge(None, false, &reloaded));
+        assert!(resolve_effective_mcp_tool_bridge(
+            Some(true),
+            false,
+            &reloaded
+        ));
         let _ = fs::remove_dir_all(&temp_root);
     }
 }

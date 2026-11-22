@@ -402,6 +402,46 @@ fn persist_cache_file_atomic(
     write_bytes_atomic_private(target, &json)
 }
 
+/// Atomically updates a single boolean field inside `settings.json` (creating the file if absent)
+/// while preserving all existing settings keys.
+pub fn sync_settings_json_bool_field(settings_path: &Path, key: &str, value: bool) {
+    let mut map: serde_json::Map<String, serde_json::Value> = match fs::read(settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(err) => {
+            tracing::warn!(
+                path = %settings_path.display(),
+                key,
+                error = ?err,
+                "failed to read settings.json while syncing runtime boolean toggle"
+            );
+            return;
+        }
+    };
+    map.insert(key.to_owned(), serde_json::Value::from(value));
+    match serde_json::to_vec_pretty(&map) {
+        Ok(mut json) => {
+            json.push(b'\n');
+            if let Err(err) = write_bytes_atomic_private(settings_path, &json) {
+                tracing::warn!(
+                    path = %settings_path.display(),
+                    key,
+                    error = ?err,
+                    "failed to persist updated runtime boolean toggle to settings.json"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %settings_path.display(),
+                key,
+                error = ?err,
+                "failed to serialize updated settings.json"
+            );
+        }
+    }
+}
+
 fn sync_settings_json_cache_fields(
     settings_path: &Path,
     max_low_cache_records: LowCacheRecordLimit,
@@ -789,6 +829,115 @@ impl TelemetryHub {
         self.notify_change();
         summary
     }
+    /// Reconciles any rounding delta between intermediate `UsageUpdate` step estimates and the
+    /// final authoritative `PromptTurnResult.usage` sum when a multi-step suspended MCP
+    /// `session/prompt` completes, guaranteeing 0-token cumulative drift.
+    pub fn reconcile_cascade_usage_drift(
+        &self,
+        accounted_sum: AcpUsage,
+        authoritative: AcpUsage,
+        all_steps_warm: bool,
+    ) {
+        if accounted_sum == authoritative
+            || (authoritative.total_prompt_tokens() == 0 && authoritative.output_tokens == 0)
+        {
+            return;
+        }
+
+        let adjust_u64 = |cur: u64, acc: u64, auth: u64| -> u64 {
+            if auth >= acc {
+                cur.saturating_add(auth - acc)
+            } else {
+                cur.saturating_sub(acc - auth)
+            }
+        };
+
+        let acc_prompt = accounted_sum.total_prompt_tokens();
+        let auth_prompt = authoritative.total_prompt_tokens();
+        let now_ms = unix_timestamp_ms();
+        let prepared = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.metrics.total_input_tokens = adjust_u64(
+                guard.metrics.total_input_tokens,
+                accounted_sum.input_tokens,
+                authoritative.input_tokens,
+            );
+            guard.metrics.total_output_tokens = adjust_u64(
+                guard.metrics.total_output_tokens,
+                accounted_sum.output_tokens,
+                authoritative.output_tokens,
+            );
+            guard.metrics.total_thought_tokens = adjust_u64(
+                guard.metrics.total_thought_tokens,
+                accounted_sum.thought_tokens,
+                authoritative.thought_tokens,
+            );
+            guard.metrics.total_cached_tokens = adjust_u64(
+                guard.metrics.total_cached_tokens,
+                accounted_sum.cached_read_tokens,
+                authoritative.cached_read_tokens,
+            );
+            guard.metrics.total_cached_write_tokens = adjust_u64(
+                guard.metrics.total_cached_write_tokens,
+                accounted_sum.cached_write_tokens,
+                authoritative.cached_write_tokens,
+            );
+
+            let cs = &mut guard.cache_store;
+            cs.file_state.total_prompt_tokens =
+                adjust_u64(cs.file_state.total_prompt_tokens, acc_prompt, auth_prompt);
+            cs.file_state.total_uncached_input_tokens = adjust_u64(
+                cs.file_state.total_uncached_input_tokens,
+                accounted_sum.input_tokens,
+                authoritative.input_tokens,
+            );
+            cs.file_state.total_cached_read_tokens = adjust_u64(
+                cs.file_state.total_cached_read_tokens,
+                accounted_sum.cached_read_tokens,
+                authoritative.cached_read_tokens,
+            );
+            cs.file_state.total_cached_write_tokens = adjust_u64(
+                cs.file_state.total_cached_write_tokens,
+                accounted_sum.cached_write_tokens,
+                authoritative.cached_write_tokens,
+            );
+            if all_steps_warm {
+                cs.file_state.warm_prompt_tokens =
+                    adjust_u64(cs.file_state.warm_prompt_tokens, acc_prompt, auth_prompt)
+                        .min(cs.file_state.total_prompt_tokens);
+            }
+            cs.file_state.warm_cached_read_tokens = adjust_u64(
+                cs.file_state.warm_cached_read_tokens,
+                accounted_sum.cached_read_tokens,
+                authoritative.cached_read_tokens,
+            )
+            .min(cs.file_state.warm_prompt_tokens);
+            cs.revision = cs.revision.saturating_add(1);
+
+            let cumulative_prompt = guard
+                .metrics
+                .total_input_tokens
+                .saturating_add(guard.metrics.total_cached_tokens)
+                .saturating_add(guard.metrics.total_cached_write_tokens);
+            guard.metrics.cache_hit_rate_bps =
+                if guard.cache_store.file_state.total_prompt_tokens > 0 {
+                    compute_cache_hit_bps(
+                        guard.cache_store.file_state.total_cached_read_tokens,
+                        guard.cache_store.file_state.total_prompt_tokens,
+                    )
+                } else {
+                    compute_cache_hit_bps(guard.metrics.total_cached_tokens, cumulative_prompt)
+                };
+
+            guard.cache_store.prepare_persist_payload(now_ms)
+        };
+
+        self.flush_prepared_persist(prepared);
+        self.notify_change();
+    }
 }
 
 fn stamp_ttft_if_first(task: &mut TaskSnapshot, now_ms: u64) -> bool {
@@ -808,6 +957,11 @@ pub struct ActiveTaskGuard {
 }
 
 impl ActiveTaskGuard {
+    #[must_use]
+    pub const fn hub(&self) -> &Arc<TelemetryHub> {
+        &self.hub
+    }
+
     pub fn bind_session(&self, session_id: &str, reused: bool, resolved_model: &str) {
         {
             let mut guard = match self.hub.inner.lock() {
@@ -907,6 +1061,27 @@ impl ActiveTaskGuard {
                 task.phase = TaskPhase::StreamingText;
                 task.output_chars = task.output_chars.saturating_add(delta.chars().count());
                 append_preview_bounded(&mut task.output_preview, delta, MAX_OUTPUT_PREVIEW_CHARS);
+                phase_changed || first_ttft
+            } else {
+                false
+            }
+        };
+        if should_notify {
+            self.hub.notify_change();
+        }
+    }
+
+    pub fn mark_calling_client_tool(&self) {
+        let now_ms = unix_timestamp_ms();
+        let should_notify = {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let first_ttft = stamp_ttft_if_first(task, now_ms);
+                let phase_changed = task.phase != TaskPhase::CallingClientTool;
+                task.phase = TaskPhase::CallingClientTool;
                 phase_changed || first_ttft
             } else {
                 false

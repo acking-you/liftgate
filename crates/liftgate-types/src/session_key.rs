@@ -825,11 +825,22 @@ fn compact_middle_chars(input: &str, max_chars: usize) -> (String, bool) {
 const MAX_CODE_MODE_TOOL_DESC_BYTES: usize = 36_000;
 const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
 
-fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
+/// Returns `true` when `tool` is a Codex Code Mode custom JavaScript `exec` tool
+/// (`CanonicalToolKind::Custom` named `"exec"` or `"*.exec"`).
+#[must_use]
+pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
+    matches!(tool.kind, CanonicalToolKind::Custom { .. })
+        && (tool.name == "exec" || tool.name.ends_with(".exec"))
+}
+
+/// Returns `true` when `tool` is a Code Mode orchestrator (`exec` custom tool, `REPL`, or TypeScript
+/// `declare const tools` runtime wrapper).
+#[must_use]
+pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
     if tool.name == "REPL" {
         return true;
     }
-    if tool.name == "exec" && matches!(tool.kind, CanonicalToolKind::Custom { .. }) {
+    if is_code_mode_custom_exec(tool) {
         return true;
     }
     tool.description.as_deref().is_some_and(|desc| {
@@ -838,6 +849,39 @@ fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
             || desc.contains("Tool TypeScript declarations:")
             || desc.contains("// @exec:")
     })
+}
+
+/// Compacts a tool description for native loopback MCP `tools/list` while preserving full
+/// Code Mode TypeScript `declare const tools` declarations up to `max_bytes` (spilling to disk if larger).
+#[must_use]
+pub fn compact_mcp_tool_description<S: TruncationSpillSink>(
+    tool: &CanonicalToolSpec,
+    max_bytes: usize,
+    spill: &mut S,
+) -> Option<String> {
+    let raw_desc = tool.description.as_deref()?.trim();
+    if raw_desc.is_empty() {
+        return None;
+    }
+    if is_code_mode_orchestrator_tool(tool) {
+        let (desc, _) = compact_code_mode_tool_description(raw_desc, max_bytes, spill);
+        (!desc.is_empty()).then_some(desc)
+    } else {
+        let collapsed = collapse_tool_description(raw_desc);
+        let bounded = if collapsed.len() > max_bytes {
+            truncate_head_tail_lines_from_source(
+                &collapsed,
+                raw_desc,
+                None,
+                max_bytes,
+                "MCP tool description",
+                spill,
+            )
+        } else {
+            collapsed
+        };
+        (!bounded.is_empty()).then_some(bounded)
+    }
 }
 
 fn collapse_tool_description(raw_desc: &str) -> String {
@@ -999,6 +1043,268 @@ fn compact_caller_system<S: TruncationSpillSink>(raw_sys: &str, spill: &mut S) -
     compacted.to_owned()
 }
 
+/// Native loopback MCP bridge tool partition passed when constructing `_meta.antigravity.systemPrompt.append`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct McpBridgePromptSpec<'a> {
+    /// `(client_tool_name, mcp_tool_name)` pairs exposed natively on the `lg` loopback MCP server.
+    pub bridged_tools: &'a [(String, String)],
+    /// Freeform `Custom` tools (e.g. `apply_patch`) or overflow `#65+` tools invoked via XML.
+    pub xml_tools: &'a [CanonicalToolSpec],
+}
+
+/// Builds `_meta.antigravity.systemPrompt.append` for sessions using the Hybrid Loopback MCP Tool
+/// Bridge + XML Coexistence architecture.
+///
+/// When `mcp_spec.bridged_tools` is empty, delegates directly to
+/// [`build_session_system_append_with_spill_sink`] so non-MCP turns remain 100% byte-identical.
+#[must_use]
+pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSink>(
+    caller_system: Option<&str>,
+    mcp_spec: McpBridgePromptSpec<'_>,
+    web_cfg: WebToolBridgeConfig,
+    tool_nonce: &str,
+    spill: &mut S,
+) -> (String, Option<String>) {
+    if mcp_spec.bridged_tools.is_empty() {
+        return build_session_system_append_with_spill_sink(
+            caller_system,
+            mcp_spec.xml_tools,
+            web_cfg,
+            tool_nonce,
+            spill,
+        );
+    }
+
+    let open_tag = format!("<agy_tool_call_{tool_nonce}>");
+    let close_tag = format!("</agy_tool_call_{tool_nonce}>");
+    let xml_tools = mcp_spec.xml_tools;
+    let has_xml_custom = xml_tools
+        .iter()
+        .any(|t| matches!(t.kind, CanonicalToolKind::Custom { .. }));
+
+    let mut header_rules = String::with_capacity(2048);
+    header_rules.push_str("<api_gateway_bridge_rules>\n");
+    header_rules.push_str(
+        "You are serving an external API harness via a structured protocol gateway.\n\
+         - NEVER invoke internal host tools (`read_file`, `write_file`, `edit_file`, `run_command`, \
+         `manage_task`, `ask_question`, `invoke_subagent`, `define_subagent`, `manage_subagents`, \
+         `run_workflow`, `swarm`, `schedule`, `send_message`, `call_mcp_tool`) or any `mcp_*` tool \
+         outside `mcp_lg_*`.\n\
+         - Ignore internal ACP host folders (`liftgate-*`) and any host plugin rules/snapshots.\n\
+         - Invoke the caller's native `mcp_lg_*` client tools directly as native tool calls (they \
+         execute in the caller's real workspace from `<developer_instructions>` and `<caller_system_instructions>`). \
+         Batch independent read-only searches, reads, or checks as parallel `mcp_lg_*` calls in a single turn.\n\
+         - NEVER emit transcript or role wrapper markers such as `<user>`, `</user>`, `<assistant>`, \
+         `</assistant>`, `<client_tool_result>`, `</client_tool_result>`, or `[Client Tool Result`. \
+         Generate ONLY the current single assistant turn.\n",
+    );
+
+    let sanitized_aliases: Vec<String> = mcp_spec
+        .bridged_tools
+        .iter()
+        .filter(|(client_name, mcp_name)| client_name != mcp_name)
+        .map(|(client_name, mcp_name)| format!("`{client_name}` -> `mcp_lg_{mcp_name}`"))
+        .collect();
+    if !sanitized_aliases.is_empty() {
+        let joined = sanitized_aliases.join(", ");
+        let bounded_aliases = if joined.len() > 2_000 {
+            compact_middle_chars(&joined, 2_000).0
+        } else {
+            joined
+        };
+        header_rules.push_str("- Native client tool name aliases: ");
+        header_rules.push_str(&bounded_aliases);
+        header_rules.push_str(".\n");
+    }
+
+    if web_cfg.force_native_web_search {
+        header_rules.push_str(
+            "- MANDATORY WEB SEARCH: Immediately invoke your built-in `search_web` native tool for the \
+             user's query before answering. After `search_web` completes, write a concise, accurate \
+             summary of the findings followed by a `Sources:` list of markdown hyperlinks `[Title](https://...)` \
+             for every relevant URL.\n",
+        );
+    } else if web_cfg.enable_native_web_search {
+        header_rules.push_str(
+            "- Built-in `search_web` IS enabled: invoke your built-in `search_web` native tool whenever \
+             live web search information is needed, and cite every source URL as `[Title](https://...)`.\n",
+        );
+    } else if let Some((_, mcp_ws)) = mcp_spec
+        .bridged_tools
+        .iter()
+        .find(|(client_name, _)| client_name.eq_ignore_ascii_case("WebSearch"))
+    {
+        header_rules.push_str(&format!(
+            "- When web search is needed, invoke the native client tool `mcp_lg_{mcp_ws}` \
+             (do NOT invoke internal `search_web` directly when client `WebSearch` is provided).\n"
+        ));
+    } else if xml_tools
+        .iter()
+        .any(|t| t.name.eq_ignore_ascii_case("WebSearch"))
+    {
+        header_rules.push_str(&format!(
+            "- When web search is needed, invoke the client tool `WebSearch` via `{open_tag}` XML \
+             below (do NOT invoke internal `search_web` directly when client `WebSearch` is provided).\n"
+        ));
+    } else {
+        header_rules.push_str(
+            "- You MAY still use built-in `search_web` if the user explicitly asks to search the live web \
+             and no client web-search tool is provided.\n",
+        );
+    }
+
+    if !xml_tools.is_empty() || web_cfg.enable_native_web_fetch {
+        header_rules.push_str(&format!(
+            "- Coexisting XML-only `<client_tools>` below (such as freeform `apply_patch` or overflow tools) \
+             are NOT native function calls: invoke those XML-only tools ONLY by writing `{open_tag}...{close_tag}` \
+             blocks in plain assistant text (never wrap in code fences, and end your turn immediately after \
+             `{close_tag}` with zero trailing text or native function calls in that step):\n\
+             {open_tag}\n\
+             {{\"name\": \"<exact_tool_name>\", \"arguments\": {{ ... }}}}\n\
+             {close_tag}\n"
+        ));
+        if has_xml_custom {
+            header_rules.push_str(
+                "  (For `apply_patch`, emit raw multi-line `*** Begin Patch ... *** End Patch` directly inside \
+                 the XML block WITHOUT JSON-escaping, keeping `@@` hunks surgical with 1-3 exact context lines.)\n",
+            );
+        }
+        if web_cfg.enable_native_web_fetch {
+            if web_cfg.force_native_web_fetch {
+                header_rules.push_str(&format!(
+                    "- MANDATORY SERVER WEB FETCH: Before answering, fetch the requested web URL by emitting \
+                     `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                     and stop; the gateway will immediately fetch the live page and deliver `<gateway_web_fetch_result>`.\n"
+                ));
+            } else {
+                header_rules.push_str(&format!(
+                    "- Server-managed URL fetching IS enabled: to read the full content of any `http://` or `https://` URL, \
+                     emit `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                     and stop; the gateway will fetch the URL server-side and return `<gateway_web_fetch_result>` in the same turn.\n"
+                ));
+            }
+        }
+    } else {
+        header_rules.push_str(&format!(
+            "- If later turns dynamically add XML-only tools via `<client_tools_update>`, invoke those \
+             newly added XML tools via `{open_tag}\n{{\"name\": \"<exact_tool_name>\", \"arguments\": {{ ... }}}}\n{close_tag}` \
+             in plain text and stop immediately after `{close_tag}`.\n"
+        ));
+    }
+
+    let close_tag_rules = "</api_gateway_bridge_rules>\n";
+    let close_with_tools = "</client_tools>\n</api_gateway_bridge_rules>\n";
+    let mut bounded = header_rules;
+    let mut inline_count = 0usize;
+    let mut inline_compacted = false;
+    let mut tool_buf = String::new();
+    let catalog_note_reserve = 220usize;
+
+    for tool in xml_tools {
+        tool_buf.clear();
+        let tool_was_compacted = render_compact_client_tool(tool, &mut tool_buf, spill);
+        let open_cost = if inline_count == 0 {
+            "<client_tools>\n".len()
+        } else {
+            0
+        };
+        let note_cost = if inline_compacted || tool_was_compacted {
+            catalog_note_reserve
+        } else {
+            0
+        };
+        if bounded.len() + open_cost + tool_buf.len() + note_cost + close_with_tools.len()
+            <= MAX_SYSTEM_APPEND_BYTES
+        {
+            if inline_count == 0 {
+                bounded.push_str("<client_tools>\n");
+            }
+            bounded.push_str(&tool_buf);
+            inline_count += 1;
+            inline_compacted |= tool_was_compacted;
+        } else {
+            break;
+        }
+    }
+
+    if inline_count > 0 {
+        if inline_compacted && let Some(inline_slice) = xml_tools.get(..inline_count) {
+            let inline_refs: Vec<&CanonicalToolSpec> = inline_slice.iter().collect();
+            if let Some(catalog_path) = spill.spill_truncated_content(
+                "client tools catalog",
+                &serialize_full_client_tools_catalog(&inline_refs),
+            ) {
+                let note = format!(
+                    "  # Full lossless inline tool schemas saved locally at `{catalog_path}`.\n"
+                );
+                if bounded.len() + note.len() + close_with_tools.len() <= MAX_SYSTEM_APPEND_BYTES {
+                    bounded.push_str(&note);
+                }
+            }
+        }
+        bounded.push_str(close_with_tools);
+    } else {
+        bounded.push_str(close_tag_rules);
+    }
+
+    let mut combined_spill_xml = String::new();
+    if let Some(raw_sys) = caller_system {
+        let compacted_sys = compact_caller_system(raw_sys, spill);
+        if !compacted_sys.is_empty() {
+            let sys_wrapper_len =
+                "\n<caller_system_instructions>\n\n</caller_system_instructions>\n".len();
+            if xml_tools.get(inline_count..).is_none_or(<[_]>::is_empty)
+                && bounded.len() + sys_wrapper_len + compacted_sys.len() <= MAX_SYSTEM_APPEND_BYTES
+            {
+                bounded.push_str("\n<caller_system_instructions>\n");
+                bounded.push_str(&compacted_sys);
+                bounded.push_str("\n</caller_system_instructions>\n");
+            } else {
+                let bounded_sys = if compacted_sys.len() > 24_000 {
+                    truncate_head_tail_lines_with_spill(
+                        &compacted_sys,
+                        24_000,
+                        "caller system instructions",
+                        spill,
+                    )
+                } else {
+                    compacted_sys
+                };
+                combined_spill_xml.push_str("<caller_system_instructions>\n");
+                combined_spill_xml.push_str(&bounded_sys);
+                if !bounded_sys.ends_with('\n') {
+                    combined_spill_xml.push('\n');
+                }
+                combined_spill_xml.push_str("</caller_system_instructions>\n");
+            }
+        }
+    }
+
+    if let Some(spilled) = xml_tools.get(inline_count..)
+        && !spilled.is_empty()
+    {
+        let spilled_refs: Vec<&CanonicalToolSpec> = spilled.iter().collect();
+        combined_spill_xml.push_str(
+            "<client_tools_update>\nAdditional active XML `<client_tools>` for this session:\n",
+        );
+        render_bounded_tools_list(
+            &spilled_refs,
+            MAX_TOOL_DIRECTIVE_BYTES,
+            &mut combined_spill_xml,
+            spill,
+        );
+        combined_spill_xml.push_str("</client_tools_update>\n");
+    }
+
+    if combined_spill_xml.is_empty() {
+        (bounded, None)
+    } else {
+        (bounded, Some(combined_spill_xml))
+    }
+}
+
+/// Builds `<api_gateway_bridge_rules>` for non-MCP sessions (existing interface).
+///
 /// Builds the `_meta.antigravity.systemPrompt.append` payload passed to ACP `session/new`.
 #[must_use]
 pub fn build_session_system_append(

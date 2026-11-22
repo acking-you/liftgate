@@ -4,16 +4,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use liftgate_types::{
-    acp::compute_cache_hit_bps,
+    acp::{AcpUsage, compute_cache_hit_bps},
     canonical::{CanonicalMessage, CanonicalToolSpec},
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
     telemetry::{PromptCacheWarmth, SessionPoolTelemetry, SessionSlotState, SessionSummary},
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
-use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
+use crate::{
+    acp_client::AcpBackend,
+    mcp_bridge::{McpSessionHandle, McpToolCallReply},
+    telemetry::unix_timestamp_ms,
+};
 
 const MAX_IDLE_RETAINED_CAP_BYTES: usize = 192 * 1024 * 1024;
 const MAX_STORED_RESPONSES_CAP_BYTES: usize = 64 * 1024 * 1024;
@@ -29,6 +33,7 @@ pub struct IdleSessionEntry {
     pub session_id: SessionId,
     pub tool_nonce: Arc<str>,
     pub model_id: ModelId,
+    pub mcp_handle: Option<Arc<McpSessionHandle>>,
     pub post_turn_hash: ConversationHash,
     pub alt_post_turn_hash: Option<ConversationHash>,
     pub post_turn_dialogue_hash: ConversationHash,
@@ -42,7 +47,7 @@ pub struct IdleSessionEntry {
     pub turn_count: u64,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
-    retained_bytes: usize,
+    pub(crate) retained_bytes: usize,
 }
 
 impl IdleSessionEntry {
@@ -55,6 +60,10 @@ impl IdleSessionEntry {
         let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
             acc.saturating_add(m.estimated_heap_bytes())
         });
+        let mcp_bytes = self
+            .mcp_handle
+            .as_deref()
+            .map_or(0, McpSessionHandle::estimated_retained_bytes);
 
         std::mem::size_of::<Self>()
             .saturating_add(self.session_id.as_str().len())
@@ -63,7 +72,142 @@ impl IdleSessionEntry {
             .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
             .saturating_add(tool_bytes)
             .saturating_add(msg_bytes)
+            .saturating_add(mcp_bytes)
     }
+}
+
+/// Metadata for a single pending client tool call parked inside a suspended MCP `session/prompt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingMcpCallInfo {
+    /// Unprefixed call suffix matched against `call_<suffix>` or `toolu_<suffix>`.
+    pub nonce_suffix: String,
+    /// Canonical `call_<suffix>` identifier recorded in `CanonicalPart::ToolCall`.
+    pub call_id: String,
+    /// Caller-declared tool name (e.g. `"exec"`, `"wait"`, `"Bash"`).
+    pub client_name: String,
+}
+
+/// Resumed HTTP step input handed from `execute_normalized_turn` into the parked MCP session driver.
+pub(crate) struct McpResumedStepInput {
+    pub raw_lease: RawSessionLease,
+    pub task_guard: crate::telemetry::ActiveTaskGuard,
+    pub req: liftgate_types::canonical::NormalizedTurnRequest,
+    pub web_cfg: liftgate_types::session_key::WebToolBridgeConfig,
+    pub full_messages: Vec<CanonicalMessage>,
+    pub route_meta: crate::turn_runner::TurnRoutingMetadata,
+    pub outbound_diag_blocks: Arc<[liftgate_types::acp::AcpPromptBlock]>,
+    pub response_id: String,
+    pub tool_replies: Vec<(String, McpToolCallReply)>,
+    pub vision_offload_usage: AcpUsage,
+    pub events_tx: tokio::sync::mpsc::Sender<crate::turn_runner::TurnEvent>,
+    pub step_cancel: tokio_util::sync::CancellationToken,
+    pub spill_store: Option<crate::spill_store::SpillStore>,
+    pub retire_after_turn: bool,
+    pub timeout_secs: u64,
+}
+
+/// Outcome delivered when a parked `McpSessionDriver` finishes unwinding via `session/cancel`.
+pub(crate) type McpUnwindOutcome = Result<(u64, AcpUsage, Arc<McpSessionHandle>), ()>;
+
+/// Control message sent to a parked `McpSessionDriver` waiting for client tool execution.
+pub(crate) enum McpDriverCommand {
+    ResumeStep(Box<McpResumedStepInput>),
+    CancelForUnwind {
+        done_tx: oneshot::Sender<McpUnwindOutcome>,
+    },
+}
+
+/// Parked ACP session whose `session/prompt` is actively suspended inside a loopback MCP `tools/call`.
+pub struct SuspendedMcpEntry {
+    pub session_id: SessionId,
+    pub tool_nonce: Arc<str>,
+    pub model_id: ModelId,
+    pub mcp_handle: Arc<McpSessionHandle>,
+    pub pending_calls: Vec<PendingMcpCallInfo>,
+    pub(crate) cmd_tx: oneshot::Sender<McpDriverCommand>,
+    pub post_turn_hash: ConversationHash,
+    pub post_turn_dialogue_hash: ConversationHash,
+    pub pre_step_hash: ConversationHash,
+    pub pre_step_dialogue_hash: ConversationHash,
+    pub alt_pre_user_hash: Option<ConversationHash>,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub last_context_used: u64,
+    pub total_prompt_tokens: u64,
+    pub total_cached_read_tokens: u64,
+    pub last_response_id: Option<String>,
+    pub accumulated_messages: Vec<CanonicalMessage>,
+    pub message_count: usize,
+    pub pre_step_message_count: usize,
+    pub turn_count: u64,
+    pub created_at_unix_ms: u64,
+    pub last_active_unix_ms: u64,
+    retained_bytes: usize,
+}
+
+impl std::fmt::Debug for SuspendedMcpEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuspendedMcpEntry")
+            .field("session_id", &self.session_id)
+            .field("model_id", &self.model_id)
+            .field("pending_calls", &self.pending_calls)
+            .field("turn_count", &self.turn_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SuspendedMcpEntry {
+    #[must_use]
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let tool_bytes = self.declared_tools.iter().fold(0usize, |acc, t| {
+            acc.saturating_add(t.estimated_heap_bytes())
+        });
+        let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
+            acc.saturating_add(m.estimated_heap_bytes())
+        });
+        let pending_bytes = self.pending_calls.iter().fold(0usize, |acc, p| {
+            acc.saturating_add(p.nonce_suffix.len() + p.call_id.len() + p.client_name.len())
+        });
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.session_id.as_str().len())
+            .saturating_add(self.tool_nonce.len())
+            .saturating_add(self.model_id.as_str().len())
+            .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
+            .saturating_add(tool_bytes)
+            .saturating_add(msg_bytes)
+            .saturating_add(pending_bytes)
+            .saturating_add(self.mcp_handle.estimated_retained_bytes())
+    }
+}
+
+/// State extracted when promoting a [`SuspendedCheckoutGuard`] into a live continuation step.
+pub(crate) struct PromotedMcpSession {
+    pub cmd_tx: oneshot::Sender<McpDriverCommand>,
+    pub pending_calls: Vec<PendingMcpCallInfo>,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub accumulated_messages: Vec<CanonicalMessage>,
+    pub last_context_used: u64,
+    pub post_turn_hash: ConversationHash,
+}
+
+/// Payload passed to [`SessionLeaseGuard::suspend_on_mcp`] when parking an active step on MCP.
+pub(crate) struct SuspendedMcpTurn {
+    pub mcp_handle: Arc<McpSessionHandle>,
+    pub pending_calls: Vec<PendingMcpCallInfo>,
+    pub cmd_tx: oneshot::Sender<McpDriverCommand>,
+    pub post_turn_hash: ConversationHash,
+    pub post_turn_dialogue_hash: ConversationHash,
+    pub pre_step_hash: ConversationHash,
+    pub pre_step_dialogue_hash: ConversationHash,
+    pub alt_pre_user_hash: Option<ConversationHash>,
+    pub declared_tools: Vec<CanonicalToolSpec>,
+    pub last_context_used: u64,
+    pub step_prompt_tokens: u64,
+    pub step_cached_read_tokens: u64,
+    pub message_count: usize,
+    pub pre_step_message_count: usize,
+    pub last_response_id: Option<String>,
+    pub accumulated_messages: Vec<CanonicalMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,16 +241,61 @@ pub struct SessionPool {
 
 struct PoolInner {
     active_leases: BTreeMap<String, ActiveLeaseMeta>,
+    suspended_sessions: VecDeque<SuspendedMcpEntry>,
     idle_sessions: VecDeque<IdleSessionEntry>,
     pending_checkins: Vec<(u64, Vec<ConversationHash>)>,
     next_pending_id: u64,
     retained_idle_bytes: usize,
     stored_responses: VecDeque<StoredResponseEntry>,
     retained_response_bytes: usize,
+    mcp_continuations: u64,
     total_sessions_created: u64,
     total_sessions_reused: u64,
     total_sessions_closed_or_evicted: u64,
     last_activity_unix_ms: u64,
+}
+
+impl PoolInner {
+    fn purge_closed_suspended(&mut self) {
+        let mut kept = VecDeque::with_capacity(self.suspended_sessions.len());
+        while let Some(entry) = self.suspended_sessions.pop_front() {
+            if entry.cmd_tx.is_closed() {
+                self.retained_idle_bytes = self
+                    .retained_idle_bytes
+                    .saturating_sub(entry.retained_bytes);
+                self.total_sessions_closed_or_evicted += 1;
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        self.suspended_sessions = kept;
+    }
+
+    fn cached_slot_count(&self) -> usize {
+        self.idle_sessions
+            .len()
+            .saturating_add(self.suspended_sessions.len())
+    }
+
+    fn evict_oldest_cached_slot(&mut self) -> Option<SessionId> {
+        let evict_idle = match (self.idle_sessions.front(), self.suspended_sessions.front()) {
+            (Some(idle), Some(susp)) => idle.last_active_unix_ms <= susp.last_active_unix_ms,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if evict_idle {
+            let old = self.idle_sessions.pop_front()?;
+            self.retained_idle_bytes = self.retained_idle_bytes.saturating_sub(old.retained_bytes);
+            self.total_sessions_closed_or_evicted += 1;
+            Some(old.session_id)
+        } else {
+            let old = self.suspended_sessions.pop_front()?;
+            self.retained_idle_bytes = self.retained_idle_bytes.saturating_sub(old.retained_bytes);
+            self.total_sessions_closed_or_evicted += 1;
+            Some(old.session_id)
+        }
+    }
 }
 
 impl SessionPool {
@@ -130,12 +319,14 @@ impl SessionPool {
             lifecycle_seq,
             inner: Mutex::new(PoolInner {
                 active_leases: BTreeMap::new(),
+                suspended_sessions: VecDeque::with_capacity(limits.max_idle_sessions().get()),
                 idle_sessions: VecDeque::with_capacity(limits.max_idle_sessions().get()),
                 pending_checkins: Vec::new(),
                 next_pending_id: 1,
                 retained_idle_bytes: 0,
                 stored_responses: VecDeque::with_capacity(limits.max_stored_responses().get()),
                 retained_response_bytes: 0,
+                mcp_continuations: 0,
                 total_sessions_created: 0,
                 total_sessions_reused: 0,
                 total_sessions_closed_or_evicted: 0,
@@ -164,6 +355,120 @@ impl SessionPool {
             Err(poisoned) => poisoned.into_inner(),
         };
         (guard.retained_idle_bytes, guard.retained_response_bytes)
+    }
+
+    /// Atomically checks out a suspended MCP session matching `previous_response_id`.
+    #[must_use]
+    pub fn checkout_suspended_by_response_id<B: AcpBackend>(
+        self: &Arc<Self>,
+        response_id: &str,
+        backend: Arc<B>,
+    ) -> Option<SuspendedCheckoutGuard<B>> {
+        self.checkout_suspended_where(backend, |e| {
+            !e.accumulated_messages.is_empty() && e.last_response_id.as_deref() == Some(response_id)
+        })
+    }
+
+    /// Atomically checks out a suspended MCP session whose `post_turn_hash` matches `hash`.
+    #[must_use]
+    pub fn checkout_suspended_by_post_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<SuspendedCheckoutGuard<B>> {
+        self.checkout_suspended_where(backend, |e| &e.post_turn_hash == hash)
+    }
+
+    /// Atomically checks out a suspended MCP session whose `pre_step_hash` matches `hash`
+    /// (e.g. client cancelled/discarded the pending assistant tool turn and sent a new prompt).
+    #[must_use]
+    pub fn checkout_suspended_by_pre_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<SuspendedCheckoutGuard<B>> {
+        self.checkout_suspended_where(backend, |e| &e.pre_step_hash == hash)
+    }
+
+    /// Atomically checks out a suspended MCP session whose `alt_pre_user_hash` matches `hash`
+    /// (e.g. client rolled back both the assistant tool turn and its triggering user message).
+    #[must_use]
+    pub fn checkout_suspended_by_alt_pre_user_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<SuspendedCheckoutGuard<B>> {
+        self.checkout_suspended_where(backend, |e| e.alt_pre_user_hash.as_ref() == Some(hash))
+    }
+
+    /// Atomically checks out a suspended MCP session matching a pure dialogue hash (`/compact`).
+    #[must_use]
+    pub fn checkout_suspended_by_dialogue_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<SuspendedCheckoutGuard<B>> {
+        self.checkout_suspended_where(backend, |e| {
+            &e.post_turn_dialogue_hash == hash || &e.pre_step_dialogue_hash == hash
+        })
+    }
+
+    fn checkout_suspended_where<B, F>(
+        self: &Arc<Self>,
+        backend: Arc<B>,
+        predicate: F,
+    ) -> Option<SuspendedCheckoutGuard<B>>
+    where
+        B: AcpBackend,
+        F: Fn(&SuspendedMcpEntry) -> bool,
+    {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.purge_closed_suspended();
+        let pos = guard
+            .suspended_sessions
+            .iter()
+            .rposition(|e| !e.cmd_tx.is_closed() && predicate(e))?;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
+        let entry = guard.suspended_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        drop(guard);
+        Some(SuspendedCheckoutGuard::new(
+            entry,
+            Arc::clone(self),
+            backend,
+        ))
+    }
+
+    /// Purges a suspended MCP session whose background `session/prompt` exited unexpectedly while parked.
+    pub fn remove_dead_suspended(&self, session_id: &SessionId) {
+        let removed = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(pos) = guard
+                .suspended_sessions
+                .iter()
+                .position(|e| &e.session_id == session_id)
+            else {
+                return;
+            };
+            guard.total_sessions_closed_or_evicted += 1;
+            let entry = guard.suspended_sessions.remove(pos);
+            if let Some(ref e) = entry {
+                guard.retained_idle_bytes =
+                    guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
+            }
+            entry.is_some()
+        };
+        if removed {
+            self.bump_lifecycle_seq();
+        }
     }
 
     /// Atomically removes an idle session matching `previous_response_id` wrapped in a
@@ -293,6 +598,15 @@ impl SessionPool {
                             .as_ref()
                             .is_some_and(|alt| candidates.contains(alt))
                         || candidates.contains(&e.post_turn_dialogue_hash)
+                }) || guard.suspended_sessions.iter().any(|e| {
+                    !e.cmd_tx.is_closed()
+                        && (candidates.contains(&e.post_turn_hash)
+                            || candidates.contains(&e.pre_step_hash)
+                            || e.alt_pre_user_hash
+                                .as_ref()
+                                .is_some_and(|alt| candidates.contains(alt))
+                            || candidates.contains(&e.post_turn_dialogue_hash)
+                            || candidates.contains(&e.pre_step_dialogue_hash))
                 });
                 if already_idle {
                     return;
@@ -356,6 +670,17 @@ impl SessionPool {
         (guard.active_leases.len(), guard.idle_sessions.len())
     }
 
+    /// Returns the number of currently parked MCP-suspended sessions.
+    #[must_use]
+    pub fn suspended_count(&self) -> usize {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.purge_closed_suspended();
+        guard.suspended_sessions.len()
+    }
+
     /// Returns the Unix millisecond timestamp of the most recent turn lease checkout or checkin.
     #[must_use]
     pub fn last_activity_unix_ms(&self) -> u64 {
@@ -372,37 +697,55 @@ impl SessionPool {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let mut idle_bytes = 0usize;
+        for e in &guard.idle_sessions {
+            idle_bytes = idle_bytes.saturating_add(e.retained_bytes);
+        }
         let count = guard.idle_sessions.len() as u64;
         guard.total_sessions_closed_or_evicted += count;
-        guard.retained_idle_bytes = 0;
+        guard.retained_idle_bytes = guard.retained_idle_bytes.saturating_sub(idle_bytes);
         guard.idle_sessions.drain(..).collect()
     }
 
-    /// Manually closes and evicts an idle session from the pool (used by operator dashboard).
+    /// Manually closes and evicts an idle or suspended session from the pool (used by operator dashboard).
     pub fn close_idle_session<B: AcpBackend>(&self, session_id: &str, backend: &B) -> bool {
-        let removed = {
+        let removed_sid = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let Some(pos) = guard
+            if let Some(pos) = guard
                 .idle_sessions
                 .iter()
                 .position(|e| e.session_id.as_str() == session_id)
-            else {
+            {
+                guard.total_sessions_closed_or_evicted += 1;
+                let entry = guard.idle_sessions.remove(pos);
+                if let Some(ref e) = entry {
+                    guard.retained_idle_bytes =
+                        guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
+                }
+                entry.map(|e| e.session_id)
+            } else if let Some(pos) = guard
+                .suspended_sessions
+                .iter()
+                .position(|e| e.session_id.as_str() == session_id)
+            {
+                guard.total_sessions_closed_or_evicted += 1;
+                let entry = guard.suspended_sessions.remove(pos);
+                if let Some(ref e) = entry {
+                    guard.retained_idle_bytes =
+                        guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
+                }
+                entry.map(|e| e.session_id)
+            } else {
                 return false;
-            };
-            guard.total_sessions_closed_or_evicted += 1;
-            let entry = guard.idle_sessions.remove(pos);
-            if let Some(ref e) = entry {
-                guard.retained_idle_bytes =
-                    guard.retained_idle_bytes.saturating_sub(e.retained_bytes);
             }
-            entry
         };
 
-        if let Some(entry) = removed {
-            backend.abort_session_nonblocking(&entry.session_id);
+        if let Some(sid) = removed_sid {
+            backend.abort_session_nonblocking(&sid);
+            self.bump_lifecycle_seq();
             true
         } else {
             false
@@ -463,8 +806,8 @@ impl SessionPool {
             .map(|entry| entry.raw_json.clone())
     }
 
-    /// Closes and evicts idle sessions whose `last_active_unix_ms` is at least `max_idle_age_ms`
-    /// behind `now_unix_ms`, returning the number of reaped sessions.
+    /// Closes and evicts idle or suspended sessions whose `last_active_unix_ms` is at least
+    /// `max_idle_age_ms` behind `now_unix_ms`, returning the number of reaped sessions.
     pub fn reap_expired_idle_sessions<B: AcpBackend>(
         &self,
         now_unix_ms: u64,
@@ -474,31 +817,49 @@ impl SessionPool {
         if max_idle_age_ms == 0 {
             return 0;
         }
-        let expired = {
+        let expired_sids = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            guard.purge_closed_suspended();
             let mut reaped = Vec::new();
-            let mut kept = VecDeque::with_capacity(guard.idle_sessions.len());
+            let mut kept_idle = VecDeque::with_capacity(guard.idle_sessions.len());
             while let Some(entry) = guard.idle_sessions.pop_front() {
                 if now_unix_ms.saturating_sub(entry.last_active_unix_ms) >= max_idle_age_ms {
                     guard.retained_idle_bytes = guard
                         .retained_idle_bytes
                         .saturating_sub(entry.retained_bytes);
                     guard.total_sessions_closed_or_evicted += 1;
-                    reaped.push(entry);
+                    reaped.push(entry.session_id);
                 } else {
-                    kept.push_back(entry);
+                    kept_idle.push_back(entry);
                 }
             }
-            guard.idle_sessions = kept;
+            guard.idle_sessions = kept_idle;
+
+            let mut kept_susp = VecDeque::with_capacity(guard.suspended_sessions.len());
+            while let Some(entry) = guard.suspended_sessions.pop_front() {
+                if now_unix_ms.saturating_sub(entry.last_active_unix_ms) >= max_idle_age_ms {
+                    guard.retained_idle_bytes = guard
+                        .retained_idle_bytes
+                        .saturating_sub(entry.retained_bytes);
+                    guard.total_sessions_closed_or_evicted += 1;
+                    reaped.push(entry.session_id);
+                } else {
+                    kept_susp.push_back(entry);
+                }
+            }
+            guard.suspended_sessions = kept_susp;
             reaped
         };
 
-        let count = expired.len();
-        for old in expired {
-            backend.abort_session_nonblocking(&old.session_id);
+        let count = expired_sids.len();
+        if count > 0 {
+            self.bump_lifecycle_seq();
+        }
+        for sid in expired_sids {
+            backend.abort_session_nonblocking(&sid);
         }
         count
     }
@@ -513,13 +874,15 @@ impl SessionPool {
     /// KV-cache warmth classification in tests and live telemetry.
     #[must_use]
     pub fn snapshot_at(&self, now_unix_ms: u64) -> SessionPoolTelemetry {
-        let guard = match self.inner.lock() {
+        let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        guard.purge_closed_suspended();
 
-        let mut sessions =
-            Vec::with_capacity(guard.active_leases.len() + guard.idle_sessions.len());
+        let mut sessions = Vec::with_capacity(
+            guard.active_leases.len() + guard.suspended_sessions.len() + guard.idle_sessions.len(),
+        );
         for (sid, meta) in &guard.active_leases {
             sessions.push(SessionSummary {
                 session_id: sid.clone(),
@@ -542,6 +905,30 @@ impl SessionPool {
                 created_at_unix_ms: meta.created_at_unix_ms,
                 last_active_unix_ms: meta.last_active_unix_ms,
                 last_response_id: meta.last_response_id.clone(),
+            });
+        }
+        for susp in guard.suspended_sessions.iter().rev() {
+            sessions.push(SessionSummary {
+                session_id: susp.session_id.as_str().to_owned(),
+                model_id: susp.model_id.as_str().to_owned(),
+                state: SessionSlotState::Suspended,
+                cache_warmth: PromptCacheWarmth::classify(
+                    SessionSlotState::Suspended,
+                    susp.last_active_unix_ms,
+                    now_unix_ms,
+                ),
+                turn_count: susp.turn_count,
+                message_count: susp.message_count,
+                last_context_tokens: susp.last_context_used,
+                total_prompt_tokens: susp.total_prompt_tokens,
+                total_cached_read_tokens: susp.total_cached_read_tokens,
+                cache_hit_rate_bps: compute_cache_hit_bps(
+                    susp.total_cached_read_tokens,
+                    susp.total_prompt_tokens,
+                ),
+                created_at_unix_ms: susp.created_at_unix_ms,
+                last_active_unix_ms: susp.last_active_unix_ms,
+                last_response_id: susp.last_response_id.clone(),
             });
         }
         for idle in guard.idle_sessions.iter().rev() {
@@ -571,7 +958,9 @@ impl SessionPool {
 
         SessionPoolTelemetry {
             active_leased_sessions: guard.active_leases.len(),
+            suspended_mcp_sessions: guard.suspended_sessions.len(),
             idle_cached_sessions: guard.idle_sessions.len(),
+            mcp_continuations: guard.mcp_continuations,
             max_idle_sessions: self.limits.max_idle_sessions().get(),
             stored_responses: guard.stored_responses.len(),
             max_stored_responses: self.limits.max_stored_responses().get(),
@@ -668,26 +1057,24 @@ impl SessionPool {
             return;
         }
 
-        let evicted = {
+        let evicted_sids = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            guard.purge_closed_suspended();
             guard.last_activity_unix_ms = entry.last_active_unix_ms;
             let _ = guard.active_leases.remove(entry.session_id.as_str());
             let mut evicted = Vec::new();
-            while guard.idle_sessions.len() >= self.limits.max_idle_sessions().get()
-                || (!guard.idle_sessions.is_empty()
+            while guard.cached_slot_count() >= self.limits.max_idle_sessions().get()
+                || (guard.cached_slot_count() > 0
                     && guard
                         .retained_idle_bytes
                         .saturating_add(entry.retained_bytes)
                         > self.max_idle_retained_bytes)
             {
-                if let Some(old) = guard.idle_sessions.pop_front() {
-                    guard.retained_idle_bytes =
-                        guard.retained_idle_bytes.saturating_sub(old.retained_bytes);
-                    guard.total_sessions_closed_or_evicted += 1;
-                    evicted.push(old);
+                if let Some(old_sid) = guard.evict_oldest_cached_slot() {
+                    evicted.push(old_sid);
                 } else {
                     break;
                 }
@@ -700,9 +1087,101 @@ impl SessionPool {
         };
 
         self.bump_lifecycle_seq();
-        for old in evicted {
-            backend.abort_session_nonblocking(&old.session_id);
+        for old_sid in evicted_sids {
+            backend.abort_session_nonblocking(&old_sid);
         }
+    }
+
+    fn park_suspended<B: AcpBackend>(&self, mut entry: SuspendedMcpEntry, backend: &B) {
+        if entry.cmd_tx.is_closed() {
+            {
+                let mut guard = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let _ = guard.active_leases.remove(entry.session_id.as_str());
+                guard.total_sessions_closed_or_evicted += 1;
+            }
+            backend.abort_session_nonblocking(&entry.session_id);
+            self.bump_lifecycle_seq();
+            return;
+        }
+
+        let mut entry_bytes = entry.estimated_retained_bytes();
+        if entry_bytes > self.max_idle_retained_bytes && !entry.accumulated_messages.is_empty() {
+            entry.accumulated_messages.clear();
+            entry.accumulated_messages.shrink_to_fit();
+            entry_bytes = entry.estimated_retained_bytes();
+        }
+        entry.retained_bytes = entry_bytes;
+
+        if entry_bytes > self.max_idle_retained_bytes {
+            let abort_sid = entry.session_id.clone();
+            {
+                let mut guard = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.last_activity_unix_ms = entry.last_active_unix_ms;
+                let _ = guard.active_leases.remove(abort_sid.as_str());
+                guard.total_sessions_closed_or_evicted += 1;
+            }
+            drop(entry);
+            backend.abort_session_nonblocking(&abort_sid);
+            self.bump_lifecycle_seq();
+            return;
+        }
+
+        let evicted_sids = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.purge_closed_suspended();
+            guard.last_activity_unix_ms = entry.last_active_unix_ms;
+            let _ = guard.active_leases.remove(entry.session_id.as_str());
+            let mut evicted = Vec::new();
+            while guard.cached_slot_count() >= self.limits.max_idle_sessions().get()
+                || (guard.cached_slot_count() > 0
+                    && guard
+                        .retained_idle_bytes
+                        .saturating_add(entry.retained_bytes)
+                        > self.max_idle_retained_bytes)
+            {
+                if let Some(old_sid) = guard.evict_oldest_cached_slot() {
+                    evicted.push(old_sid);
+                } else {
+                    break;
+                }
+            }
+            guard.retained_idle_bytes = guard
+                .retained_idle_bytes
+                .saturating_add(entry.retained_bytes);
+            guard.suspended_sessions.push_back(entry);
+            evicted
+        };
+
+        self.bump_lifecycle_seq();
+        for old_sid in evicted_sids {
+            backend.abort_session_nonblocking(&old_sid);
+        }
+    }
+
+    fn record_mcp_continuation(&self) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.mcp_continuations += 1;
+        guard.total_sessions_reused += 1;
+    }
+
+    fn record_unwound_session_reused(&self) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.total_sessions_reused += 1;
     }
 
     fn bump_lifecycle_seq(&self) {
@@ -769,6 +1248,14 @@ impl<B: AcpBackend> IdleCheckoutGuard<B> {
         }
     }
 
+    /// Wraps a gracefully unwound suspended MCP session as an [`IdleCheckoutGuard`] so standard
+    /// warm continuation / model-switch / `/compact` paths reuse the live ACP worker seamlessly.
+    #[must_use]
+    pub fn from_unwound(entry: IdleSessionEntry, pool: Arc<SessionPool>, backend: Arc<B>) -> Self {
+        pool.record_unwound_session_reused();
+        Self::new(entry, pool, backend)
+    }
+
     #[must_use]
     pub fn entry(&self) -> &IdleSessionEntry {
         self.entry
@@ -806,6 +1293,134 @@ impl<B: AcpBackend> Drop for IdleCheckoutGuard<B> {
     }
 }
 
+/// Cancel-safe RAII checkout guard for a parked [`SuspendedMcpEntry`].
+///
+/// Dropping without calling `promote_for_mcp_continuation` or `take_for_unwind`
+/// restores the untouched suspended entry back into `SessionPool`.
+pub struct SuspendedCheckoutGuard<B: AcpBackend> {
+    entry: Option<SuspendedMcpEntry>,
+    pool: Arc<SessionPool>,
+    backend: Arc<B>,
+}
+
+impl<B: AcpBackend> SuspendedCheckoutGuard<B> {
+    #[must_use]
+    fn new(entry: SuspendedMcpEntry, pool: Arc<SessionPool>, backend: Arc<B>) -> Self {
+        Self {
+            entry: Some(entry),
+            pool,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub fn entry(&self) -> &SuspendedMcpEntry {
+        self.entry.as_ref().expect(
+            "SuspendedCheckoutGuard entry invariant: populated until promote, unwind, or drop",
+        )
+    }
+
+    /// Promotes this parked session into an active [`SessionLeaseGuard`] for native MCP
+    /// tool-result continuation inside the same running `session/prompt`.
+    #[must_use]
+    pub(crate) fn promote_for_mcp_continuation(
+        mut self,
+        new_message_count: usize,
+    ) -> (PromotedMcpSession, SessionLeaseGuard<B>) {
+        let mut entry = self.entry.take().expect(
+            "SuspendedCheckoutGuard entry invariant: populated until promote, unwind, or drop",
+        );
+        self.pool.record_mcp_continuation();
+        let now_ms = unix_timestamp_ms();
+        let idle_ms = now_ms.saturating_sub(entry.last_active_unix_ms);
+        let next_turn = entry.turn_count.saturating_add(1);
+        self.pool.register_lease(
+            &entry.session_id,
+            ActiveLeaseMeta {
+                model_id: entry.model_id.clone(),
+                in_flight_hashes: Vec::new(),
+                turn_count: next_turn,
+                message_count: new_message_count,
+                last_context_used: entry.last_context_used,
+                total_prompt_tokens: entry.total_prompt_tokens,
+                total_cached_read_tokens: entry.total_cached_read_tokens,
+                created_at_unix_ms: entry.created_at_unix_ms,
+                last_active_unix_ms: now_ms,
+                last_response_id: entry.last_response_id.clone(),
+            },
+            false,
+        );
+        let lease = SessionLeaseGuard {
+            session_id: entry.session_id,
+            tool_nonce: entry.tool_nonce,
+            model_id: entry.model_id,
+            mcp_handle: Some(entry.mcp_handle),
+            declared_tools: entry.declared_tools.clone(),
+            last_context_used: entry.last_context_used,
+            total_prompt_tokens: entry.total_prompt_tokens,
+            total_cached_read_tokens: entry.total_cached_read_tokens,
+            turn_count: next_turn,
+            idle_before_checkout_ms: Some(idle_ms),
+            created_at_unix_ms: entry.created_at_unix_ms,
+            pool: Arc::clone(&self.pool),
+            backend: Arc::clone(&self.backend),
+            armed: true,
+        };
+        let promoted = PromotedMcpSession {
+            cmd_tx: entry.cmd_tx,
+            pending_calls: entry.pending_calls,
+            declared_tools: entry.declared_tools,
+            accumulated_messages: std::mem::take(&mut entry.accumulated_messages),
+            last_context_used: entry.last_context_used,
+            post_turn_hash: entry.post_turn_hash,
+        };
+        (promoted, lease)
+    }
+
+    /// Takes ownership of the [`SuspendedMcpEntry`] without restoring on drop so the caller can
+    /// unwind its `session/prompt` via `session/cancel` and transition to warm continuation.
+    #[must_use]
+    pub fn take_for_unwind(mut self) -> SuspendedMcpEntry {
+        self.entry.take().expect(
+            "SuspendedCheckoutGuard entry invariant: populated until promote, unwind, or drop",
+        )
+    }
+}
+
+impl<B: AcpBackend> Drop for SuspendedCheckoutGuard<B> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.pool.park_suspended(entry, &*self.backend);
+        }
+    }
+}
+
+/// Non-generic RAII transfer token used to pass an active lease across `McpDriverCommand`
+/// without making `SessionPool` generic over `B: AcpBackend`.
+pub(crate) struct RawSessionLease {
+    session_id: SessionId,
+    tool_nonce: Arc<str>,
+    model_id: ModelId,
+    mcp_handle: Option<Arc<McpSessionHandle>>,
+    declared_tools: Vec<CanonicalToolSpec>,
+    last_context_used: u64,
+    total_prompt_tokens: u64,
+    total_cached_read_tokens: u64,
+    turn_count: u64,
+    idle_before_checkout_ms: Option<u64>,
+    created_at_unix_ms: u64,
+    pool: Arc<SessionPool>,
+    armed: bool,
+}
+
+impl Drop for RawSessionLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.unregister_aborted_lease(&self.session_id);
+        }
+    }
+}
+
 /// RAII lease guard for an active ACP session turn.
 ///
 /// Created *before* awaiting prompt execution. If dropped without calling `commit`
@@ -815,6 +1430,7 @@ pub struct SessionLeaseGuard<B: AcpBackend> {
     session_id: SessionId,
     tool_nonce: Arc<str>,
     model_id: ModelId,
+    mcp_handle: Option<Arc<McpSessionHandle>>,
     declared_tools: Vec<CanonicalToolSpec>,
     last_context_used: u64,
     total_prompt_tokens: u64,
@@ -859,6 +1475,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             session_id,
             tool_nonce,
             model_id,
+            mcp_handle: None,
             declared_tools,
             last_context_used: 0,
             total_prompt_tokens: 0,
@@ -870,6 +1487,12 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             backend,
             armed: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_mcp_handle(mut self, mcp_handle: Option<Arc<McpSessionHandle>>) -> Self {
+        self.mcp_handle = mcp_handle;
+        self
     }
 
     #[must_use]
@@ -902,6 +1525,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             session_id: cached.session_id.clone(),
             tool_nonce: Arc::clone(&cached.tool_nonce),
             model_id: cached.model_id.clone(),
+            mcp_handle: cached.mcp_handle.clone(),
             declared_tools: cached.declared_tools.clone(),
             last_context_used: cached.last_context_used,
             total_prompt_tokens: cached.total_prompt_tokens,
@@ -910,6 +1534,47 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             idle_before_checkout_ms: Some(idle_ms),
             created_at_unix_ms: cached.created_at_unix_ms,
             pool,
+            backend,
+            armed: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn into_raw_parts(mut self) -> RawSessionLease {
+        self.armed = false;
+        RawSessionLease {
+            session_id: self.session_id.clone(),
+            tool_nonce: Arc::clone(&self.tool_nonce),
+            model_id: self.model_id.clone(),
+            mcp_handle: self.mcp_handle.take(),
+            declared_tools: std::mem::take(&mut self.declared_tools),
+            last_context_used: self.last_context_used,
+            total_prompt_tokens: self.total_prompt_tokens,
+            total_cached_read_tokens: self.total_cached_read_tokens,
+            turn_count: self.turn_count,
+            idle_before_checkout_ms: self.idle_before_checkout_ms,
+            created_at_unix_ms: self.created_at_unix_ms,
+            pool: Arc::clone(&self.pool),
+            armed: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_raw_parts(mut raw: RawSessionLease, backend: Arc<B>) -> Self {
+        raw.armed = false;
+        Self {
+            session_id: raw.session_id.clone(),
+            tool_nonce: Arc::clone(&raw.tool_nonce),
+            model_id: raw.model_id.clone(),
+            mcp_handle: raw.mcp_handle.take(),
+            declared_tools: std::mem::take(&mut raw.declared_tools),
+            last_context_used: raw.last_context_used,
+            total_prompt_tokens: raw.total_prompt_tokens,
+            total_cached_read_tokens: raw.total_cached_read_tokens,
+            turn_count: raw.turn_count,
+            idle_before_checkout_ms: raw.idle_before_checkout_ms,
+            created_at_unix_ms: raw.created_at_unix_ms,
+            pool: Arc::clone(&raw.pool),
             backend,
             armed: true,
         }
@@ -928,6 +1593,11 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     #[must_use]
     pub const fn model_id(&self) -> &ModelId {
         &self.model_id
+    }
+
+    #[must_use]
+    pub const fn mcp_handle(&self) -> Option<&Arc<McpSessionHandle>> {
+        self.mcp_handle.as_ref()
     }
 
     #[must_use]
@@ -955,9 +1625,60 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
         self.model_id = model_id;
     }
 
+    /// Reconciles prior step estimates in a multi-step MCP cascade with authoritative cumulative tokens.
+    pub fn reconcile_prior_cascade_tokens(
+        &mut self,
+        accounted_prior_prompt: u64,
+        accounted_prior_cached_read: u64,
+    ) {
+        self.total_prompt_tokens = self
+            .total_prompt_tokens
+            .saturating_sub(accounted_prior_prompt);
+        self.total_cached_read_tokens = self
+            .total_cached_read_tokens
+            .saturating_sub(accounted_prior_cached_read);
+    }
+
     #[must_use]
     pub fn register_pending_checkin(&self, hashes: Vec<ConversationHash>) -> PendingCheckinGuard {
         self.pool.register_pending_checkin(hashes)
+    }
+
+    /// Disarms abort-on-drop and parks this active session into `SessionPool` while its
+    /// `session/prompt` remains suspended inside a loopback MCP `tools/call`.
+    pub(crate) fn suspend_on_mcp(mut self, suspended: SuspendedMcpTurn) {
+        self.armed = false;
+        let now_ms = unix_timestamp_ms();
+        let entry = SuspendedMcpEntry {
+            session_id: self.session_id.clone(),
+            tool_nonce: Arc::clone(&self.tool_nonce),
+            model_id: self.model_id.clone(),
+            mcp_handle: suspended.mcp_handle,
+            pending_calls: suspended.pending_calls,
+            cmd_tx: suspended.cmd_tx,
+            post_turn_hash: suspended.post_turn_hash,
+            post_turn_dialogue_hash: suspended.post_turn_dialogue_hash,
+            pre_step_hash: suspended.pre_step_hash,
+            pre_step_dialogue_hash: suspended.pre_step_dialogue_hash,
+            alt_pre_user_hash: suspended.alt_pre_user_hash,
+            declared_tools: suspended.declared_tools,
+            last_context_used: suspended.last_context_used,
+            total_prompt_tokens: self
+                .total_prompt_tokens
+                .saturating_add(suspended.step_prompt_tokens),
+            total_cached_read_tokens: self
+                .total_cached_read_tokens
+                .saturating_add(suspended.step_cached_read_tokens),
+            last_response_id: suspended.last_response_id,
+            accumulated_messages: suspended.accumulated_messages,
+            message_count: suspended.message_count,
+            pre_step_message_count: suspended.pre_step_message_count,
+            turn_count: self.turn_count,
+            created_at_unix_ms: self.created_at_unix_ms,
+            last_active_unix_ms: now_ms,
+            retained_bytes: 0,
+        };
+        self.pool.park_suspended(entry, &*self.backend);
     }
 
     /// Disarms abort-on-drop and returns the healthy session to `pool` for future turns.
@@ -968,6 +1689,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             session_id: self.session_id.clone(),
             tool_nonce: Arc::clone(&self.tool_nonce),
             model_id: self.model_id.clone(),
+            mcp_handle: self.mcp_handle.take(),
             post_turn_hash: committed.post_turn_hash,
             alt_post_turn_hash: committed.alt_post_turn_hash,
             post_turn_dialogue_hash: committed.post_turn_dialogue_hash,
