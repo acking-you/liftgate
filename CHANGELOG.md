@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Adaptive MCP tool virtualization (`<= 24` Eager-safe slots), namespace action hubs & 0-RTT gateway-local `search_client_tools` (`docs/mcp-tool-virtualization.md`)**:
+  - Adapted loopback MCP tool partitioning (`partition_tools_for_mcp`) to `agy acp`'s 50-tool Eager ceiling (which otherwise evicts the largest tools by `schema_bytes` such as `exec`, `exec_command`, and `spawn_agent` when large connector packs are attached): sessions with `<= 20` tools and `<= 22 KiB` non-orchestrator wire schemas stay 1:1 passthrough, while larger catalogs keep core coding tools (`exec`, `wait`, `REPL`, `exec_command`, `write_stdin`, `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `view_image`, etc.) 1:1 direct and collapse connector families into compact `mcp_lg_ns__<namespace>` hubs (`~550 B` each) plus `mcp_lg_call_client_tool`.
+  - Added zero-round-trip gateway-local `mcp_lg_search_client_tools` and required-parameter preflight self-healing inside `run_mcp_session_driver`'s `'substep_loop`, resolving lexical/namespace/exact-name schema + Code Mode TypeScript lookups and missing-parameter diagnostics in-memory (`< 0.1 ms`) without ending or polluting client HTTP/SSE turns.
+  - Synced mid-session tool mutations into `McpSessionHandle`'s `RwLock` routing table on warm and `mcp-cont` turns (`build_mcp_virtualized_tools_delta_xml_with_spill`), eliminating multi-kilobyte `<client_tools_update>` JSON schema spills.
+
+### Fixed
+- **Code Mode child TypeScript footer misclassification (`split_code_mode_ts_declaration`)**:
+  - Excluded trailing `exec tool declaration:\n```ts\ndeclare const tools: ...` footers appended by Codex `features.code_mode_host=true` from `is_code_mode_orchestrator_tool` so ordinary nested tools no longer masquerade as `tier = 0` orchestrators or duplicate TypeScript signatures on wire MCP descriptions while keeping extracted signatures queryable via `search_client_tools`.
+
 ## [0.2.7] - 2026-11-23
 
 ### Added

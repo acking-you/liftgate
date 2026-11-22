@@ -833,8 +833,28 @@ pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
         && (tool.name == "exec" || tool.name.ends_with(".exec"))
 }
 
+/// Splits a tool description into its primary prose and an optional trailing Codex Code Mode
+/// TypeScript signature footer (`exec tool declaration:\n```ts\ndeclare const tools: ...`).
+#[must_use]
+pub fn split_code_mode_ts_declaration(raw_desc: &str) -> (&str, Option<&str>) {
+    let trimmed = raw_desc.trim();
+    if trimmed.starts_with("exec tool declaration:") {
+        return ("", Some(trimmed));
+    }
+    if let Some(idx) = trimmed.find("\nexec tool declaration:")
+        && let Some((prose, footer)) = trimmed.split_at_checked(idx)
+    {
+        return (prose.trim_end(), Some(footer.trim()));
+    }
+    (trimmed, None)
+}
+
 /// Returns `true` when `tool` is a Code Mode orchestrator (`exec` custom tool, `REPL`, or TypeScript
 /// `declare const tools` runtime wrapper).
+///
+/// Ordinary nested tools whose descriptions merely carry a trailing `exec tool declaration:`
+/// signature block from Codex `code_mode_host` are excluded so they are not misclassified as
+/// top-tier orchestrators.
 #[must_use]
 pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
     if tool.name == "REPL" {
@@ -844,15 +864,20 @@ pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
         return true;
     }
     tool.description.as_deref().is_some_and(|desc| {
-        desc.contains("declare const tools")
-            || desc.contains("globalThis.tools")
-            || desc.contains("Tool TypeScript declarations:")
-            || desc.contains("// @exec:")
+        let (prose, _) = split_code_mode_ts_declaration(desc);
+        prose.contains("declare const tools")
+            || prose.contains("globalThis.tools")
+            || prose.contains("Tool TypeScript declarations:")
+            || prose.contains("// @exec:")
     })
 }
 
 /// Compacts a tool description for native loopback MCP `tools/list` while preserving full
 /// Code Mode TypeScript `declare const tools` declarations up to `max_bytes` (spilling to disk if larger).
+///
+/// For non-orchestrator tools, redundant trailing `exec tool declaration:` TypeScript blocks are
+/// stripped from wire `tools/list` prose because the MCP wire entry already carries `inputSchema`
+/// (and the extracted TypeScript signature remains queryable via `search_client_tools`).
 #[must_use]
 pub fn compact_mcp_tool_description<S: TruncationSpillSink>(
     tool: &CanonicalToolSpec,
@@ -867,11 +892,13 @@ pub fn compact_mcp_tool_description<S: TruncationSpillSink>(
         let (desc, _) = compact_code_mode_tool_description(raw_desc, max_bytes, spill);
         (!desc.is_empty()).then_some(desc)
     } else {
-        let collapsed = collapse_tool_description(raw_desc);
+        let (prose, _) = split_code_mode_ts_declaration(raw_desc);
+        let source_desc = if prose.is_empty() { raw_desc } else { prose };
+        let collapsed = collapse_tool_description(source_desc);
         let bounded = if collapsed.len() > max_bytes {
             truncate_head_tail_lines_from_source(
                 &collapsed,
-                raw_desc,
+                source_desc,
                 None,
                 max_bytes,
                 "MCP tool description",
@@ -1050,12 +1077,17 @@ pub struct McpBridgePromptSpec<'a> {
     pub bridged_tools: &'a [(String, String)],
     /// Freeform `Custom` tools (e.g. `apply_patch`) or overflow `#65+` tools invoked via XML.
     pub xml_tools: &'a [CanonicalToolSpec],
+    /// `(hub_mcp_name, namespace_label, action_count)` summaries when adaptive namespace
+    /// virtualization (`mcp_lg_ns__*`) is active on the `lg` loopback MCP server.
+    pub virtualized_hubs: &'a [(String, String, usize)],
+    /// Whether `mcp_lg_search_client_tools` and `mcp_lg_call_client_tool` are mounted on `lg`.
+    pub has_virtualized_dispatch: bool,
 }
 
 /// Builds `_meta.antigravity.systemPrompt.append` for sessions using the Hybrid Loopback MCP Tool
 /// Bridge + XML Coexistence architecture.
 ///
-/// When `mcp_spec.bridged_tools` is empty, delegates directly to
+/// When both `mcp_spec.bridged_tools` is empty and `has_virtualized_dispatch` is `false`, delegates directly to
 /// [`build_session_system_append_with_spill_sink`] so non-MCP turns remain 100% byte-identical.
 #[must_use]
 pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSink>(
@@ -1065,7 +1097,7 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
     tool_nonce: &str,
     spill: &mut S,
 ) -> (String, Option<String>) {
-    if mcp_spec.bridged_tools.is_empty() {
+    if mcp_spec.bridged_tools.is_empty() && !mcp_spec.has_virtualized_dispatch {
         return build_session_system_append_with_spill_sink(
             caller_system,
             mcp_spec.xml_tools,
@@ -1115,6 +1147,36 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         header_rules.push_str("- Native client tool name aliases: ");
         header_rules.push_str(&bounded_aliases);
         header_rules.push_str(".\n");
+    }
+
+    if mcp_spec.has_virtualized_dispatch {
+        if !mcp_spec.virtualized_hubs.is_empty() {
+            let hub_list: Vec<String> = mcp_spec
+                .virtualized_hubs
+                .iter()
+                .map(|(mcp_name, ns_label, count)| {
+                    format!("`mcp_lg_{mcp_name}` ({ns_label}: {count} actions)")
+                })
+                .collect();
+            let joined_hubs = hub_list.join(", ");
+            let bounded_hubs = if joined_hubs.len() > 1_200 {
+                compact_middle_chars(&joined_hubs, 1_200).0
+            } else {
+                joined_hubs
+            };
+            header_rules.push_str("- Virtualized client tool hubs: ");
+            header_rules.push_str(&bounded_hubs);
+            header_rules.push_str(".\n");
+        }
+        header_rules.push_str(
+            "- Virtualized tool discovery & dispatch: grouped client tool families are invoked via \
+             `mcp_lg_ns__<namespace>` (`{\"action\": \"<action_name>\", \"args\": { ... }}`) and \
+             standalone or dynamically added tools via `mcp_lg_call_client_tool` \
+             (`{\"name\": \"<exact_tool_name>\", \"arguments\": { ... }}`). Call \
+             `mcp_lg_search_client_tools` FIRST (zero-round-trip local lookup) whenever you need \
+             exact action names, required parameter schemas, or Code Mode `tools.*` TypeScript \
+             declarations before calling an unfamiliar hub action.\n",
+        );
     }
 
     if web_cfg.force_native_web_search {
@@ -1985,6 +2047,94 @@ pub fn build_client_tools_delta_xml_with_spill<S: TruncationSpillSink>(
             spill,
         );
     }
+    out.push_str("</client_tools_update>\n");
+    Some(out)
+}
+
+/// Builds a compact `<client_tools_update>` block for warm MCP sessions where virtualized
+/// dispatch (`mcp_lg_search_client_tools` + `mcp_lg_call_client_tool`) is active, avoiding
+/// multi-kilobyte JSON schema dumps when standard `Function` tools are added or updated mid-session.
+#[must_use]
+pub fn build_mcp_virtualized_tools_delta_xml_with_spill<S: TruncationSpillSink>(
+    prev_tools: &[CanonicalToolSpec],
+    next_tools: &[CanonicalToolSpec],
+    tool_nonce: &str,
+    spill: &mut S,
+) -> Option<String> {
+    if prev_tools == next_tools {
+        return None;
+    }
+    let mut out = String::with_capacity(512);
+    out.push_str("<client_tools_update>\n");
+    if next_tools.is_empty() {
+        out.push_str(&format!(
+            "External `<client_tools>` are disabled for this turn; respond in plain text without emitting any `<agy_tool_call_{tool_nonce}>` XML blocks or invoking any `mcp_lg_*` tool calls.\n"
+        ));
+        out.push_str("</client_tools_update>\n");
+        return Some(out);
+    }
+
+    let removed_names: Vec<&str> = prev_tools
+        .iter()
+        .filter(|pt| !next_tools.iter().any(|nt| nt.name == pt.name))
+        .map(|pt| pt.name.as_str())
+        .collect();
+    if !removed_names.is_empty() {
+        out.push_str("Removed client tools (no longer available): ");
+        let joined = removed_names.join(", ");
+        if joined.len() > 2_000 {
+            out.push_str(&truncate_head_tail_lines_with_spill(
+                &joined,
+                2_000,
+                "removed client tools",
+                spill,
+            ));
+        } else {
+            out.push_str(&joined);
+        }
+        out.push('\n');
+    }
+
+    let mut added_mcp_names: Vec<&str> = Vec::new();
+    let mut added_xml_custom: Vec<&CanonicalToolSpec> = Vec::new();
+    for nt in next_tools {
+        if prev_tools.iter().any(|pt| pt == nt) {
+            continue;
+        }
+        if matches!(nt.kind, CanonicalToolKind::Custom { .. }) && !is_code_mode_custom_exec(nt) {
+            added_xml_custom.push(nt);
+        } else {
+            added_mcp_names.push(nt.name.as_str());
+        }
+    }
+
+    if !added_mcp_names.is_empty() {
+        out.push_str(
+            "Added/updated native client tools (inspect schemas via `mcp_lg_search_client_tools` and invoke via `mcp_lg_call_client_tool` or matching `mcp_lg_ns__*` hub): ",
+        );
+        let joined = added_mcp_names.join(", ");
+        if joined.len() > 2_000 {
+            out.push_str(&truncate_head_tail_lines_with_spill(
+                &joined,
+                2_000,
+                "added native client tools",
+                spill,
+            ));
+        } else {
+            out.push_str(&joined);
+        }
+        out.push('\n');
+    }
+
+    if !added_xml_custom.is_empty() {
+        let open_tag = format!("<agy_tool_call_{tool_nonce}>");
+        let close_tag = format!("</agy_tool_call_{tool_nonce}>");
+        out.push_str(&format!(
+            "Added/updated XML-only custom tools (invoke via `{open_tag}...{close_tag}`):\n"
+        ));
+        render_bounded_tools_list(&added_xml_custom, 4_096, &mut out, spill);
+    }
+
     out.push_str("</client_tools_update>\n");
     Some(out)
 }

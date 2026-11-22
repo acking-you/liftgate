@@ -8965,3 +8965,386 @@ async fn warm_mcp_turn_rejects_disabled_or_removed_tools_with_is_error_and_compl
         prompts[2].text_joined
     );
 }
+
+#[tokio::test]
+async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_heal_and_dynamic_sync()
+ {
+    let final_sum = AcpUsage {
+        input_tokens: 18_500,
+        output_tokens: 920,
+        cached_read_tokens: 46_000,
+        cached_write_tokens: 0,
+        thought_tokens: 210,
+        total_tokens: 65_420,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            // Substep 1 (0-RTT inside Turn 1): search `github` namespace for `merge_pr_42`
+            McpMockStep::CallTool {
+                usage_used: 12_000,
+                thoughts: vec!["Searching GitHub hub for merge_pr_42 schema.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({
+                    "namespace": "github",
+                    "query": "merge_pr_42"
+                }),
+                expect_reply_substrings: vec![
+                    "mcp__codex_apps__github._merge_pr_42",
+                    "repository_full_name",
+                    "declare const tools:",
+                ],
+            },
+            // Substep 2 (0-RTT preflight self-heal inside Turn 1): pass wrong key `repo_full_name`
+            McpMockStep::CallTool {
+                usage_used: 12_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__github".to_owned(),
+                arguments: json!({
+                    "action": "merge_pr_42",
+                    "args": { "repo_full_name": "acking-you/liftgate", "pr_number": 42 }
+                }),
+                expect_reply_substrings: vec![
+                    "Missing required parameter(s)",
+                    "repository_full_name",
+                ],
+            },
+            // Substep 3 (Suspends Turn 1 -> emits `mcp__codex_apps__github._merge_pr_42` over SSE)
+            McpMockStep::CallTool {
+                usage_used: 12_900,
+                thoughts: vec!["Retrying with exact required parameter.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "ns__github".to_owned(),
+                arguments: json!({
+                    "action": "_merge_pr_42",
+                    "args": { "repository_full_name": "acking-you/liftgate", "pr_number": 42 },
+                    "toolSummary": "Merge PR #42"
+                }),
+                expect_reply_substrings: vec!["merged_sha=deadbeef"],
+            },
+            // Substep 4 (0-RTT inside Turn 2): search newly added dynamic `slack` tool
+            McpMockStep::CallTool {
+                usage_used: 14_100,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({ "query": "slack post_release" }),
+                expect_reply_substrings: vec!["mcp__slack__post_release", "call_client_tool"],
+            },
+            // Substep 5 (Suspends Turn 2 -> emits dynamically added `mcp__slack__post_release`)
+            McpMockStep::CallTool {
+                usage_used: 14_600,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "call_client_tool".to_owned(),
+                arguments: json!({
+                    "name": "mcp__slack__post_release",
+                    "arguments": { "channel": "#releases", "text": "Merged #42" }
+                }),
+                expect_reply_substrings: vec!["slack_ok=true"],
+            },
+            // Substep 6 (Suspends Turn 3 -> invokes direct Code Mode `exec` custom JS tool!)
+            McpMockStep::CallTool {
+                usage_used: 15_200,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "exec".to_owned(),
+                arguments: json!({
+                    "code": "const out = await tools.exec_command({ cmd: 'git status -sb' }); text(out.output);",
+                    "toolSummary": "Check git status"
+                }),
+                expect_reply_substrings: vec!["## feat/mcp-tool-virtualization"],
+            },
+            // Substep 7 (Completes Turn 4)
+            McpMockStep::FinalReply {
+                usage_used: 16_000,
+                thoughts: vec!["All tasks complete.".to_owned()],
+                chunks_template: vec![
+                    "PR #42 merged, Slack notified, and branch clean.".to_owned(),
+                ],
+                final_usage: final_sum,
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let ts_footer = "\n\nexec tool declaration:\n```ts\ndeclare const tools: { helper(args: { x: string }): Promise<unknown>; };\n```";
+    let mut tools_vec = vec![
+        json!({
+            "type": "custom",
+            "name": "exec",
+            "description": "Execute JavaScript in Code Mode. globalThis.tools exposes nested tools."
+        }),
+        json!({
+            "type": "function",
+            "name": "wait",
+            "description": format!("Wait on running exec cell.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "cell_id": { "type": "string" } },
+                "required": ["cell_id"]
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "exec_command",
+            "description": format!("Execute command in PTY.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        }),
+        json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Patch files with raw freeform grammar."
+        }),
+    ];
+    for i in 0..85 {
+        tools_vec.push(json!({
+            "type": "function",
+            "name": format!("mcp__codex_apps__github._merge_pr_{i:02}"),
+            "description": format!("Merge pull request variant #{i}.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repository_full_name": { "type": "string" },
+                    "pr_number": { "type": "integer" }
+                },
+                "required": ["repository_full_name", "pr_number"]
+            }
+        }));
+    }
+    for i in 0..40 {
+        tools_vec.push(json!({
+            "type": "function",
+            "name": format!("mcp__codex_tui.thread_op_{i:02}"),
+            "description": format!("Codex TUI thread operation #{i}.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "thread_id": { "type": "string" } },
+                "required": ["thread_id"]
+            }
+        }));
+    }
+    assert_eq!(tools_vec.len(), 129);
+
+    // Turn 1: Cold request with 129 tools -> 0-RTT search + 0-RTT preflight self-heal -> suspends on `_merge_pr_42`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "instructions": "Merge PR #42 and announce release.",
+                        "tools": tools_vec,
+                        "input": "Please merge PR #42, post to Slack, and verify git status."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r1_events = parse_sse_events(&r1.into_body().collect().await.unwrap().to_bytes());
+    let r1_done = &r1_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_1 = r1_done["id"].as_str().unwrap().to_owned();
+    let r1_outputs = r1_done["output"].as_array().unwrap();
+    let r1_fcs: Vec<&Value> = r1_outputs
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .collect();
+    // Neither `search_client_tools` nor the failed preflight call may leak to the caller!
+    assert_eq!(r1_fcs.len(), 1);
+    assert_eq!(r1_fcs[0]["namespace"], "mcp__codex_apps__github");
+    assert_eq!(r1_fcs[0]["name"], "_merge_pr_42");
+    let fc1_args: Value = serde_json::from_str(r1_fcs[0]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        fc1_args,
+        json!({ "repository_full_name": "acking-you/liftgate", "pr_number": 42 })
+    );
+    let call_id_1 = r1_fcs[0]["call_id"].as_str().unwrap().to_owned();
+
+    // Cold turn outbound prompt must NOT carry any overflow `<client_tools_update>` spill!
+    {
+        let prompts = backend.recorded_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            !prompts[0].text_joined.contains("<client_tools_update>"),
+            "cold virtualized turn should not spill overflow XML tools: {}",
+            prompts[0].text_joined
+        );
+    }
+
+    // Turn 2: Resume `mcp-cont` AND dynamically add `mcp__slack__post_release` mid-session!
+    let mut tools_turn_2 = tools_vec.clone();
+    tools_turn_2.push(json!({
+        "type": "function",
+        "name": "mcp__slack__post_release",
+        "description": "Post release announcement to Slack channel.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "required": ["channel", "text"]
+        }
+    }));
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_1,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_1,
+                            "output": "merged_sha=deadbeef"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let r2_events = parse_sse_events(&r2.into_body().collect().await.unwrap().to_bytes());
+    let r2_done = &r2_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_2 = r2_done["id"].as_str().unwrap().to_owned();
+    let fc_2 = r2_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected dynamic slack function_call");
+    assert_eq!(fc_2["name"], "mcp__slack__post_release");
+    let call_id_2 = fc_2["call_id"].as_str().unwrap().to_owned();
+
+    // Turn 3: Resume `mcp-cont` -> receives direct Code Mode `exec` `custom_tool_call`!
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_2,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_2,
+                            "output": "slack_ok=true"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let r3_events = parse_sse_events(&r3.into_body().collect().await.unwrap().to_bytes());
+    let r3_done = &r3_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_3 = r3_done["id"].as_str().unwrap().to_owned();
+    let custom_3 = r3_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "custom_tool_call")
+        .expect("expected direct exec custom_tool_call");
+    assert_eq!(custom_3["name"], "exec");
+    assert_eq!(
+        custom_3["input"],
+        "const out = await tools.exec_command({ cmd: 'git status -sb' }); text(out.output);"
+    );
+    let call_id_3 = custom_3["call_id"].as_str().unwrap().to_owned();
+
+    // Turn 4: Resume `mcp-cont` with `custom_tool_call_output` -> Final answer!
+    let r4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_3,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": call_id_3,
+                            "output": "## feat/mcp-tool-virtualization"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+    let r4_events = parse_sse_events(&r4.into_body().collect().await.unwrap().to_bytes());
+    let r4_done = &r4_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let r4_msg = r4_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("expected final assistant message item");
+    assert_eq!(
+        r4_msg["content"][0]["text"],
+        "PR #42 merged, Slack notified, and branch clean."
+    );
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 3);
+}

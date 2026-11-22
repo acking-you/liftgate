@@ -219,9 +219,9 @@ matching warm session before retiring it.
 By default (`--mcp-tool-bridge`, `AGY_MCP_TOOL_BRIDGE=true`, or
 `mcp_tool_bridge: true` in `~/.liftgate/settings.json`), Liftgate runs an
 authenticated loopback-only (`127.0.0.1`) HTTP MCP server with a per-session
-256-bit token and registers the caller's Code Mode orchestrators (`exec`,
-`wait`, `REPL`) plus up to 64 prioritized JSON `Function` tools natively on
-each `agy acp` session:
+256-bit token and mounts caller tools onto each `agy acp` session within an
+Eager-safe budget (`<= 24` MCP slots) so `agy acp`'s 50-tool Eager ceiling never
+evicts large coding tools (`exec`, `exec_command`, `Bash`):
 
 - **Single-prompt native suspension**: when the model invokes a bridged client
   tool, Liftgate parks the live `session/prompt` turn on the loopback MCP
@@ -231,10 +231,21 @@ each `agy acp` session:
   (whether via stateful `previous_response_id` or stateless `input` / `messages`
   arrays)—keeping multi-step tool cascades inside one `session/prompt` turn for
   consistent ~93%+ prompt KV cache hits without replica-sharding misses.
+- **Adaptive namespace hubs & 0-RTT `search_client_tools`**: small sessions
+  (`<= 20` tools and `<= 22 KiB` wire schemas) expose every tool 1:1. When large
+  connector packs are attached (e.g. 128+ tools across GitHub, TUI, and
+  multi-agent plugins), core coding tools (`exec`, `wait`, `REPL`,
+  `exec_command`, `write_stdin`, `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`)
+  stay 1:1 while connector families collapse into `mcp_lg_ns__<namespace>` hubs
+  paired with `mcp_lg_call_client_tool` and gateway-local
+  `mcp_lg_search_client_tools` (resolved in-memory in `< 0.1 ms` with zero
+  client round-trips and automatic required-parameter preflight self-healing;
+  see [MCP tool virtualization](mcp-tool-virtualization.md)).
 - **Seamless XML coexistence & clean unwind**: freeform `Custom` tools (such as
-  raw multi-line `apply_patch` diffs), tools beyond the 64-tool eager cap, and
-  mid-session `ToolSearch` additions automatically use the coexisting
-  `<agy_tool_call_...>` XML channel in the same session. User `Esc` interrupts,
+  raw multi-line `apply_patch` diffs) coexist seamlessly on the
+  `<agy_tool_call_...>` XML channel in the same session, while mid-session
+  `ToolSearch` / connector additions sync into the live in-memory MCP routing
+  table without multi-kilobyte XML schema dumps. User `Esc` interrupts,
   new user messages without tool results, mid-session model switches, and
   `/compact` unwind suspended turns non-destructively via `session/cancel` so
   the warm session stays reusable.

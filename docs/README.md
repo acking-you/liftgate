@@ -16,6 +16,7 @@ must keep. Start with the [usage guide](usage.md); contributor rules are in
 | Page | Covers |
 | --- | --- |
 | [Architecture](architecture.md) | why ACP, the request path, session reuse, model routing, process supervision, workspace layout |
+| [MCP tool virtualization](mcp-tool-virtualization.md) | `agy acp` Eager tool budget adaptation, namespace action hubs, 0-RTT gateway-local `search_client_tools`, preflight self-healing |
 
 ## Project
 
