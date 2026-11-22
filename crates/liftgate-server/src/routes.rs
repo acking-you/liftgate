@@ -24,11 +24,11 @@ use liftgate_types::{
     canonical::{extract_markdown_links, extract_search_query_hint},
     config::{CacheHitThresholdBps, LowCacheRecordLimit},
     openai::{
-        CreateResponseRequest, LocalShellAction, ModelCard, ModelListResponse,
-        OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError, ResponseObject,
-        ResponseOutputItem, ResponseTextFormatConfig, ResponsesUsage, WebSearchAction,
-        WebSearchSource, build_codex_model_catalog_with_tool_mode, normalize_responses_request,
-        split_namespaced_tool_name,
+        CreateResponseRequest, LocalShellAction, ModelCard, ModelChatMetadata, ModelListResponse,
+        ModelModalities, OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError,
+        ResponseObject, ResponseOutputItem, ResponseTextFormatConfig, ResponsesUsage,
+        WebSearchAction, WebSearchSource, build_codex_model_catalog_with_tool_mode,
+        normalize_responses_request, split_namespaced_tool_name,
     },
     session_key::{INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL},
     telemetry::{GatewayTelemetrySnapshot, TaskProtocol},
@@ -375,6 +375,12 @@ fn build_model_card(id: String, display_name: String, created: u64) -> ModelCard
         auto_compact_token_limit,
         max_input_tokens: context_window,
         max_output_tokens: 65_536,
+        chat: ModelChatMetadata {
+            modalities: ModelModalities {
+                input: vec!["text", "image"],
+                output: vec!["text"],
+            },
+        },
     }
 }
 
