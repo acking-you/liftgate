@@ -43,8 +43,8 @@ use crate::{
     error::{AcpError, GatewayError},
     mcp_bridge::{
         ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LocalReplyKind, LoopbackMcpServer,
-        McpContentItem, McpSessionHandle, McpToolCallReply, ResolvedMcpIncoming,
-        partition_tools_for_mcp, strip_call_prefix,
+        McpContentItem, McpSessionHandle, McpToolCallReply, ProtocolHint, ResolvedMcpIncoming,
+        partition_tools_for_mcp_with_hint, strip_call_prefix,
     },
     session_pool::{
         CommittedSessionTurn, IdleCheckoutGuard, IdleSessionEntry, McpDriverCommand,
@@ -804,7 +804,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             && !req.client_tools.is_empty()
             && let Some(ref mcp_srv) = cfg.mcp_server
         {
-            let catalog = partition_tools_for_mcp(&req.client_tools, &mut spill_store);
+            let proto_hint = match protocol {
+                TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
+                TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
+            };
+            let catalog =
+                partition_tools_for_mcp_with_hint(proto_hint, &req.client_tools, &mut spill_store);
             if catalog.is_empty() {
                 build_session_system_append_with_spill_sink(
                     req.system_instructions.as_deref(),
@@ -2994,111 +2999,11 @@ fn normalize_emitted_tool_arguments(
     serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_owned())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExpectedJsonContainer {
-    Array,
-    Object,
-}
-
-fn schema_declares_container(prop_schema: &serde_json::Value) -> Option<ExpectedJsonContainer> {
-    if let Some(ty) = prop_schema.get("type") {
-        match ty {
-            serde_json::Value::String(s) => match s.as_str() {
-                "array" => return Some(ExpectedJsonContainer::Array),
-                "object" => return Some(ExpectedJsonContainer::Object),
-                _ => {}
-            },
-            serde_json::Value::Array(arr) => {
-                let has_string = arr.iter().any(|v| v.as_str() == Some("string"));
-                if !has_string {
-                    if arr.iter().any(|v| v.as_str() == Some("array")) {
-                        return Some(ExpectedJsonContainer::Array);
-                    }
-                    if arr.iter().any(|v| v.as_str() == Some("object")) {
-                        return Some(ExpectedJsonContainer::Object);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for union_key in ["anyOf", "oneOf"] {
-        if let Some(serde_json::Value::Array(branches)) = prop_schema.get(union_key) {
-            let allows_string = branches
-                .iter()
-                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("string"));
-            if !allows_string {
-                for branch in branches {
-                    if let Some(kind) = schema_declares_container(branch) {
-                        return Some(kind);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Unwraps JSON-stringified `array` or `object` fields (e.g. `"edits": "[{\"path\":\"a.rs\"}]"`
-/// emitted by Gemini/Antigravity on nested tool calls) ONLY when the client tool's JSON Schema
-/// explicitly declares that property as an `array` or `object` (and not a `string`).
-pub(crate) fn coerce_stringified_container_fields(
+fn coerce_stringified_container_fields(
     map: &mut serde_json::Map<String, serde_json::Value>,
     parameters_json: &str,
 ) -> bool {
-    let has_candidate = map.values().any(|v| {
-        v.as_str().is_some_and(|s| {
-            let t = s.trim();
-            (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'))
-        })
-    });
-    if !has_candidate {
-        return false;
-    }
-
-    let Ok(schema) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
-        return false;
-    };
-    let Some(props) = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-
-    let mut mutated = false;
-    for (prop_name, prop_schema) in props {
-        let Some(expected) = schema_declares_container(prop_schema) else {
-            continue;
-        };
-        let Some(slot) = map.get_mut(prop_name) else {
-            continue;
-        };
-        let Some(raw_str) = slot.as_str() else {
-            continue;
-        };
-        let trimmed = raw_str.trim();
-        match expected {
-            ExpectedJsonContainer::Array if trimmed.starts_with('[') && trimmed.ends_with(']') => {
-                if let Ok(parsed @ serde_json::Value::Array(_)) =
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    *slot = parsed;
-                    mutated = true;
-                }
-            }
-            ExpectedJsonContainer::Object if trimmed.starts_with('{') && trimmed.ends_with('}') => {
-                if let Ok(parsed @ serde_json::Value::Object(_)) =
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    *slot = parsed;
-                    mutated = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    mutated
+    liftgate_tool_virtualizer::coerce_stringified_container_fields(map, parameters_json)
 }
 
 fn single_required_string_param(parameters_json: &str) -> Option<String> {

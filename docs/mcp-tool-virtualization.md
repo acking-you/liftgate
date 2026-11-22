@@ -50,6 +50,15 @@ Caller Tool Catalog (e.g. 128 tools, 183.7 KB)
         • mcp_lg_search_client_tools (in-memory lexical + exact-name schema & TS lookup)
 ```
 
+### Zero-Cost `HarnessToolProfile` Trait & Static Dispatch (`crates/liftgate-tool-virtualizer`)
+
+All virtualization planning, harness adaptation, 0-RTT lexical search, and schema preflight validation live in the standalone, zero-I/O crate **`crates/liftgate-tool-virtualizer`** (`liftgate_tool_virtualizer` → `liftgate_types`, zero `tokio`/`axum` dependencies). Each coding harness is modeled as a zero-sized unit struct (`size_of::<P>() == 0`) implementing `HarnessToolProfile: Copy + Default + Send + Sync + 'static`, monomorphized directly into `plan_virtualization<P, S>`:
+
+- **`CodexToolProfile` (`"codex"`)**: Prioritizes Code Mode (`exec` + `wait`) at Tier 0 and PTY/workspace primitives (`exec_command`, `write_stdin`, `local_shell`/`shell`, `view_image`, `update_plan`, `tool_search`) at Tier 1; strips `mcp__codex_apps__` cleanly (`ns__github`, `ns__linear`); unifies dotted (`multi_agent_v1.*`, `clock.*`) and top-level un-namespaced Codex families (`spawn_agent`..`close_agent`, `request_user_input*`, `get_goal*`, `js_repl*`); and dehydrates trailing `exec tool declaration:` TypeScript footers out of wire `tools/list` while preserving them in 0-RTT search.
+- **`ClaudeCodeToolProfile` (`"claude-code"`)**: Prioritizes `REPL` (Tier 0) and `Bash`, `Read`, `Edit`, `Write`, `MultiEdit`, `Grep`, `Glob`, `LS`, `Agent`/`Task`, `LSP`, `NotebookEdit`, `ToolSearch` (Tier 1); groups underscore-free PascalCase built-in families into inline-`enum` hubs (`ns__tasks`, `ns__workflow`, `ns__teams`, `ns__schedule`, `ns__mcp_resources`); deduplicates repeated plugin server slugs (`mcp__plugin_playwright_playwright__*` → `ns__playwright`) and `mcp__claude_ai_*` cloud connectors (`ns__linear`); and ranks `AskUserQuestion`, `Skill`, `SlashCommand`, and `Config` first for **Slack-Slot Backfill** into 1:1 Direct Eager slots.
+- **`GenericToolProfile` (`"generic"`)**: Fallback profile supporting `mcp__<server>__<tool>`, `mcp__<server>.<tool>`, repeated single-underscore `mcp__<server>_<tool>` servers, dotted namespaces, and case-insensitive core coding primitives.
+- **Closed-set static dispatch & warm rebuild**: `DetectedHarness` (`Codex` | `ClaudeCode` | `Generic`) dispatches exhaustively without `dyn` trait objects, while `McpRoutingTable` stores a monomorphized `fn` pointer (`build_routing_table_for_profile::<P>`) so dynamic warm-turn tool updates re-index under the exact same zero-cost profile `P`.
+
 ### End-to-End Execution Flow
 
 ```text

@@ -8,9 +8,10 @@ repository.workspace = true
 
 [features]
 default = []
-test-support = ["liftgate-types/test-support"]
+test-support = ["liftgate-types/test-support", "liftgate-tool-virtualizer/test-support"]
 
 [dependencies]
+liftgate-tool-virtualizer = { workspace = true }
 liftgate-types = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }

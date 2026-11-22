@@ -16,7 +16,7 @@ Rules for changing this repository.
 ## Architecture
 
 - One-way workspace dependency graph (`resolver = "3"`, `edition = "2024"`, `rust-version = "1.100.0"`):
-  `liftgate` (CLI/TUI binaries `liftgate`/`lg`) → `liftgate-core` (shared control plane: daemon lifecycle, embedded UI, config sync, terminal/desktop harness launchers, `agy`/proxy management, doctor & self-upgrade) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
+  `liftgate` (CLI/TUI binaries `liftgate`/`lg`) → `liftgate-core` (shared control plane: daemon lifecycle, embedded UI, config sync, terminal/desktop harness launchers, `agy`/proxy management, doctor & self-upgrade) → `liftgate-server` (HTTP/SSE, ACP transport, session pool, process-tree supervision, SSRF-safe web fetch, telemetry) → `liftgate-tool-virtualizer` (zero-cost `HarnessToolProfile` 3-tier MCP tool virtualizer, Codex & Claude Code ZST adapters, slack-slot backfill, 0-RTT search & preflight; zero async runtime, HTTP or I/O dependencies) → `liftgate-types` (pure protocol, wire & config types; zero async runtime, HTTP or I/O dependencies).
 - `web/` is the companion real-time observability dashboard (TypeScript + Bun + Vite + React 19 + Tailwind CSS v4 + shadcn/ui). Release builds embed `web/dist` via `crates/liftgate-core/build.rs` so `liftgate` serves it at `/`.
 - Cross-platform child supervision (`crates/liftgate-server/src/job.rs`): Win32 Job Object (`KILL_ON_JOB_CLOSE`) on Windows; `process_group(0)` + `killpg` on Unix plus `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux, backed by a chained panic hook.
 

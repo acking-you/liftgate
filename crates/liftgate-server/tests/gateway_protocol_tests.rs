@@ -9348,3 +9348,340 @@ async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_he
     assert_eq!(pool_snap.total_sessions_created, 1);
     assert_eq!(pool_snap.mcp_continuations, 3);
 }
+
+#[tokio::test]
+async fn anthropic_messages_claude_code_profile_virtualizes_pascal_families_plugins_and_backfills_standalones()
+ {
+    let final_usage = AcpUsage {
+        input_tokens: 14_200,
+        output_tokens: 610,
+        cached_read_tokens: 51_000,
+        cached_write_tokens: 0,
+        thought_tokens: 180,
+        total_tokens: 65_810,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 11_000,
+                thoughts: vec!["Creating task and loading skill.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "ns__tasks".to_owned(),
+                arguments: json!({
+                    "action": "TaskCreate",
+                    "args": { "subject": "Audit Playwright E2E", "description": "Check login selector" },
+                    "toolSummary": "Create tracking task"
+                }),
+                expect_reply_substrings: vec!["task_id=task-1"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 12_100,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Skill".to_owned(),
+                arguments: json!({
+                    "skill": "chrome-devtools",
+                    "toolSummary": "Load browser skill"
+                }),
+                expect_reply_substrings: vec!["skill_loaded=true"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 12_800,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({
+                    "namespace": "playwright",
+                    "query": "browser_op_07"
+                }),
+                expect_reply_substrings: vec![
+                    "mcp__plugin_playwright_playwright__browser_op_07",
+                    "ns__playwright",
+                ],
+            },
+            McpMockStep::CallTool {
+                usage_used: 13_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__playwright".to_owned(),
+                arguments: json!({
+                    "action": "browser_op_07",
+                    "args": { "selector": "#login-btn" }
+                }),
+                expect_reply_substrings: vec!["clicked=#login-btn"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 14_200,
+                thoughts: vec!["Playwright audit complete.".to_owned()],
+                chunks_template: vec!["Claude Code workflow verified.".to_owned()],
+                final_usage,
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let mut claude_tools = Vec::new();
+    for core in [
+        "REPL",
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "Grep",
+        "Glob",
+        "Agent",
+        "LSP",
+        "ToolSearch",
+    ] {
+        claude_tools.push(json!({
+            "name": core,
+            "description": format!("Claude Code core {core}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } }
+            }
+        }));
+    }
+    claude_tools.push(json!({
+        "name": "TaskCreate",
+        "description": "Create a structured task item.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string" },
+                "description": { "type": "string" }
+            },
+            "required": ["subject", "description"]
+        }
+    }));
+    for family in [
+        "TodoWrite",
+        "TaskUpdate",
+        "TaskList",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "TeamCreate",
+        "SendMessage",
+        "CronCreate",
+        "ScheduleWakeup",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+    ] {
+        claude_tools.push(json!({
+            "name": family,
+            "description": format!("Claude Code built-in {family}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }
+        }));
+    }
+    claude_tools.push(json!({
+        "name": "AskUserQuestion",
+        "description": "Ask user clarifying questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "question": { "type": "string" } },
+            "required": ["question"]
+        }
+    }));
+    claude_tools.push(json!({
+        "name": "Skill",
+        "description": "Load a Claude Code skill.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "skill": { "type": "string" } },
+            "required": ["skill"]
+        }
+    }));
+    for i in 0..25 {
+        claude_tools.push(json!({
+            "name": format!("mcp__plugin_playwright_playwright__browser_op_{i:02}"),
+            "description": format!("Playwright plugin op #{i}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "selector": { "type": "string" } },
+                "required": ["selector"]
+            }
+        }));
+    }
+    for i in 0..34 {
+        claude_tools.push(json!({
+            "name": format!("mcp__claude_ai_Linear__issue_op_{i:02}"),
+            "description": format!("Linear cloud connector op #{i}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "issue_id": { "type": "string" } },
+                "required": ["issue_id"]
+            }
+        }));
+    }
+    assert_eq!(claude_tools.len(), 85);
+
+    let mut messages =
+        vec![json!({ "role": "user", "content": "Audit the login button via Playwright." })];
+    let m1_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m1_resp.status(), StatusCode::OK);
+    let m1_json: Value =
+        serde_json::from_slice(&m1_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu1 = m1_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected TaskCreate tool_use");
+    assert_eq!(tu1["name"], "TaskCreate");
+    assert_eq!(tu1["input"]["subject"], "Audit Playwright E2E");
+    assert!(tu1["input"].get("toolSummary").is_none());
+    let tu1_id = tu1["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m1_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu1_id, "content": "task_id=task-1" }]
+    }));
+    let m2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m2_resp.status(), StatusCode::OK);
+    let m2_json: Value =
+        serde_json::from_slice(&m2_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu2 = m2_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected backfilled Skill tool_use");
+    assert_eq!(tu2["name"], "Skill");
+    assert_eq!(tu2["input"]["skill"], "chrome-devtools");
+    let tu2_id = tu2["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m2_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu2_id, "content": "skill_loaded=true" }]
+    }));
+    let m3_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m3_resp.status(), StatusCode::OK);
+    let m3_json: Value =
+        serde_json::from_slice(&m3_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu3 = m3_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected Playwright plugin tool_use");
+    assert_eq!(
+        tu3["name"],
+        "mcp__plugin_playwright_playwright__browser_op_07"
+    );
+    assert_eq!(tu3["input"]["selector"], "#login-btn");
+    let tu3_id = tu3["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m3_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu3_id, "content": "clicked=#login-btn" }]
+    }));
+    let m4_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m4_resp.status(), StatusCode::OK);
+    let m4_json: Value =
+        serde_json::from_slice(&m4_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let final_text = m4_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "text")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(final_text, "Claude Code workflow verified.");
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 3);
+}

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Zero-cost `liftgate-tool-virtualizer` crate & per-harness `HarnessToolProfile` ZST adapters (`CodexToolProfile`, `ClaudeCodeToolProfile`, `GenericToolProfile`)**:
+  - Extracted the 3-tier MCP tool virtualization planner, 0-RTT lexical search index, and preflight validator into a standalone zero-I/O crate (`crates/liftgate-tool-virtualizer`), parameterized via compile-time monomorphized `HarnessToolProfile` unit structs and closed-enum static dispatch (`DetectedHarness`).
+  - Tailored `CodexToolProfile` (Code Mode `exec`+`wait`, PTY `exec_command`/`write_stdin`, `update_plan`, `mcp__codex_apps__*` stripping, unified top-level & dotted `multi_agent_v1`/`user_input`/`goals`/`mcp_resources` hubs) and `ClaudeCodeToolProfile` (`REPL`+`Bash`/`Read`/`Edit`/`Write`/`Grep`/`Glob`/`Agent`/`LSP` Tier-0/1 direct slots, inline-`enum` hubs for PascalCase `tasks`/`workflow`/`teams`/`schedule`/`mcp_resources` families, `mcp__plugin_<x>_<x>__*` deduplication, and **Slack-Slot Backfill** promoting `AskUserQuestion`/`Skill`/`SlashCommand` into spare Eager slots).
+
 ### Changed
 - **Adaptive MCP tool virtualization (`<= 24` Eager-safe slots), namespace action hubs & 0-RTT gateway-local `search_client_tools` (`docs/mcp-tool-virtualization.md`)**:
   - Adapted loopback MCP tool partitioning (`partition_tools_for_mcp`) to `agy acp`'s 50-tool Eager ceiling (which otherwise evicts the largest tools by `schema_bytes` such as `exec`, `exec_command`, and `spawn_agent` when large connector packs are attached): sessions with `<= 20` tools and `<= 22 KiB` non-orchestrator wire schemas stay 1:1 passthrough, while larger catalogs keep core coding tools (`exec`, `wait`, `REPL`, `exec_command`, `write_stdin`, `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `view_image`, etc.) 1:1 direct and collapse connector families into compact `mcp_lg_ns__<namespace>` hubs (`~550 B` each) plus `mcp_lg_call_client_tool`.

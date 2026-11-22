@@ -806,6 +806,7 @@ dependencies = [
  "dunce",
  "http-body-util",
  "libc",
+ "liftgate-tool-virtualizer",
  "liftgate-types",
  "serde",
  "serde_json",
@@ -817,6 +818,15 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys",
+]
+
+[[package]]
+name = "liftgate-tool-virtualizer"
+version = "0.2.7"
+dependencies = [
+ "liftgate-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
