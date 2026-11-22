@@ -210,6 +210,10 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             get(handle_get_low_cache_hits::<B>),
         )
         .route(
+            "/api/telemetry/low-cache-hits/{task_id}",
+            get(handle_get_low_cache_hit_detail::<B>),
+        )
+        .route(
             "/api/telemetry/low-cache-hits/clear",
             post(handle_clear_low_cache_hits::<B>),
         )
@@ -3435,7 +3439,36 @@ async fn send_sse_frame<T: serde::Serialize>(
 }
 
 fn sse_body_response(rx: mpsc::Receiver<Result<Bytes, Infallible>>) -> Response {
-    let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+    let (hb_tx, hb_rx) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate initial tick so normal fast streams emit zero extra frames.
+        let _ = heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = hb_tx.closed() => break,
+                maybe_frame = rx.recv() => {
+                    match maybe_frame {
+                        Some(frame) => {
+                            if hb_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if hb_tx.send(Ok(Bytes::from_static(b": keep-alive\n\n"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let body = axum::body::Body::from_stream(ReceiverStream::new(hb_rx));
     (
         StatusCode::OK,
         [
@@ -3705,6 +3738,30 @@ async fn handle_get_low_cache_hits<B: AcpBackend>(
     Json(state.telemetry.low_cache_hits()).into_response()
 }
 
+async fn handle_get_low_cache_hit_detail<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    match state.telemetry.low_cache_hit_detail(task_id.trim()) {
+        Some(detail) => Json(detail).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!("low-cache diagnostic record `{}` not found", task_id.trim()),
+                    "type": "not_found_error",
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct ClearLowCachePayload {
     #[serde(default)]
@@ -3761,6 +3818,8 @@ struct CacheConfigUpdatePayload {
     low_cache_threshold_bps: Option<u16>,
     #[serde(default)]
     low_cache_threshold_pct: Option<u8>,
+    #[serde(default)]
+    capture_request_details: Option<bool>,
 }
 
 async fn handle_set_cache_config<B: AcpBackend>(
@@ -3835,9 +3894,11 @@ async fn handle_set_cache_config<B: AcpBackend>(
         None
     };
 
-    let summary = state
-        .telemetry
-        .update_cache_config(next_limit, next_threshold);
+    let summary = state.telemetry.update_cache_config(
+        next_limit,
+        next_threshold,
+        parsed.capture_request_details,
+    );
     Json(summary).into_response()
 }
 

@@ -254,6 +254,9 @@ pub struct LiftgateSettings {
     /// Basis-point threshold (`5_000` = `50.00%` by default) below which a turn is recorded as low cache hit.
     #[serde(default)]
     pub low_cache_threshold_bps: CacheHitThresholdBps,
+    /// Persist full request payload details & message breakdown for low-cache turns (`true` by default).
+    #[serde(default = "default_true")]
+    pub capture_low_cache_request_details: bool,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -270,6 +273,7 @@ impl Default for LiftgateSettings {
             vision_offload: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
+            capture_low_cache_request_details: true,
             agy_bin: None,
             extra: serde_json::Map::new(),
         }
@@ -344,6 +348,22 @@ pub fn resolve_effective_low_cache_threshold_bps(
     }
 }
 
+/// Resolves whether full request payload capture on low-cache turns is enabled (`CLI/env` -> `settings.json` -> `true`).
+#[must_use]
+pub const fn resolve_effective_low_cache_capture_payload(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.capture_low_cache_request_details
+    }
+}
+
 /// Resolves the `agy` executable path, consulting saved `settings.agy_bin` when not yet on `PATH`.
 #[must_use]
 pub fn resolve_effective_agy_bin(
@@ -391,6 +411,8 @@ pub struct DaemonState {
     pub max_low_cache_records: LowCacheRecordLimit,
     #[serde(default)]
     pub low_cache_threshold_bps: CacheHitThresholdBps,
+    #[serde(default = "default_true")]
+    pub capture_low_cache_request_details: bool,
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
@@ -671,6 +693,7 @@ mod tests {
             vision_offload: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
+            capture_low_cache_request_details: true,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,

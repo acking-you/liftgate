@@ -38,8 +38,12 @@ import {
 } from "@/components/ui/dialog";
 import { useGatewayTelemetry } from "@/hooks/useGatewayTelemetry";
 import type {
+  CapturedFullPart,
+  LowCacheDiagnosticCause,
   LowCacheHitReason,
   LowCacheHitRecord,
+  LowCachePayloadDetailResponse,
+  LowCacheRoutingStrategy,
   TaskPhase,
   TaskProtocol,
   TaskSnapshot,
@@ -94,6 +98,76 @@ function formatCompactTokens(n: number): string {
 function formatBpsPct(bps: number | null | undefined, digits = 1): string {
   if (typeof bps !== "number" || !Number.isFinite(bps)) return "—";
   return `${(bps / 100).toFixed(digits)}%`;
+}
+
+function formatBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${Math.round(bytes)} B`;
+}
+
+function formatRoutingStrategy(
+  strategy: LowCacheRoutingStrategy | undefined,
+): string {
+  switch (strategy) {
+    case "previous_response_id":
+      return "previous_response_id 续接";
+    case "prefix_hash":
+      return "前缀 SHA-256 哈希命中";
+    case "compaction_dialogue_hash":
+      return "压缩对话哈希命中";
+    case "cold_new_session":
+      return "首轮新建会话";
+    case "cold_mid_conversation_rebuild":
+      return "多轮中途冷重建重放";
+    default:
+      return "—";
+  }
+}
+
+function renderDiagnosticCauseTag(
+  cause: LowCacheDiagnosticCause | undefined,
+): React.JSX.Element | null {
+  switch (cause) {
+    case "warm_upstream_implicit_miss":
+      return <span className="sf-tag">上游隐式副本未命中</span>;
+    case "warm_idle_ttl_expired":
+      return <span className="sf-tag">空闲 &ge;5m TTL 过期</span>;
+    case "warm_model_switched":
+      return <span className="sf-tag">中途切换模型</span>;
+    case "warm_large_delta_dilution":
+      return <span className="sf-tag">大体积新增增量稀释</span>;
+    case "mid_conversation_cold_rebuild":
+      return <span className="sf-tag">多轮中途会话重建</span>;
+    case "first_turn_cold_start":
+      return <span className="sf-tag">首轮冷启动</span>;
+    default:
+      return null;
+  }
+}
+
+function formatCapturedFullPart(part: CapturedFullPart): string {
+  switch (part.kind) {
+    case "text":
+      return part.is_developer_instructions
+        ? `[developer_instructions · ${formatBytes(part.bytes)}]\n${part.text}`
+        : part.text;
+    case "reasoning":
+      return `[reasoning · ${formatBytes(part.bytes)}]\n${part.text}`;
+    case "image":
+      return `[image · ${part.media_type} · base64 ${formatBytes(part.base64_bytes)}]`;
+    case "tool_call":
+      return `[${part.is_custom ? "custom_tool_call" : "tool_call"}:${part.name} id=${part.call_id} · ${formatBytes(part.bytes)}]\n${part.arguments}`;
+    case "tool_result":
+      return `[${part.is_error ? "tool_error" : "tool_result"}:${part.call_id} · ${formatBytes(part.bytes)}]\n${part.output}`;
+  }
 }
 
 function computeTaskHitBps(task: TaskSnapshot): number | null {
@@ -176,9 +250,44 @@ function renderReasonPill(reason: LowCacheHitReason): React.JSX.Element {
 }
 
 function explainLowCacheReason(record: LowCacheHitRecord): string {
+  const m = record.request_metrics;
+  const idleNote =
+    m?.session_idle_ms != null
+      ? `（本轮检出前空闲 ${formatDurationMs(m.session_idle_ms)}）`
+      : "";
+  switch (record.diagnostic_cause) {
+    case "warm_upstream_implicit_miss": {
+      const isGemini = record.resolved_model.toLowerCase().includes("gemini");
+      const prevCtx = m?.previous_session_context_tokens ?? 0;
+      const readDetail =
+        record.cached_read_tokens > 0 && prevCtx > 0
+          ? `仅命中基础共享前缀（cachedReadTokens = ${formatNumber(record.cached_read_tokens)} / 上轮上下文 ${formatNumber(prevCtx)}）`
+          : "cachedReadTokens = 0";
+      const sub100kHint =
+        prevCtx > 0 && prevCtx < 100_000
+          ? ` 当前历史前缀约 ${formatNumber(prevCtx)} tokens（低于 ~100k 稳态块亲和水位，上游跨副本隐式缓存粘性较弱，进入 >=100k 后通常稳定升至 92%~98%）。`
+          : "";
+      return isGemini
+        ? `本地 SessionPool 已成功复用热会话${idleNote}且仅发送本轮增量（Δ${m?.delta_message_count ?? 1} 条），但上游 Gemini 采用机会式隐式前缀缓存（Implicit Caching），本轮请求被调度到了未持有上一轮完整会话 KV 快照的推理副本，因此${readDetail}。${sub100kHint}`
+        : `本地 SessionPool 已复用热会话${idleNote}且未切模型，但上游后端未命中完整前缀 KV 缓存（${readDetail}）。`;
+    }
+    case "warm_idle_ttl_expired":
+      return `该轮复用了会话池中的 ACP 会话${idleNote}，但由于空闲时长达到或超过 5 分钟，上游模型侧 KV 缓存已自然过期（仍省去了本地冷会话重放开销）。`;
+    case "warm_model_switched":
+      return `该轮复用了现有 ACP 会话，但模型从 ${m?.previous_model ?? "原模型"} 切换到了 ${record.resolved_model}（session/set_model），不同模型权重无法共享上游 KV 缓存。`;
+    case "warm_large_delta_dilution":
+      return `该轮命中了上游前缀缓存（读取 ${formatNumber(record.cached_read_tokens)} tokens），但本轮新增输入增量较大（发送 ${formatBytes(m?.outbound_acp_prompt_bytes ?? 0)}），拉低了单轮缓存占比。`;
+    case "mid_conversation_cold_rebuild":
+      return `当前对话已有 ${m?.total_message_count ?? "多"} 条消息，但未命中空闲会话池（常见原因为上一轮触发工具后流短路销毁了污染会话、发生上下文压缩切换或会话池容量淘汰），因此新建了 ACP 会话并重放历史上下文。`;
+    case "first_turn_cold_start":
+      return "该轮为全新对话的第 1 轮请求，新建了独立的 ACP 子进程，尚无历史前缀缓存可读取。";
+    default:
+      break;
+  }
+
   switch (record.reason) {
     case "warm_cache_miss":
-      return "该轮复用了会话池中的 ACP 热会话，但上游返回 cachedReadTokens = 0。常见原因为会话空闲超过 5 分钟导致上游 KV 缓存自然过期，或在会话中途切换了模型。";
+      return "该轮复用了会话池中的 ACP 热会话，但上游返回 cachedReadTokens = 0。常见原因为上游隐式缓存跨副本调度未命中、会话空闲超过 5 分钟或中途切换模型。";
     case "warm_partial_hit":
       return "该轮复用了会话池热会话并命中了部分前缀缓存，但由于本轮新增了较大体积的工具输出或上下文增量，整体命中率低于设定阈值。";
     case "cold_session_start":
@@ -210,6 +319,8 @@ export function App(): React.JSX.Element {
     closeIdleSession,
     toggleVisionOffload,
     updateCacheConfig,
+    toggleLowCacheCapturePayload,
+    fetchLowCacheHitDetail,
     clearLowCacheHits,
   } = useGatewayTelemetry();
 
@@ -233,8 +344,15 @@ export function App(): React.JSX.Element {
   const [cachePage, setCachePage] = useState(1);
   const [selectedLowRecord, setSelectedLowRecord] =
     useState<LowCacheHitRecord | null>(null);
+  const [selectedLowDetail, setSelectedLowDetail] =
+    useState<LowCachePayloadDetailResponse | null>(null);
+  const [lowDetailLoading, setLowDetailLoading] = useState(false);
+  const [lowDetailTab, setLowDetailTab] = useState<
+    "metrics" | "acp_prompt" | "messages" | "tools"
+  >("metrics");
   const [draftMaxRecords, setDraftMaxRecords] = useState<string>("1000");
   const [draftThresholdPct, setDraftThresholdPct] = useState<string>("50");
+  const [draftCaptureDetails, setDraftCaptureDetails] = useState<boolean>(true);
   const [cacheConfigDirty, setCacheConfigDirty] = useState(false);
   const [cacheConfigSaving, setCacheConfigSaving] = useState(false);
   const [cacheConfigBanner, setCacheConfigBanner] = useState<{
@@ -282,12 +400,34 @@ export function App(): React.JSX.Element {
     setDraftThresholdPct(
       String(Math.round(cacheSummary.low_cache_threshold_bps / 100)),
     );
+    setDraftCaptureDetails(cacheSummary.capture_request_details ?? true);
   }, [
     cacheSummary?.max_low_cache_records,
     cacheSummary?.low_cache_threshold_bps,
+    cacheSummary?.capture_request_details,
     cacheConfigDirty,
     cacheSummary,
   ]);
+
+  useEffect(() => {
+    if (!selectedLowRecord) {
+      setSelectedLowDetail(null);
+      setLowDetailLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLowDetailTab("metrics");
+    setSelectedLowDetail(null);
+    setLowDetailLoading(true);
+    void fetchLowCacheHitDetail(selectedLowRecord.task_id).then((detail) => {
+      if (cancelled) return;
+      setSelectedLowDetail(detail);
+      setLowDetailLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedLowRecord, fetchLowCacheHitDetail]);
 
   const effectiveThresholdBps = cacheSummary?.low_cache_threshold_bps ?? 5000;
   const effectiveMaxLowRecords = cacheSummary?.max_low_cache_records ?? 1000;
@@ -481,7 +621,7 @@ claude`,
 
     setCacheConfigSaving(true);
     setCacheConfigBanner(null);
-    const res = await updateCacheConfig(parsedMax, parsedPct);
+    const res = await updateCacheConfig(parsedMax, parsedPct, draftCaptureDetails);
     setCacheConfigSaving(false);
 
     if (res.ok) {
@@ -489,7 +629,7 @@ claude`,
       setCachePage(1);
       setCacheConfigBanner({
         tone: "ok",
-        text: `已生效并持久化：最多保留 ${formatNumber(res.summary.max_low_cache_records)} 条低命中记录，判定阈值 < ${Math.round(res.summary.low_cache_threshold_bps / 100)}%。`,
+        text: `已生效并持久化：最多保留 ${formatNumber(res.summary.max_low_cache_records)} 条低命中记录，判定阈值 < ${Math.round(res.summary.low_cache_threshold_bps / 100)}%，全量请求载荷捕获已${(res.summary.capture_request_details ?? true) ? "开启" : "关闭"}。`,
       });
     } else {
       setCacheConfigBanner({
@@ -1427,12 +1567,26 @@ claude`,
                         <code>
                           cachedRead / (uncachedInput + cachedRead + cachedWrite)
                         </code>
-                        （跨网关重启持久化累计）
+                        （跨网关重启持久化累计，已自动剔除后台一次性辅助请求）
                       </p>
                     </div>
-                    <span className="sf-tag">
-                      已评估 {formatNumber(overallCacheStats.evaluatedTurns)} 轮
-                    </span>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="sf-tag">
+                        已评估 {formatNumber(overallCacheStats.evaluatedTurns)} 轮
+                      </span>
+                      {(cacheSummary?.auxiliary_turns ?? 0) > 0 && (
+                        <span
+                          className="sf-tag"
+                          title="标题生成、安全分类等后台一次性子请求不计入主会话缓存命中率分母"
+                        >
+                          已隔离辅助 {formatNumber(cacheSummary?.auxiliary_turns ?? 0)} 轮 (
+                          {formatCompactTokens(
+                            cacheSummary?.auxiliary_prompt_tokens ?? 0,
+                          )}
+                          )
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="sf-card__body space-y-5">
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -1642,6 +1796,44 @@ claude`,
                       />
                     </div>
 
+                    <div className="flex items-center justify-between gap-3 rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+                      <div className="space-y-0.5">
+                        <div className="text-xs font-medium text-[var(--text)]">
+                          捕获完整请求内容与结构 Metrics（默认开启）
+                        </div>
+                        <div className="text-[11px] text-[var(--faint)]">
+                          低命中时落盘实际发送的 ACP Prompt、完整消息序列与工具 Schema，便于离线复盘
+                        </div>
+                      </div>
+                      <button
+                        id="btn-toggle-low-cache-capture-payload"
+                        type="button"
+                        className={`sf-btn sf-btn--sm shrink-0 ${
+                          draftCaptureDetails ? "sf-btn--primary" : ""
+                        }`}
+                        onClick={() => {
+                          const next = !draftCaptureDetails;
+                          setDraftCaptureDetails(next);
+                          void toggleLowCacheCapturePayload(next).then(
+                            (updated) => {
+                              if (updated) {
+                                setCacheConfigBanner({
+                                  tone: "ok",
+                                  text: `全量请求内容捕获已实时${
+                                    (updated.capture_request_details ?? next)
+                                      ? "开启"
+                                      : "关闭"
+                                  }并同步至 settings.json。`,
+                                });
+                              }
+                            },
+                          );
+                        }}
+                      >
+                        {draftCaptureDetails ? "已开启（点击关闭）" : "已关闭（点击开启）"}
+                      </button>
+                    </div>
+
                     {cacheConfigBanner && (
                       <div
                         className={`sf-banner ${
@@ -1824,7 +2016,10 @@ claude`,
                                 {formatDateTime(rec.recorded_at_unix_ms)}
                               </td>
                               <td className="whitespace-nowrap">
-                                {renderReasonPill(rec.reason)}
+                                <div className="flex flex-col items-start gap-1">
+                                  {renderReasonPill(rec.reason)}
+                                  {renderDiagnosticCauseTag(rec.diagnostic_cause)}
+                                </div>
                               </td>
                               <td className="whitespace-nowrap">
                                 <div className="flex items-center gap-2">
@@ -1852,7 +2047,20 @@ claude`,
                                   {rec.session_id
                                     ? `${rec.session_reused ? "复用" : "新建"} · ${rec.session_id.slice(0, 10)}…`
                                     : rec.task_id}
+                                  {rec.request_metrics?.session_idle_ms != null &&
+                                    ` · 空闲 ${formatDurationMs(rec.request_metrics.session_idle_ms)}`}
                                 </div>
+                                {rec.request_metrics && (
+                                  <div className="mt-0.5 font-mono text-[11px] text-[var(--muted)]">
+                                    Δ{rec.request_metrics.delta_message_count}/
+                                    {rec.request_metrics.total_message_count}条 · 发送{" "}
+                                    {formatBytes(
+                                      rec.request_metrics.outbound_acp_prompt_bytes,
+                                    )}
+                                    {rec.request_capture?.full_payload_saved &&
+                                      " · 全量已存"}
+                                  </div>
+                                )}
                               </td>
                               <td className="num whitespace-nowrap text-xs">
                                 <span className="text-[var(--ok)]">
@@ -2552,20 +2760,42 @@ claude`,
           if (!open) setSelectedLowRecord(null);
         }}
       >
-        <DialogContent>
+        <DialogContent className="max-w-4xl max-h-[88vh] overflow-y-auto">
           {selectedLowRecord && (
             <>
               <DialogHeader>
-                <DialogTitle className="flex flex-wrap items-center gap-2">
-                  <span>低缓存命中诊断详情</span>
-                  {renderReasonPill(selectedLowRecord.reason)}
-                  <span className="sf-pill sf-pill--err font-mono">
-                    {formatBpsPct(selectedLowRecord.cache_hit_rate_bps, 2)}
-                  </span>
-                </DialogTitle>
+                <div className="flex flex-wrap items-center justify-between gap-2 pr-6">
+                  <DialogTitle className="flex flex-wrap items-center gap-2">
+                    <span>低缓存命中全量请求诊断</span>
+                    {renderReasonPill(selectedLowRecord.reason)}
+                    {renderDiagnosticCauseTag(
+                      selectedLowRecord.diagnostic_cause,
+                    )}
+                    <span className="sf-pill sf-pill--err font-mono">
+                      {formatBpsPct(selectedLowRecord.cache_hit_rate_bps, 2)}
+                    </span>
+                  </DialogTitle>
+                  <CopyButton
+                    value={JSON.stringify(
+                      selectedLowDetail ?? selectedLowRecord,
+                      null,
+                      2,
+                    )}
+                    label="复制完整诊断 JSON"
+                  />
+                </div>
                 <DialogDescription>
                   任务 <code>{selectedLowRecord.task_id}</code> · 记录于{" "}
                   {formatDateTime(selectedLowRecord.recorded_at_unix_ms)}
+                  {selectedLowRecord.request_capture?.payload_file_path && (
+                    <>
+                      {" "}
+                      · 载荷文件{" "}
+                      <code>
+                        {selectedLowRecord.request_capture.payload_file_path}
+                      </code>
+                    </>
+                  )}
                 </DialogDescription>
               </DialogHeader>
 
@@ -2573,73 +2803,561 @@ claude`,
                 <span>{explainLowCacheReason(selectedLowRecord)}</span>
               </div>
 
-              <div className="grid grid-cols-2 gap-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 text-xs sm:grid-cols-3 font-mono">
-                <div>
-                  <div className="font-sans text-[var(--faint)]">总输入 Prompt</div>
-                  <div className="mt-0.5 text-sm font-semibold text-[var(--text)]">
-                    {formatNumber(selectedLowRecord.total_prompt_tokens)}
-                  </div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="sf-seg" role="tablist" aria-label="低缓存诊断视图">
+                  <button
+                    type="button"
+                    className={`sf-seg__btn${lowDetailTab === "metrics" ? " is-active" : ""}`}
+                    onClick={() => setLowDetailTab("metrics")}
+                  >
+                    结构与路由 Metrics
+                  </button>
+                  <button
+                    type="button"
+                    className={`sf-seg__btn${lowDetailTab === "acp_prompt" ? " is-active" : ""}`}
+                    onClick={() => setLowDetailTab("acp_prompt")}
+                  >
+                    实际 ACP 请求内容
+                  </button>
+                  <button
+                    type="button"
+                    className={`sf-seg__btn${lowDetailTab === "messages" ? " is-active" : ""}`}
+                    onClick={() => setLowDetailTab("messages")}
+                  >
+                    消息明细 ({
+                      selectedLowDetail?.full_payload?.messages.length ??
+                      selectedLowRecord.request_metrics?.total_message_count ??
+                      selectedLowRecord.request_capture?.message_digests.length ??
+                      0
+                    })
+                  </button>
+                  <button
+                    type="button"
+                    className={`sf-seg__btn${lowDetailTab === "tools" ? " is-active" : ""}`}
+                    onClick={() => setLowDetailTab("tools")}
+                  >
+                    客户端工具 ({
+                      selectedLowRecord.request_metrics?.client_tool_count ??
+                      selectedLowRecord.request_capture?.client_tool_names.length ??
+                      0
+                    })
+                  </button>
                 </div>
-                <div>
-                  <div className="font-sans text-[var(--faint)]">缓存命中读取</div>
-                  <div className="mt-0.5 text-sm font-semibold text-[var(--ok)]">
-                    {formatNumber(selectedLowRecord.cached_read_tokens)}
-                  </div>
-                </div>
-                <div>
-                  <div className="font-sans text-[var(--faint)]">未命中输入</div>
-                  <div className="mt-0.5 text-sm font-semibold text-[var(--primary)]">
-                    {formatNumber(selectedLowRecord.input_uncached_tokens)}
-                  </div>
-                </div>
-                <div>
-                  <div className="font-sans text-[var(--faint)]">缓存写入</div>
-                  <div className="mt-0.5 text-[var(--text-2)]">
-                    {formatNumber(selectedLowRecord.cached_write_tokens)}
-                  </div>
-                </div>
-                <div>
-                  <div className="font-sans text-[var(--faint)]">输出 Tokens</div>
-                  <div className="mt-0.5 text-[var(--text-2)]">
-                    {formatNumber(selectedLowRecord.output_tokens)}
-                  </div>
-                </div>
-                <div>
-                  <div className="font-sans text-[var(--faint)]">TTFT / 总耗时</div>
-                  <div className="mt-0.5 text-[var(--text-2)]">
-                    {selectedLowRecord.ttft_ms != null
-                      ? formatDurationMs(selectedLowRecord.ttft_ms)
-                      : "-"}{" "}
-                    / {formatDurationMs(selectedLowRecord.elapsed_ms)}
-                  </div>
-                </div>
+                {lowDetailLoading && (
+                  <span className="font-mono text-xs text-[var(--faint)]">
+                    正在加载本地全量请求载荷…
+                  </span>
+                )}
               </div>
 
-              <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-                <div>
-                  <span className="text-[var(--faint)]">路由模型: </span>
-                  <code className="font-mono text-[var(--text)]">
-                    {selectedLowRecord.requested_model ===
-                    selectedLowRecord.resolved_model
-                      ? selectedLowRecord.resolved_model
-                      : `${selectedLowRecord.requested_model} → ${selectedLowRecord.resolved_model}`}
-                  </code>
-                </div>
-                <div>
-                  <span className="text-[var(--faint)]">绑定会话: </span>
-                  <code className="font-mono text-[var(--text)]">
-                    {selectedLowRecord.session_id ?? "-"} (
-                    {selectedLowRecord.session_reused ? "复用会话" : "新建会话"})
-                  </code>
-                </div>
-              </div>
-
-              {selectedLowRecord.prompt_preview && (
-                <div className="space-y-1">
-                  <div className="text-xs font-medium text-[var(--muted)]">
-                    该轮输入摘要
+              {lowDetailTab === "metrics" && (
+                <div className="space-y-3.5">
+                  <div className="grid grid-cols-2 gap-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 text-xs sm:grid-cols-3 font-mono">
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">总输入 Prompt</div>
+                      <div className="mt-0.5 text-sm font-semibold text-[var(--text)]">
+                        {formatNumber(selectedLowRecord.total_prompt_tokens)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">缓存命中读取</div>
+                      <div className="mt-0.5 text-sm font-semibold text-[var(--ok)]">
+                        {formatNumber(selectedLowRecord.cached_read_tokens)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">未命中输入</div>
+                      <div className="mt-0.5 text-sm font-semibold text-[var(--primary)]">
+                        {formatNumber(selectedLowRecord.input_uncached_tokens)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">缓存写入 / 思考</div>
+                      <div className="mt-0.5 text-[var(--text-2)]">
+                        {formatNumber(selectedLowRecord.cached_write_tokens)} /{" "}
+                        {formatNumber(
+                          selectedLowRecord.request_metrics?.thought_tokens ?? 0,
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">输出 Tokens</div>
+                      <div className="mt-0.5 text-[var(--text-2)]">
+                        {formatNumber(selectedLowRecord.output_tokens)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="font-sans text-[var(--faint)]">TTFT / 总耗时</div>
+                      <div className="mt-0.5 text-[var(--text-2)]">
+                        {selectedLowRecord.ttft_ms != null
+                          ? formatDurationMs(selectedLowRecord.ttft_ms)
+                          : "-"}{" "}
+                        / {formatDurationMs(selectedLowRecord.elapsed_ms)}
+                      </div>
+                    </div>
                   </div>
-                  <pre className="sf-code">{selectedLowRecord.prompt_preview}</pre>
+
+                  {selectedLowRecord.request_metrics ? (
+                    <>
+                      <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-2 text-xs">
+                        <div className="font-medium text-[var(--text)]">
+                          会话池路由与连续性指标
+                        </div>
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 font-mono">
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">路由方式: </span>
+                            {formatRoutingStrategy(
+                              selectedLowRecord.request_metrics.routing_strategy,
+                            )}
+                          </div>
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">会话轮次: </span>
+                            第 {selectedLowRecord.request_metrics.session_turn_index} 轮 (
+                            {selectedLowRecord.session_reused ? "热复用" : "冷启动"})
+                          </div>
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">检出前空闲: </span>
+                            {selectedLowRecord.request_metrics.session_idle_ms != null
+                              ? formatDurationMs(
+                                  selectedLowRecord.request_metrics.session_idle_ms,
+                                )
+                              : "— (新建会话)"}
+                          </div>
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">上轮上下文占用: </span>
+                            {formatNumber(
+                              selectedLowRecord.request_metrics
+                                .previous_session_context_tokens,
+                            )}{" "}
+                            tokens
+                          </div>
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">模型切换: </span>
+                            {selectedLowRecord.request_metrics.model_switched
+                              ? `是 (${selectedLowRecord.request_metrics.previous_model ?? "?"} → ${selectedLowRecord.resolved_model})`
+                              : `否 (${selectedLowRecord.resolved_model})`}
+                          </div>
+                          <div>
+                            <span className="font-sans text-[var(--faint)]">热轮工具变更: </span>
+                            {selectedLowRecord.request_metrics.tools_updated_on_warm_turn
+                              ? `是 (${formatBytes(selectedLowRecord.request_metrics.tools_delta_xml_bytes)})`
+                              : "否"}
+                          </div>
+                          <div className="sm:col-span-2 lg:col-span-3 truncate">
+                            <span className="font-sans text-[var(--faint)]">绑定 Session ID: </span>
+                            {selectedLowRecord.session_id ?? "—"}
+                            {selectedLowRecord.request_metrics.previous_response_id &&
+                              ` · prev_resp=${selectedLowRecord.request_metrics.previous_response_id}`}
+                          </div>
+                          {selectedLowRecord.request_metrics.prefix_hash_hex && (
+                            <div className="sm:col-span-2 lg:col-span-3 break-all">
+                              <span className="font-sans text-[var(--faint)]">
+                                前缀匹配 SHA-256:{" "}
+                              </span>
+                              {selectedLowRecord.request_metrics.prefix_hash_hex}
+                            </div>
+                          )}
+                          {selectedLowRecord.request_metrics.base_state_hash_hex && (
+                            <div className="sm:col-span-2 lg:col-span-3 break-all">
+                              <span className="font-sans text-[var(--faint)]">
+                                本轮状态 SHA-256:{" "}
+                              </span>
+                              {selectedLowRecord.request_metrics.base_state_hash_hex}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-2 text-xs">
+                        <div className="font-medium text-[var(--text)]">
+                          请求内容体积分解（Content Composition Metrics）
+                        </div>
+                        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 font-mono">
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              实际发送 ACP Prompt
+                            </div>
+                            <div className="mt-0.5 font-semibold text-[var(--primary)]">
+                              {formatBytes(
+                                selectedLowRecord.request_metrics
+                                  .outbound_acp_prompt_bytes,
+                              )}{" "}
+                              ({selectedLowRecord.request_metrics.outbound_acp_text_blocks} 块)
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              本轮增量消息 (Delta)
+                            </div>
+                            <div className="mt-0.5 font-semibold text-[var(--text)]">
+                              {selectedLowRecord.request_metrics.delta_message_count} /{" "}
+                              {selectedLowRecord.request_metrics.total_message_count} 条 ·{" "}
+                              {formatBytes(
+                                selectedLowRecord.request_metrics.delta_messages_bytes,
+                              )}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              全量历史总体积
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {formatBytes(
+                                selectedLowRecord.request_metrics
+                                  .total_conversation_bytes,
+                              )}{" "}
+                              (对话{" "}
+                              {selectedLowRecord.request_metrics
+                                .conversational_message_count}{" "}
+                              条)
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              Developer 指令体积
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {formatBytes(
+                                selectedLowRecord.request_metrics
+                                  .developer_instructions_bytes,
+                              )}{" "}
+                              ({selectedLowRecord.request_metrics.developer_instructions_blocks}{" "}
+                              段)
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              客户端工具 Schema
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {selectedLowRecord.request_metrics.client_tool_count} 个 ·{" "}
+                              {formatBytes(
+                                selectedLowRecord.request_metrics
+                                  .client_tools_schema_bytes,
+                              )}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              工具调用 / 工具输出
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {selectedLowRecord.request_metrics.tool_call_part_count} 次 /
+                              {" "}
+                              {selectedLowRecord.request_metrics.tool_result_part_count} 条 (
+                              {formatBytes(
+                                selectedLowRecord.request_metrics.tool_result_bytes,
+                              )}
+                              )
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              User / Assistant 正文
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {formatBytes(
+                                selectedLowRecord.request_metrics.user_text_bytes,
+                              )}{" "}
+                              /{" "}
+                              {formatBytes(
+                                selectedLowRecord.request_metrics.assistant_text_bytes,
+                              )}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="font-sans text-[var(--faint)]">
+                              session/new 追加指令
+                            </div>
+                            <div className="mt-0.5 text-[var(--text-2)]">
+                              {formatBytes(
+                                selectedLowRecord.request_metrics
+                                  .acp_system_append_bytes,
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
+                      <div>
+                        <span className="text-[var(--faint)]">路由模型: </span>
+                        <code className="font-mono text-[var(--text)]">
+                          {selectedLowRecord.resolved_model}
+                        </code>
+                      </div>
+                      <div>
+                        <span className="text-[var(--faint)]">绑定会话: </span>
+                        <code className="font-mono text-[var(--text)]">
+                          {selectedLowRecord.session_id ?? "-"} (
+                          {selectedLowRecord.session_reused ? "复用会话" : "新建会话"})
+                        </code>
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedLowRecord.prompt_preview && (
+                    <div className="space-y-1">
+                      <div className="text-xs font-medium text-[var(--muted)]">
+                        末条用户输入摘要
+                      </div>
+                      <pre className="sf-code">{selectedLowRecord.prompt_preview}</pre>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {lowDetailTab === "acp_prompt" && (
+                <div className="space-y-3">
+                  {!selectedLowRecord.request_capture &&
+                  !selectedLowDetail?.full_payload ? (
+                    <div className="sf-empty">
+                      <p className="sf-empty__title">
+                        该记录产生时未开启全量请求载荷捕获（或属于旧版历史记录）
+                      </p>
+                      <p className="sf-empty__hint">
+                        确认「捕获完整请求内容与结构 Metrics」处于开启状态后，后续低命中轮次将自动保存实际发送给 agy acp 的完整载荷。
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      {(selectedLowDetail?.full_payload?.acp_system_append ??
+                        selectedLowRecord.request_capture
+                          ?.acp_system_append_excerpt) && (
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between text-xs font-medium text-[var(--muted)]">
+                            <span>
+                              新建会话桥接指令 (<code>_meta.antigravity.systemPrompt.append</code>)
+                            </span>
+                            <CopyButton
+                              value={
+                                selectedLowDetail?.full_payload
+                                  ?.acp_system_append ??
+                                selectedLowRecord.request_capture
+                                  ?.acp_system_append_excerpt ??
+                                ""
+                              }
+                              label="复制"
+                            />
+                          </div>
+                          <pre className="sf-code max-h-60 overflow-auto">
+                            {selectedLowDetail?.full_payload?.acp_system_append ??
+                              selectedLowRecord.request_capture
+                                ?.acp_system_append_excerpt}
+                          </pre>
+                        </div>
+                      )}
+
+                      {(selectedLowDetail?.full_payload?.tools_delta_xml ??
+                        selectedLowRecord.request_capture
+                          ?.tools_delta_xml_excerpt) && (
+                        <div className="space-y-1">
+                          <div className="text-xs font-medium text-[var(--muted)]">
+                            增量工具同步指令 (<code>&lt;client_tools_update&gt;</code>)
+                          </div>
+                          <pre className="sf-code max-h-52 overflow-auto">
+                            {selectedLowDetail?.full_payload?.tools_delta_xml ??
+                              selectedLowRecord.request_capture
+                                ?.tools_delta_xml_excerpt}
+                          </pre>
+                        </div>
+                      )}
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-xs font-medium text-[var(--muted)]">
+                          <span>
+                            本轮实际发送给 <code>agy acp</code> 的{" "}
+                            <code>session/prompt</code> 内容
+                          </span>
+                          <CopyButton
+                            value={
+                              selectedLowDetail?.full_payload
+                                ? selectedLowDetail.full_payload.outbound_acp_prompt_blocks
+                                    .map((b) =>
+                                      b.type === "text"
+                                        ? b.text
+                                        : `[image:${b.mime_type} base64=${b.base64_bytes}B]`,
+                                    )
+                                    .join("\n")
+                                : (selectedLowRecord.request_capture
+                                    ?.outbound_acp_prompt_excerpt ?? "")
+                            }
+                            label="复制 Prompt"
+                          />
+                        </div>
+                        <pre className="sf-code max-h-96 overflow-auto">
+                          {selectedLowDetail?.full_payload
+                            ? selectedLowDetail.full_payload.outbound_acp_prompt_blocks
+                                .map((b) =>
+                                  b.type === "text"
+                                    ? b.text
+                                    : `[image:${b.mime_type} base64=${b.base64_bytes}B]`,
+                                )
+                                .join("\n")
+                            : selectedLowRecord.request_capture
+                                ?.outbound_acp_prompt_excerpt}
+                        </pre>
+                      </div>
+
+                      {(selectedLowDetail?.full_payload
+                        ?.assistant_output_preview ||
+                        selectedLowRecord.request_capture?.output_preview) && (
+                        <div className="space-y-1">
+                          <div className="text-xs font-medium text-[var(--muted)]">
+                            该轮模型输出预览
+                          </div>
+                          <pre className="sf-code max-h-40 overflow-auto">
+                            {selectedLowDetail?.full_payload
+                              ?.assistant_output_preview ||
+                              selectedLowRecord.request_capture?.output_preview}
+                          </pre>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {lowDetailTab === "messages" && (
+                <div className="space-y-2.5 max-h-[56vh] overflow-y-auto pr-1">
+                  {selectedLowDetail?.full_payload?.messages.length ? (
+                    selectedLowDetail.full_payload.messages.map((msg) => (
+                      <div
+                        key={msg.index}
+                        className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3 space-y-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <div className="flex items-center gap-2 font-mono">
+                            <span className="font-semibold text-[var(--text)]">
+                              #{msg.index} {msg.role}
+                            </span>
+                            <span
+                              className={`sf-pill ${
+                                msg.in_delta ? "sf-pill--warn" : "sf-pill--ok"
+                              }`}
+                            >
+                              {msg.in_delta
+                                ? "本轮发送 (Delta)"
+                                : "历史前缀 (驻留)"}
+                            </span>
+                          </div>
+                          <span className="font-mono text-[11px] text-[var(--faint)]">
+                            {formatBytes(msg.total_bytes)} · {msg.parts.length} parts
+                          </span>
+                        </div>
+                        <pre className="sf-code max-h-64 overflow-auto">
+                          {msg.parts.map(formatCapturedFullPart).join("\n\n")}
+                        </pre>
+                      </div>
+                    ))
+                  ) : selectedLowRecord.request_capture?.message_digests
+                      .length ? (
+                    selectedLowRecord.request_capture.message_digests.map(
+                      (msg) => (
+                        <div
+                          key={msg.index}
+                          className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3 space-y-1.5"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div className="flex items-center gap-2 font-mono">
+                              <span className="font-semibold text-[var(--text)]">
+                                #{msg.index} {msg.role}
+                              </span>
+                              <span
+                                className={`sf-pill ${
+                                  msg.in_delta ? "sf-pill--warn" : "sf-pill--ok"
+                                }`}
+                              >
+                                {msg.in_delta
+                                  ? "本轮发送 (Delta)"
+                                  : "历史前缀 (驻留)"}
+                              </span>
+                            </div>
+                            <span className="font-mono text-[11px] text-[var(--faint)]">
+                              {formatBytes(msg.total_bytes)} ·{" "}
+                              {msg.part_kinds.join(", ")}
+                            </span>
+                          </div>
+                          <pre className="sf-code max-h-48 overflow-auto">
+                            {msg.excerpt || "—"}
+                          </pre>
+                        </div>
+                      ),
+                    )
+                  ) : (
+                    <div className="sf-empty">
+                      <p className="sf-empty__title">暂无捕获的消息序列明细</p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {lowDetailTab === "tools" && (
+                <div className="space-y-3 max-h-[56vh] overflow-y-auto pr-1">
+                  {selectedLowRecord.request_capture && (
+                    <div className="flex flex-wrap gap-1.5 text-xs">
+                      <span className="sf-tag">
+                        原生联网搜索:{" "}
+                        {selectedLowRecord.request_capture
+                          .enable_native_web_search
+                          ? "开启"
+                          : "关闭"}
+                      </span>
+                      <span className="sf-tag">
+                        原生网页抓取:{" "}
+                        {selectedLowRecord.request_capture
+                          .enable_native_web_fetch
+                          ? "开启"
+                          : "关闭"}
+                      </span>
+                    </div>
+                  )}
+                  {selectedLowDetail?.full_payload?.client_tools.length ? (
+                    selectedLowDetail.full_payload.client_tools.map((tool) => (
+                      <div
+                        key={tool.name}
+                        className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-xs font-mono">
+                          <span className="font-semibold text-[var(--text)]">
+                            {tool.name}{" "}
+                            <span className="text-[var(--faint)]">
+                              ({tool.kind})
+                            </span>
+                          </span>
+                          <span className="text-[var(--faint)]">
+                            {formatBytes(tool.schema_bytes)}
+                          </span>
+                        </div>
+                        {tool.description && (
+                          <div className="text-xs text-[var(--muted)] whitespace-pre-wrap">
+                            {tool.description}
+                          </div>
+                        )}
+                        {tool.schema_or_format && (
+                          <pre className="sf-code max-h-40 overflow-auto">
+                            {tool.schema_or_format}
+                          </pre>
+                        )}
+                      </div>
+                    ))
+                  ) : selectedLowRecord.request_capture?.client_tool_names
+                      .length ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {selectedLowRecord.request_capture.client_tool_names.map(
+                        (name) => (
+                          <code key={name} className="sf-tag font-mono">
+                            {name}
+                          </code>
+                        ),
+                      )}
+                    </div>
+                  ) : (
+                    <div className="sf-empty">
+                      <p className="sf-empty__title">该轮未声明客户端工具</p>
+                    </div>
+                  )}
                 </div>
               )}
             </>

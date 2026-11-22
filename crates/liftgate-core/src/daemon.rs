@@ -28,8 +28,8 @@ use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
     resolve_effective_agy_bin, resolve_effective_agy_proxy,
-    resolve_effective_low_cache_threshold_bps, resolve_effective_max_low_cache_records,
-    resolve_effective_vision_offload, write_file_atomic,
+    resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
+    resolve_effective_max_low_cache_records, resolve_effective_vision_offload, write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -82,6 +82,11 @@ pub async fn start_daemon_with_exe(
         resolve_effective_max_low_cache_records(serve.max_low_cache_records, &settings)?;
     let effective_low_cache_threshold_bps =
         resolve_effective_low_cache_threshold_bps(serve.low_cache_threshold_pct, &settings)?;
+    let effective_low_cache_capture_payload = resolve_effective_low_cache_capture_payload(
+        serve.low_cache_capture_payload,
+        serve.no_low_cache_capture_payload,
+        &settings,
+    );
     let _ = ModelId::try_new(&serve.default_model)?;
     let _ = AcpModeId::try_new(&serve.acp_mode)?;
     let _ = GatewayLimits::try_new(
@@ -114,6 +119,8 @@ pub async fn start_daemon_with_exe(
                 && existing.vision_offload == effective_vision_offload
                 && existing.max_low_cache_records == effective_max_low_cache_records
                 && existing.low_cache_threshold_bps == effective_low_cache_threshold_bps
+                && existing.capture_low_cache_request_details
+                    == effective_low_cache_capture_payload
                 && existing.max_line_bytes == serve.max_line_bytes
                 && existing.max_body_bytes == serve.max_body_bytes
                 && existing.channel_capacity == serve.channel_capacity
@@ -201,6 +208,12 @@ pub async fn start_daemon_with_exe(
         .arg(effective_max_low_cache_records.get().to_string())
         .arg("--low-cache-threshold-pct")
         .arg((effective_low_cache_threshold_bps.get() / 100).to_string())
+        .arg("--low-cache-capture-payload")
+        .arg(if effective_low_cache_capture_payload {
+            "true"
+        } else {
+            "false"
+        })
         .arg("--default-model")
         .arg(&serve.default_model)
         .arg("--acp-mode")
@@ -289,6 +302,7 @@ pub async fn start_daemon_with_exe(
         vision_offload: effective_vision_offload,
         max_low_cache_records: effective_max_low_cache_records,
         low_cache_threshold_bps: effective_low_cache_threshold_bps,
+        capture_low_cache_request_details: effective_low_cache_capture_payload,
         max_line_bytes: serve.max_line_bytes,
         max_body_bytes: serve.max_body_bytes,
         channel_capacity: serve.channel_capacity,
@@ -393,6 +407,7 @@ pub fn serve_args_from_daemon_state(old: &DaemonState) -> ServeArgs {
         low_cache_threshold_pct: Some(
             u8::try_from(old.low_cache_threshold_bps.get() / 100).unwrap_or(50),
         ),
+        low_cache_capture_payload: Some(old.capture_low_cache_request_details),
         max_line_bytes: old.max_line_bytes,
         max_body_bytes: old.max_body_bytes,
         channel_capacity: old.channel_capacity,
@@ -452,6 +467,14 @@ pub async fn restart_daemon(
     }
     if let Some(pct) = args.low_cache_threshold_pct {
         serve.low_cache_threshold_pct = Some(pct);
+    }
+    if let Some(cp) = args.low_cache_capture_payload {
+        serve.low_cache_capture_payload = Some(cp);
+        serve.no_low_cache_capture_payload = false;
+    }
+    if args.no_low_cache_capture_payload {
+        serve.low_cache_capture_payload = None;
+        serve.no_low_cache_capture_payload = true;
     }
 
     let outcome = start_daemon(state_paths, serve, true).await?;
@@ -1819,6 +1842,7 @@ mod tests {
             vision_offload: true,
             max_low_cache_records: liftgate_types::config::LowCacheRecordLimit::default(),
             low_cache_threshold_bps: liftgate_types::config::CacheHitThresholdBps::default(),
+            capture_low_cache_request_details: true,
             max_line_bytes: liftgate_types::config::DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: liftgate_types::config::DEFAULT_MAX_BODY_BYTES,
             channel_capacity: liftgate_types::config::DEFAULT_CHANNEL_CAPACITY,
@@ -1862,6 +1886,7 @@ mod tests {
                 .unwrap(),
             low_cache_threshold_bps:
                 liftgate_types::config::CacheHitThresholdBps::try_from_percent(40).unwrap(),
+            capture_low_cache_request_details: false,
             max_line_bytes: 67_108_864,
             max_body_bytes: 33_554_432,
             channel_capacity: 512,
@@ -1879,6 +1904,7 @@ mod tests {
         assert_eq!(restored.vision_offload, Some(false));
         assert_eq!(restored.max_low_cache_records, Some(250));
         assert_eq!(restored.low_cache_threshold_pct, Some(40));
+        assert_eq!(restored.low_cache_capture_payload, Some(false));
         assert_eq!(restored.max_line_bytes, 67_108_864);
         assert_eq!(restored.max_idle_sessions, 32);
         assert_eq!(restored.turn_timeout_secs, 3600);
@@ -1973,6 +1999,7 @@ mod tests {
             vision_offload: true,
             max_low_cache_records: liftgate_types::config::LowCacheRecordLimit::default(),
             low_cache_threshold_bps: liftgate_types::config::CacheHitThresholdBps::default(),
+            capture_low_cache_request_details: true,
             max_line_bytes: 33_554_432,
             max_body_bytes: 16_777_216,
             channel_capacity: 256,

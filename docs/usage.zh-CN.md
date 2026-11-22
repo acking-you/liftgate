@@ -281,6 +281,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true`（或读取 `~/.liftgate/settings.json` 中的 `vision_offload`，亦可在 Web 面板与 `lg top` 按 `v` 实时切换） |
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000`（`0..=50000`；原子持久化至 `~/.liftgate/cache-telemetry.json`，可在 Web 面板实时调整） |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50`（`0..=100%`；低于该命中率阈值的请求自动持久化归档） |
+| `--low-cache-capture-payload` / `--no-low-cache-capture-payload` | `AGY_LOW_CACHE_CAPTURE_PAYLOAD` | `true`（低命中时在 `~/.liftgate/low-cache-payloads/` 落盘完整请求内容与消息明细，可在 Web 面板实时开关） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |

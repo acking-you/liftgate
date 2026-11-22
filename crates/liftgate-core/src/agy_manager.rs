@@ -2338,6 +2338,7 @@ fn main() {{
             TaskProtocol::OpenaiResponses,
             true,
             "gemini-4-carbon-high".to_owned(),
+            None,
             &[],
         );
 

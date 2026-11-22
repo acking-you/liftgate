@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::{AcpUsage, AvailableModel};
+use crate::canonical::{AuxiliaryTaskKind, ReasoningEffort};
 
 /// Single bounded stderr diagnostic line captured from `agy acp`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -173,6 +174,8 @@ pub struct TaskSnapshot {
     pub resolved_model: String,
     pub session_id: Option<String>,
     pub session_reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_task: Option<AuxiliaryTaskKind>,
     pub phase: TaskPhase,
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: Option<u64>,
@@ -224,6 +227,324 @@ impl LowCacheHitReason {
     }
 }
 
+/// Fine-grained root-cause diagnosis refining [`LowCacheHitReason`] with session idle age,
+/// model-switch tracking, and multi-turn conversation rebuild detection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowCacheDiagnosticCause {
+    /// First turn of a brand-new conversation (`!session_reused`, single conversational turn).
+    FirstTurnColdStart,
+    /// Multi-turn conversation (`conversational_message_count > 1`) that missed the warm session
+    /// pool (e.g. prior session retired after post-tool short-circuit, compaction, or LRU eviction).
+    MidConversationColdRebuild,
+    /// Reused warm session within `< 5m` idle window on the same model, yet upstream returned
+    /// `cached_read_tokens == 0` (typical of opportunistic implicit KV replica routing on Gemini).
+    WarmUpstreamImplicitMiss,
+    /// Reused warm session after `>= 5m` idle time; upstream KV cache TTL naturally expired.
+    WarmIdleTtlExpired,
+    /// Reused warm session after switching models via `session/set_model`.
+    WarmModelSwitched,
+    /// Reused warm session with partial prefix cache hit, diluted below threshold by large new delta.
+    WarmLargeDeltaDilution,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl LowCacheDiagnosticCause {
+    #[must_use]
+    pub const fn classify(
+        session_reused: bool,
+        cached_read_tokens: u64,
+        previous_session_context_tokens: u64,
+        conversational_message_count: usize,
+        session_idle_ms: Option<u64>,
+        model_switched: bool,
+    ) -> Self {
+        if !session_reused {
+            if conversational_message_count > 1 {
+                Self::MidConversationColdRebuild
+            } else {
+                Self::FirstTurnColdStart
+            }
+        } else if cached_read_tokens == 0
+            || (previous_session_context_tokens > 0
+                && cached_read_tokens.saturating_mul(2) < previous_session_context_tokens)
+        {
+            if model_switched {
+                Self::WarmModelSwitched
+            } else if let Some(idle_ms) = session_idle_ms
+                && idle_ms >= PromptCacheWarmth::WARM_IDLE_THRESHOLD_MS
+            {
+                Self::WarmIdleTtlExpired
+            } else {
+                Self::WarmUpstreamImplicitMiss
+            }
+        } else {
+            Self::WarmLargeDeltaDilution
+        }
+    }
+}
+
+/// How `turn_runner` matched (or created) the ACP session for a turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowCacheRoutingStrategy {
+    /// Matched warm session via OpenAI `previous_response_id`.
+    PreviousResponseId,
+    /// Matched warm session via deterministic conversation prefix SHA-256 hash.
+    PrefixHash,
+    /// Matched warm pre-compaction session via pure dialogue SHA-256 hash.
+    CompactionDialogueHash,
+    /// Created a new ACP session for a first-turn conversation.
+    #[default]
+    ColdNewSession,
+    /// Created a new ACP session replaying multi-turn history after missing warm pool.
+    ColdMidConversationRebuild,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exhaustive structural, byte-level, and routing metrics captured for low-cache-hit analysis.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LowCacheRequestMetrics {
+    #[serde(default)]
+    pub routing_strategy: LowCacheRoutingStrategy,
+    #[serde(default)]
+    pub session_turn_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_idle_ms: Option<u64>,
+    #[serde(default)]
+    pub previous_session_context_tokens: u64,
+    #[serde(default)]
+    pub model_switched: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash_hex: Option<String>,
+    #[serde(default)]
+    pub base_state_hash_hex: String,
+    #[serde(default)]
+    pub tools_updated_on_warm_turn: bool,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub total_message_count: usize,
+    #[serde(default)]
+    pub conversational_message_count: usize,
+    #[serde(default)]
+    pub user_message_count: usize,
+    #[serde(default)]
+    pub assistant_message_count: usize,
+    #[serde(default)]
+    pub delta_message_count: usize,
+    #[serde(default)]
+    pub total_conversation_bytes: usize,
+    #[serde(default)]
+    pub delta_messages_bytes: usize,
+    #[serde(default)]
+    pub developer_instructions_blocks: usize,
+    #[serde(default)]
+    pub developer_instructions_bytes: usize,
+    #[serde(default)]
+    pub user_text_bytes: usize,
+    #[serde(default)]
+    pub assistant_text_bytes: usize,
+    #[serde(default)]
+    pub reasoning_part_count: usize,
+    #[serde(default)]
+    pub reasoning_bytes: usize,
+    #[serde(default)]
+    pub tool_call_part_count: usize,
+    #[serde(default)]
+    pub tool_call_bytes: usize,
+    #[serde(default)]
+    pub tool_result_part_count: usize,
+    #[serde(default)]
+    pub tool_result_bytes: usize,
+    #[serde(default)]
+    pub image_part_count: usize,
+    #[serde(default)]
+    pub image_bytes: usize,
+    #[serde(default)]
+    pub client_tool_count: usize,
+    #[serde(default)]
+    pub client_tools_schema_bytes: usize,
+    #[serde(default)]
+    pub acp_system_append_bytes: usize,
+    #[serde(default)]
+    pub tools_delta_xml_bytes: usize,
+    #[serde(default)]
+    pub outbound_acp_prompt_bytes: usize,
+    #[serde(default)]
+    pub outbound_acp_text_blocks: usize,
+    #[serde(default)]
+    pub outbound_acp_image_blocks: usize,
+    #[serde(default)]
+    pub thought_tokens: u64,
+    #[serde(default)]
+    pub thought_chars: usize,
+    #[serde(default)]
+    pub output_chars: usize,
+    #[serde(default)]
+    pub native_web_searches: usize,
+    #[serde(default)]
+    pub native_web_fetches: usize,
+    #[serde(default)]
+    pub vision_offloaded_images: usize,
+    #[serde(default)]
+    pub emitted_client_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+/// Per-message structural digest stored inline inside [`LowCacheRequestCapture`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CapturedMessageSummary {
+    pub index: usize,
+    pub role: String,
+    pub in_delta: bool,
+    pub total_bytes: usize,
+    pub part_kinds: Vec<String>,
+    pub excerpt: String,
+}
+
+/// Bounded inline request payload snapshot attached to [`LowCacheHitRecord`] when
+/// `capture_request_details` is enabled (`true` by default).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the four orthogonal web bridge flags plus full-payload persistence status"
+)]
+pub struct LowCacheRequestCapture {
+    #[serde(default)]
+    pub client_tool_names: Vec<String>,
+    #[serde(default)]
+    pub enable_native_web_search: bool,
+    #[serde(default)]
+    pub force_native_web_search: bool,
+    #[serde(default)]
+    pub enable_native_web_fetch: bool,
+    #[serde(default)]
+    pub force_native_web_fetch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_system_append_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_delta_xml_excerpt: Option<String>,
+    #[serde(default)]
+    pub outbound_acp_prompt_excerpt: String,
+    #[serde(default)]
+    pub output_preview: String,
+    #[serde(default)]
+    pub message_digests: Vec<CapturedMessageSummary>,
+    #[serde(default)]
+    pub full_payload_saved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_file_path: Option<String>,
+}
+
+/// Serialized ACP prompt block stored inside [`LowCacheFullRequestPayload`] (omitting raw base64 image blobs).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CapturedAcpPromptBlock {
+    Text {
+        bytes: usize,
+        text: String,
+    },
+    Image {
+        mime_type: String,
+        base64_bytes: usize,
+    },
+}
+
+/// Serialized message part stored inside [`LowCacheFullRequestPayload`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapturedFullPart {
+    Text {
+        is_developer_instructions: bool,
+        bytes: usize,
+        text: String,
+    },
+    Reasoning {
+        bytes: usize,
+        text: String,
+    },
+    Image {
+        media_type: String,
+        base64_bytes: usize,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        is_custom: bool,
+        bytes: usize,
+        arguments: String,
+    },
+    ToolResult {
+        call_id: String,
+        is_error: bool,
+        bytes: usize,
+        output: String,
+    },
+}
+
+/// Complete normalized conversation message stored in [`LowCacheFullRequestPayload`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CapturedFullMessage {
+    pub index: usize,
+    pub role: String,
+    pub in_delta: bool,
+    pub total_bytes: usize,
+    pub parts: Vec<CapturedFullPart>,
+}
+
+/// Client tool specification summary stored in [`LowCacheFullRequestPayload`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CapturedToolSpec {
+    pub name: String,
+    pub kind: String,
+    pub schema_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_or_format: Option<String>,
+}
+
+/// Full on-disk diagnostic payload persisted at `~/.liftgate/low-cache-payloads/<task_id>.json`
+/// when `capture_request_details` is enabled (`true` by default).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LowCacheFullRequestPayload {
+    pub task_id: String,
+    pub recorded_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_system_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_delta_xml: Option<String>,
+    #[serde(default)]
+    pub outbound_acp_prompt_blocks: Vec<CapturedAcpPromptBlock>,
+    #[serde(default)]
+    pub messages: Vec<CapturedFullMessage>,
+    #[serde(default)]
+    pub client_tools: Vec<CapturedToolSpec>,
+    #[serde(default)]
+    pub assistant_output_preview: String,
+    #[serde(default)]
+    pub payload_truncated: bool,
+}
+
+/// Response served by `GET /api/telemetry/low-cache-hits/{task_id}`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LowCachePayloadDetailResponse {
+    pub record: LowCacheHitRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_payload: Option<LowCacheFullRequestPayload>,
+}
+
 /// Persisted diagnostic record for a turn whose prompt cache hit rate fell below threshold.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LowCacheHitRecord {
@@ -238,6 +559,8 @@ pub struct LowCacheHitRecord {
     pub session_reused: bool,
     #[serde(default)]
     pub reason: LowCacheHitReason,
+    #[serde(default)]
+    pub diagnostic_cause: LowCacheDiagnosticCause,
     pub cache_hit_rate_bps: u16,
     pub input_uncached_tokens: u64,
     pub cached_read_tokens: u64,
@@ -250,6 +573,10 @@ pub struct LowCacheHitRecord {
     pub ttft_ms: Option<u64>,
     #[serde(default)]
     pub prompt_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_metrics: Option<LowCacheRequestMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_capture: Option<LowCacheRequestCapture>,
 }
 
 const fn default_max_low_cache_records_usize() -> usize {
@@ -269,8 +596,12 @@ pub struct CacheTelemetrySummary {
     pub max_low_cache_records: usize,
     #[serde(default = "default_low_cache_threshold_bps_u16")]
     pub low_cache_threshold_bps: u16,
+    #[serde(default = "default_true")]
+    pub capture_request_details: bool,
     #[serde(default)]
     pub persisted_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_dir: Option<String>,
     #[serde(default)]
     pub total_prompt_tokens: u64,
     #[serde(default)]
@@ -295,6 +626,10 @@ pub struct CacheTelemetrySummary {
     pub total_low_cache_turns: u64,
     #[serde(default)]
     pub stored_low_cache_count: usize,
+    #[serde(default)]
+    pub auxiliary_turns: u64,
+    #[serde(default)]
+    pub auxiliary_prompt_tokens: u64,
 }
 
 impl Default for CacheTelemetrySummary {
@@ -303,7 +638,9 @@ impl Default for CacheTelemetrySummary {
             revision: 0,
             max_low_cache_records: crate::config::DEFAULT_MAX_LOW_CACHE_RECORDS,
             low_cache_threshold_bps: crate::config::DEFAULT_LOW_CACHE_THRESHOLD_BPS,
+            capture_request_details: true,
             persisted_path: None,
+            payload_dir: None,
             total_prompt_tokens: 0,
             total_uncached_input_tokens: 0,
             total_cached_read_tokens: 0,
@@ -316,6 +653,8 @@ impl Default for CacheTelemetrySummary {
             warm_evaluated_turns: 0,
             total_low_cache_turns: 0,
             stored_low_cache_count: 0,
+            auxiliary_turns: 0,
+            auxiliary_prompt_tokens: 0,
         }
     }
 }

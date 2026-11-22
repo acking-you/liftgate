@@ -9,6 +9,17 @@ use crate::error::ProtocolError;
 
 pub type ConversationHash = [u8; 32];
 
+/// Formats a 32-byte [`ConversationHash`] as a lowercase 64-character hex string for telemetry.
+#[must_use]
+pub fn format_conversation_hash_hex(hash: &ConversationHash) -> String {
+    let mut out = String::with_capacity(64);
+    for &byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 /// Pluggable sink that persists the complete, un-truncated UTF-8 payload to a local file
 /// before any head+tail truncation, schema compaction, or archival turn omission is applied.
 ///
@@ -163,6 +174,10 @@ pub struct WebToolBridgeConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRoutingPlan {
     pub prefix_lookup: Option<(ConversationHash, usize)>,
+    /// Secondary prefix lookup when a prior in-flight turn on a warm session was cancelled
+    /// (via `session/cancel`) after already delivering `messages[..len - 1]` to `agy acp`,
+    /// and the client immediately follows up with an appended `User` steering message.
+    pub cancelled_turn_lookup: Option<(ConversationHash, usize)>,
     pub compaction_lookup: Option<(ConversationHash, usize)>,
     pub base_state_hash_before_reply: ConversationHash,
 }
@@ -190,6 +205,33 @@ pub fn compute_routing_plan(
         }
     });
 
+    let cancelled_turn_lookup = {
+        let after_assistant = last_assistant_idx.map_or(0, |idx| idx + 1);
+        let trailing_substantive: Vec<usize> = (after_assistant..messages.len())
+            .filter(|&i| {
+                messages.get(i).is_some_and(|m| {
+                    m.role == CanonicalRole::User && message_has_stable_hash_content(m, true)
+                })
+            })
+            .collect();
+        if let Some(&prev_user_idx) =
+            trailing_substantive.get(trailing_substantive.len().wrapping_sub(2))
+        {
+            let split_at = prev_user_idx + 1;
+            let already_covered = prefix_lookup.is_some_and(|(_, p_split)| p_split == split_at);
+            if !already_covered && let Some(prefix_slice) = messages.get(..split_at) {
+                Some((
+                    hash_conversation_state(system, tools, web_cfg, model, prefix_slice),
+                    split_at,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let compaction_lookup = if is_compaction_summarization_turn(system, messages, tools) {
         last_assistant_idx.and_then(|idx| {
             let split_at = idx + 1;
@@ -209,6 +251,7 @@ pub fn compute_routing_plan(
 
     SessionRoutingPlan {
         prefix_lookup,
+        cancelled_turn_lookup,
         compaction_lookup,
         base_state_hash_before_reply,
     }
@@ -603,7 +646,8 @@ pub fn strip_unstable_harness_noise(input: &str) -> String {
         "<current_time_unavailable>",
         "</current_time_unavailable>",
     );
-    let without_volatile_tags = strip_tag_blocks(&s8, "<timestamp>", "</timestamp>");
+    let s9 = strip_tag_blocks(&s8, "<current_date>", "</current_date>");
+    let without_volatile_tags = strip_tag_blocks(&s9, "<timestamp>", "</timestamp>");
     let collapsed_rem = collapse_empty_wrapper_blocks(
         &without_volatile_tags,
         "<system-reminder>",
@@ -1103,16 +1147,17 @@ fn append_xml_invocation_bridge_rules(
     out.push_str(close_tag);
     if has_custom_tools {
         out.push_str(
-            "\n  (For freeform custom tools like `apply_patch` or Code Mode `exec` — even when a tool's \
-             description says \"Accepts raw JavaScript source text, not JSON\" — you MUST still wrap the \
-             call in a JSON `\"input\"` string inside the XML block: \
-             `{\"name\": \"exec\", \"input\": \"<JSON-escaped JS source>\"}` or \
-             `{\"name\": \"apply_patch\", \"input\": \"*** Begin Patch\\n...\"}`.)\n",
+            "\n  (For `apply_patch`, emit the raw multi-line patch directly inside the XML block \
+             WITHOUT JSON-escaping — starting with `*** Begin Patch` and ending with `*** End Patch`, \
+             keeping `@@` hunks surgical with 1-3 exact unchanged context lines per edit, splitting \
+             distant edits into separate `@@` hunks, and re-reading exact target lines first if prior \
+             output showed `[...omitted ...]`. For Code Mode `exec`, pass `{\"name\": \"exec\", \"input\": \
+             \"<JSON-escaped JS source>\"}` or start a bare JS block with `// @exec:`.)\n",
         );
     } else {
         out.push_str(
-            "\n  (For freeform string tools like `apply_patch`, pass a JSON string in `\"input\"`: \
-             `{\"name\": \"apply_patch\", \"input\": \"...\"}`.)\n",
+            "\n  (For `apply_patch`, emit raw multi-line `*** Begin Patch ... *** End Patch` directly \
+             inside the XML block with 1-3 exact context lines per `@@` hunk, or pass `\"input\"`.)\n",
         );
     }
 

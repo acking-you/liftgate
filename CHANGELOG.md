@@ -2,16 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.6] - 2026-11-22
 
 ### Added
-- **Prompt cache hit rate calculation & configurable persisted low-cache-hit audit store (`~/.liftgate/cache-telemetry.json`)**:
-  - Computes per-turn, per-session, warm-continuation, and cumulative overall prompt cache hit rates (`cachedReadTokens / (inputTokens + cachedReadTokens + cachedWriteTokens)` in integer basis points) across `GatewayTelemetrySnapshot`, `GET /api/telemetry/low-cache-hits`, `lg st`, and the Web Dashboard.
-  - Atomically persists turns whose prompt cache hit rate falls below threshold (`50%` by default, configurable via `--low-cache-threshold-pct` / `AGY_LOW_CACHE_THRESHOLD_PCT` or live `POST /api/telemetry/cache-config`) into a bounded ring buffer capped at `1,000` records by default (`--max-low-cache-records` / `AGY_MAX_LOW_CACHE_RECORDS`, `0..=50,000`, live-resizable and clearable from the Web UI), tagged with root-cause classifications (`warm_cache_miss`, `warm_partial_hit`, `cold_session_start`).
+- **Prompt cache hit rate observability, root-cause diagnostics & full low-cache payload inspector (`~/.liftgate/cache-telemetry.json` & `~/.liftgate/low-cache-payloads/`)**:
+  - Computes per-turn, per-session, warm-continuation, and cumulative overall prompt cache hit rates (`cachedReadTokens / (inputTokens + cachedReadTokens + cachedWriteTokens)` in integer basis points) across `GatewayTelemetrySnapshot`, `GET /api/telemetry/low-cache-hits`, `GET /api/telemetry/low-cache-hits/{task_id}`, `lg st`, `lg top`, and the Web Dashboard, isolating one-shot background auxiliary requests (`SessionTitleOrTopic`, `AutoModeClassifier`, `AwayRecapOrSuggestion`) into separate `auxiliary_turns` / `auxiliary_prompt_tokens` counters so they never skew primary session hit rates.
+  - Atomically persists turns below threshold (`50%` by default, configurable via `--low-cache-threshold-pct` / `AGY_LOW_CACHE_THRESHOLD_PCT` or live `POST /api/telemetry/cache-config`) into a bounded ring buffer (`1,000` records by default via `--max-low-cache-records` / `AGY_MAX_LOW_CACHE_RECORDS`, `0..=50,000`), paired with default-enabled full request payload capture (`--low-cache-capture-payload` / `--no-low-cache-capture-payload` / `AGY_LOW_CACHE_CAPTURE_PAYLOAD`) recording exact routing hashes, session idle age, content byte breakdowns, outbound ACP prompt blocks, tail-prioritized message sequences, and client tool schemas, plus fine-grained `LowCacheDiagnosticCause` classification (`warm_upstream_implicit_miss`, `warm_idle_ttl_expired`, `warm_model_switched`, `warm_large_delta_dilution`, `mid_conversation_cold_rebuild`, `first_turn_cold_start`).
+- **Vision modality metadata on `/v1/models` cards**:
+  - Advertises `chat.modalities` (`input: ["text", "image"]`, `output: ["text"]`) on `GET /v1/models` and `GET /v1/models/{id}` cards so downstream OpenAI-compatible routers detect multimodal support automatically.
 
 ### Changed
 - **StaticFlow Warm Editorial Web Dashboard redesign**:
-  - Redesigned the embedded React observability workbench (`web/`) to match the StaticFlow (`ackingliu.top`) Warm Parchment & Obsidian design system (`Source Serif 4` display headings, `Inter` UI controls, `JetBrains Mono` tabular metrics, terracotta `#C96442` / `#D97757` & sage `#5A7A4F` / `#8FAF7F` accents, 1px hairline surfaces, collapsible sidebar + mobile drawer, interactive SVG cache trend chart, and sun-to-crescent circular `ViewTransition` theme switch).
+  - Redesigned the embedded React observability workbench (`web/`) to match the StaticFlow (`ackingliu.top`) Warm Parchment & Obsidian design system (zero external font requests, coalesced idle SSE updates, 1px hairline surfaces, collapsible sidebar + mobile drawer, interactive SVG cache trend chart, 4-tab full low-cache request inspector modal, and circular `ViewTransition` theme switch).
+
+### Fixed
+- **Warm ACP session preservation across `150k+` deep-thinking streams, steering interrupts & post-tool reasoning sub-steps**:
+  - Added 15-second SSE `: keep-alive` heartbeat frames on streaming responses to prevent idle client/socket timeouts during long-context (`150k+` token) deep-thinking pauses.
+  - Upgraded mid-stream client cancellations/steering interrupts and post-XML-tool internal ACP reasoning (`AgentThoughtChunk`) short-circuits from destructive `abort_session_nonblocking` teardown to non-destructive `session/cancel` (`cancel_prompt_for_reuse`), paired with `cancelled_turn_lookup`, `alt_post_turn_hash`, and `watch`-backed pending check-in coordination in `SessionPool` so follow-up turns reuse the live warm session instead of cold-rebuilding.
+  - Normalized volatile `<current_date>` tags in `strip_unstable_harness_noise` so conversations crossing midnight retain deterministic `SessionPool` prefix hashes.
+- **Resilient multi-format `apply_patch` tool parsing & bridge guidance**:
+  - Extended `IncrementalToolParser` (streaming and buffered paths) to natively accept unescaped raw multi-line `*** Begin Patch ... *** End Patch` blocks, `apply_patch\n*** Begin Patch` labels, `{"name":"apply_patch"}\n*** Begin Patch` hybrid headers, and nested JSON object wrappers (`patch` / `input` / `diff` / `content`), automatically stripping inner Markdown code fences and normalizing `\r\n` line endings while guiding models in `<api_gateway_bridge_rules>` to emit unescaped multi-line patches directly.
 
 ## [0.2.5] - 2026-11-21
 

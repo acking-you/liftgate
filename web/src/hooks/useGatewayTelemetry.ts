@@ -4,6 +4,7 @@ import type {
   GatewayTelemetrySnapshot,
   LowCacheHitRecord,
   LowCacheHitsResponse,
+  LowCachePayloadDetailResponse,
 } from "@/types/telemetry";
 
 export type StreamConnectionState = "connecting" | "live" | "reconnecting" | "error";
@@ -103,7 +104,14 @@ export interface GatewayTelemetryState {
   updateCacheConfig: (
     maxLowCacheRecords: number,
     lowCacheThresholdPct: number,
+    captureRequestDetails?: boolean,
   ) => Promise<{ ok: true; summary: CacheTelemetrySummary } | { ok: false; error: string }>;
+  toggleLowCacheCapturePayload: (
+    enabled: boolean,
+  ) => Promise<CacheTelemetrySummary | null>;
+  fetchLowCacheHitDetail: (
+    taskId: string,
+  ) => Promise<LowCachePayloadDetailResponse | null>;
   clearLowCacheHits: (resetTotals?: boolean) => Promise<CacheTelemetrySummary | null>;
 }
 
@@ -234,20 +242,25 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     async (
       maxLowCacheRecords: number,
       lowCacheThresholdPct: number,
+      captureRequestDetails?: boolean,
     ): Promise<
       { ok: true; summary: CacheTelemetrySummary } | { ok: false; error: string }
     > => {
       try {
+        const reqBody: Record<string, unknown> = {
+          max_low_cache_records: maxLowCacheRecords,
+          low_cache_threshold_pct: lowCacheThresholdPct,
+        };
+        if (typeof captureRequestDetails === "boolean") {
+          reqBody.capture_request_details = captureRequestDetails;
+        }
         const resp = await fetch(buildUrl("/api/telemetry/cache-config"), {
           method: "POST",
           headers: {
             ...authHeaders,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            max_low_cache_records: maxLowCacheRecords,
-            low_cache_threshold_pct: lowCacheThresholdPct,
-          }),
+          body: JSON.stringify(reqBody),
         });
         const payload = (await resp.json()) as
           | CacheTelemetrySummary
@@ -270,6 +283,52 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
       }
     },
     [authHeaders, buildUrl, refreshLowCacheHits, refreshSnapshot],
+  );
+
+  const toggleLowCacheCapturePayload = useCallback(
+    async (enabled: boolean): Promise<CacheTelemetrySummary | null> => {
+      try {
+        const resp = await fetch(buildUrl("/api/telemetry/cache-config"), {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            capture_request_details: enabled,
+          }),
+        });
+        if (!resp.ok) {
+          return null;
+        }
+        const summary = (await resp.json()) as CacheTelemetrySummary;
+        await Promise.all([refreshSnapshot(), refreshLowCacheHits()]);
+        return summary;
+      } catch {
+        return null;
+      }
+    },
+    [authHeaders, buildUrl, refreshLowCacheHits, refreshSnapshot],
+  );
+
+  const fetchLowCacheHitDetail = useCallback(
+    async (taskId: string): Promise<LowCachePayloadDetailResponse | null> => {
+      try {
+        const resp = await fetch(
+          buildUrl(`/api/telemetry/low-cache-hits/${encodeURIComponent(taskId)}`),
+          {
+            headers: authHeaders,
+          },
+        );
+        if (!resp.ok) {
+          return null;
+        }
+        return (await resp.json()) as LowCachePayloadDetailResponse;
+      } catch {
+        return null;
+      }
+    },
+    [authHeaders, buildUrl],
   );
 
   const clearLowCacheHits = useCallback(
@@ -399,6 +458,8 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     closeIdleSession,
     toggleVisionOffload,
     updateCacheConfig,
+    toggleLowCacheCapturePayload,
+    fetchLowCacheHitDetail,
     clearLowCacheHits,
   };
 }

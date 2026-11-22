@@ -1690,14 +1690,39 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 
     // 2. Token Accounting KPI
     if let Some(&c1) = cols.get(1) {
-        let (inp, outp, thk, cached) = snap.map_or((0, 0, 0, 0), |s| {
-            (
-                s.metrics.total_input_tokens,
-                s.metrics.total_output_tokens,
-                s.metrics.total_thought_tokens,
-                s.metrics.total_cached_tokens,
-            )
-        });
+        let (inp, outp, thk, cached, cache_line) = snap.map_or_else(
+            || (0, 0, 0, 0, "Total processed: 0".to_owned()),
+            |s| {
+                let ct = &s.cache_telemetry;
+                let line = if ct.evaluated_turns > 0 {
+                    let rate_bps = ct.warm_cache_hit_rate_bps.or(ct.total_cache_hit_rate_bps);
+                    let rate_str = rate_bps.map_or_else(
+                        || "—".to_owned(),
+                        |b| format!("{:.1}%", f64::from(b) / 100.0),
+                    );
+                    format!(
+                        "KV hit {rate_str} · low {}/{}",
+                        ct.stored_low_cache_count, ct.max_low_cache_records
+                    )
+                } else {
+                    format!(
+                        "Total processed: {}",
+                        format_tokens(
+                            s.metrics
+                                .total_input_tokens
+                                .saturating_add(s.metrics.total_output_tokens)
+                        )
+                    )
+                };
+                (
+                    s.metrics.total_input_tokens,
+                    s.metrics.total_output_tokens,
+                    s.metrics.total_thought_tokens,
+                    s.metrics.total_cached_tokens,
+                    line,
+                )
+            },
+        );
         let card = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("In ", Style::default().fg(Color::DarkGray)),
@@ -1722,14 +1747,11 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 Span::styled(format_tokens(cached), Style::default().fg(Color::Green)),
             ]),
             Line::from(Span::styled(
-                format!(
-                    "Total processed: {}",
-                    format_tokens(inp.saturating_add(outp))
-                ),
+                cache_line,
                 Style::default().fg(Color::DarkGray),
             )),
         ])
-        .block(kpi_block(" Tokens "));
+        .block(kpi_block(" Tokens & Cache "));
         frame.render_widget(card, c1);
     }
 
@@ -2049,6 +2071,10 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             let ttft_label = selected
                 .ttft_ms
                 .map_or_else(|| "—".to_owned(), format_latency_ms);
+            let cache_hit_label = selected.cache_hit_rate_bps.map_or_else(
+                || "—".to_owned(),
+                |bps| format!("{:.1}%", f64::from(bps) / 100.0),
+            );
             let preview = if let Some(err) = &selected.error_message {
                 Line::from(vec![
                     Span::styled(
@@ -2074,6 +2100,8 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Span::styled(sess_id, Style::default().fg(Color::Green)),
                     Span::styled("   TTFT: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(ttft_label, Style::default().fg(Color::Cyan)),
+                    Span::styled("   Cache: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(cache_hit_label, Style::default().fg(Color::Green)),
                     Span::styled("   Stop: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         selected.stop_reason.as_deref().unwrap_or("in-progress"),

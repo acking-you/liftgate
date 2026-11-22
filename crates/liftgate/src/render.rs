@@ -363,12 +363,17 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             None => "—".to_owned(),
         };
         let cache_detail = format!(
-            "warm {warm_str} · cached {} / prompt {} · low-hit stored {}/{} (<{}%)",
+            "warm {warm_str} · cached {} / prompt {} · low-hit {}/{} (<{}%, payload:{})",
             ui::format_tokens(ct.total_cached_read_tokens),
             ui::format_tokens(ct.total_prompt_tokens),
             ct.stored_low_cache_count,
             ct.max_low_cache_records,
             ct.low_cache_threshold_bps / 100,
+            if ct.capture_request_details {
+                "on"
+            } else {
+                "off"
+            },
         );
         table.add_row(vec![
             ui::accent_cell("Prompt Cache"),

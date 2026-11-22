@@ -19,8 +19,9 @@ use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
 use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
-    resolve_effective_agy_proxy, resolve_effective_low_cache_threshold_bps,
-    resolve_effective_max_low_cache_records, resolve_effective_vision_offload,
+    resolve_effective_agy_proxy, resolve_effective_low_cache_capture_payload,
+    resolve_effective_low_cache_threshold_bps, resolve_effective_max_low_cache_records,
+    resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -142,6 +143,11 @@ pub async fn run_serve_with_hook(
         resolve_effective_max_low_cache_records(args.max_low_cache_records, &settings)?;
     let low_cache_threshold_bps =
         resolve_effective_low_cache_threshold_bps(args.low_cache_threshold_pct, &settings)?;
+    let capture_low_cache_payload = resolve_effective_low_cache_capture_payload(
+        args.low_cache_capture_payload,
+        args.no_low_cache_capture_payload,
+        &settings,
+    );
     let binary_path =
         resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
@@ -185,6 +191,7 @@ pub async fn run_serve_with_hook(
         vision_offload = vision_offload_enabled,
         max_low_cache_records = max_low_cache_records.get(),
         low_cache_threshold_bps = low_cache_threshold_bps.get(),
+        low_cache_capture_payload = capture_low_cache_payload,
         "starting liftgate"
     );
 
@@ -207,6 +214,7 @@ pub async fn run_serve_with_hook(
         settings_path: Some(state_paths.settings_file()),
         max_low_cache_records,
         low_cache_threshold_bps,
+        capture_request_details: capture_low_cache_payload,
     }));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();

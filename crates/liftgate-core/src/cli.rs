@@ -316,6 +316,14 @@ pub struct ServeArgs {
     #[arg(long, env = "AGY_LOW_CACHE_THRESHOLD_PCT")]
     pub low_cache_threshold_pct: Option<u8>,
 
+    /// Persist full request payload details & message breakdown for low-cache turns (`true` by default).
+    #[arg(long, env = "AGY_LOW_CACHE_CAPTURE_PAYLOAD")]
+    pub low_cache_capture_payload: Option<bool>,
+
+    /// Disable full request payload capture for low-cache turns while keeping lightweight summary counters.
+    #[arg(long, conflicts_with = "low_cache_capture_payload")]
+    pub no_low_cache_capture_payload: bool,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -393,6 +401,13 @@ impl Default for ServeArgs {
         let low_cache_threshold_pct = std::env::var("AGY_LOW_CACHE_THRESHOLD_PCT")
             .ok()
             .and_then(|s| s.trim().parse::<u8>().ok());
+        let low_cache_capture_payload = std::env::var("AGY_LOW_CACHE_CAPTURE_PAYLOAD")
+            .ok()
+            .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            });
 
         Self {
             listen,
@@ -410,6 +425,8 @@ impl Default for ServeArgs {
             no_vision_offload: false,
             max_low_cache_records,
             low_cache_threshold_pct,
+            low_cache_capture_payload,
+            no_low_cache_capture_payload: false,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -487,6 +504,14 @@ pub struct RestartArgs {
     /// Override percentage threshold (`0..=100`, `50` by default) for recording low cache hits.
     #[arg(long)]
     pub low_cache_threshold_pct: Option<u8>,
+
+    /// Override full request payload capture on low-cache turns (`true` or `false`, `true` by default).
+    #[arg(long)]
+    pub low_cache_capture_payload: Option<bool>,
+
+    /// Disable full request payload capture on low-cache turns.
+    #[arg(long, conflicts_with = "low_cache_capture_payload")]
+    pub no_low_cache_capture_payload: bool,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]

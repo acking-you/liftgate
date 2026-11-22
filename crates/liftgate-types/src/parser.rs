@@ -193,7 +193,12 @@ impl IncrementalToolParser {
             ParserMode::InTag => {
                 self.mode = ParserMode::Text;
                 let progress = mem::take(&mut self.in_tag_progress);
-                if let Some(call) = parse_tool_call_body(&leftover) {
+                let allow_patch_rewrite = progress.emitted_decoded_bytes().is_none_or(|n| n == 0);
+                if let Some(mut call) = parse_tool_call_body(&leftover) {
+                    if allow_patch_rewrite && call.name == "apply_patch" {
+                        call.arguments = normalize_apply_patch_text(&call.arguments);
+                        call.is_raw_input = true;
+                    }
                     if let Some(streamed_bytes) = progress.emitted_decoded_bytes()
                         && let Some(rem) = call.arguments.get(streamed_bytes..)
                         && !rem.is_empty()
@@ -438,7 +443,13 @@ impl IncrementalToolParser {
                         let progress = mem::take(&mut self.in_tag_progress);
 
                         let pending_wrapper = mem::take(&mut self.pending_open_wrapper);
-                        if let Some(call) = parse_tool_call_body(&body_owned) {
+                        let allow_patch_rewrite =
+                            progress.emitted_decoded_bytes().is_none_or(|n| n == 0);
+                        if let Some(mut call) = parse_tool_call_body(&body_owned) {
+                            if allow_patch_rewrite && call.name == "apply_patch" {
+                                call.arguments = normalize_apply_patch_text(&call.arguments);
+                                call.is_raw_input = true;
+                            }
                             self.strip_closing_wrapper = classify_closing_wrapper(&pending_wrapper);
                             if let Some(streamed_bytes) = progress.emitted_decoded_bytes()
                                 && let Some(rem) = call.arguments.get(streamed_bytes..)
@@ -661,6 +672,28 @@ fn probe_in_tag_header(buf: &str) -> HeaderProbe {
             return HeaderProbe::NeedMoreBytes;
         }
         if sep_rest.starts_with('}') {
+            if name == "apply_patch" {
+                let after_brace_pos = skip_ascii_ws(buf, sep_pos + 1);
+                if let Some(after_brace) = buf.get(after_brace_pos..) {
+                    if after_brace.is_empty()
+                        || ("*** Begin Patch".starts_with(after_brace)
+                            && after_brace.len() < "*** Begin Patch".len())
+                    {
+                        return HeaderProbe::NeedMoreBytes;
+                    }
+                    if let Some(after_hdr) = after_brace.strip_prefix("*** Begin Patch") {
+                        if after_hdr.is_empty() {
+                            return HeaderProbe::NeedMoreBytes;
+                        }
+                        if after_hdr.starts_with('\n') || after_hdr.starts_with("\r\n") {
+                            return HeaderProbe::StartStreamingBareBody {
+                                name,
+                                raw_cursor: after_brace_pos,
+                            };
+                        }
+                    }
+                }
+            }
             return HeaderProbe::StartBuffered { name };
         }
         if !sep_rest.starts_with(',') {
@@ -741,6 +774,38 @@ fn probe_in_tag_header(buf: &str) -> HeaderProbe {
                 name: "apply_patch".to_owned(),
                 raw_cursor: start,
             };
+        }
+        return HeaderProbe::WaitUntilClose;
+    }
+
+    if "apply_patch".starts_with(body) && body.len() < "apply_patch".len() {
+        return HeaderProbe::NeedMoreBytes;
+    }
+    if let Some(after_tool_label) = body.strip_prefix("apply_patch")
+        && (after_tool_label.is_empty()
+            || after_tool_label.starts_with('\n')
+            || after_tool_label.starts_with("\r\n"))
+    {
+        let patch_pos = skip_ascii_ws(buf, start + "apply_patch".len());
+        let Some(patch_rest) = buf.get(patch_pos..) else {
+            return HeaderProbe::NeedMoreBytes;
+        };
+        if patch_rest.is_empty()
+            || ("*** Begin Patch".starts_with(patch_rest)
+                && patch_rest.len() < "*** Begin Patch".len())
+        {
+            return HeaderProbe::NeedMoreBytes;
+        }
+        if let Some(after_hdr) = patch_rest.strip_prefix("*** Begin Patch") {
+            if after_hdr.is_empty() {
+                return HeaderProbe::NeedMoreBytes;
+            }
+            if after_hdr.starts_with('\n') || after_hdr.starts_with("\r\n") {
+                return HeaderProbe::StartStreamingBareBody {
+                    name: "apply_patch".to_owned(),
+                    raw_cursor: patch_pos,
+                };
+            }
         }
         return HeaderProbe::WaitUntilClose;
     }
@@ -1041,6 +1106,15 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
                 is_raw_input: true,
             });
         }
+        if name == "apply_patch"
+            && let Some(unwrapped_patch) = extract_patch_from_json_object(raw_text)
+        {
+            return Some(ParsedToolCall {
+                name,
+                arguments: unwrapped_patch,
+                is_raw_input: true,
+            });
+        }
         return Some(ParsedToolCall {
             name,
             arguments: raw_text.to_owned(),
@@ -1055,6 +1129,15 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments: inner_str,
+                is_raw_input: true,
+            });
+        }
+        if name == "apply_patch"
+            && let Some(unwrapped_patch) = extract_patch_from_json_object(raw_text)
+        {
+            return Some(ParsedToolCall {
+                name,
+                arguments: unwrapped_patch,
                 is_raw_input: true,
             });
         }
@@ -1219,15 +1302,46 @@ fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
 /// `"Accepts raw JavaScript source text, not JSON"` literally, or writes a bare `*** Begin Patch`).
 fn salvage_raw_custom_tool_body(cleaned: &str) -> Option<ParsedToolCall> {
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') {
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('{') {
+        // Handle `{"name": "apply_patch"}\n*** Begin Patch...` hybrid header + bare body.
+        if let Some((header_obj, rest)) = trimmed.split_once('}') {
+            let candidate_obj = format!("{header_obj}}}");
+            if let Ok(env) = serde_json::from_str::<RawToolCallEnvelope<'_>>(&candidate_obj)
+                && env.name.trim() == "apply_patch"
+                && env.arguments.is_none()
+                && env.input.is_none()
+            {
+                let normalized = normalize_apply_patch_text(rest);
+                if normalized.starts_with("*** Begin Patch") {
+                    return Some(ParsedToolCall {
+                        name: "apply_patch".to_owned(),
+                        arguments: normalized,
+                        is_raw_input: true,
+                    });
+                }
+            }
+        }
         return None;
     }
     if trimmed.starts_with("*** Begin Patch") {
         return Some(ParsedToolCall {
             name: "apply_patch".to_owned(),
-            arguments: trimmed.to_owned(),
+            arguments: normalize_apply_patch_text(trimmed),
             is_raw_input: true,
         });
+    }
+    if let Some(after_label) = trimmed.strip_prefix("apply_patch") {
+        let normalized = normalize_apply_patch_text(after_label);
+        if normalized.starts_with("*** Begin Patch") {
+            return Some(ParsedToolCall {
+                name: "apply_patch".to_owned(),
+                arguments: normalized,
+                is_raw_input: true,
+            });
+        }
     }
     if looks_like_code_mode_js(trimmed) {
         return Some(ParsedToolCall {
@@ -1237,6 +1351,46 @@ fn salvage_raw_custom_tool_body(cleaned: &str) -> Option<ParsedToolCall> {
         });
     }
     None
+}
+
+fn extract_patch_from_json_object(raw_json_obj: &str) -> Option<String> {
+    let val = serde_json::from_str::<serde_json::Value>(raw_json_obj).ok()?;
+    let map = val.as_object()?;
+    for key in ["input", "patch", "diff", "content"] {
+        if let Some(s) = map.get(key).and_then(serde_json::Value::as_str) {
+            let normalized = normalize_apply_patch_text(s);
+            if normalized.starts_with("*** Begin Patch") {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
+/// Normalizes an `apply_patch` body so CRLF line endings, accidental inner markdown code fences
+/// (` ```diff ` / ` ```patch `), or stray surrounding whitespace never violate Codex's Lark grammar.
+fn normalize_apply_patch_text(raw: &str) -> String {
+    let unfenced = strip_optional_code_fence(raw);
+    let lf_only = if unfenced.contains('\r') {
+        unfenced.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        unfenced.to_owned()
+    };
+    if let Some(begin_idx) = lf_only.find("*** Begin Patch")
+        && let Some(from_begin) = lf_only.get(begin_idx..)
+    {
+        if let Some(end_rel) = from_begin.rfind("*** End Patch") {
+            let end_marker_end = end_rel + "*** End Patch".len();
+            if let Some(after_end) = from_begin.get(end_marker_end..)
+                && after_end.chars().all(|c| c.is_whitespace() || c == '`')
+                && let Some(clean_patch) = from_begin.get(..end_marker_end)
+            {
+                return clean_patch.to_owned();
+            }
+        }
+        return from_begin.trim_end().to_owned();
+    }
+    lf_only.trim().to_owned()
 }
 
 fn looks_like_code_mode_js(src: &str) -> bool {
@@ -1826,5 +1980,52 @@ mod tests {
             "*** Begin Patch\n+bad \\uD800 mid \\uDC00 end\n*** End Patch"
         );
         assert_eq!(streamed, call.arguments);
+    }
+
+    #[test]
+    fn apply_patch_accepts_bare_multiline_header_prefix_and_json_object_wrappers() {
+        let expected_patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old(\"hi\")\n+new(\"hi\")\n*** End Patch";
+
+        let cases = [
+            format!("<agy_tool_call_cafe>\n{expected_patch}\n</agy_tool_call_cafe>"),
+            format!("<agy_tool_call_cafe>apply_patch\n{expected_patch}</agy_tool_call_cafe>"),
+            format!(
+                "<agy_tool_call_cafe>{{\"name\": \"apply_patch\"}}\n```diff\r\n{}\r\n```</agy_tool_call_cafe>",
+                expected_patch.replace('\n', "\r\n")
+            ),
+            "<agy_tool_call_cafe>{\"name\":\"apply_patch\",\"arguments\":{\"patch\":\"*** Begin Patch\\n*** Update File: src/lib.rs\\n@@\\n-old(\\\"hi\\\")\\n+new(\\\"hi\\\")\\n*** End Patch\"}}</agy_tool_call_cafe>".to_owned(),
+        ];
+
+        for (idx, raw) in cases.iter().enumerate() {
+            let mut parser = IncrementalToolParser::new("cafe", true);
+            let mut items = Vec::new();
+            for chunk in raw.as_bytes().chunks(5) {
+                let s = core::str::from_utf8(chunk).expect("ascii chunks");
+                parser.feed(s, &mut items);
+            }
+            parser.finish(&mut items);
+
+            let mut streamed = String::new();
+            let mut final_call = None;
+            for item in items {
+                match item {
+                    ParsedStreamItem::ToolCallDelta(d) => streamed.push_str(&d),
+                    ParsedStreamItem::ToolCall(c) => final_call = Some(c),
+                    ParsedStreamItem::ToolCallStart { .. }
+                    | ParsedStreamItem::TextDelta(_)
+                    | ParsedStreamItem::ToolCallAborted { .. } => {}
+                }
+            }
+            let call = final_call.unwrap_or_else(|| panic!("case {idx} failed to parse"));
+            assert_eq!(call.name, "apply_patch", "case {idx}");
+            assert!(call.is_raw_input, "case {idx}");
+            assert_eq!(call.arguments, expected_patch, "case {idx}");
+            if !streamed.is_empty() {
+                assert_eq!(
+                    streamed, expected_patch,
+                    "case {idx} streamed delta mismatch"
+                );
+            }
+        }
     }
 }

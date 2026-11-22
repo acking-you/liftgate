@@ -86,6 +86,13 @@ pub trait AcpBackend: Send + Sync + 'static {
     /// the session, used to immediately halt runaway post-tool hallucinations.
     fn cancel_prompt_nonblocking(&self, _session_id: &SessionId) {}
 
+    /// Sends a non-destructive `session/cancel` (`CancelOnly`, without `session/close`) and
+    /// returns `true` when the backend supports draining the cancelled `session/prompt` turn
+    /// and returning the live warm session back to `SessionPool`.
+    fn cancel_prompt_for_reuse(&self, _session_id: &SessionId) -> bool {
+        false
+    }
+
     /// Non-blocking synchronous cancellation & session teardown safe to call from `Drop`.
     fn abort_session_nonblocking(&self, session_id: &SessionId);
 
@@ -956,6 +963,15 @@ impl AcpBackend for Arc<LiveAcpClient> {
             .inner
             .abort_tx
             .try_send(AbortCommand::CancelOnly(session_id.clone()));
+    }
+
+    fn cancel_prompt_for_reuse(&self, session_id: &SessionId) -> bool {
+        let active = self.active_gen();
+        active
+            .inner
+            .abort_tx
+            .try_send(AbortCommand::CancelOnly(session_id.clone()))
+            .is_ok()
     }
 
     fn abort_session_nonblocking(&self, session_id: &SessionId) {
