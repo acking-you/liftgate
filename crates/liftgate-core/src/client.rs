@@ -216,6 +216,31 @@ impl GatewayClient {
         Ok(parsed.vision_offload_enabled)
     }
 
+    pub async fn set_mcp_tool_bridge(&self, enabled: Option<bool>) -> Result<bool, CliError> {
+        #[derive(serde::Deserialize)]
+        struct McpToolBridgeResponse {
+            mcp_tool_bridge_enabled: bool,
+        }
+
+        let path = match enabled {
+            Some(true) => "/api/telemetry/mcp-tool-bridge?enabled=true",
+            Some(false) => "/api/telemetry/mcp-tool-bridge?enabled=false",
+            None => "/api/telemetry/mcp-tool-bridge",
+        };
+        let url = format!("{}{path}", self.base_url);
+        let (status, body) = self.authed_request("POST", path, DEFAULT_TIMEOUT).await?;
+        if !(200..300).contains(&status) {
+            return Err(CliError::GatewayHttpStatus {
+                url,
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        let parsed: McpToolBridgeResponse = serde_json::from_slice(&body)
+            .map_err(|source| CliError::GatewayBadJson { url, source })?;
+        Ok(parsed.mcp_tool_bridge_enabled)
+    }
+
     pub async fn request_shutdown(&self, shutdown_token: &str) -> Result<(), CliError> {
         let path = "/api/admin/shutdown";
         let url = format!("{}{path}", self.base_url);

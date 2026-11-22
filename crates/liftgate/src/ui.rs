@@ -238,6 +238,7 @@ pub fn print_serve_ready_banner(
     agy_proxy_display: Option<&str>,
     agy_auto_update: bool,
     vision_offload: bool,
+    mcp_tool_bridge: bool,
 ) {
     if !stderr().is_terminal() {
         return;
@@ -262,10 +263,11 @@ pub fn print_serve_ready_banner(
         (
             "AGY Policy",
             format!(
-                "proxy={} · idle-auto-update={} · vision-offload={}",
+                "proxy={} · idle-auto-update={} · vision-offload={} · mcp-bridge={}",
                 agy_proxy_display.unwrap_or("none"),
                 if agy_auto_update { "on" } else { "off" },
-                if vision_offload { "on" } else { "off" }
+                if vision_offload { "on" } else { "off" },
+                if mcp_tool_bridge { "on" } else { "off" }
             ),
         ),
         (

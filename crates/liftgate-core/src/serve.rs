@@ -21,7 +21,7 @@ use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
     resolve_effective_agy_proxy, resolve_effective_low_cache_capture_payload,
     resolve_effective_low_cache_threshold_bps, resolve_effective_max_low_cache_records,
-    resolve_effective_vision_offload,
+    resolve_effective_mcp_tool_bridge, resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -43,6 +43,7 @@ pub struct ServeReadyInfo {
     pub agy_proxy_display: Option<String>,
     pub agy_auto_update: bool,
     pub vision_offload: bool,
+    pub mcp_tool_bridge: bool,
 }
 
 mod generated {
@@ -139,6 +140,8 @@ pub async fn run_serve_with_hook(
         resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
     let vision_offload_enabled =
         resolve_effective_vision_offload(args.vision_offload, args.no_vision_offload, &settings);
+    let mcp_tool_bridge_enabled =
+        resolve_effective_mcp_tool_bridge(args.mcp_tool_bridge, args.no_mcp_tool_bridge, &settings);
     let max_low_cache_records =
         resolve_effective_max_low_cache_records(args.max_low_cache_records, &settings)?;
     let low_cache_threshold_bps =
@@ -189,6 +192,7 @@ pub async fn run_serve_with_hook(
             .unwrap_or("none"),
         agy_auto_update = auto_update_enabled,
         vision_offload = vision_offload_enabled,
+        mcp_tool_bridge = mcp_tool_bridge_enabled,
         max_low_cache_records = max_low_cache_records.get(),
         low_cache_threshold_bps = low_cache_threshold_bps.get(),
         low_cache_capture_payload = capture_low_cache_payload,
@@ -235,6 +239,22 @@ pub async fn run_serve_with_hook(
         None => (None, None),
     };
 
+    let mcp_server = match liftgate_server::mcp_bridge::LoopbackMcpServer::bind(
+        limits.max_body_bytes(),
+        limits.channel_capacity(),
+    )
+    .await
+    {
+        Ok(srv) => Some(srv),
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "failed to bind loopback MCP tool bridge listener; falling back to pure XML client tools"
+            );
+            None
+        }
+    };
+
     let app_state = AppState {
         backend: Arc::new(Arc::clone(&live_client)),
         pool: Arc::clone(&pool),
@@ -242,11 +262,14 @@ pub async fn run_serve_with_hook(
         config: GatewayRuntimeConfig {
             title_model_file: Some(state_paths.title_model_file()),
             spill_dir: Some(spill_dir),
+            settings_path: Some(state_paths.settings_file()),
             default_model,
             acp_mode,
             api_key,
             limits,
             vision_offload: Arc::new(AtomicBool::new(vision_offload_enabled)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(mcp_tool_bridge_enabled)),
+            mcp_server,
         },
         ui_dist_dir: ui_dist_dir.clone(),
         embedded_ui,
@@ -348,13 +371,14 @@ pub async fn run_serve_with_hook(
         agy_proxy_display: proxy_banner,
         agy_auto_update: auto_update_enabled,
         vision_offload: vision_offload_enabled,
+        mcp_tool_bridge: mcp_tool_bridge_enabled,
     };
     if let Some(cb) = on_ready {
         cb(&ready_info);
     }
 
     if let Some(extra_listener) = ui_listener {
-        let ui_router = build_router(app_state);
+        let ui_router = build_router(app_state.clone());
         let mut ui_stop_rx = stop_rx.clone();
         bg_tasks.spawn(async move {
             let _ = serve_router(extra_listener, ui_router, async move {
@@ -371,28 +395,29 @@ pub async fn run_serve_with_hook(
     tokio::pin!(serve_fut);
 
     let mut drain_stop_rx = stop_rx;
-    tokio::select! {
+    let serve_res: Result<(), CliError> = tokio::select! {
         biased;
         res = &mut serve_fut => {
-            res.map_err(|source| CliError::Serve { source })?;
+            res.map_err(|source| CliError::Serve { source })
         }
         () = async {
             let _ = drain_stop_rx.wait_for(|&stop| stop).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
         } => {
             tracing::info!("graceful HTTP drain budget elapsed; closing remaining connections");
+            Ok(())
         }
-    }
+    };
 
     bg_tasks.abort_all();
     while bg_tasks.join_next().await.is_some() {}
 
     tracing::info!("shutting down ACP subprocess tree");
-    if let Ok(owned) = Arc::try_unwrap(live_client) {
-        let _ = owned.close().await;
-    }
+    live_client.shutdown().await;
+    pool.clear_for_shutdown();
+    drop(app_state);
 
-    Ok(())
+    serve_res
 }
 
 async fn wait_admin_shutdown(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {

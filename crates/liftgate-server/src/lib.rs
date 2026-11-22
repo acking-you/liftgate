@@ -3,6 +3,7 @@
 pub mod acp_client;
 pub mod error;
 pub mod job;
+pub mod mcp_bridge;
 pub mod platform;
 pub mod routes;
 pub mod session_pool;

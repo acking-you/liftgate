@@ -1890,7 +1890,7 @@ fn is_gateway_idle_for_update(
         return false;
     }
     let (active_leases, idle_sessions) = pool.idle_and_active_counts();
-    if active_leases > 0 {
+    if active_leases > 0 || pool.suspended_count() > 0 {
         return false;
     }
     let quiet_required_ms = if idle_sessions == 0 {

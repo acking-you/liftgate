@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-11-23
+
+### Added
+- **Configurable Hybrid Loopback MCP Tool Bridge + XML Coexistence for high-cache multi-step client tool loops (enabled by default)**:
+  - Added `--mcp-tool-bridge <true|false>` / `--no-mcp-tool-bridge` (`AGY_MCP_TOOL_BRIDGE`, persisted as `mcp_tool_bridge: true` in `~/.liftgate/settings.json` and tracked in `DaemonState`), with zero-restart live toggling via `POST /api/telemetry/mcp-tool-bridge`, `b` in `lg top`, and the StaticFlow Web Dashboard (`mcp_tool_bridge_enabled` across `lg st`, `ServeReadyInfo`, and `GatewayTelemetrySnapshot`).
+  - Added an authenticated loopback-only (`127.0.0.1:0`) HTTP MCP server (`LoopbackMcpServer` with constant-time 256-bit per-session token verification) paired with a `SessionPool` `Suspended` continuation state machine (`previous_response_id` and stateless `prefix_hash` / `dialogue_hash` lookup, prefix-agnostic `call_` / `toolu_` correlation across OpenAI `/v1/responses` and Anthropic `/v1/messages`, zero-LLM sequential sibling tool-call popping, zero-drift cumulative `PromptTurnResult.usage` reconciliation, and non-destructive `session/cancel` unwind on user `Esc` interrupts, model switches, or `/compact`).
+  - Routed Code Mode orchestrators (`exec` with lossless raw-JS unwrapping, `wait`, `REPL`) and up to 64 prioritized JSON `Function` tools over native MCP while coexisting seamlessly in the same session with `<agy_tool_call_{nonce}>` XML fallback for freeform `Custom` tools (such as raw multi-line `apply_patch` diffs), tools past the 64-tool eager cap, and mid-cascade `ToolSearch` `<client_tools_update>` deltas; surfaced `SessionSlotState::Suspended`, `suspended_mcp_sessions`, `mcp_continuations`, and `LowCacheRoutingStrategy::McpSuspendedContinuation` across CLI, TUI, and Web telemetry.
+
 ## [0.2.6] - 2026-11-22
 
 ### Added

@@ -18,7 +18,8 @@ without the `/v1` prefix.
 | `GET /api/telemetry/low-cache-hits`, `GET /api/telemetry/low-cache-hits/{task_id}` | persisted low-cache-hit audit records and full captured request payloads |
 | `POST /api/telemetry/low-cache-hits/clear`, `POST /api/telemetry/cache-config` | clear low-cache records or update retention cap, threshold, and payload capture live |
 | `POST /api/telemetry/vision-offload` | live toggle for `>=150k` ephemeral vision sub-session offload |
-| `POST /api/telemetry/sessions/{id}/close` | close an idle pooled session |
+| `POST /api/telemetry/mcp-tool-bridge` | live toggle for the hybrid loopback MCP tool bridge |
+| `POST /api/telemetry/sessions/{id}/close` | close an idle or MCP-suspended pooled session |
 | `POST /api/admin/shutdown` | graceful shutdown for managed background daemons (requires `x-liftgate-shutdown-token`) |
 
 ## Authentication

@@ -206,6 +206,10 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             post(handle_set_vision_offload::<B>),
         )
         .route(
+            "/api/telemetry/mcp-tool-bridge",
+            post(handle_set_mcp_tool_bridge::<B>),
+        )
+        .route(
             "/api/telemetry/low-cache-hits",
             get(handle_get_low_cache_hits::<B>),
         )
@@ -3559,6 +3563,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         generated_at_unix_ms: unix_timestamp_ms(),
         gateway_version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
         vision_offload_enabled: state.config.vision_offload.load(Ordering::Relaxed),
+        mcp_tool_bridge_enabled: state.config.mcp_tool_bridge.load(Ordering::Relaxed),
         acp_process,
         session_pool,
         metrics,
@@ -3729,8 +3734,67 @@ async fn handle_set_vision_offload<B: AcpBackend>(
             .vision_offload
             .fetch_xor(true, Ordering::AcqRel),
     };
+    if let Some(ref settings_path) = state.config.settings_path {
+        crate::telemetry::sync_settings_json_bool_field(settings_path, "vision_offload", next);
+    }
     state.telemetry.notify_change();
     Json(json!({ "vision_offload_enabled": next })).into_response()
+}
+
+async fn handle_set_mcp_tool_bridge<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+
+    let query_opt = match parse_query_bool_param(&uri, "enabled") {
+        Ok(opt) => opt,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let body_opt = if query_opt.is_none() && !body.iter().all(u8::is_ascii_whitespace) {
+        match serde_json::from_slice::<VisionOffloadTogglePayload>(&body) {
+            Ok(parsed) => parsed.enabled,
+            Err(err) => {
+                return GatewayError::from(RequestBodyError::from(err)).into_openai_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let next = match query_opt.or(body_opt) {
+        Some(explicit) => {
+            state
+                .config
+                .mcp_tool_bridge
+                .store(explicit, Ordering::Release);
+            explicit
+        }
+        None => !state
+            .config
+            .mcp_tool_bridge
+            .fetch_xor(true, Ordering::AcqRel),
+    };
+    if let Some(ref settings_path) = state.config.settings_path {
+        crate::telemetry::sync_settings_json_bool_field(settings_path, "mcp_tool_bridge", next);
+    }
+    state.telemetry.notify_change();
+    Json(json!({ "mcp_tool_bridge_enabled": next })).into_response()
 }
 
 async fn handle_get_low_cache_hits<B: AcpBackend>(

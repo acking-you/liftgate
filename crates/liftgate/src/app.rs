@@ -202,6 +202,7 @@ async fn run_foreground_serve(state_paths: &StatePaths, args: ServeArgs) -> Resu
             info.agy_proxy_display.as_deref(),
             info.agy_auto_update,
             info.vision_offload,
+            info.mcp_tool_bridge,
         );
     };
     serve::run_serve_with_hook(state_paths, args, Some(&banner_cb)).await

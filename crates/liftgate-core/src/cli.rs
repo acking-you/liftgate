@@ -308,6 +308,14 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
 
+    /// Expose client tools over a loopback HTTP MCP bridge so multi-step tool cascades stay inside a single `session/prompt` (`true` by default).
+    #[arg(long, env = "AGY_MCP_TOOL_BRIDGE")]
+    pub mcp_tool_bridge: Option<bool>,
+
+    /// Disable the Hybrid Loopback MCP Tool Bridge and route all client tools exclusively via XML.
+    #[arg(long, conflicts_with = "mcp_tool_bridge")]
+    pub no_mcp_tool_bridge: bool,
+
     /// Maximum persisted low-cache-hit diagnostic records (`1000` by default; `0` disables recording).
     #[arg(long, env = "AGY_MAX_LOW_CACHE_RECORDS")]
     pub max_low_cache_records: Option<usize>,
@@ -395,6 +403,13 @@ impl Default for ServeArgs {
                 _ => None,
             }
         });
+        let mcp_tool_bridge = std::env::var("AGY_MCP_TOOL_BRIDGE").ok().and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        });
         let max_low_cache_records = std::env::var("AGY_MAX_LOW_CACHE_RECORDS")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok());
@@ -423,6 +438,8 @@ impl Default for ServeArgs {
             no_agy_auto_update: false,
             vision_offload,
             no_vision_offload: false,
+            mcp_tool_bridge,
+            no_mcp_tool_bridge: false,
             max_low_cache_records,
             low_cache_threshold_pct,
             low_cache_capture_payload,
@@ -496,6 +513,14 @@ pub struct RestartArgs {
     /// Disable `>=150k`-token ephemeral vision sub-session offload.
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
+
+    /// Override Hybrid Loopback MCP Tool Bridge (`true` or `false`).
+    #[arg(long)]
+    pub mcp_tool_bridge: Option<bool>,
+
+    /// Disable Hybrid Loopback MCP Tool Bridge.
+    #[arg(long, conflicts_with = "mcp_tool_bridge")]
+    pub no_mcp_tool_bridge: bool,
 
     /// Override maximum persisted low-cache-hit diagnostic records (`1000` by default).
     #[arg(long)]
@@ -1793,6 +1818,8 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--agy-proxy",
         "--agy-auto-update",
         "--vision-offload",
+        "--mcp-tool-bridge",
+        "--low-cache-capture-payload",
         "--max-low-cache-records",
         "--low-cache-threshold-pct",
         "--max-line-bytes",
@@ -1901,6 +1928,25 @@ mod tests {
             Some(Commands::Codex(c)) => {
                 assert!(!c.code_mode && !c.code_mode_only && !c.no_code_mode);
                 assert_eq!(c.passthrough_args, vec!["exec", "cargo test"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let top_flag_codex = parse_strs(&[
+            "lg",
+            "--mcp-tool-bridge",
+            "false",
+            "--low-cache-capture-payload",
+            "false",
+            "cx",
+            "-p",
+            "quick verify",
+        ]);
+        assert_eq!(top_flag_codex.serve.mcp_tool_bridge, Some(false));
+        assert_eq!(top_flag_codex.serve.low_cache_capture_payload, Some(false));
+        match top_flag_codex.command {
+            Some(Commands::Codex(c)) => {
+                assert_eq!(c.passthrough_args, vec!["-p", "quick verify"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
