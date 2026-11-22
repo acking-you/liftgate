@@ -57,6 +57,14 @@ pub enum ValidationError {
     #[error("configured limit `{field}` must be non-zero")]
     ZeroLimit { field: &'static str },
 
+    #[error("configured limit `{field}` ({value}) must be between {min} and {max}")]
+    LimitOutOfRange {
+        field: &'static str,
+        value: usize,
+        min: usize,
+        max: usize,
+    },
+
     #[error("`max_line_bytes` ({max_line_bytes}) must exceed `max_body_bytes` ({max_body_bytes})")]
     LineLimitBelowBodyLimit {
         max_line_bytes: usize,

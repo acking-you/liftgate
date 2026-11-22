@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use liftgate_types::{
+    acp::compute_cache_hit_bps,
     canonical::{CanonicalMessage, CanonicalToolSpec},
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
     telemetry::{PromptCacheWarmth, SessionPoolTelemetry, SessionSlotState, SessionSummary},
 };
+use tokio::sync::watch;
 
 use crate::{acp_client::AcpBackend, telemetry::unix_timestamp_ms};
 
@@ -27,9 +30,12 @@ pub struct IdleSessionEntry {
     pub tool_nonce: Arc<str>,
     pub model_id: ModelId,
     pub post_turn_hash: ConversationHash,
+    pub alt_post_turn_hash: Option<ConversationHash>,
     pub post_turn_dialogue_hash: ConversationHash,
     pub declared_tools: Vec<CanonicalToolSpec>,
     pub last_context_used: u64,
+    pub total_prompt_tokens: u64,
+    pub total_cached_read_tokens: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
     pub message_count: usize,
@@ -63,9 +69,12 @@ impl IdleSessionEntry {
 #[derive(Clone, Debug)]
 struct ActiveLeaseMeta {
     model_id: ModelId,
+    in_flight_hashes: Vec<ConversationHash>,
     turn_count: u64,
     message_count: usize,
     last_context_used: u64,
+    total_prompt_tokens: u64,
+    total_cached_read_tokens: u64,
     created_at_unix_ms: u64,
     last_active_unix_ms: u64,
     last_response_id: Option<String>,
@@ -82,12 +91,15 @@ pub struct SessionPool {
     limits: GatewayLimits,
     max_idle_retained_bytes: usize,
     max_stored_response_bytes: usize,
+    lifecycle_seq: watch::Sender<u64>,
     inner: Mutex<PoolInner>,
 }
 
 struct PoolInner {
     active_leases: BTreeMap<String, ActiveLeaseMeta>,
     idle_sessions: VecDeque<IdleSessionEntry>,
+    pending_checkins: Vec<(u64, Vec<ConversationHash>)>,
+    next_pending_id: u64,
     retained_idle_bytes: usize,
     stored_responses: VecDeque<StoredResponseEntry>,
     retained_response_bytes: usize,
@@ -109,14 +121,18 @@ impl SessionPool {
             .saturating_mul(2)
             .min(MAX_STORED_RESPONSES_CAP_BYTES)
             .max(max_body);
+        let (lifecycle_seq, _) = watch::channel(0u64);
 
         Self {
             limits,
             max_idle_retained_bytes,
             max_stored_response_bytes,
+            lifecycle_seq,
             inner: Mutex::new(PoolInner {
                 active_leases: BTreeMap::new(),
                 idle_sessions: VecDeque::with_capacity(limits.max_idle_sessions().get()),
+                pending_checkins: Vec::new(),
+                next_pending_id: 1,
                 retained_idle_bytes: 0,
                 stored_responses: VecDeque::with_capacity(limits.max_stored_responses().get()),
                 retained_response_bytes: 0,
@@ -199,6 +215,108 @@ impl SessionPool {
             .saturating_sub(entry.retained_bytes);
         drop(guard);
         Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
+    }
+
+    /// Atomically removes an idle session whose secondary `alt_post_turn_hash` matches `hash`
+    /// (for example when a prior turn was cancelled mid-flight and the client harness rolled back
+    /// the cancelled turn's user message before submitting a replacement prompt).
+    #[must_use]
+    pub fn checkout_by_alt_hash<B: AcpBackend>(
+        self: &Arc<Self>,
+        hash: &ConversationHash,
+        backend: Arc<B>,
+    ) -> Option<IdleCheckoutGuard<B>> {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let pos = guard
+            .idle_sessions
+            .iter()
+            .rposition(|e| e.alt_post_turn_hash.as_ref() == Some(hash))?;
+        guard.total_sessions_reused += 1;
+        guard.last_activity_unix_ms = unix_timestamp_ms();
+        let entry = guard.idle_sessions.remove(pos)?;
+        guard.retained_idle_bytes = guard
+            .retained_idle_bytes
+            .saturating_sub(entry.retained_bytes);
+        drop(guard);
+        Some(IdleCheckoutGuard::new(entry, Arc::clone(self), backend))
+    }
+
+    /// Registers an in-flight soft-cancelled session drain so an immediate follow-up turn
+    /// arriving within milliseconds waits briefly for `session/cancel` to finish instead of
+    /// spawning a duplicate cold session.
+    #[must_use]
+    pub fn register_pending_checkin(
+        self: &Arc<Self>,
+        hashes: Vec<ConversationHash>,
+    ) -> PendingCheckinGuard {
+        let id = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let id = guard.next_pending_id;
+            guard.next_pending_id = guard.next_pending_id.wrapping_add(1);
+            guard.pending_checkins.push((id, hashes));
+            id
+        };
+        PendingCheckinGuard {
+            id,
+            pool: Arc::clone(self),
+        }
+    }
+
+    /// Waits up to `max_wait` if a warm session matching any hash in `candidates` is currently
+    /// active or completing a non-destructive `session/cancel` drain.
+    pub async fn wait_for_pending_checkin(
+        &self,
+        candidates: &[ConversationHash],
+        max_wait: Duration,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        let mut rx = self.lifecycle_seq.subscribe();
+        loop {
+            {
+                let guard = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let _ = *rx.borrow_and_update();
+                let already_idle = guard.idle_sessions.iter().any(|e| {
+                    candidates.contains(&e.post_turn_hash)
+                        || e.alt_post_turn_hash
+                            .as_ref()
+                            .is_some_and(|alt| candidates.contains(alt))
+                        || candidates.contains(&e.post_turn_dialogue_hash)
+                });
+                if already_idle {
+                    return;
+                }
+                let in_flight_or_draining = guard
+                    .pending_checkins
+                    .iter()
+                    .any(|(_, hashes)| hashes.iter().any(|h| candidates.contains(h)))
+                    || guard
+                        .active_leases
+                        .values()
+                        .any(|meta| meta.in_flight_hashes.iter().any(|h| candidates.contains(h)));
+                if !in_flight_or_draining {
+                    return;
+                }
+            }
+
+            if !matches!(
+                tokio::time::timeout_at(deadline, rx.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+        }
     }
 
     /// Atomically removes an idle session matching a pure dialogue hash wrapped in a
@@ -415,6 +533,12 @@ impl SessionPool {
                 turn_count: meta.turn_count,
                 message_count: meta.message_count,
                 last_context_tokens: meta.last_context_used,
+                total_prompt_tokens: meta.total_prompt_tokens,
+                total_cached_read_tokens: meta.total_cached_read_tokens,
+                cache_hit_rate_bps: compute_cache_hit_bps(
+                    meta.total_cached_read_tokens,
+                    meta.total_prompt_tokens,
+                ),
                 created_at_unix_ms: meta.created_at_unix_ms,
                 last_active_unix_ms: meta.last_active_unix_ms,
                 last_response_id: meta.last_response_id.clone(),
@@ -433,6 +557,12 @@ impl SessionPool {
                 turn_count: idle.turn_count,
                 message_count: idle.message_count,
                 last_context_tokens: idle.last_context_used,
+                total_prompt_tokens: idle.total_prompt_tokens,
+                total_cached_read_tokens: idle.total_cached_read_tokens,
+                cache_hit_rate_bps: compute_cache_hit_bps(
+                    idle.total_cached_read_tokens,
+                    idle.total_prompt_tokens,
+                ),
                 created_at_unix_ms: idle.created_at_unix_ms,
                 last_active_unix_ms: idle.last_active_unix_ms,
                 last_response_id: idle.last_response_id.clone(),
@@ -474,14 +604,27 @@ impl SessionPool {
         }
     }
 
-    fn unregister_aborted_lease(&self, sid: &SessionId) {
+    fn set_lease_in_flight_hashes(&self, sid: &SessionId, hashes: Vec<ConversationHash>) {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let _ = guard.active_leases.remove(sid.as_str());
-        guard.total_sessions_closed_or_evicted += 1;
-        guard.last_activity_unix_ms = unix_timestamp_ms();
+        if let Some(meta) = guard.active_leases.get_mut(sid.as_str()) {
+            meta.in_flight_hashes = hashes;
+        }
+    }
+
+    fn unregister_aborted_lease(&self, sid: &SessionId) {
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = guard.active_leases.remove(sid.as_str());
+            guard.total_sessions_closed_or_evicted += 1;
+            guard.last_activity_unix_ms = unix_timestamp_ms();
+        }
+        self.bump_lifecycle_seq();
     }
 
     /// Returns a checked-out idle session back to the LRU pool when turn admission is rejected
@@ -521,6 +664,7 @@ impl SessionPool {
                 guard.total_sessions_closed_or_evicted += 1;
             }
             backend.abort_session_nonblocking(&entry.session_id);
+            self.bump_lifecycle_seq();
             return;
         }
 
@@ -555,21 +699,52 @@ impl SessionPool {
             evicted
         };
 
+        self.bump_lifecycle_seq();
         for old in evicted {
             backend.abort_session_nonblocking(&old.session_id);
         }
+    }
+
+    fn bump_lifecycle_seq(&self) {
+        self.lifecycle_seq
+            .send_modify(|seq| *seq = seq.wrapping_add(1));
     }
 }
 
 /// Post-turn session state committed back to `SessionPool` when an interactive turn completes.
 pub struct CommittedSessionTurn {
     pub post_turn_hash: ConversationHash,
+    pub alt_post_turn_hash: Option<ConversationHash>,
     pub post_turn_dialogue_hash: ConversationHash,
     pub declared_tools: Vec<CanonicalToolSpec>,
     pub last_context_used: u64,
+    pub turn_prompt_tokens: u64,
+    pub turn_cached_read_tokens: u64,
     pub message_count: usize,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+}
+
+/// RAII guard that notifies any waiting follow-up request as soon as a soft-cancelled warm
+/// session finishes draining and checks back into `SessionPool`.
+pub struct PendingCheckinGuard {
+    id: u64,
+    pool: Arc<SessionPool>,
+}
+
+impl Drop for PendingCheckinGuard {
+    fn drop(&mut self) {
+        {
+            let mut guard = match self.pool.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .pending_checkins
+                .retain(|(entry_id, _)| *entry_id != self.id);
+        }
+        self.pool.bump_lifecycle_seq();
+    }
 }
 
 /// RAII guard for a warm session checked out of `idle_sessions` before it transitions into an
@@ -642,7 +817,10 @@ pub struct SessionLeaseGuard<B: AcpBackend> {
     model_id: ModelId,
     declared_tools: Vec<CanonicalToolSpec>,
     last_context_used: u64,
+    total_prompt_tokens: u64,
+    total_cached_read_tokens: u64,
     turn_count: u64,
+    idle_before_checkout_ms: Option<u64>,
     created_at_unix_ms: u64,
     pool: Arc<SessionPool>,
     backend: Arc<B>,
@@ -665,9 +843,12 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             &session_id,
             ActiveLeaseMeta {
                 model_id: model_id.clone(),
+                in_flight_hashes: Vec::new(),
                 turn_count: 1,
                 message_count: initial_message_count,
                 last_context_used: 0,
+                total_prompt_tokens: 0,
+                total_cached_read_tokens: 0,
                 created_at_unix_ms: now_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: None,
@@ -680,7 +861,10 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             model_id,
             declared_tools,
             last_context_used: 0,
+            total_prompt_tokens: 0,
+            total_cached_read_tokens: 0,
             turn_count: 1,
+            idle_before_checkout_ms: None,
             created_at_unix_ms: now_ms,
             pool,
             backend,
@@ -696,14 +880,18 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
         backend: Arc<B>,
     ) -> Self {
         let now_ms = unix_timestamp_ms();
+        let idle_ms = now_ms.saturating_sub(cached.last_active_unix_ms);
         let next_turn = cached.turn_count.saturating_add(1);
         pool.register_lease(
             &cached.session_id,
             ActiveLeaseMeta {
                 model_id: cached.model_id.clone(),
+                in_flight_hashes: Vec::new(),
                 turn_count: next_turn,
                 message_count: new_message_count,
                 last_context_used: cached.last_context_used,
+                total_prompt_tokens: cached.total_prompt_tokens,
+                total_cached_read_tokens: cached.total_cached_read_tokens,
                 created_at_unix_ms: cached.created_at_unix_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: cached.last_response_id.clone(),
@@ -716,7 +904,10 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             model_id: cached.model_id.clone(),
             declared_tools: cached.declared_tools.clone(),
             last_context_used: cached.last_context_used,
+            total_prompt_tokens: cached.total_prompt_tokens,
+            total_cached_read_tokens: cached.total_cached_read_tokens,
             turn_count: next_turn,
+            idle_before_checkout_ms: Some(idle_ms),
             created_at_unix_ms: cached.created_at_unix_ms,
             pool,
             backend,
@@ -749,9 +940,24 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
         self.last_context_used
     }
 
+    #[must_use]
+    pub const fn turn_count(&self) -> u64 {
+        self.turn_count
+    }
+
+    #[must_use]
+    pub const fn idle_before_checkout_ms(&self) -> Option<u64> {
+        self.idle_before_checkout_ms
+    }
+
     pub fn set_model_id(&mut self, model_id: ModelId) {
         self.pool.update_lease_model(&self.session_id, &model_id);
         self.model_id = model_id;
+    }
+
+    #[must_use]
+    pub fn register_pending_checkin(&self, hashes: Vec<ConversationHash>) -> PendingCheckinGuard {
+        self.pool.register_pending_checkin(hashes)
     }
 
     /// Disarms abort-on-drop and returns the healthy session to `pool` for future turns.
@@ -763,9 +969,16 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             tool_nonce: Arc::clone(&self.tool_nonce),
             model_id: self.model_id.clone(),
             post_turn_hash: committed.post_turn_hash,
+            alt_post_turn_hash: committed.alt_post_turn_hash,
             post_turn_dialogue_hash: committed.post_turn_dialogue_hash,
             declared_tools: committed.declared_tools,
             last_context_used: committed.last_context_used,
+            total_prompt_tokens: self
+                .total_prompt_tokens
+                .saturating_add(committed.turn_prompt_tokens),
+            total_cached_read_tokens: self
+                .total_cached_read_tokens
+                .saturating_add(committed.turn_cached_read_tokens),
             last_response_id: committed.last_response_id,
             accumulated_messages: committed.accumulated_messages,
             message_count: committed.message_count,
@@ -775,6 +988,11 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             retained_bytes: 0,
         };
         self.pool.checkin(entry, &*self.backend);
+    }
+
+    pub fn set_in_flight_hashes(&self, hashes: Vec<ConversationHash>) {
+        self.pool
+            .set_lease_in_flight_hashes(&self.session_id, hashes);
     }
 
     /// Disarms abort-on-drop and closes a one-shot auxiliary/classifier session immediately so

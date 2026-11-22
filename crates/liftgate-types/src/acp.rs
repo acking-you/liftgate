@@ -277,6 +277,37 @@ pub struct AcpUsage {
     pub total_tokens: u64,
 }
 
+/// Computes prompt cache hit rate in rounded basis points (`0..=10_000`, where `10_000 == 100.00%`),
+/// returning `None` when `total_prompt_tokens == 0`.
+#[must_use]
+pub fn compute_cache_hit_bps(cached_read_tokens: u64, total_prompt_tokens: u64) -> Option<u16> {
+    if total_prompt_tokens == 0 {
+        return None;
+    }
+    let clamped_cached = cached_read_tokens.min(total_prompt_tokens);
+    let bps = (u128::from(clamped_cached)
+        .saturating_mul(10_000)
+        .saturating_add(u128::from(total_prompt_tokens) / 2))
+        / u128::from(total_prompt_tokens);
+    Some(u16::try_from(bps.min(10_000)).unwrap_or(10_000))
+}
+
+impl AcpUsage {
+    /// Total prompt/context input tokens (`input_tokens + cached_read_tokens + cached_write_tokens`).
+    #[must_use]
+    pub const fn total_prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_read_tokens)
+            .saturating_add(self.cached_write_tokens)
+    }
+
+    /// Prompt cache hit rate in basis points (`0..=10_000`), or `None` when `total_prompt_tokens == 0`.
+    #[must_use]
+    pub fn cache_hit_bps(&self) -> Option<u16> {
+        compute_cache_hit_bps(self.cached_read_tokens, self.total_prompt_tokens())
+    }
+}
+
 /// `session/cancel` notification/request parameters.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

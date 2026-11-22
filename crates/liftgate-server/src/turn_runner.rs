@@ -19,10 +19,11 @@ use liftgate_types::{
         INTERNAL_GATEWAY_WEB_FETCH_TOOL, MAX_ACP_PROMPT_TEXT_BYTES, WebToolBridgeConfig,
         build_acp_prompt_plan_with_spill, build_client_tools_delta_xml_with_spill,
         build_compaction_directive_xml_with_spill, build_session_system_append_with_spill_sink,
-        compute_routing_plan, hash_conversation_with_reply, hash_dialogue_with_reply,
+        compute_routing_plan, format_conversation_hash_hex, hash_conversation_state,
+        hash_conversation_with_reply, hash_dialogue_state, hash_dialogue_with_reply,
         truncate_head_tail_lines_with_spill,
     },
-    telemetry::TaskProtocol,
+    telemetry::{LowCacheRoutingStrategy, TaskProtocol},
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -39,7 +40,7 @@ use crate::{
     error::{AcpError, GatewayError},
     session_pool::{CommittedSessionTurn, SessionLeaseGuard, SessionPool},
     spill_store::SpillStore,
-    telemetry::{ActiveTaskGuard, TelemetryHub, unix_timestamp_ms},
+    telemetry::{ActiveTaskGuard, TelemetryHub, TurnCompletionDiagnostics, unix_timestamp_ms},
     web_fetch::{WebFetchError, WebFetchOutcome},
 };
 
@@ -106,8 +107,34 @@ pub struct ActiveTurnStream {
 
 impl Drop for ActiveTurnStream {
     fn drop(&mut self) {
-        self._worker.abort();
+        // `_cancel_guard` drops immediately after this hook, signalling `CancellationToken`
+        // so `run_turn_pipeline` can soft-cancel & recycle the live ACP session (`session/cancel`
+        // without `session/close`) instead of destroying warm context on steering interrupts.
     }
+}
+
+type BoxedPromptFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Result<PromptTurnResult, AcpError>, tokio::time::error::Elapsed>,
+            > + Send,
+    >,
+>;
+
+/// Lightweight routing & payload metadata retained across a turn so low-cache-hit diagnostics
+/// can inspect exact hashes, idle duration, and ACP payloads with zero cloning on cache hits.
+struct TurnRoutingMetadata {
+    routing_strategy: LowCacheRoutingStrategy,
+    delta_start_index: usize,
+    session_turn_index: u64,
+    session_idle_ms: Option<u64>,
+    previous_session_context_tokens: u64,
+    model_switched: bool,
+    previous_model: Option<String>,
+    prefix_hash_hex: Option<String>,
+    base_state_hash_hex: String,
+    acp_system_append: Option<String>,
+    tools_delta_xml: Option<String>,
 }
 
 /// Shared gateway runtime configuration.
@@ -153,6 +180,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         protocol,
         req.stream,
         requested_label,
+        req.auxiliary_task,
         &req.messages,
     );
 
@@ -195,6 +223,11 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 && let Some(checkout) =
                     pool.checkout_by_response_id(prev_resp_id, Arc::clone(&backend))
             {
+                let delta_start_index = checkout.entry().accumulated_messages.len();
+                let previous_session_context_tokens = checkout.entry().last_context_used;
+                let prefix_hash_hex = Some(format_conversation_hash_hex(
+                    &checkout.entry().post_turn_hash,
+                ));
                 let combined_len = checkout
                     .entry()
                     .accumulated_messages
@@ -214,7 +247,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     &mut spill_store,
                 )?;
                 let (mut guard, mut combined) = checkout.into_lease_guard(combined_len);
+                let session_idle_ms = guard.idle_before_checkout_ms();
+                let session_turn_index = guard.turn_count();
+                let mut model_switched = false;
+                let mut previous_model = None;
                 if guard.model_id() != &resolved_model {
+                    model_switched = true;
+                    previous_model = Some(guard.model_id().as_str().to_owned());
                     timeout_at(
                         deadline,
                         backend.set_session_model(guard.session_id(), &resolved_model),
@@ -226,7 +265,27 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     guard.set_model_id(resolved_model.clone());
                 }
                 combined.extend(std::mem::take(&mut req.messages));
-                return Ok((guard, true, false, prompt_blocks, combined));
+                let base_state_hash_hex = format_conversation_hash_hex(&hash_conversation_state(
+                    req.system_instructions.as_deref(),
+                    &req.client_tools,
+                    web_cfg,
+                    &resolved_model,
+                    &combined,
+                ));
+                let route_meta = TurnRoutingMetadata {
+                    routing_strategy: LowCacheRoutingStrategy::PreviousResponseId,
+                    delta_start_index,
+                    session_turn_index,
+                    session_idle_ms,
+                    previous_session_context_tokens,
+                    model_switched,
+                    previous_model,
+                    prefix_hash_hex,
+                    base_state_hash_hex,
+                    acp_system_append: None,
+                    tools_delta_xml: tools_delta,
+                };
+                return Ok((guard, true, false, prompt_blocks, combined, route_meta));
             }
 
             let routing = compute_routing_plan(
@@ -238,10 +297,47 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             );
             is_compaction_turn = routing.compaction_lookup.is_some();
 
-            if let Some((prefix_hash, delta_start)) = routing.prefix_lookup
+            let mut wait_candidates = Vec::with_capacity(4);
+            if let Some((h, _)) = routing.prefix_lookup {
+                wait_candidates.push(h);
+            }
+            if let Some((h, _)) = routing.cancelled_turn_lookup {
+                wait_candidates.push(h);
+            }
+            if let Some((h, _)) = routing.compaction_lookup {
+                wait_candidates.push(h);
+            }
+            wait_candidates.push(routing.base_state_hash_before_reply);
+            pool.wait_for_pending_checkin(&wait_candidates, Duration::from_secs(2))
+                .await;
+
+            let matched_prefix_checkout = routing
+                .prefix_lookup
+                .and_then(|(prefix_hash, delta_start)| {
+                    pool.checkout_by_hash(&prefix_hash, Arc::clone(&backend))
+                        .map(|checkout| (checkout, prefix_hash, delta_start))
+                })
+                .or_else(|| {
+                    routing
+                        .cancelled_turn_lookup
+                        .and_then(|(cancel_hash, delta_start)| {
+                            pool.checkout_by_hash(&cancel_hash, Arc::clone(&backend))
+                                .map(|checkout| (checkout, cancel_hash, delta_start))
+                        })
+                })
+                .or_else(|| {
+                    routing
+                        .prefix_lookup
+                        .and_then(|(prefix_hash, delta_start)| {
+                            pool.checkout_by_alt_hash(&prefix_hash, Arc::clone(&backend))
+                                .map(|checkout| (checkout, prefix_hash, delta_start))
+                        })
+                });
+
+            if let Some((checkout, prefix_hash, delta_start)) = matched_prefix_checkout
                 && let Some(delta_slice) = req.messages.get(delta_start..)
-                && let Some(checkout) = pool.checkout_by_hash(&prefix_hash, Arc::clone(&backend))
             {
+                let previous_session_context_tokens = checkout.entry().last_context_used;
                 let tools_delta = build_client_tools_delta_xml_with_spill(
                     &checkout.entry().declared_tools,
                     &req.client_tools,
@@ -256,7 +352,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     &mut spill_store,
                 )?;
                 let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                let session_idle_ms = guard.idle_before_checkout_ms();
+                let session_turn_index = guard.turn_count();
+                let mut model_switched = false;
+                let mut previous_model = None;
                 if guard.model_id() != &resolved_model {
+                    model_switched = true;
+                    previous_model = Some(guard.model_id().as_str().to_owned());
                     timeout_at(
                         deadline,
                         backend.set_session_model(guard.session_id(), &resolved_model),
@@ -267,12 +369,28 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     })??;
                     guard.set_model_id(resolved_model.clone());
                 }
+                let route_meta = TurnRoutingMetadata {
+                    routing_strategy: LowCacheRoutingStrategy::PrefixHash,
+                    delta_start_index: delta_start,
+                    session_turn_index,
+                    session_idle_ms,
+                    previous_session_context_tokens,
+                    model_switched,
+                    previous_model,
+                    prefix_hash_hex: Some(format_conversation_hash_hex(&prefix_hash)),
+                    base_state_hash_hex: format_conversation_hash_hex(
+                        &routing.base_state_hash_before_reply,
+                    ),
+                    acp_system_append: None,
+                    tools_delta_xml: tools_delta,
+                };
                 return Ok((
                     guard,
                     true,
                     is_compaction_turn,
                     prompt_blocks,
                     std::mem::take(&mut req.messages),
+                    route_meta,
                 ));
             }
 
@@ -281,6 +399,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 && let Some(checkout) =
                     pool.checkout_by_dialogue_hash(&dialogue_hash, Arc::clone(&backend))
             {
+                let previous_session_context_tokens = checkout.entry().last_context_used;
                 let tools_delta = build_client_tools_delta_xml_with_spill(
                     &checkout.entry().declared_tools,
                     &req.client_tools,
@@ -300,7 +419,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     &mut spill_store,
                 )?;
                 let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                let session_idle_ms = guard.idle_before_checkout_ms();
+                let session_turn_index = guard.turn_count();
+                let mut model_switched = false;
+                let mut previous_model = None;
                 if guard.model_id() != &resolved_model {
+                    model_switched = true;
+                    previous_model = Some(guard.model_id().as_str().to_owned());
                     timeout_at(
                         deadline,
                         backend.set_session_model(guard.session_id(), &resolved_model),
@@ -316,12 +441,28 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     delta_messages = delta_slice.len(),
                     "reusing warm pre-compaction ACP session for harness context compaction"
                 );
+                let route_meta = TurnRoutingMetadata {
+                    routing_strategy: LowCacheRoutingStrategy::CompactionDialogueHash,
+                    delta_start_index: delta_start,
+                    session_turn_index,
+                    session_idle_ms,
+                    previous_session_context_tokens,
+                    model_switched,
+                    previous_model,
+                    prefix_hash_hex: Some(format_conversation_hash_hex(&dialogue_hash)),
+                    base_state_hash_hex: format_conversation_hash_hex(
+                        &routing.base_state_hash_before_reply,
+                    ),
+                    acp_system_append: None,
+                    tools_delta_xml: directive,
+                };
                 return Ok((
                     guard,
                     true,
                     true,
                     prompt_blocks,
                     std::mem::take(&mut req.messages),
+                    route_meta,
                 ));
             }
         }
@@ -377,26 +518,89 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             seconds: timeout_secs,
         })??;
 
+        let route_meta = if is_ephemeral_aux {
+            TurnRoutingMetadata {
+                routing_strategy: LowCacheRoutingStrategy::ColdNewSession,
+                delta_start_index: 0,
+                session_turn_index: 1,
+                session_idle_ms: None,
+                previous_session_context_tokens: 0,
+                model_switched: false,
+                previous_model: None,
+                prefix_hash_hex: None,
+                base_state_hash_hex: String::new(),
+                acp_system_append: None,
+                tools_delta_xml: None,
+            }
+        } else {
+            let cold_routing = compute_routing_plan(
+                req.system_instructions.as_deref(),
+                &req.client_tools,
+                web_cfg,
+                &resolved_model,
+                &req.messages,
+            );
+            let has_prior_assistant = req
+                .messages
+                .iter()
+                .any(|m| m.role == CanonicalRole::Assistant);
+            TurnRoutingMetadata {
+                routing_strategy: if has_prior_assistant {
+                    LowCacheRoutingStrategy::ColdMidConversationRebuild
+                } else {
+                    LowCacheRoutingStrategy::ColdNewSession
+                },
+                delta_start_index: 0,
+                session_turn_index: 1,
+                session_idle_ms: None,
+                previous_session_context_tokens: 0,
+                model_switched: false,
+                previous_model: None,
+                prefix_hash_hex: cold_routing
+                    .prefix_lookup
+                    .map(|(h, _)| format_conversation_hash_hex(&h)),
+                base_state_hash_hex: format_conversation_hash_hex(
+                    &cold_routing.base_state_hash_before_reply,
+                ),
+                acp_system_append: Some(system_append),
+                tools_delta_xml: initial_tools_spill,
+            }
+        };
+
         Ok((
             guard,
             false,
             is_ephemeral_aux || is_compaction_turn,
             prompt_blocks,
             std::mem::take(&mut req.messages),
+            route_meta,
         ))
     }
     .await;
 
-    let (lease, session_reused, retire_after_turn, prompt_blocks, base_messages) = match setup_res {
-        Ok(t) => t,
-        Err(err) => {
-            let err = upgrade_gateway_error(err, &resolved_model);
-            task_guard.fail(format_error_chain(&err));
-            return Err(err);
-        }
-    };
+    let (lease, session_reused, retire_after_turn, prompt_blocks, base_messages, route_meta) =
+        match setup_res {
+            Ok(t) => t,
+            Err(err) => {
+                let err = upgrade_gateway_error(err, &resolved_model);
+                task_guard.fail(format_error_chain(&err));
+                return Err(err);
+            }
+        };
 
     let active_model = lease.model_id().clone();
+    if !retire_after_turn && req.auxiliary_task.is_none() {
+        lease.set_in_flight_hashes(vec![
+            hash_conversation_state(
+                req.system_instructions.as_deref(),
+                &req.client_tools,
+                web_cfg,
+                &active_model,
+                &base_messages,
+            ),
+            hash_dialogue_state(&active_model, &base_messages),
+        ]);
+    }
     task_guard.bind_session(
         lease.session_id().as_str(),
         session_reused,
@@ -419,6 +623,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         task_guard,
         prompt_blocks,
         base_messages,
+        route_meta,
         req,
         web_cfg,
         active_model,
@@ -856,6 +1061,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
     task_guard: ActiveTaskGuard,
     prompt_blocks: Vec<AcpPromptBlock>,
     mut full_messages: Vec<CanonicalMessage>,
+    route_meta: TurnRoutingMetadata,
     req: NormalizedTurnRequest,
     web_cfg: WebToolBridgeConfig,
     active_model: ModelId,
@@ -929,7 +1135,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
             AcpPromptBlock::Image { .. } => 8_192,
         })
         .sum();
+    let initial_acp_blocks: Arc<[AcpPromptBlock]> = Arc::from(current_prompt_blocks);
+    let mut next_step_blocks: Option<Arc<[AcpPromptBlock]>> = Some(Arc::clone(&initial_acp_blocks));
     let mut state = TurnStreamState::new(initial_context_used);
+    let mut deferred_soft_cancel_drain: Option<BoxedPromptFuture> = None;
     let mut last_step_started_ms: u64;
     let mut last_suppressed_banners: Vec<String>;
     let mut last_turn_error: Option<String>;
@@ -952,8 +1161,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
 
         let prompt_backend = Arc::clone(&backend);
         let prompt_session_id = session_id.clone();
-        let step_blocks = current_prompt_blocks;
-        let mut prompt_fut = std::pin::pin!(async move {
+        let step_blocks = next_step_blocks
+            .take()
+            .unwrap_or_else(|| Arc::clone(&initial_acp_blocks));
+        let mut prompt_fut: BoxedPromptFuture = Box::pin(async move {
             timeout_at(
                 deadline,
                 prompt_backend.start_prompt(&prompt_session_id, &step_blocks, acp_tx),
@@ -968,6 +1179,91 @@ async fn run_turn_pipeline<B: AcpBackend>(
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
+                    let can_recycle_warm = req.auxiliary_task.is_none()
+                        && !retire_after_turn
+                        && !state.tainted_session
+                        && completed_web_fetches == 0
+                        && backend.cancel_prompt_for_reuse(&session_id);
+                    if can_recycle_warm
+                        && let Some(cancelled_lease) = lease.take()
+                    {
+                        drop(task_guard);
+                        let post_cancel_hash = hash_conversation_state(
+                            req.system_instructions.as_deref(),
+                            &req.client_tools,
+                            web_cfg,
+                            cancelled_lease.model_id(),
+                            &full_messages,
+                        );
+                        let alt_pre_cancel_hash = (route_meta.delta_start_index > 0)
+                            .then(|| full_messages.get(..route_meta.delta_start_index))
+                            .flatten()
+                            .map(|prefix| {
+                                hash_conversation_state(
+                                    req.system_instructions.as_deref(),
+                                    &req.client_tools,
+                                    web_cfg,
+                                    cancelled_lease.model_id(),
+                                    prefix,
+                                )
+                            });
+                        let dialogue_hash =
+                            hash_dialogue_state(cancelled_lease.model_id(), &full_messages);
+                        let mut pending_hashes = vec![post_cancel_hash, dialogue_hash];
+                        if let Some(alt_h) = alt_pre_cancel_hash {
+                            pending_hashes.push(alt_h);
+                        }
+                        let pending_guard =
+                            cancelled_lease.register_pending_checkin(pending_hashes);
+                        let message_count = full_messages.len();
+                        let retained_messages = if req.retain_response_history {
+                            full_messages
+                        } else {
+                            Vec::new()
+                        };
+                        let declared_tools = req.client_tools;
+                        let approx_ctx = if state.turn_peak_context_used > 0 {
+                            state.latest_context_used
+                        } else {
+                            initial_context_used.saturating_add(
+                                u64::try_from(outbound_prompt_bytes / 4).unwrap_or(0),
+                            )
+                        };
+                        tokio::spawn(async move {
+                            let _pending = pending_guard;
+                            match timeout(Duration::from_secs(5), prompt_fut).await {
+                                Ok(Ok(Ok(res))) => {
+                                    let prompt_tok = res.usage.total_prompt_tokens();
+                                    let cached_tok = res.usage.cached_read_tokens;
+                                    let final_ctx = if res.usage.total_tokens > 0 {
+                                        res.usage.total_tokens
+                                    } else {
+                                        approx_ctx
+                                    };
+                                    tracing::info!(
+                                        session_id = %cancelled_lease.session_id(),
+                                        context_tokens = final_ctx,
+                                        "drained cancelled turn via session/cancel and preserved warm ACP session in pool"
+                                    );
+                                    cancelled_lease.commit(CommittedSessionTurn {
+                                        post_turn_hash: post_cancel_hash,
+                                        alt_post_turn_hash: alt_pre_cancel_hash,
+                                        post_turn_dialogue_hash: dialogue_hash,
+                                        declared_tools,
+                                        last_context_used: final_ctx,
+                                        turn_prompt_tokens: prompt_tok,
+                                        turn_cached_read_tokens: cached_tok,
+                                        message_count,
+                                        last_response_id: None,
+                                        accumulated_messages: retained_messages,
+                                    });
+                                }
+                                _ => {
+                                    cancelled_lease.finish_ephemeral();
+                                }
+                            }
+                        });
+                    }
                     return;
                 }
                 maybe_upd = acp_rx.recv() => {
@@ -999,6 +1295,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                 tracing::info!(
                                     "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
                                 );
+                                state.tainted_session = true;
                                 state.halted_post_tool_runaway = true;
                             }
                         }
@@ -1017,6 +1314,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                 upstream_abort = Some((sig, detail));
                                 break;
                             }
+                            state.tainted_session = true;
                             state.halted_post_tool_runaway = true;
                         }
                         if state.halted_post_tool_runaway
@@ -1027,8 +1325,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                             break;
                         }
                         if state.halted_post_tool_runaway {
-                            state.tainted_session = true;
                             if !state.pending_web_fetches.is_empty() && !state.emitted_client_tool {
+                                state.tainted_session = true;
                                 // Keep session alive for server-side `web_fetch` continuation; ask
                                 // ACP to stop only the current step's generation.
                                 backend.cancel_prompt_nonblocking(&session_id);
@@ -1045,7 +1343,41 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                         error: None,
                                     }));
                                 }
+                            } else if !state.tainted_session
+                                && req.auxiliary_task.is_none()
+                                && !retire_after_turn
+                                && backend.cancel_prompt_for_reuse(&session_id)
+                            {
+                                let desired_stop = if state.emitted_client_tool {
+                                    "tool_use".to_owned()
+                                } else {
+                                    "end_turn".to_owned()
+                                };
+                                match timeout(Duration::from_millis(250), &mut prompt_fut).await {
+                                    Ok(Ok(Ok(mut res))) => {
+                                        res.stop_reason = desired_stop;
+                                        prompt_outcome = Some(Ok(res));
+                                    }
+                                    Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                                        state.tainted_session = true;
+                                        prompt_outcome = Some(Ok(PromptTurnResult {
+                                            stop_reason: desired_stop,
+                                            usage: AcpUsage::default(),
+                                            error: None,
+                                        }));
+                                    }
+                                    Err(_) => {
+                                        deferred_soft_cancel_drain = Some(prompt_fut);
+                                        prompt_outcome = Some(Ok(PromptTurnResult {
+                                            stop_reason: desired_stop,
+                                            usage: AcpUsage::default(),
+                                            error: None,
+                                        }));
+                                        break;
+                                    }
+                                }
                             } else {
+                                state.tainted_session = true;
                                 // Client tool or runaway transcript detected: complete turn with
                                 // ZERO wait so Claude Code / Codex never hangs waiting on trailing
                                 // hallucinated tokens; `lease.finish_ephemeral()` below terminates
@@ -1105,6 +1437,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         tracing::info!(
                             "short-circuiting internal ACP post-tool retry banner because XML tool call was already captured"
                         );
+                        state.tainted_session = true;
                         state.halted_post_tool_runaway = true;
                     }
                 }
@@ -1123,6 +1456,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         upstream_abort = Some((sig, detail));
                         break;
                     }
+                    state.tainted_session = true;
                     state.halted_post_tool_runaway = true;
                 }
                 if state.halted_post_tool_runaway
@@ -1133,7 +1467,6 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     break;
                 }
                 if state.halted_post_tool_runaway {
-                    state.tainted_session = true;
                     break;
                 }
             }
@@ -1309,9 +1642,9 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     }
                     state.post_tool_spill_buf.clear();
                     state.halted_post_tool_runaway = false;
-                    current_prompt_blocks = vec![AcpPromptBlock::Text {
+                    next_step_blocks = Some(Arc::from(vec![AcpPromptBlock::Text {
                         text: continuation_xml,
-                    }];
+                    }]));
                     continue;
                 }
 
@@ -1378,16 +1711,49 @@ async fn run_turn_pipeline<B: AcpBackend>(
         outbound_prompt_bytes,
     );
 
+    // Materialize low-cache diagnostics BEFORE `full_messages` or `req.client_tools` are moved
+    // into `SessionPool`, doing zero work when `cumulative_usage` is a healthy cache hit.
+    let complete_stop_reason = final_stop_reason.clone();
+    let req_auxiliary = req.auxiliary_task;
+    let req_prev_resp_id = req.previous_response_id.clone();
+    let req_reasoning_effort = req.reasoning_effort;
+    let req_sys_inst = req.system_instructions.clone();
+
     if let Some(final_lease) = lease.take() {
         if retire_after_turn || req.auxiliary_task.is_some() || state.tainted_session {
             final_lease.finish_ephemeral();
+            let diag = TurnCompletionDiagnostics {
+                routing_strategy: route_meta.routing_strategy,
+                delta_start_index: route_meta.delta_start_index,
+                session_turn_index: route_meta.session_turn_index,
+                session_idle_ms: route_meta.session_idle_ms,
+                previous_session_context_tokens: route_meta.previous_session_context_tokens,
+                model_switched: route_meta.model_switched,
+                previous_model: route_meta.previous_model.as_deref(),
+                previous_response_id: req_prev_resp_id.as_deref(),
+                prefix_hash_hex: route_meta.prefix_hash_hex.as_deref(),
+                base_state_hash_hex: &route_meta.base_state_hash_hex,
+                reasoning_effort: req_reasoning_effort,
+                web_cfg,
+                acp_system_append: route_meta.acp_system_append.as_deref(),
+                tools_delta_xml: route_meta.tools_delta_xml.as_deref(),
+                outbound_acp_blocks: &initial_acp_blocks,
+                messages: &full_messages,
+                client_tools: &req.client_tools,
+            };
+            task_guard.complete_with_diagnostics(
+                complete_stop_reason,
+                cumulative_usage,
+                req_auxiliary.is_none().then_some(diag),
+            );
         } else {
+            let pre_reply_len = full_messages.len();
             let assistant_msg = CanonicalMessage {
                 role: CanonicalRole::Assistant,
                 parts: state.assistant_parts,
             };
             let post_hash = hash_conversation_with_reply(
-                req.system_instructions.as_deref(),
+                req_sys_inst.as_deref(),
                 &req.client_tools,
                 web_cfg,
                 final_lease.model_id(),
@@ -1396,6 +1762,33 @@ async fn run_turn_pipeline<B: AcpBackend>(
             );
             let dialogue_hash =
                 hash_dialogue_with_reply(final_lease.model_id(), &full_messages, &assistant_msg);
+            {
+                let pre_reply_slice = full_messages.get(..pre_reply_len).unwrap_or(&[]);
+                let diag = TurnCompletionDiagnostics {
+                    routing_strategy: route_meta.routing_strategy,
+                    delta_start_index: route_meta.delta_start_index,
+                    session_turn_index: route_meta.session_turn_index,
+                    session_idle_ms: route_meta.session_idle_ms,
+                    previous_session_context_tokens: route_meta.previous_session_context_tokens,
+                    model_switched: route_meta.model_switched,
+                    previous_model: route_meta.previous_model.as_deref(),
+                    previous_response_id: req_prev_resp_id.as_deref(),
+                    prefix_hash_hex: route_meta.prefix_hash_hex.as_deref(),
+                    base_state_hash_hex: &route_meta.base_state_hash_hex,
+                    reasoning_effort: req_reasoning_effort,
+                    web_cfg,
+                    acp_system_append: route_meta.acp_system_append.as_deref(),
+                    tools_delta_xml: route_meta.tools_delta_xml.as_deref(),
+                    outbound_acp_blocks: &initial_acp_blocks,
+                    messages: pre_reply_slice,
+                    client_tools: &req.client_tools,
+                };
+                task_guard.complete_with_diagnostics(
+                    complete_stop_reason,
+                    cumulative_usage,
+                    Some(diag),
+                );
+            }
             full_messages.push(assistant_msg);
             let message_count = full_messages.len();
             let retained_messages = if req.retain_response_history {
@@ -1408,19 +1801,40 @@ async fn run_turn_pipeline<B: AcpBackend>(
             } else {
                 context_usage.total_tokens
             };
-            final_lease.commit(CommittedSessionTurn {
+            let committed_turn = CommittedSessionTurn {
                 post_turn_hash: post_hash,
+                alt_post_turn_hash: None,
                 post_turn_dialogue_hash: dialogue_hash,
                 declared_tools: req.client_tools,
                 last_context_used: committed_context_used,
+                turn_prompt_tokens: cumulative_usage.total_prompt_tokens(),
+                turn_cached_read_tokens: cumulative_usage.cached_read_tokens,
                 message_count,
                 last_response_id: Some(response_id),
                 accumulated_messages: retained_messages,
-            });
+            };
+            if let Some(pending_fut) = deferred_soft_cancel_drain.take() {
+                let pending_guard =
+                    final_lease.register_pending_checkin(vec![post_hash, dialogue_hash]);
+                tokio::spawn(async move {
+                    let _pending = pending_guard;
+                    match timeout(Duration::from_secs(5), pending_fut).await {
+                        Ok(Ok(Ok(_))) => {
+                            final_lease.commit(committed_turn);
+                        }
+                        _ => {
+                            final_lease.finish_ephemeral();
+                        }
+                    }
+                });
+            } else {
+                final_lease.commit(committed_turn);
+            }
         }
+    } else {
+        task_guard.complete(complete_stop_reason, cumulative_usage);
     }
 
-    task_guard.complete(final_stop_reason.clone(), cumulative_usage);
     let _ = events_tx
         .send(TurnEvent::Completed {
             usage: context_usage,
@@ -1636,6 +2050,7 @@ async fn forward_acp_update(
                     acp_kind = %kind,
                     "short-circuiting post-tool native ACP tool call because XML tool call was already captured"
                 );
+                state.tainted_session = true;
                 state.halted_post_tool_runaway = true;
                 return true;
             }
@@ -1907,6 +2322,12 @@ async fn emit_parsed_items_inner(
                             non_ws_chars,
                             "detected post-tool hallucination / simulated transcript boundary; halting turn immediately"
                         );
+                        if contains_runaway_marker(&state.post_tool_spill_buf)
+                            || is_malformed_function_call_banner(&state.post_tool_spill_buf)
+                            || classify_upstream_error_text(&state.post_tool_spill_buf).is_some()
+                        {
+                            state.tainted_session = true;
+                        }
                         state.halted_post_tool_runaway = true;
                         break;
                     }
@@ -1934,6 +2355,7 @@ async fn emit_parsed_items_inner(
                     tracing::warn!(
                         "detected simulated role/tool-result boundary in assistant text; halting turn immediately"
                     );
+                    state.tainted_session = true;
                     state.halted_post_tool_runaway = true;
                     break;
                 }

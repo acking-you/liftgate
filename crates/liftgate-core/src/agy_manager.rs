@@ -1882,7 +1882,7 @@ fn is_gateway_idle_for_update(
     telemetry: &TelemetryHub,
     opts: &IdleAutoUpdateOptions,
 ) -> bool {
-    let (metrics, _, _) = telemetry.snapshot_tasks();
+    let (metrics, _, _, _) = telemetry.snapshot_tasks();
     if metrics.active_requests > 0 {
         return false;
     }
@@ -2338,6 +2338,7 @@ fn main() {{
             TaskProtocol::OpenaiResponses,
             true,
             "gemini-4-carbon-high".to_owned(),
+            None,
             &[],
         );
 

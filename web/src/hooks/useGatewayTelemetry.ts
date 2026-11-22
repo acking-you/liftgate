@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { GatewayTelemetrySnapshot } from "@/types/telemetry";
+import type {
+  CacheTelemetrySummary,
+  GatewayTelemetrySnapshot,
+  LowCacheHitRecord,
+  LowCacheHitsResponse,
+  LowCachePayloadDetailResponse,
+} from "@/types/telemetry";
 
 export type StreamConnectionState = "connecting" | "live" | "reconnecting" | "error";
 
@@ -76,8 +82,6 @@ function defaultGatewayBaseUrl(): string {
   if (saved !== null && saved.trim().length > 0) {
     return saved.trim().replace(/\/+$/, "");
   }
-  // If running under Vite dev server on :5173, use empty base so Vite proxy or explicit URL works;
-  // if co-hosted directly on the Rust gateway port, window.location.origin is exact!
   if (window.location.port === "5173") {
     return "";
   }
@@ -86,14 +90,29 @@ function defaultGatewayBaseUrl(): string {
 
 export interface GatewayTelemetryState {
   snapshot: GatewayTelemetrySnapshot | null;
+  lowCacheRecords: LowCacheHitRecord[];
+  lowCacheLoading: boolean;
   connectionState: StreamConnectionState;
   lastError: string | null;
   baseUrl: string;
   apiKey: string;
   updateConnectionConfig: (nextBaseUrl: string, nextApiKey: string) => void;
   refreshSnapshot: () => Promise<void>;
+  refreshLowCacheHits: () => Promise<void>;
   closeIdleSession: (sessionId: string) => Promise<boolean>;
   toggleVisionOffload: (enabled?: boolean) => Promise<boolean | null>;
+  updateCacheConfig: (
+    maxLowCacheRecords: number,
+    lowCacheThresholdPct: number,
+    captureRequestDetails?: boolean,
+  ) => Promise<{ ok: true; summary: CacheTelemetrySummary } | { ok: false; error: string }>;
+  toggleLowCacheCapturePayload: (
+    enabled: boolean,
+  ) => Promise<CacheTelemetrySummary | null>;
+  fetchLowCacheHitDetail: (
+    taskId: string,
+  ) => Promise<LowCachePayloadDetailResponse | null>;
+  clearLowCacheHits: (resetTotals?: boolean) => Promise<CacheTelemetrySummary | null>;
 }
 
 export function useGatewayTelemetry(): GatewayTelemetryState {
@@ -106,10 +125,13 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
   });
 
   const [snapshot, setSnapshot] = useState<GatewayTelemetrySnapshot | null>(null);
+  const [lowCacheRecords, setLowCacheRecords] = useState<LowCacheHitRecord[]>([]);
+  const [lowCacheLoading, setLowCacheLoading] = useState<boolean>(false);
   const [connectionState, setConnectionState] =
     useState<StreamConnectionState>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const lastFetchedCacheRevisionRef = useRef<number>(-1);
 
   const buildUrl = useCallback(
     (path: string, includeQueryKey = false): string => {
@@ -124,13 +146,34 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     [baseUrl, apiKey],
   );
 
-  const authHeaders = useMemo< Record<string, string> >(() => {
+  const authHeaders = useMemo<Record<string, string>>(() => {
     const headers: Record<string, string> = {};
     if (apiKey.trim().length > 0) {
       headers["Authorization"] = `Bearer ${apiKey.trim()}`;
     }
     return headers;
   }, [apiKey]);
+
+  const refreshLowCacheHits = useCallback(async (): Promise<void> => {
+    setLowCacheLoading(true);
+    try {
+      const resp = await fetch(buildUrl("/api/telemetry/low-cache-hits"), {
+        headers: authHeaders,
+      });
+      if (!resp.ok) {
+        return;
+      }
+      const data = (await resp.json()) as LowCacheHitsResponse;
+      setLowCacheRecords(data.records ?? []);
+      if (data.summary) {
+        lastFetchedCacheRevisionRef.current = data.summary.revision;
+      }
+    } catch {
+      // Snapshot SSE loop already surfaces connectivity errors cleanly.
+    } finally {
+      setLowCacheLoading(false);
+    }
+  }, [authHeaders, buildUrl]);
 
   const refreshSnapshot = useCallback(async (): Promise<void> => {
     try {
@@ -148,6 +191,13 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
       setLastError(msg);
     }
   }, [authHeaders, buildUrl]);
+
+  const cacheRevision = snapshot?.cache_telemetry?.revision ?? -1;
+  useEffect(() => {
+    if (cacheRevision >= 0 && cacheRevision !== lastFetchedCacheRevisionRef.current) {
+      void refreshLowCacheHits();
+    }
+  }, [cacheRevision, refreshLowCacheHits]);
 
   const closeIdleSession = useCallback(
     async (sessionId: string): Promise<boolean> => {
@@ -188,10 +238,124 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     [authHeaders, buildUrl, refreshSnapshot],
   );
 
+  const updateCacheConfig = useCallback(
+    async (
+      maxLowCacheRecords: number,
+      lowCacheThresholdPct: number,
+      captureRequestDetails?: boolean,
+    ): Promise<
+      { ok: true; summary: CacheTelemetrySummary } | { ok: false; error: string }
+    > => {
+      try {
+        const reqBody: Record<string, unknown> = {
+          max_low_cache_records: maxLowCacheRecords,
+          low_cache_threshold_pct: lowCacheThresholdPct,
+        };
+        if (typeof captureRequestDetails === "boolean") {
+          reqBody.capture_request_details = captureRequestDetails;
+        }
+        const resp = await fetch(buildUrl("/api/telemetry/cache-config"), {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(reqBody),
+        });
+        const payload = (await resp.json()) as
+          | CacheTelemetrySummary
+          | { error?: { message?: string } };
+        if (!resp.ok) {
+          const errMsg =
+            "error" in payload && payload.error?.message
+              ? payload.error.message
+              : `HTTP ${resp.status}`;
+          return { ok: false, error: errMsg };
+        }
+        const summary = payload as CacheTelemetrySummary;
+        await Promise.all([refreshSnapshot(), refreshLowCacheHits()]);
+        return { ok: true, summary };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    [authHeaders, buildUrl, refreshLowCacheHits, refreshSnapshot],
+  );
+
+  const toggleLowCacheCapturePayload = useCallback(
+    async (enabled: boolean): Promise<CacheTelemetrySummary | null> => {
+      try {
+        const resp = await fetch(buildUrl("/api/telemetry/cache-config"), {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            capture_request_details: enabled,
+          }),
+        });
+        if (!resp.ok) {
+          return null;
+        }
+        const summary = (await resp.json()) as CacheTelemetrySummary;
+        await Promise.all([refreshSnapshot(), refreshLowCacheHits()]);
+        return summary;
+      } catch {
+        return null;
+      }
+    },
+    [authHeaders, buildUrl, refreshLowCacheHits, refreshSnapshot],
+  );
+
+  const fetchLowCacheHitDetail = useCallback(
+    async (taskId: string): Promise<LowCachePayloadDetailResponse | null> => {
+      try {
+        const resp = await fetch(
+          buildUrl(`/api/telemetry/low-cache-hits/${encodeURIComponent(taskId)}`),
+          {
+            headers: authHeaders,
+          },
+        );
+        if (!resp.ok) {
+          return null;
+        }
+        return (await resp.json()) as LowCachePayloadDetailResponse;
+      } catch {
+        return null;
+      }
+    },
+    [authHeaders, buildUrl],
+  );
+
+  const clearLowCacheHits = useCallback(
+    async (resetTotals = false): Promise<CacheTelemetrySummary | null> => {
+      const query = resetTotals ? "?reset_totals=true" : "";
+      const resp = await fetch(
+        buildUrl(`/api/telemetry/low-cache-hits/clear${query}`),
+        {
+          method: "POST",
+          headers: authHeaders,
+        },
+      );
+      if (!resp.ok) {
+        return null;
+      }
+      const summary = (await resp.json()) as CacheTelemetrySummary;
+      await Promise.all([refreshSnapshot(), refreshLowCacheHits()]);
+      return summary;
+    },
+    [authHeaders, buildUrl, refreshLowCacheHits, refreshSnapshot],
+  );
+
   const updateConnectionConfig = useCallback(
     (nextBaseUrl: string, nextApiKey: string): void => {
       const cleanUrl = nextBaseUrl.trim().replace(/\/+$/, "");
       const cleanKey = nextApiKey.trim();
+      lastFetchedCacheRevisionRef.current = -1;
       setBaseUrl(cleanUrl);
       setApiKey(cleanKey);
       if (typeof window !== "undefined") {
@@ -215,11 +379,36 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
 
       es.addEventListener("snapshot", (ev: MessageEvent<string>) => {
         if (cancelled) return;
+        setConnectionState("live");
+        setLastError(null);
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+          return;
+        }
         try {
           const parsed = JSON.parse(ev.data) as GatewayTelemetrySnapshot;
-          setSnapshot(parsed);
-          setConnectionState("live");
-          setLastError(null);
+          setSnapshot((prev) => {
+            if (
+              prev !== null &&
+              parsed.active_tasks.length === 0 &&
+              prev.active_tasks.length === 0 &&
+              parsed.metrics.total_requests === prev.metrics.total_requests &&
+              parsed.metrics.completed_requests === prev.metrics.completed_requests &&
+              parsed.metrics.failed_requests === prev.metrics.failed_requests &&
+              (parsed.cache_telemetry?.revision ?? 0) ===
+                (prev.cache_telemetry?.revision ?? 0) &&
+              parsed.vision_offload_enabled === prev.vision_offload_enabled &&
+              parsed.acp_process.connected === prev.acp_process.connected &&
+              parsed.acp_process.recent_stderr.length ===
+                prev.acp_process.recent_stderr.length &&
+              parsed.session_pool.sessions.length ===
+                prev.session_pool.sessions.length &&
+              parsed.available_models.length === prev.available_models.length &&
+              parsed.acp_process.uptime_secs - prev.acp_process.uptime_secs < 10
+            ) {
+              return prev;
+            }
+            return parsed;
+          });
         } catch (parseErr) {
           setLastError(
             parseErr instanceof Error ? parseErr.message : "Invalid SSE JSON",
@@ -243,6 +432,7 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     };
 
     void refreshSnapshot();
+    void refreshLowCacheHits();
     connect();
 
     return () => {
@@ -252,17 +442,24 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
         window.clearTimeout(reconnectTimerRef.current);
       }
     };
-  }, [buildUrl, refreshSnapshot]);
+  }, [buildUrl, refreshLowCacheHits, refreshSnapshot]);
 
   return {
     snapshot,
+    lowCacheRecords,
+    lowCacheLoading,
     connectionState,
     lastError,
     baseUrl,
     apiKey,
     updateConnectionConfig,
     refreshSnapshot,
+    refreshLowCacheHits,
     closeIdleSession,
     toggleVisionOffload,
+    updateCacheConfig,
+    toggleLowCacheCapturePayload,
+    fetchLowCacheHitDetail,
+    clearLowCacheHits,
   };
 }

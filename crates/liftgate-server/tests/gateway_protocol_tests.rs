@@ -15,15 +15,17 @@ use liftgate_server::{
     error::AcpError,
     routes::{ADMIN_SHUTDOWN_HEADER, AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router},
     session_pool::SessionPool,
-    telemetry::TelemetryHub,
+    telemetry::{CacheTelemetryConfig, TelemetryHub},
     turn_runner::GatewayRuntimeConfig,
 };
 use liftgate_types::{
     acp::{
-        AcpChunkContent, AcpPromptBlock, AvailableModel, ModelsCatalog, ModesCatalog,
+        AcpChunkContent, AcpPromptBlock, AcpUsage, AvailableModel, ModelsCatalog, ModesCatalog,
         PromptTurnResult, SessionNewResult, SessionUpdatePayload,
     },
-    config::{AcpModeId, GatewayLimits, ModelId, SessionId},
+    config::{
+        AcpModeId, CacheHitThresholdBps, GatewayLimits, LowCacheRecordLimit, ModelId, SessionId,
+    },
     test_support::{mock_acp_usage, mock_available_models},
 };
 use serde_json::{Value, json, value::RawValue};
@@ -35,6 +37,10 @@ enum MockScript {
     Immediate {
         thoughts: Vec<String>,
         chunks_template: Vec<String>,
+    },
+    ImmediateWithExactUsage {
+        usage: AcpUsage,
+        reply: String,
     },
     ImmediateWithUsage {
         usage_updates: Vec<(u64, u64)>,
@@ -60,6 +66,11 @@ enum MockScript {
         message: String,
     },
     HangForever,
+    SoftCancellableHang {
+        cancel_rx: Arc<tokio::sync::Notify>,
+        cancelled_usage: AcpUsage,
+        initial_updates: Vec<SessionUpdatePayload>,
+    },
 }
 
 struct RecordedPrompt {
@@ -71,6 +82,8 @@ struct RecordedPrompt {
 struct MockAcpBackend {
     next_session_num: AtomicUsize,
     aborted_count: AtomicUsize,
+    soft_cancel_enabled: std::sync::atomic::AtomicBool,
+    soft_cancel_notify_slot: Mutex<Option<Arc<tokio::sync::Notify>>>,
     session_nonces: Mutex<Vec<(String, String)>>,
     recorded_system_appends: Mutex<Vec<String>>,
     recorded_models: Mutex<Vec<String>>,
@@ -83,12 +96,19 @@ impl MockAcpBackend {
         Self {
             next_session_num: AtomicUsize::new(1),
             aborted_count: AtomicUsize::new(0),
+            soft_cancel_enabled: std::sync::atomic::AtomicBool::new(false),
+            soft_cancel_notify_slot: Mutex::new(None),
             session_nonces: Mutex::new(Vec::new()),
             recorded_system_appends: Mutex::new(Vec::new()),
             recorded_models: Mutex::new(Vec::new()),
             recorded_prompts: Mutex::new(Vec::new()),
             scripts: Mutex::new(VecDeque::from(scripts)),
         }
+    }
+
+    fn enable_soft_cancel_with_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        self.soft_cancel_enabled.store(true, Ordering::SeqCst);
+        *self.soft_cancel_notify_slot.lock().unwrap() = Some(notify);
     }
 
     fn extract_nonce(system_append: &str) -> String {
@@ -226,6 +246,22 @@ impl AcpBackend for MockAcpBackend {
                 Ok(PromptTurnResult {
                     stop_reason: "end_turn".to_owned(),
                     usage: mock_acp_usage(100, 25, 10),
+                    error: None,
+                })
+            }
+            MockScript::ImmediateWithExactUsage { usage, reply } => {
+                let hydrated = reply.replace("{NONCE}", &nonce);
+                let _ = updates_tx
+                    .send(SessionUpdatePayload::AgentMessageChunk {
+                        content: AcpChunkContent {
+                            content_type: "text".to_owned(),
+                            text: hydrated,
+                        },
+                    })
+                    .await;
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage,
                     error: None,
                 })
             }
@@ -369,6 +405,35 @@ impl AcpBackend for MockAcpBackend {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 Ok(PromptTurnResult::default())
             }
+            MockScript::SoftCancellableHang {
+                cancel_rx,
+                cancelled_usage,
+                initial_updates,
+            } => {
+                for mut upd in initial_updates {
+                    if let SessionUpdatePayload::AgentMessageChunk { content } = &mut upd {
+                        content.text = content.text.replace("{NONCE}", &nonce);
+                    }
+                    let _ = updates_tx.send(upd).await;
+                }
+                cancel_rx.notified().await;
+                Ok(PromptTurnResult {
+                    stop_reason: "cancelled".to_owned(),
+                    usage: cancelled_usage,
+                    error: None,
+                })
+            }
+        }
+    }
+
+    fn cancel_prompt_for_reuse(&self, _session_id: &SessionId) -> bool {
+        if self.soft_cancel_enabled.load(Ordering::SeqCst) {
+            if let Some(custom) = self.soft_cancel_notify_slot.lock().unwrap().as_ref() {
+                custom.notify_one();
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -5393,7 +5458,7 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
     }
 
     // Verify telemetry recorded `vision_offloaded_images == 1` and `ttft_ms`
-    let (_metrics, _active, recent) = state.telemetry.snapshot_tasks();
+    let (_metrics, _cache, _active, recent) = state.telemetry.snapshot_tasks();
     assert_eq!(recent[0].vision_offloaded_images, 1);
     assert!(recent[0].ttft_ms.is_some());
 
@@ -5590,4 +5655,748 @@ async fn session_pool_classifies_cache_warmth_and_reaps_expired_idle_sessions() 
         backend.aborted_count.load(Ordering::SeqCst),
         aborted_before + 1
     );
+}
+
+#[tokio::test]
+async fn cache_hit_rates_and_bounded_low_cache_records_persist_and_reconfigure_atomically() {
+    use liftgate_types::telemetry::{LowCacheHitReason, LowCacheHitsResponse};
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "liftgate-cache-persist-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let persist_path = tmp_dir.join("cache-telemetry.json");
+    let settings_path = tmp_dir.join("settings.json");
+
+    let scripts = vec![
+        // Turn 1: Cold session start -> 0 / 1_000 (0.00% < 50% -> recorded as ColdSessionStart)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 50,
+                thought_tokens: 0,
+                total_tokens: 1_050,
+            },
+            reply: "Reply 1".to_owned(),
+        },
+        // Turn 2: Warm session reused -> 1_800 / 2_000 (90.00% >= 50% -> NOT low-hit)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 200,
+                cached_read_tokens: 1_800,
+                cached_write_tokens: 0,
+                output_tokens: 60,
+                thought_tokens: 0,
+                total_tokens: 2_060,
+            },
+            reply: "Reply 2".to_owned(),
+        },
+        // Turn 3: Warm session reused, upstream KV cache expired -> 0 / 2_000 (0.00% < 50% -> WarmCacheMiss)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 2_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 40,
+                thought_tokens: 0,
+                total_tokens: 2_040,
+            },
+            reply: "Reply 3".to_owned(),
+        },
+        // Turn 4: Warm session reused, partial prefix hit -> 500 / 2_000 (25.00% < 50% -> WarmPartialHit)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_500,
+                cached_read_tokens: 500,
+                cached_write_tokens: 0,
+                output_tokens: 45,
+                thought_tokens: 0,
+                total_tokens: 2_045,
+            },
+            reply: "Reply 4".to_owned(),
+        },
+        // Turn 5: Fresh cold session -> 0 / 1_000 (0.00% < 50% -> ColdSessionStart; evicts Turn 1 under cap=3)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 1_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 30,
+                thought_tokens: 0,
+                total_tokens: 1_030,
+            },
+            reply: "Reply 5".to_owned(),
+        },
+    ];
+
+    let backend = Arc::new(MockAcpBackend::new(scripts));
+    let mut state = test_state(Arc::clone(&backend), 30, None);
+    state.telemetry = Arc::new(TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(persist_path.clone()),
+        settings_path: Some(settings_path.clone()),
+        max_low_cache_records: LowCacheRecordLimit::try_new(3).unwrap(),
+        low_cache_threshold_bps: CacheHitThresholdBps::try_from_percent(50).unwrap(),
+        capture_request_details: true,
+    }));
+    let app = build_router(state.clone());
+
+    let mut prev_id: Option<String> = None;
+    for idx in 1..=4 {
+        let mut payload = json!({
+            "model": "gemini-4-carbon-high",
+            "stream": false,
+            "input": format!("Chain turn {idx}"),
+        });
+        if let Some(pid) = &prev_id {
+            payload["previous_response_id"] = json!(pid);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        prev_id = Some(body["id"].as_str().unwrap().to_owned());
+    }
+
+    // Turn 5 without previous_response_id -> new cold session
+    let resp5 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": "Fresh cold turn 5",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp5.status(), StatusCode::OK);
+
+    // Total prompt = 1000 + 2000 + 2000 + 2000 + 1000 = 8_000; cached_read = 2_300 -> 28.75% (2_875 bps)
+    // Warm prompt = 2000 + 2000 + 2000 = 6_000; warm cached_read = 2_300 -> 38.33% (3_833 bps)
+    let low_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/low-cache-hits")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(low_resp.status(), StatusCode::OK);
+    let low_bytes = low_resp.into_body().collect().await.unwrap().to_bytes();
+    let low_data: LowCacheHitsResponse = serde_json::from_slice(&low_bytes).unwrap();
+
+    assert_eq!(low_data.summary.total_prompt_tokens, 8_000);
+    assert_eq!(low_data.summary.total_cached_read_tokens, 2_300);
+    assert_eq!(low_data.summary.total_cache_hit_rate_bps, Some(2_875));
+    assert_eq!(low_data.summary.warm_prompt_tokens, 6_000);
+    assert_eq!(low_data.summary.warm_cached_read_tokens, 2_300);
+    assert_eq!(low_data.summary.warm_cache_hit_rate_bps, Some(3_833));
+    assert_eq!(low_data.summary.evaluated_turns, 5);
+    assert_eq!(low_data.summary.warm_evaluated_turns, 3);
+    assert_eq!(low_data.summary.total_low_cache_turns, 4);
+    assert_eq!(low_data.summary.stored_low_cache_count, 3);
+    assert_eq!(low_data.records.len(), 3);
+
+    // Newest-first order: Turn 5 (ColdSessionStart), Turn 4 (WarmPartialHit), Turn 3 (WarmCacheMiss)
+    assert_eq!(
+        low_data.records[0].reason,
+        LowCacheHitReason::ColdSessionStart
+    );
+    assert_eq!(low_data.records[0].prompt_preview, "Fresh cold turn 5");
+    assert_eq!(
+        low_data.records[1].reason,
+        LowCacheHitReason::WarmPartialHit
+    );
+    assert_eq!(low_data.records[1].cache_hit_rate_bps, 2_500);
+    assert_eq!(low_data.records[2].reason, LowCacheHitReason::WarmCacheMiss);
+    assert_eq!(low_data.records[2].cache_hit_rate_bps, 0);
+
+    // Verify durable disk persistence across TelemetryHub restart!
+    assert!(persist_path.is_file());
+    let reloaded_hub = TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(persist_path.clone()),
+        settings_path: Some(settings_path.clone()),
+        max_low_cache_records: LowCacheRecordLimit::try_new(3).unwrap(),
+        low_cache_threshold_bps: CacheHitThresholdBps::try_from_percent(50).unwrap(),
+        capture_request_details: true,
+    });
+    let reloaded = reloaded_hub.low_cache_hits();
+    assert_eq!(reloaded.summary.total_cache_hit_rate_bps, Some(2_875));
+    assert_eq!(reloaded.summary.warm_cache_hit_rate_bps, Some(3_833));
+    assert_eq!(reloaded.records.len(), 3);
+    assert_eq!(reloaded.records[0].prompt_preview, "Fresh cold turn 5");
+
+    // Reject out-of-range limit (> 50_000) with 400 Bad Request
+    let bad_cfg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/cache-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "max_low_cache_records": 99_999 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_cfg.status(), StatusCode::BAD_REQUEST);
+
+    // Live resize max_low_cache_records -> 2 and threshold -> 65%, verifying immediate trim & settings.json sync
+    let update_cfg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/cache-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "max_low_cache_records": 2,
+                        "low_cache_threshold_pct": 65,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_cfg.status(), StatusCode::OK);
+    let after_trim = state.telemetry.low_cache_hits();
+    assert_eq!(after_trim.summary.max_low_cache_records, 2);
+    assert_eq!(after_trim.summary.low_cache_threshold_bps, 6_500);
+    assert_eq!(after_trim.records.len(), 2);
+
+    let saved_settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(saved_settings["max_low_cache_records"], json!(2));
+    assert_eq!(saved_settings["low_cache_threshold_bps"], json!(6_500));
+
+    // Clear low-cache records while preserving cumulative totals
+    let clear_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/low-cache-hits/clear")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_resp.status(), StatusCode::OK);
+    let after_clear = state.telemetry.low_cache_hits();
+    assert!(after_clear.records.is_empty());
+    assert_eq!(after_clear.summary.total_cache_hit_rate_bps, Some(2_875));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn soft_cancel_preserves_warm_session_across_post_tool_thought_and_mid_turn_steering_cancel()
+{
+    let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::SoftCancellableHang {
+            cancel_rx: Arc::clone(&cancel_notify),
+            cancelled_usage: AcpUsage {
+                input_tokens: 8_000,
+                output_tokens: 120,
+                cached_read_tokens: 142_000,
+                cached_write_tokens: 0,
+                thought_tokens: 20,
+                total_tokens: 150_120,
+            },
+            initial_updates: vec![
+                SessionUpdatePayload::AgentMessageChunk {
+                    content: AcpChunkContent {
+                        content_type: "text".to_owned(),
+                        text: "<agy_tool_call_{NONCE}>\n*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** End Patch\n</agy_tool_call_{NONCE}>".to_owned(),
+                    },
+                },
+                SessionUpdatePayload::AgentThoughtChunk {
+                    content: AcpChunkContent {
+                        content_type: "text".to_owned(),
+                        text: "Post-tool internal thinking that triggers short-circuit".to_owned(),
+                    },
+                },
+            ],
+        },
+        MockScript::SoftCancellableHang {
+            cancel_rx: Arc::clone(&cancel_notify),
+            cancelled_usage: AcpUsage {
+                input_tokens: 5_000,
+                output_tokens: 0,
+                cached_read_tokens: 150_000,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+                total_tokens: 155_000,
+            },
+            initial_updates: vec![SessionUpdatePayload::UsageUpdate {
+                used: 155_000,
+                size: 500_000,
+            }],
+        },
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 200,
+                output_tokens: 40,
+                cached_read_tokens: 155_000,
+                cached_write_tokens: 0,
+                thought_tokens: 0,
+                total_tokens: 155_240,
+            },
+            reply: "Steering handled on warm session-1!".to_owned(),
+        },
+    ]));
+    backend.enable_soft_cancel_with_notify(Arc::clone(&cancel_notify));
+
+    let state = test_state(Arc::clone(&backend), 30, None);
+    let app = build_router(state.clone());
+
+    let tools_json = json!([{
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply patch"
+    }]);
+
+    let t1_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "tools": tools_json,
+                        "input": [{
+                            "role": "user",
+                            "content": "Fix a.rs"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1_resp.status(), StatusCode::OK);
+    let t1_body: serde_json::Value =
+        serde_json::from_slice(&t1_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let call_id = t1_body["output"][0]["call_id"].as_str().unwrap().to_owned();
+    assert_eq!(t1_body["output"][0]["name"], "apply_patch");
+    assert_eq!(
+        t1_body["output"][0]["input"],
+        "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** End Patch"
+    );
+    assert_eq!(backend.aborted_count.load(Ordering::SeqCst), 0);
+
+    let t2_input = json!([
+        { "role": "user", "content": "Fix a.rs" },
+        {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** End Patch"
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": "Success. Updated a.rs"
+        }
+    ]);
+    let t2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "tools": tools_json,
+                        "input": t2_input,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2_resp.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(t2_resp);
+
+    let t3_input = json!([
+        { "role": "user", "content": "Fix a.rs" },
+        {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** End Patch"
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": "Success. Updated a.rs"
+        },
+        {
+            "role": "user",
+            "content": "Also keep reusing the warm session without creating a new one!"
+        }
+    ]);
+    let t3_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "tools": tools_json,
+                        "input": t3_input,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3_resp.status(), StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[0].session_id, "sess_1");
+    assert_eq!(
+        prompts[1].session_id, "sess_1",
+        "Turn 2 must reuse sess_1 after post-tool thought short-circuit"
+    );
+    assert_eq!(
+        prompts[2].session_id, "sess_1",
+        "Turn 3 must reuse sess_1 after mid-turn SSE cancel"
+    );
+    assert!(
+        !prompts[2].text_joined.contains("Success. Updated a.rs"),
+        "Turn 3 must send ONLY the new steering message delta, not replay Turn 2 tool output: {}",
+        prompts[2].text_joined
+    );
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("Also keep reusing the warm session")
+    );
+    assert_eq!(backend.aborted_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn auxiliary_turns_excluded_and_low_cache_full_payload_capture_toggles_cleanly() {
+    use liftgate_types::telemetry::{
+        LowCacheDiagnosticCause, LowCacheHitsResponse, LowCachePayloadDetailResponse,
+        LowCacheRoutingStrategy,
+    };
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "liftgate-cache-payload-detail-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let persist_path = tmp_dir.join("cache-telemetry.json");
+    let settings_path = tmp_dir.join("settings.json");
+    let payload_dir = tmp_dir.join("low-cache-payloads");
+
+    let scripts = vec![
+        // 1. Ephemeral background title task -> 0 / 12_000 (MUST NOT dilute primary cache hit rate or enter low_cache_records)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 12_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 12,
+                thought_tokens: 0,
+                total_tokens: 12_012,
+            },
+            reply: "Inspect cache telemetry".to_owned(),
+        },
+        // 2. Interactive turn 1 (with instructions + tool) -> 0 / 4_000 (ColdSessionStart -> full payload captured)
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 4_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 80,
+                thought_tokens: 20,
+                total_tokens: 4_100,
+            },
+            reply: "First reply".to_owned(),
+        },
+        // 3. Interactive turn 2 across <current_date> midnight rollover -> MUST reuse warm session via prefix_hash!
+        //    Upstream Gemini implicit replica miss (0 / 5_000) -> WarmUpstreamImplicitMiss with full payload
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 5_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 90,
+                thought_tokens: 15,
+                total_tokens: 5_105,
+            },
+            reply: "Second reply".to_owned(),
+        },
+        // 4. Interactive turn 3 after disabling capture_request_details -> metrics captured, payload omitted
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 3_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 50,
+                thought_tokens: 0,
+                total_tokens: 3_050,
+            },
+            reply: "Third reply".to_owned(),
+        },
+    ];
+
+    let backend = Arc::new(MockAcpBackend::new(scripts));
+    let mut state = test_state(Arc::clone(&backend), 30, None);
+    state.telemetry = Arc::new(TelemetryHub::with_config(CacheTelemetryConfig {
+        persist_path: Some(persist_path.clone()),
+        settings_path: Some(settings_path.clone()),
+        max_low_cache_records: LowCacheRecordLimit::try_new(10).unwrap(),
+        low_cache_threshold_bps: CacheHitThresholdBps::try_from_percent(50).unwrap(),
+        capture_request_details: true,
+    }));
+    let app = build_router(state.clone());
+
+    // Step 1: Send auxiliary title request
+    let aux_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": "Generate a concise, single-line task title of at most 36 characters for: why is cache hit low",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(aux_resp.status(), StatusCode::OK);
+
+    let after_aux = state.telemetry.low_cache_hits();
+    assert_eq!(after_aux.summary.evaluated_turns, 0);
+    assert_eq!(after_aux.summary.total_prompt_tokens, 0);
+    assert_eq!(after_aux.summary.auxiliary_turns, 1);
+    assert_eq!(after_aux.summary.auxiliary_prompt_tokens, 12_000);
+    assert!(after_aux.records.is_empty());
+
+    let tools = json!([{
+        "type": "function",
+        "name": "exec_command",
+        "description": "Execute shell command",
+        "parameters": {
+            "type": "object",
+            "properties": { "cmd": { "type": "string" } },
+            "required": ["cmd"]
+        }
+    }]);
+
+    // Step 2: Interactive turn 1 (date = 2026-11-22)
+    let t1_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "instructions": "Be concise and precise.",
+                        "tools": tools,
+                        "input": [
+                            { "role": "user", "content": "<environment_context><current_date>2026-11-22</current_date></environment_context>\nAnalyze cache hit rate" }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1_resp.status(), StatusCode::OK);
+
+    // Step 3: Interactive turn 2 without previous_response_id AND with <current_date> rolled over to 2026-11-23
+    let t2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "instructions": "Be concise and precise.",
+                        "tools": tools,
+                        "input": [
+                            { "role": "user", "content": "<environment_context><current_date>2026-11-23</current_date></environment_context>\nAnalyze cache hit rate" },
+                            { "role": "assistant", "content": "First reply" },
+                            { "role": "user", "content": "Now optimize it" }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2_resp.status(), StatusCode::OK);
+
+    let snap = state.telemetry.low_cache_hits();
+    assert_eq!(snap.summary.evaluated_turns, 2);
+    assert_eq!(snap.summary.warm_evaluated_turns, 1);
+    assert_eq!(snap.summary.auxiliary_turns, 1);
+    assert_eq!(snap.records.len(), 2);
+
+    // Verify Turn 2 reused the warm session via PrefixHash despite <current_date> midnight rollover!
+    let rec_t2 = &snap.records[0];
+    assert!(rec_t2.session_reused);
+    assert_eq!(
+        rec_t2.diagnostic_cause,
+        LowCacheDiagnosticCause::WarmUpstreamImplicitMiss
+    );
+    let m2 = rec_t2.request_metrics.as_ref().expect("metrics populated");
+    assert_eq!(m2.routing_strategy, LowCacheRoutingStrategy::PrefixHash);
+    assert_eq!(m2.session_turn_index, 2);
+    assert!(m2.session_idle_ms.is_some());
+    assert_eq!(m2.delta_message_count, 1);
+    assert_eq!(m2.client_tool_count, 1);
+    assert!(m2.developer_instructions_bytes > 0);
+    assert!(m2.outbound_acp_prompt_bytes > 0);
+    assert!(rec_t2.request_capture.as_ref().unwrap().full_payload_saved);
+
+    // Fetch full lossless payload over HTTP endpoint
+    let detail_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/telemetry/low-cache-hits/{}", rec_t2.task_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_resp.status(), StatusCode::OK);
+    let detail_bytes = detail_resp.into_body().collect().await.unwrap().to_bytes();
+    let detail: LowCachePayloadDetailResponse = serde_json::from_slice(&detail_bytes).unwrap();
+    let full = detail.full_payload.expect("full payload saved on disk");
+    assert_eq!(full.client_tools.len(), 1);
+    assert_eq!(full.client_tools[0].name, "exec_command");
+    assert!(full.messages.iter().any(|m| m.in_delta));
+    assert!(!full.outbound_acp_prompt_blocks.is_empty());
+
+    // Step 4: Disable full payload capture dynamically via /api/telemetry/cache-config
+    let toggle_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/cache-config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "capture_request_details": false }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_resp.status(), StatusCode::OK);
+
+    let saved_settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        saved_settings["capture_low_cache_request_details"],
+        json!(false)
+    );
+
+    // Step 5: Send cold turn 3 while capture_request_details == false
+    let t3_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "input": "Turn with payload capture disabled",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3_resp.status(), StatusCode::OK);
+
+    let after_t3: LowCacheHitsResponse = state.telemetry.low_cache_hits();
+    assert!(!after_t3.summary.capture_request_details);
+    assert!(after_t3.records[0].request_metrics.is_some());
+    assert!(after_t3.records[0].request_capture.is_none());
+
+    // Clearing low-cache records must also delete saved payload JSON files
+    assert!(payload_dir.is_dir());
+    let _ = state.telemetry.clear_low_cache_hits(true);
+    let remaining_files: Vec<_> = std::fs::read_dir(&payload_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    assert!(remaining_files.is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

@@ -15,6 +15,9 @@ without the `/v1` prefix.
 | `GET /claude-desktop/v1/models`, `POST /claude-desktop/v1/messages` | Claude Desktop 3P gateway namespace (encodes ACP models into Claude-safe `claude-*-lg--<id>` route IDs and unwraps them automatically) |
 | `GET /healthz` | liveness |
 | `GET /api/telemetry/snapshot`, `GET /api/telemetry/events` | dashboard data (snapshot and SSE stream) |
+| `GET /api/telemetry/low-cache-hits`, `GET /api/telemetry/low-cache-hits/{task_id}` | persisted low-cache-hit audit records and full captured request payloads |
+| `POST /api/telemetry/low-cache-hits/clear`, `POST /api/telemetry/cache-config` | clear low-cache records or update retention cap, threshold, and payload capture live |
+| `POST /api/telemetry/vision-offload` | live toggle for `>=150k` ephemeral vision sub-session offload |
 | `POST /api/telemetry/sessions/{id}/close` | close an idle pooled session |
 | `POST /api/admin/shutdown` | graceful shutdown for managed background daemons (requires `x-liftgate-shutdown-token`) |
 

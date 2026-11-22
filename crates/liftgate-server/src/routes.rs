@@ -22,6 +22,7 @@ use liftgate_types::{
         AnthropicWebSearchResultItem, estimate_anthropic_tokens, normalize_anthropic_request,
     },
     canonical::{extract_markdown_links, extract_search_query_hint},
+    config::{CacheHitThresholdBps, LowCacheRecordLimit},
     openai::{
         CreateResponseRequest, LocalShellAction, ModelCard, ModelChatMetadata, ModelListResponse,
         ModelModalities, OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError,
@@ -203,6 +204,22 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/api/telemetry/vision-offload",
             post(handle_set_vision_offload::<B>),
+        )
+        .route(
+            "/api/telemetry/low-cache-hits",
+            get(handle_get_low_cache_hits::<B>),
+        )
+        .route(
+            "/api/telemetry/low-cache-hits/{task_id}",
+            get(handle_get_low_cache_hit_detail::<B>),
+        )
+        .route(
+            "/api/telemetry/low-cache-hits/clear",
+            post(handle_clear_low_cache_hits::<B>),
+        )
+        .route(
+            "/api/telemetry/cache-config",
+            post(handle_set_cache_config::<B>),
         )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
@@ -3428,7 +3445,36 @@ async fn send_sse_frame<T: serde::Serialize>(
 }
 
 fn sse_body_response(rx: mpsc::Receiver<Result<Bytes, Infallible>>) -> Response {
-    let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+    let (hb_tx, hb_rx) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate initial tick so normal fast streams emit zero extra frames.
+        let _ = heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = hb_tx.closed() => break,
+                maybe_frame = rx.recv() => {
+                    match maybe_frame {
+                        Some(frame) => {
+                            if hb_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if hb_tx.send(Ok(Bytes::from_static(b": keep-alive\n\n"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let body = axum::body::Body::from_stream(ReceiverStream::new(hb_rx));
     (
         StatusCode::OK,
         [
@@ -3506,7 +3552,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         state.config.acp_mode.as_str(),
     );
     let session_pool = state.pool.snapshot();
-    let (metrics, active_tasks, recent_tasks) = state.telemetry.snapshot_tasks();
+    let (metrics, cache_telemetry, active_tasks, recent_tasks) = state.telemetry.snapshot_tasks();
     let available_models = state.backend.available_models();
 
     GatewayTelemetrySnapshot {
@@ -3516,6 +3562,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         acp_process,
         session_pool,
         metrics,
+        cache_telemetry,
         active_tasks,
         recent_tasks,
         available_models,
@@ -3626,7 +3673,7 @@ fn parse_query_bool_param(uri: &Uri, param_key: &str) -> Result<Option<bool>, &'
             return match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "on" | "yes" => Ok(Some(true)),
                 "0" | "false" | "off" | "no" => Ok(Some(false)),
-                _ => Err("invalid `enabled` query value (expected `true` or `false`)"),
+                _ => Err("invalid boolean query value (expected `true` or `false`)"),
             };
         }
     }
@@ -3684,6 +3731,181 @@ async fn handle_set_vision_offload<B: AcpBackend>(
     };
     state.telemetry.notify_change();
     Json(json!({ "vision_offload_enabled": next })).into_response()
+}
+
+async fn handle_get_low_cache_hits<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    Json(state.telemetry.low_cache_hits()).into_response()
+}
+
+async fn handle_get_low_cache_hit_detail<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    match state.telemetry.low_cache_hit_detail(task_id.trim()) {
+        Some(detail) => Json(detail).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!("low-cache diagnostic record `{}` not found", task_id.trim()),
+                    "type": "not_found_error",
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClearLowCachePayload {
+    #[serde(default)]
+    reset_totals: Option<bool>,
+}
+
+async fn handle_clear_low_cache_hits<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+
+    let query_opt = match parse_query_bool_param(&uri, "reset_totals") {
+        Ok(opt) => opt,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let body_opt = if query_opt.is_none() && !body.iter().all(u8::is_ascii_whitespace) {
+        match serde_json::from_slice::<ClearLowCachePayload>(&body) {
+            Ok(parsed) => parsed.reset_totals,
+            Err(err) => {
+                return GatewayError::from(RequestBodyError::from(err)).into_openai_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let summary = state
+        .telemetry
+        .clear_low_cache_hits(query_opt.or(body_opt).unwrap_or(false));
+    Json(summary).into_response()
+}
+
+#[derive(Deserialize)]
+struct CacheConfigUpdatePayload {
+    #[serde(default)]
+    max_low_cache_records: Option<usize>,
+    #[serde(default)]
+    low_cache_threshold_bps: Option<u16>,
+    #[serde(default)]
+    low_cache_threshold_pct: Option<u8>,
+    #[serde(default)]
+    capture_request_details: Option<bool>,
+}
+
+async fn handle_set_cache_config<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+
+    let parsed: CacheConfigUpdatePayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return GatewayError::from(RequestBodyError::from(err)).into_openai_response();
+        }
+    };
+
+    let next_limit = match parsed.max_low_cache_records {
+        Some(raw) => match LowCacheRecordLimit::try_new(raw) {
+            Ok(valid) => Some(valid),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": err.to_string(),
+                            "type": "invalid_request_error",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let next_threshold = if let Some(bps) = parsed.low_cache_threshold_bps {
+        match CacheHitThresholdBps::try_new(bps) {
+            Ok(valid) => Some(valid),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": err.to_string(),
+                            "type": "invalid_request_error",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(pct) = parsed.low_cache_threshold_pct {
+        match CacheHitThresholdBps::try_from_percent(pct) {
+            Ok(valid) => Some(valid),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": err.to_string(),
+                            "type": "invalid_request_error",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let summary = state.telemetry.update_cache_config(
+        next_limit,
+        next_threshold,
+        parsed.capture_request_details,
+    );
+    Json(summary).into_response()
 }
 
 async fn handle_admin_shutdown<B: AcpBackend>(

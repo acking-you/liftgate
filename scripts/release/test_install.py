@@ -262,11 +262,16 @@ class PosixInstallScriptTests(unittest.TestCase):
         # Pre-existing .bashrc without .bash_profile sourcing it.
         (fake_home / ".bashrc").write_text("# existing bashrc\n", encoding="utf-8")
 
+        sanitized_sys_path = os.pathsep.join(
+            p
+            for p in os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep)
+            if p and not (Path(p) / "liftgate").exists() and not (Path(p) / "lg").exists()
+        )
         env = {
             **os.environ,
             "HOME": str(fake_home),
             "SHELL": "/bin/bash",
-            "PATH": f"{mock_tools}:{fake_bin_link}:{os.environ.get('PATH', '')}",
+            "PATH": f"{mock_tools}:{fake_bin_link}:{sanitized_sys_path}",
             "LIFTGATE_BASE_URL": server.base_url,
             "LIFTGATE_TARGET": target,
         }
@@ -288,7 +293,12 @@ class PosixInstallScriptTests(unittest.TestCase):
 
         # Both .bashrc and login profile (.profile on Linux) must configure PATH idempotently.
         self.assertIn(str(local_bin), (fake_home / ".bashrc").read_text(encoding="utf-8"))
-        self.assertIn(str(local_bin), (fake_home / ".profile").read_text(encoding="utf-8"))
+        expected_login_profile = (
+            fake_home / ".bash_profile"
+            if hasattr(os, "uname") and os.uname().sysname == "Darwin"
+            else fake_home / ".profile"
+        )
+        self.assertIn(str(local_bin), expected_login_profile.read_text(encoding="utf-8"))
         if shutil.which("bash"):
             login_path = subprocess.check_output(
                 ["bash", "--login", "-c", "printf '%s' \"$PATH\""],
