@@ -14,8 +14,9 @@ use crate::{
     budget::VirtualizerBudget,
     profile::{HarnessToolProfile, ToolPlacement, count_fallback_prefix_stems},
     schema::{
-        McpBridgedTool, coerce_stringified_container_fields, extract_custom_tool_input,
-        extract_schema_metadata, normalize_mcp_object_schema, truncate_utf8_prefix,
+        McpBridgedTool, code_mode_exec_input_schema, coerce_stringified_container_fields,
+        extract_custom_tool_input, extract_schema_metadata, normalize_apply_patch_text,
+        normalize_mcp_object_schema, truncate_utf8_prefix, validate_apply_patch_preflight,
     },
 };
 
@@ -182,22 +183,29 @@ impl McpRoutingTable {
         let mut all_indexed_tools = Vec::with_capacity(client_tools.len());
         for spec in client_tools {
             let placement = profile.classify_tool(spec, &stem_counts);
-            let (is_orchestrator, custom_unwrap_key) = match &placement {
-                ToolPlacement::Orchestrator { custom_unwrap_key } => (true, *custom_unwrap_key),
-                ToolPlacement::CoreDirect { .. }
-                | ToolPlacement::Namespaced { .. }
-                | ToolPlacement::Standalone { .. } => (false, None),
+            let is_orchestrator = matches!(placement, ToolPlacement::Orchestrator { .. });
+            let custom_bridge = match &spec.kind {
+                CanonicalToolKind::Custom { .. } => match &placement {
+                    ToolPlacement::Orchestrator {
+                        custom_unwrap_key: Some(key),
+                    } => Some((*key, code_mode_exec_input_schema())),
+                    ToolPlacement::Orchestrator { .. }
+                    | ToolPlacement::CoreDirect { .. }
+                    | ToolPlacement::Namespaced { .. }
+                    | ToolPlacement::Standalone { .. } => profile.custom_tool_mcp_bridge(spec),
+                },
+                CanonicalToolKind::Function { .. } => None,
             };
+            let custom_unwrap_key = custom_bridge.as_ref().map(|(k, _)| *k);
+            let is_custom_eligible = custom_bridge.is_some();
 
-            let is_custom_eligible = match &spec.kind {
-                CanonicalToolKind::Custom { .. } => custom_unwrap_key.is_some(),
-                CanonicalToolKind::Function { .. } => false,
-            };
             if matches!(spec.kind, CanonicalToolKind::Custom { .. }) && !is_custom_eligible {
                 continue;
             }
             let params_json = match &spec.kind {
-                CanonicalToolKind::Custom { .. } => None,
+                CanonicalToolKind::Custom { .. } => {
+                    custom_bridge.map(|(_, schema_val)| schema_val.to_string())
+                }
                 CanonicalToolKind::Function { parameters_json } => {
                     if normalize_mcp_object_schema(parameters_json).is_none() {
                         continue;
@@ -354,11 +362,18 @@ impl McpRoutingTable {
             if !is_tool_active(&bridged.client_name, active_tools) {
                 return disabled_tool_decision(&bridged.client_name);
             }
+            if bridged.is_custom {
+                return resolve_custom_tool_call(
+                    &bridged.client_name,
+                    arguments,
+                    bridged.unwrap_custom_key,
+                );
+            }
             let serialized = format_direct_tool_arguments(arguments, bridged);
             return VirtualizedCallDecision::ForwardToClient {
                 client_name: bridged.client_name.clone(),
                 arguments: serialized,
-                is_custom: bridged.is_custom,
+                is_custom: false,
             };
         }
 
@@ -690,6 +705,30 @@ fn preflight_error_decision(message: String) -> VirtualizedCallDecision {
     }
 }
 
+fn resolve_custom_tool_call(
+    client_name: &str,
+    raw_args: &Value,
+    unwrap_custom_key: Option<&'static str>,
+) -> VirtualizedCallDecision {
+    let extracted = extract_custom_tool_input(raw_args, unwrap_custom_key);
+    if client_name == "apply_patch" {
+        let normalized = normalize_apply_patch_text(&extracted);
+        if let Err(msg) = validate_apply_patch_preflight(&normalized) {
+            return preflight_error_decision(msg);
+        }
+        return VirtualizedCallDecision::ForwardToClient {
+            client_name: client_name.to_owned(),
+            arguments: normalized,
+            is_custom: true,
+        };
+    }
+    VirtualizedCallDecision::ForwardToClient {
+        client_name: client_name.to_owned(),
+        arguments: extracted,
+        is_custom: true,
+    }
+}
+
 fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> String {
     if bridged.is_custom {
         return extract_custom_tool_input(raw_args, bridged.unwrap_custom_key);
@@ -762,12 +801,11 @@ fn finalize_indexed_tool_call(
     max_schema_bytes: usize,
 ) -> VirtualizedCallDecision {
     if indexed.is_custom {
-        let raw_code = extract_custom_tool_input(inner_args, indexed.unwrap_custom_key);
-        return VirtualizedCallDecision::ForwardToClient {
-            client_name: indexed.client_name.clone(),
-            arguments: raw_code,
-            is_custom: true,
-        };
+        return resolve_custom_tool_call(
+            &indexed.client_name,
+            inner_args,
+            indexed.unwrap_custom_key,
+        );
     }
 
     let mut map = match inner_args {

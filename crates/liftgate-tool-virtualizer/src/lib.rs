@@ -24,9 +24,10 @@ pub use profile::{
 pub use profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile};
 pub use router::{LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
 pub use schema::{
-    McpBridgedTool, McpWireTool, code_mode_exec_input_schema, coerce_stringified_container_fields,
-    estimate_wire_tool_bytes, extract_custom_tool_input, normalize_mcp_object_schema,
-    sanitize_mcp_tool_name, strip_call_prefix,
+    McpBridgedTool, McpWireTool, apply_patch_input_schema, code_mode_exec_input_schema,
+    coerce_stringified_container_fields, estimate_wire_tool_bytes, extract_custom_tool_input,
+    normalize_apply_patch_text, normalize_mcp_object_schema, sanitize_mcp_tool_name,
+    strip_call_prefix, validate_apply_patch_preflight,
 };
 
 /// Default hard ceiling on MCP tools exposed per session on `lg`.
@@ -114,7 +115,12 @@ mod tests {
             ),
             CanonicalToolSpec {
                 name: "apply_patch".to_owned(),
-                description: Some("Freeform patch grammar.".to_owned()),
+                description: Some(format!("Freeform patch grammar.{ts_footer}")),
+                kind: CanonicalToolKind::Custom { format_json: None },
+            },
+            CanonicalToolSpec {
+                name: "sql_lark".to_owned(),
+                description: Some("Arbitrary custom Lark grammar.".to_owned()),
                 kind: CanonicalToolKind::Custom { format_json: None },
             },
         ];
@@ -146,7 +152,7 @@ mod tests {
                 json!({"type": "object", "properties": {"id": {"type": "string"}}}),
             ));
         }
-        assert_eq!(tools.len(), 128);
+        assert_eq!(tools.len(), 129);
         assert_eq!(
             detect_harness(ProtocolHint::Unknown, &tools),
             DetectedHarness::Codex
@@ -157,13 +163,54 @@ mod tests {
         assert!(cat.has_virtualized_dispatch);
         assert!(cat.wire_tools.len() <= MAX_NATIVE_MCP_TOOLS);
         assert_eq!(cat.xml_only_tools.len(), 1);
-        assert_eq!(cat.xml_only_tools[0].name, "apply_patch");
+        assert_eq!(cat.xml_only_tools[0].name, "sql_lark");
 
-        for must_direct in ["exec", "wait", "exec_command", "write_stdin", "update_plan"] {
+        for must_direct in [
+            "exec",
+            "wait",
+            "exec_command",
+            "write_stdin",
+            "apply_patch",
+            "update_plan",
+        ] {
             assert!(
                 cat.by_mcp_name.contains_key(must_direct),
                 "expected Codex core tool `{must_direct}` in 1:1 Direct Eager MCP"
             );
+        }
+        assert!(cat.by_mcp_name["apply_patch"].is_custom);
+
+        match cat.routing_table.resolve_call(
+            "apply_patch",
+            &json!({"patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\nbad_context_line\n-old\n+new\n*** End Patch"}),
+            &tools,
+        ) {
+            VirtualizedCallDecision::LocalReply { is_error, kind, text } => {
+                assert!(is_error);
+                assert_eq!(kind, LocalReplyKind::PreflightError);
+                assert!(text.contains("line 4"), "got: {text}");
+            }
+            VirtualizedCallDecision::ForwardToClient { .. } => {
+                panic!("malformed apply_patch must be caught in 0-RTT preflight")
+            }
+        }
+
+        match cat.routing_table.resolve_call(
+            "apply_patch",
+            &json!({"patch": "```diff\n*** Update File: src/lib.rs\n@@\n-a\n+b\n\n ctx\n*** Update File: src/lib.rs\n@@\n-c\n+d\n```"}),
+            &tools,
+        ) {
+            VirtualizedCallDecision::ForwardToClient { client_name, arguments, is_custom } => {
+                assert_eq!(client_name, "apply_patch");
+                assert!(is_custom);
+                assert_eq!(
+                    arguments,
+                    "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n \n ctx\n@@\n-c\n+d\n*** End Patch"
+                );
+            }
+            VirtualizedCallDecision::LocalReply { text, .. } => {
+                panic!("expected coalesced ForwardToClient, got LocalReply: {text}")
+            }
         }
         let exec_cmd_wire = cat
             .wire_tools

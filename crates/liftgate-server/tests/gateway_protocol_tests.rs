@@ -6886,6 +6886,11 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
             description: Some("Freeform patch.".to_owned()),
             kind: CanonicalToolKind::Custom { format_json: None },
         },
+        CanonicalToolSpec {
+            name: "sql_lark".to_owned(),
+            description: Some("Arbitrary custom Lark grammar.".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
     ];
     let catalog = liftgate_server::mcp_bridge::partition_tools_for_mcp(&tools, &mut NoopSpillSink);
     let handle = srv.register_session(catalog);
@@ -6917,7 +6922,8 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
     assert_eq!(disc_status, 200);
     assert_eq!(disc_json.unwrap()["error"]["code"], -32601);
 
-    // 3. `tools/list` exposes `exec` with `{code: string}` schema and omits freeform `apply_patch`
+    // 3. `tools/list` exposes `exec` (`{code: string}`) + `apply_patch` (`{patch: string}`)
+    //    natively and omits arbitrary unbridged custom grammars (`sql_lark`)
     let (list_status, list_json) = post_loopback_mcp_json(
         &url,
         &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
@@ -6928,10 +6934,15 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(wire_tools.len(), 1);
+    assert_eq!(wire_tools.len(), 2);
     assert_eq!(wire_tools[0]["name"], "exec");
     assert_eq!(
         wire_tools[0]["inputSchema"]["properties"]["code"]["type"],
+        "string"
+    );
+    assert_eq!(wire_tools[1]["name"], "apply_patch");
+    assert_eq!(
+        wire_tools[1]["inputSchema"]["properties"]["patch"]["type"],
         "string"
     );
 
@@ -9347,6 +9358,153 @@ async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_he
     let pool_snap = state.pool.snapshot();
     assert_eq!(pool_snap.total_sessions_created, 1);
     assert_eq!(pool_snap.mcp_continuations, 3);
+}
+
+#[tokio::test]
+async fn codex_native_mcp_apply_patch_preflight_heals_bad_syntax_and_coalesces_duplicate_files() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 9_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "apply_patch".to_owned(),
+                arguments: json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/router.rs\n@@\nunprefixed_context_line\n-old()\n+new()\n*** End Patch",
+                    "toolSummary": "Patch router.rs"
+                }),
+                expect_reply_substrings: vec![
+                    "Invalid `apply_patch` syntax at line 4",
+                    "src/router.rs",
+                ],
+            },
+            McpMockStep::CallTool {
+                usage_used: 9_600,
+                thoughts: vec![],
+                pre_text_templates: vec!["正在应用修复后的补丁。".to_owned()],
+                mcp_name: "apply_patch".to_owned(),
+                arguments: json!({
+                    "patch": "```patch\r\n*** Update File: src/router.rs\r\n@@\r\n-let a = 1;\r\n+let a = 2;\r\n\r\n let stay = true;\r\n*** Update File: src/router.rs\r\n@@ fn tail()\r\n-let b = 3;\r\n+let b = 4;\r\n```",
+                    "toolSummary": "Patch router.rs cleanly"
+                }),
+                expect_reply_substrings: vec!["Success. Updated the following files:"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 10_200,
+                thoughts: vec![],
+                chunks_template: vec!["`src/router.rs` 更新完成。".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 1_500,
+                    output_tokens: 180,
+                    cached_read_tokens: 8_500,
+                    cached_write_tokens: 0,
+                    thought_tokens: 20,
+                    total_tokens: 10_200,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let tools = json!([
+        {
+            "type": "custom",
+            "name": "exec",
+            "description": "Run JavaScript in Code Mode."
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Freeform V4A patch tool.",
+            "format": { "type": "grammar", "syntax": "lark", "definition": "start: /.+/" }
+        }
+    ]);
+
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "tools": tools,
+                        "input": [{ "role": "user", "content": "Update src/router.rs" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r1_events = parse_sse_events(&r1.into_body().collect().await.unwrap().to_bytes());
+    let r1_done = &r1_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let r1_id = r1_done["id"].as_str().unwrap().to_owned();
+    let ctc_items: Vec<&Value> = r1_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "custom_tool_call")
+        .collect();
+    assert_eq!(
+        ctc_items.len(),
+        1,
+        "failed preflight call must never leak to client"
+    );
+    assert_eq!(ctc_items[0]["name"], "apply_patch");
+    assert_eq!(
+        ctc_items[0]["input"].as_str().unwrap(),
+        "*** Begin Patch\n*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n \n let stay = true;\n@@ fn tail()\n-let b = 3;\n+let b = 4;\n*** End Patch"
+    );
+    let ctc_call_id = ctc_items[0]["call_id"].as_str().unwrap().to_owned();
+
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "previous_response_id": r1_id,
+                        "tools": tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": ctc_call_id,
+                            "output": "Success. Updated the following files:\nM src/router.rs"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let r2_json: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let final_msg = r2_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(final_msg, "`src/router.rs` 更新完成。");
 }
 
 #[tokio::test]

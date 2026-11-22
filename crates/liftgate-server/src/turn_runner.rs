@@ -2954,16 +2954,25 @@ fn normalize_emitted_tool_arguments(
     matched_spec: Option<&liftgate_types::canonical::CanonicalToolSpec>,
 ) -> String {
     if is_custom {
+        let is_apply_patch = matched_spec.is_some_and(|s| s.name == "apply_patch");
         if !is_raw_input
             && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments)
         {
             for key in ["input", "patch", "diff"] {
                 if let Some(serde_json::Value::String(inner)) = map.get(key) {
-                    return inner.clone();
+                    return if is_apply_patch {
+                        liftgate_types::parser::normalize_apply_patch_text(inner)
+                    } else {
+                        inner.clone()
+                    };
                 }
             }
         }
-        return arguments;
+        return if is_apply_patch {
+            liftgate_types::parser::normalize_apply_patch_text(&arguments)
+        } else {
+            arguments
+        };
     }
 
     if !is_raw_input {

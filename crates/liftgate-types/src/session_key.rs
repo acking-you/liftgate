@@ -1148,6 +1148,15 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         header_rules.push_str(&bounded_aliases);
         header_rules.push_str(".\n");
     }
+    if let Some((_, mcp_ap)) = mcp_spec
+        .bridged_tools
+        .iter()
+        .find(|(client_name, _)| client_name == "apply_patch")
+    {
+        header_rules.push_str(&format!(
+            "- File edits: invoke native `mcp_lg_{mcp_ap}` directly (prefer native `mcp_lg_{mcp_ap}` over embedding multi-line patches inside `exec` JavaScript template literals; keep `@@` hunks surgical with 1-3 exact context lines and merge multiple edits to the same file under one `*** Update File:` header).\n"
+        ));
+    }
 
     if mcp_spec.has_virtualized_dispatch {
         if !mcp_spec.virtualized_hubs.is_empty() {

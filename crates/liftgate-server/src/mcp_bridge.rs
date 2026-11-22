@@ -25,9 +25,10 @@ pub use liftgate_tool_virtualizer::{
     GenericToolProfile, HarnessToolProfile, LocalReplyKind, MAX_NATIVE_MCP_TOOLS, McpBridgedTool,
     McpRoutingTable, McpSessionCatalog, McpWireTool, NAMESPACE_HUB_MCP_PREFIX, ProtocolHint,
     SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement, VirtualizedCallDecision, VirtualizerBudget,
-    detect_harness, extract_custom_tool_input, partition_tools_for_harness,
-    partition_tools_for_mcp, partition_tools_for_mcp_with_hint, plan_virtualization,
-    sanitize_mcp_tool_name, strip_call_prefix,
+    apply_patch_input_schema, detect_harness, extract_custom_tool_input,
+    normalize_apply_patch_text, partition_tools_for_harness, partition_tools_for_mcp,
+    partition_tools_for_mcp_with_hint, plan_virtualization, sanitize_mcp_tool_name,
+    strip_call_prefix, validate_apply_patch_preflight,
 };
 use liftgate_types::{acp::McpServerConfig, canonical::CanonicalToolSpec};
 use serde::{Deserialize, Serialize};
@@ -725,7 +726,7 @@ mod tests {
         );
         let tools = vec![
             CanonicalToolSpec {
-                name: "apply_patch".to_owned(),
+                name: "custom_grammar_tool".to_owned(),
                 description: Some("Freeform patch tool.".to_owned()),
                 kind: CanonicalToolKind::Custom { format_json: None },
             },

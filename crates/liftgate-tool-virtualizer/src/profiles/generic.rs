@@ -62,6 +62,7 @@ impl HarnessToolProfile for GenericToolProfile {
             || name.eq_ignore_ascii_case("edit")
             || name.eq_ignore_ascii_case("write")
             || name.eq_ignore_ascii_case("multiedit")
+            || name.eq_ignore_ascii_case("apply_patch")
         {
             return ToolPlacement::CoreDirect { rank: 2 };
         }

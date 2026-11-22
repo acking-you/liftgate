@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+pub use liftgate_types::parser::{normalize_apply_patch_text, validate_apply_patch_preflight};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -58,6 +59,21 @@ pub fn code_mode_exec_input_schema() -> Value {
             }
         },
         "required": ["code"]
+    })
+}
+
+/// Input JSON Schema synthesized for freeform `apply_patch` tools exposed natively over JSON MCP.
+#[must_use]
+pub fn apply_patch_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "patch": {
+                "type": "string",
+                "description": "Raw V4A patch text starting with '*** Begin Patch' and ending with '*** End Patch'. Keep '@@' hunks surgical (1-3 exact context lines) and combine multiple edits to the same file under a single '*** Update File: <path>' header."
+            }
+        },
+        "required": ["patch"]
     })
 }
 
@@ -208,7 +224,7 @@ pub fn extract_custom_tool_input(arguments: &Value, preferred_key: Option<&str>)
         return s.to_owned();
     }
     if let Value::Object(map) = arguments {
-        for fallback in ["code", "input"] {
+        for fallback in ["code", "patch", "input", "diff", "content"] {
             if let Some(s) = map.get(fallback).and_then(Value::as_str) {
                 return s.to_owned();
             }

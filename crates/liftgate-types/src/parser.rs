@@ -1085,6 +1085,15 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
             let inner_trimmed = inner_str.trim();
             if inner_trimmed.starts_with('{') {
                 if serde_json::from_str::<serde::de::IgnoredAny>(inner_trimmed).is_ok() {
+                    if name == "apply_patch"
+                        && let Some(unwrapped_patch) = extract_patch_from_json_object(inner_trimmed)
+                    {
+                        return Some(ParsedToolCall {
+                            name,
+                            arguments: unwrapped_patch,
+                            is_raw_input: true,
+                        });
+                    }
                     return Some(ParsedToolCall {
                         name,
                         arguments: inner_trimmed.to_owned(),
@@ -1093,6 +1102,16 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
                 }
                 let repaired_inner = repair_llm_json(inner_trimmed);
                 if serde_json::from_str::<serde::de::IgnoredAny>(&repaired_inner).is_ok() {
+                    if name == "apply_patch"
+                        && let Some(unwrapped_patch) =
+                            extract_patch_from_json_object(&repaired_inner)
+                    {
+                        return Some(ParsedToolCall {
+                            name,
+                            arguments: unwrapped_patch,
+                            is_raw_input: true,
+                        });
+                    }
                     return Some(ParsedToolCall {
                         name,
                         arguments: repaired_inner,
@@ -1100,9 +1119,14 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
                     });
                 }
             }
+            let arguments = if name == "apply_patch" {
+                normalize_apply_patch_text(&inner_str)
+            } else {
+                inner_str
+            };
             return Some(ParsedToolCall {
                 name,
-                arguments: inner_str,
+                arguments,
                 is_raw_input: true,
             });
         }
@@ -1126,9 +1150,14 @@ fn parse_strict_envelope(candidate: &str) -> Option<ParsedToolCall> {
         let raw_text = input_raw.get().trim();
         if raw_text.starts_with('"') {
             let inner_str = serde_json::from_str::<String>(raw_text).ok()?;
+            let arguments = if name == "apply_patch" {
+                normalize_apply_patch_text(&inner_str)
+            } else {
+                inner_str
+            };
             return Some(ParsedToolCall {
                 name,
-                arguments: inner_str,
+                arguments,
                 is_raw_input: true,
             });
         }
@@ -1290,9 +1319,15 @@ fn salvage_freeform_input_envelope(cleaned: &str) -> Option<ParsedToolCall> {
         return None;
     }
 
+    let decoded = unescape_lenient_json_string(raw_body);
+    let arguments = if name == "apply_patch" {
+        normalize_apply_patch_text(&decoded)
+    } else {
+        decoded
+    };
     Some(ParsedToolCall {
         name,
-        arguments: unescape_lenient_json_string(raw_body),
+        arguments,
         is_raw_input: true,
     })
 }
@@ -1367,17 +1402,64 @@ fn extract_patch_from_json_object(raw_json_obj: &str) -> Option<String> {
     None
 }
 
-/// Normalizes an `apply_patch` body so CRLF line endings, accidental inner markdown code fences
-/// (` ```diff ` / ` ```patch `), or stray surrounding whitespace never violate Codex's Lark grammar.
-fn normalize_apply_patch_text(raw: &str) -> String {
-    let unfenced = strip_optional_code_fence(raw);
-    let lf_only = if unfenced.contains('\r') {
-        unfenced.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        unfenced.to_owned()
-    };
-    if let Some(begin_idx) = lf_only.find("*** Begin Patch")
-        && let Some(from_begin) = lf_only.get(begin_idx..)
+/// Normalizes an `apply_patch` payload across XML and native MCP channels:
+/// 1. Strips accidental markdown code fences, JSON object/string wrappers, and CRLF line endings.
+/// 2. Unescapes single-line double-escaped `\n` patches (`"*** Begin Patch\\n..."`).
+/// 3. Translates standard unified git diffs (`--- a/p` + `+++ b/p`) into V4A patches when V4A
+///    headers are absent, and restores omitted outer `*** Begin Patch` / `*** End Patch` markers.
+/// 4. Repairs stripped blank context/add lines (`""` -> `" "` in `Update File`, `"+"` in `Add File`)
+///    that would otherwise fail Codex's Lark grammar.
+/// 5. Coalesces duplicate `*** Update File: <same_path>` blocks into a single file operation so
+///    Codex never aborts with `invalid patch: multiple operations target <path>`.
+#[must_use]
+pub fn normalize_apply_patch_text(raw: &str) -> String {
+    let mut text = strip_optional_code_fence(raw).trim().to_owned();
+    if text.starts_with('{')
+        && text.ends_with('}')
+        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        for key in ["patch", "input", "diff", "content"] {
+            if let Some(s) = map.get(key).and_then(serde_json::Value::as_str) {
+                text = strip_optional_code_fence(s).trim().to_owned();
+                break;
+            }
+        }
+    } else if text.starts_with('"')
+        && text.ends_with('"')
+        && let Ok(unquoted) = serde_json::from_str::<String>(&text)
+    {
+        text = strip_optional_code_fence(&unquoted).trim().to_owned();
+    }
+
+    if text.contains('\r') {
+        text = text.replace("\r\n", "\n").replace('\r', "\n");
+    }
+
+    if !text.contains("*** Begin Patch\n") && text.contains("*** Begin Patch\\n") {
+        text = unescape_lenient_json_string(&text);
+        if text.contains('\r') {
+            text = text.replace("\r\n", "\n").replace('\r', "\n");
+        }
+    }
+    if !text.contains("\n*** End Patch")
+        && let Some(stem) = text.strip_suffix("\\n*** End Patch")
+    {
+        text = format!("{stem}\n*** End Patch");
+    }
+
+    if !text.contains("*** Begin Patch")
+        && !starts_with_v4a_file_header(&text)
+        && let Some(converted) = try_convert_unified_diff_to_v4a(&text)
+    {
+        return coalesce_and_repair_v4a_patch(&converted);
+    }
+
+    if !text.contains("*** Begin Patch") && starts_with_v4a_file_header(&text) {
+        text = format!("*** Begin Patch\n{text}");
+    }
+
+    let framed = if let Some(begin_idx) = text.find("*** Begin Patch")
+        && let Some(from_begin) = text.get(begin_idx..)
     {
         if let Some(end_rel) = from_begin.rfind("*** End Patch") {
             let end_marker_end = end_rel + "*** End Patch".len();
@@ -1385,12 +1467,541 @@ fn normalize_apply_patch_text(raw: &str) -> String {
                 && after_end.chars().all(|c| c.is_whitespace() || c == '`')
                 && let Some(clean_patch) = from_begin.get(..end_marker_end)
             {
-                return clean_patch.to_owned();
+                clean_patch.to_owned()
+            } else {
+                from_begin.trim_end().to_owned()
+            }
+        } else if contains_v4a_file_header(from_begin) {
+            format!("{}\n*** End Patch", from_begin.trim_end())
+        } else {
+            from_begin.trim_end().to_owned()
+        }
+    } else {
+        return text.trim().to_owned();
+    };
+
+    coalesce_and_repair_v4a_patch(&framed)
+}
+
+/// Validates a normalized V4A `apply_patch` payload before forwarding an MCP call to the client,
+/// returning an actionable 1-based line diagnostic so models self-heal in 0-RTT.
+pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
+    let trimmed = patch.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "Empty `patch`: provide a non-empty V4A patch starting with '*** Begin Patch' and ending with '*** End Patch'."
+                .to_owned(),
+        );
+    }
+    let Some(after_begin) = trimmed.strip_prefix("*** Begin Patch") else {
+        return Err(
+            "Invalid `apply_patch` header: patch must start with '*** Begin Patch' followed by '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
+                .to_owned(),
+        );
+    };
+    if !after_begin.starts_with('\n') || !trimmed.ends_with("*** End Patch") {
+        return Err(
+            "Invalid `apply_patch` framing: patch must start with '*** Begin Patch\\n' and end with '*** End Patch'."
+                .to_owned(),
+        );
+    }
+
+    enum Section<'a> {
+        Root,
+        Add {
+            path: &'a str,
+            count: usize,
+        },
+        Delete,
+        Update {
+            path: &'a str,
+            has_move: bool,
+            count: usize,
+        },
+    }
+
+    let finalize_section = |sec: &Section<'_>| -> Result<(), String> {
+        match *sec {
+            Section::Root | Section::Delete => Ok(()),
+            Section::Add { path, count } => {
+                if count == 0 {
+                    Err(format!(
+                        "Invalid `apply_patch`: '*** Add File: {path}' has no '+<line>' content lines."
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Section::Update {
+                path,
+                has_move,
+                count,
+            } => {
+                if !has_move && count == 0 {
+                    Err(format!(
+                        "Invalid `apply_patch`: '*** Update File: {path}' contains no '@@' hunk or '+/-' change lines."
+                    ))
+                } else {
+                    Ok(())
+                }
             }
         }
-        return from_begin.trim_end().to_owned();
+    };
+
+    let lines: Vec<&str> = trimmed.split('\n').collect();
+    let last_idx = lines.len().saturating_sub(1);
+    let mut section = Section::Root;
+    let mut op_count = 0usize;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        if idx == 0 {
+            continue;
+        }
+        if idx == last_idx && line == "*** End Patch" {
+            finalize_section(&section)?;
+            break;
+        }
+        if let Some(p) = line.strip_prefix("*** Add File: ") {
+            finalize_section(&section)?;
+            let path = p.trim();
+            if path.is_empty() {
+                return Err(format!(
+                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Add File: '."
+                ));
+            }
+            op_count += 1;
+            section = Section::Add { path, count: 0 };
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("*** Delete File: ") {
+            finalize_section(&section)?;
+            let path = p.trim();
+            if path.is_empty() {
+                return Err(format!(
+                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Delete File: '."
+                ));
+            }
+            op_count += 1;
+            section = Section::Delete;
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("*** Update File: ") {
+            finalize_section(&section)?;
+            let path = p.trim();
+            if path.is_empty() {
+                return Err(format!(
+                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Update File: '."
+                ));
+            }
+            op_count += 1;
+            section = Section::Update {
+                path,
+                has_move: false,
+                count: 0,
+            };
+            continue;
+        }
+
+        match &mut section {
+            Section::Root | Section::Delete => {
+                return Err(format!(
+                    "Invalid `apply_patch` syntax at line {line_no} ({}): expected '*** Update File: <path>', '*** Add File: <path>', '*** Delete File: <path>', or '*** End Patch'.",
+                    preview_patch_line(line)
+                ));
+            }
+            Section::Add { path, count } => {
+                if !line.starts_with('+') {
+                    return Err(format!(
+                        "Invalid `apply_patch` syntax at line {line_no} in '*** Add File: {path}' ({}): every added file line must start with '+'.",
+                        preview_patch_line(line)
+                    ));
+                }
+                *count += 1;
+            }
+            Section::Update {
+                path,
+                has_move,
+                count,
+            } => {
+                if *count == 0
+                    && !*has_move
+                    && let Some(dst) = line.strip_prefix("*** Move to: ")
+                {
+                    if dst.trim().is_empty() {
+                        return Err(format!(
+                            "Invalid `apply_patch` at line {line_no}: empty destination path in '*** Move to: '."
+                        ));
+                    }
+                    *has_move = true;
+                    continue;
+                }
+                let valid_hunk_line = line == "@@"
+                    || line.starts_with("@@ ")
+                    || line == "*** End of File"
+                    || line.starts_with('+')
+                    || line.starts_with('-')
+                    || line.starts_with(' ');
+                if !valid_hunk_line {
+                    return Err(format!(
+                        "Invalid `apply_patch` syntax at line {line_no} in '*** Update File: {path}' ({}): every hunk line must start with ' ' (context), '-' (remove), '+' (add), or '@@'.",
+                        preview_patch_line(line)
+                    ));
+                }
+                *count += 1;
+            }
+        }
     }
-    lf_only.trim().to_owned()
+
+    if op_count == 0 {
+        return Err(
+            "Invalid `apply_patch`: patch contains zero file operations; include at least one '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn starts_with_v4a_file_header(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("*** Update File: ")
+        || t.starts_with("*** Add File: ")
+        || t.starts_with("*** Delete File: ")
+}
+
+fn contains_v4a_file_header(s: &str) -> bool {
+    s.contains("\n*** Update File: ")
+        || s.contains("\n*** Add File: ")
+        || s.contains("\n*** Delete File: ")
+}
+
+fn preview_patch_line(line: &str) -> String {
+    let mut end = line.len().min(64);
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}", line.get(..end).unwrap_or_default())
+}
+
+fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
+    if framed == "*** Begin Patch\n*** End Patch" {
+        return framed.to_owned();
+    }
+    let Some(after_begin) = framed.strip_prefix("*** Begin Patch\n") else {
+        return framed.to_owned();
+    };
+    let Some(inner) = after_begin.strip_suffix("\n*** End Patch") else {
+        return framed.to_owned();
+    };
+
+    enum V4aOp {
+        Add {
+            path: String,
+            lines: Vec<String>,
+        },
+        Delete {
+            path: String,
+        },
+        Update {
+            path: String,
+            move_to: Option<String>,
+            lines: Vec<String>,
+        },
+    }
+
+    let mut ops: Vec<V4aOp> = Vec::new();
+    for line in inner.split('\n') {
+        if let Some(p) = line.strip_prefix("*** Add File: ") {
+            ops.push(V4aOp::Add {
+                path: p.trim().to_owned(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("*** Delete File: ") {
+            ops.push(V4aOp::Delete {
+                path: p.trim().to_owned(),
+            });
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("*** Update File: ") {
+            ops.push(V4aOp::Update {
+                path: p.trim().to_owned(),
+                move_to: None,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        match ops.last_mut() {
+            None | Some(V4aOp::Delete { .. }) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return framed.to_owned();
+            }
+            Some(V4aOp::Add { lines, .. }) => {
+                lines.push(line.to_owned());
+            }
+            Some(V4aOp::Update { move_to, lines, .. }) => {
+                if lines.is_empty()
+                    && move_to.is_none()
+                    && let Some(dst) = line.strip_prefix("*** Move to: ")
+                {
+                    *move_to = Some(dst.trim().to_owned());
+                } else {
+                    lines.push(line.to_owned());
+                }
+            }
+        }
+    }
+
+    for op in &mut ops {
+        match op {
+            V4aOp::Delete { .. } => {}
+            V4aOp::Add { lines, .. } => {
+                while lines.last().is_some_and(String::is_empty) {
+                    let _ = lines.pop();
+                }
+                for ln in lines {
+                    if ln.is_empty() {
+                        ln.push('+');
+                    }
+                }
+            }
+            V4aOp::Update { lines, .. } => {
+                while lines.last().is_some_and(String::is_empty) {
+                    let _ = lines.pop();
+                }
+                for ln in lines {
+                    if ln.is_empty() {
+                        ln.push(' ');
+                    }
+                }
+            }
+        }
+    }
+
+    let mut coalesced: Vec<V4aOp> = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            V4aOp::Update {
+                path,
+                move_to: None,
+                lines: mut extra,
+            } => {
+                let mut merged = false;
+                for prev in coalesced.iter_mut().rev() {
+                    match prev {
+                        V4aOp::Delete { path: p } | V4aOp::Add { path: p, .. } if *p == path => {
+                            break;
+                        }
+                        V4aOp::Update {
+                            path: p,
+                            move_to: Some(dst),
+                            ..
+                        } if *p == path || *dst == path => {
+                            break;
+                        }
+                        V4aOp::Update {
+                            path: p,
+                            move_to: None,
+                            lines: existing,
+                        } if *p == path => {
+                            if !extra.is_empty() {
+                                let starts_with_hunk = extra
+                                    .first()
+                                    .is_some_and(|l| l == "@@" || l.starts_with("@@ "));
+                                if !existing.is_empty() && !starts_with_hunk {
+                                    existing.push("@@".to_owned());
+                                }
+                                existing.append(&mut extra);
+                            }
+                            merged = true;
+                            break;
+                        }
+                        V4aOp::Delete { .. } | V4aOp::Add { .. } | V4aOp::Update { .. } => {}
+                    }
+                }
+                if !merged {
+                    coalesced.push(V4aOp::Update {
+                        path,
+                        move_to: None,
+                        lines: extra,
+                    });
+                }
+            }
+            other => coalesced.push(other),
+        }
+    }
+
+    let mut out = String::with_capacity(framed.len() + 16);
+    out.push_str("*** Begin Patch\n");
+    for op in coalesced {
+        match op {
+            V4aOp::Add { path, lines } => {
+                out.push_str("*** Add File: ");
+                out.push_str(&path);
+                out.push('\n');
+                for ln in lines {
+                    out.push_str(&ln);
+                    out.push('\n');
+                }
+            }
+            V4aOp::Delete { path } => {
+                out.push_str("*** Delete File: ");
+                out.push_str(&path);
+                out.push('\n');
+            }
+            V4aOp::Update {
+                path,
+                move_to,
+                lines,
+            } => {
+                out.push_str("*** Update File: ");
+                out.push_str(&path);
+                out.push('\n');
+                if let Some(dst) = move_to {
+                    out.push_str("*** Move to: ");
+                    out.push_str(&dst);
+                    out.push('\n');
+                }
+                for ln in lines {
+                    out.push_str(&ln);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.push_str("*** End Patch");
+    out
+}
+
+fn try_convert_unified_diff_to_v4a(text: &str) -> Option<String> {
+    if !(text.starts_with("diff --git ") || text.starts_with("--- ") || text.contains("\n--- "))
+        || !text.contains("\n+++ ")
+    {
+        return None;
+    }
+
+    let strip_diff_path = |raw: &str, prefix: &str| -> Option<String> {
+        let token = raw.split('\t').next().unwrap_or(raw).trim();
+        if token == "/dev/null" {
+            return None;
+        }
+        Some(token.strip_prefix(prefix).unwrap_or(token).to_owned())
+    };
+
+    let mut out = String::from("*** Begin Patch\n");
+    let mut pending_old: Option<Option<String>> = None;
+    let mut current_mode: Option<&'static str> = None;
+    let mut emitted_ops = 0usize;
+
+    for line in text.split('\n') {
+        if line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("\\ No newline at end of file")
+        {
+            continue;
+        }
+        if current_mode.is_none()
+            && let Some(old_raw) = line.strip_prefix("--- ")
+        {
+            pending_old = Some(strip_diff_path(old_raw, "a/"));
+            continue;
+        }
+        if let Some(old_opt) = pending_old.take()
+            && let Some(new_raw) = line.strip_prefix("+++ ")
+        {
+            let new_opt = strip_diff_path(new_raw, "b/");
+            match (old_opt, new_opt) {
+                (None, Some(new_p)) => {
+                    out.push_str("*** Add File: ");
+                    out.push_str(&new_p);
+                    out.push('\n');
+                    current_mode = Some("add");
+                    emitted_ops += 1;
+                }
+                (Some(old_p), None) => {
+                    out.push_str("*** Delete File: ");
+                    out.push_str(&old_p);
+                    out.push('\n');
+                    current_mode = Some("delete");
+                    emitted_ops += 1;
+                }
+                (Some(old_p), Some(new_p)) => {
+                    out.push_str("*** Update File: ");
+                    out.push_str(&old_p);
+                    out.push('\n');
+                    if old_p != new_p {
+                        out.push_str("*** Move to: ");
+                        out.push_str(&new_p);
+                        out.push('\n');
+                    }
+                    current_mode = Some("update");
+                    emitted_ops += 1;
+                }
+                (None, None) => return None,
+            }
+            continue;
+        }
+        if let Some(old_raw) = line.strip_prefix("--- ") {
+            pending_old = Some(strip_diff_path(old_raw, "a/"));
+            current_mode = None;
+            continue;
+        }
+        if let Some(after_at) = line.strip_prefix("@@ ") {
+            if current_mode == Some("update") {
+                if let Some((_, ctx)) = after_at.split_once("@@") {
+                    let ctx_trimmed = ctx.trim();
+                    if ctx_trimmed.is_empty() {
+                        out.push_str("@@\n");
+                    } else {
+                        out.push_str("@@ ");
+                        out.push_str(ctx_trimmed);
+                        out.push('\n');
+                    }
+                } else {
+                    out.push_str("@@\n");
+                }
+            }
+            continue;
+        }
+        match current_mode {
+            Some("add") => {
+                if line.starts_with('+') {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Some("update") => {
+                if line.starts_with('+')
+                    || line.starts_with('-')
+                    || line.starts_with(' ')
+                    || line.is_empty()
+                {
+                    if line.is_empty() {
+                        out.push_str(" \n");
+                    } else {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
+            Some("delete" | _) | None => {}
+        }
+    }
+
+    if emitted_ops == 0 {
+        return None;
+    }
+    out.push_str("*** End Patch");
+    Some(out)
 }
 
 fn looks_like_code_mode_js(src: &str) -> bool {
@@ -2027,5 +2638,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn normalize_and_validate_apply_patch_coalesces_duplicates_repairs_blank_lines_and_converts_unified_diff()
+     {
+        let dup_and_blank = "*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n\n let keep = true;\n*** Update File: src/router.rs\n@@ fn second()\n-let b = 3;\n+let b = 4;";
+        let repaired = normalize_apply_patch_text(dup_and_blank);
+        assert_eq!(
+            repaired,
+            "*** Begin Patch\n*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n \n let keep = true;\n@@ fn second()\n-let b = 3;\n+let b = 4;\n*** End Patch"
+        );
+        assert!(validate_apply_patch_preflight(&repaired).is_ok());
+
+        let unified = "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ pub fn run() {\n let x = 1;\n-let y = 2;\n+let y = 3;\n";
+        let v4a = normalize_apply_patch_text(unified);
+        assert_eq!(
+            v4a,
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@ pub fn run() {\n let x = 1;\n-let y = 2;\n+let y = 3;\n*** End Patch"
+        );
+        assert!(validate_apply_patch_preflight(&v4a).is_ok());
+
+        let bad_ctx = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\nlet missing_prefix = 1;\n-old\n+new\n*** End Patch";
+        let err = validate_apply_patch_preflight(bad_ctx)
+            .expect_err("missing context prefix must fail preflight");
+        assert!(err.contains("line 4"), "got err: {err}");
     }
 }

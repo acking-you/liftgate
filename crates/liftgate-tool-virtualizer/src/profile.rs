@@ -80,6 +80,23 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
     fn search_aliases(self, _spec: &CanonicalToolSpec, _namespace: Option<&str>) -> &'static str {
         ""
     }
+
+    /// Returns `Some((unwrap_key, input_schema))` when a freeform `CanonicalToolKind::Custom` tool
+    /// (such as Codex `exec` or `apply_patch`) should be exposed natively over JSON MCP and
+    /// unwrapped back to its raw freeform string on dispatch.
+    #[inline]
+    fn custom_tool_mcp_bridge(
+        self,
+        spec: &CanonicalToolSpec,
+    ) -> Option<(&'static str, serde_json::Value)> {
+        if is_code_mode_custom_exec(spec) {
+            return Some(("code", crate::schema::code_mode_exec_input_schema()));
+        }
+        if spec.name == "apply_patch" {
+            return Some(("patch", crate::schema::apply_patch_input_schema()));
+        }
+        None
+    }
 }
 
 /// Optional ingress wire-protocol hint supplied by the HTTP route layer.

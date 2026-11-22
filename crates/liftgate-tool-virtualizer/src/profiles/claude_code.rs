@@ -80,6 +80,7 @@ impl HarnessToolProfile for ClaudeCodeToolProfile {
             "LSP" => return ToolPlacement::CoreDirect { rank: 9 },
             "NotebookEdit" => return ToolPlacement::CoreDirect { rank: 10 },
             "ToolSearch" => return ToolPlacement::CoreDirect { rank: 11 },
+            "apply_patch" => return ToolPlacement::CoreDirect { rank: 12 },
             _ => {}
         }
 

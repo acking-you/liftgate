@@ -130,91 +130,81 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
 
     for (orig_idx, spec) in client_tools.iter().enumerate() {
         let placement = profile.classify_tool(spec, &stem_counts);
-        if let ToolPlacement::Orchestrator {
-            custom_unwrap_key: Some(key),
-        } = &placement
-            && matches!(spec.kind, CanonicalToolKind::Custom { .. })
-        {
-            let description =
-                compact_mcp_tool_description(spec, budget.max_orchestrator_desc_bytes, spill);
-            let input_schema = code_mode_exec_input_schema();
-            let est_wire_bytes =
-                estimate_wire_tool_bytes(&spec.name, description.as_deref(), &input_schema);
-            eligible.push(EligibleCandidate {
-                orig_idx,
-                kind: CandidateKind::Orchestrator,
-                is_orchestrator: true,
-                is_custom: true,
-                unwrap_custom_key: Some(key),
-                description,
-                input_schema,
-                parameters_json: None,
-                est_wire_bytes,
-            });
-            continue;
-        }
-
-        match &spec.kind {
+        let resolved_schema = match &spec.kind {
             CanonicalToolKind::Custom { .. } => {
-                ineligible_indices.insert(orig_idx);
+                let bridged = match &placement {
+                    ToolPlacement::Orchestrator {
+                        custom_unwrap_key: Some(key),
+                    } => Some((*key, code_mode_exec_input_schema())),
+                    ToolPlacement::Orchestrator { .. }
+                    | ToolPlacement::CoreDirect { .. }
+                    | ToolPlacement::Namespaced { .. }
+                    | ToolPlacement::Standalone { .. } => profile.custom_tool_mcp_bridge(spec),
+                };
+                bridged.map(|(unwrap_key, schema_val)| (schema_val, true, Some(unwrap_key), None))
             }
             CanonicalToolKind::Function { parameters_json } => {
-                if let Some(schema_val) = normalize_mcp_object_schema(parameters_json) {
-                    let (cand_kind, is_orchestrator) = match placement {
-                        ToolPlacement::Orchestrator { .. } => (CandidateKind::Orchestrator, true),
-                        ToolPlacement::CoreDirect { rank } => {
-                            (CandidateKind::CoreDirect { rank }, false)
-                        }
-                        ToolPlacement::Namespaced { namespace, action } => (
-                            CandidateKind::Namespaced {
-                                namespace: namespace.into_owned(),
-                                action: action.into_owned(),
-                            },
-                            false,
-                        ),
-                        ToolPlacement::Standalone { backfill_rank } => {
-                            (CandidateKind::Standalone { backfill_rank }, false)
-                        }
-                    };
-
-                    let max_desc = if is_orchestrator {
-                        budget.max_orchestrator_desc_bytes
-                    } else {
-                        budget.max_standard_desc_bytes
-                    };
-                    let dehydrated_spec = if is_orchestrator {
-                        None
-                    } else {
-                        spec.description.as_deref().and_then(|raw| {
-                            let (prose, ts) = profile.dehydrate_description(raw, false);
-                            ts.is_some().then(|| CanonicalToolSpec {
-                                name: spec.name.clone(),
-                                description: Some(prose.to_owned()),
-                                kind: spec.kind.clone(),
-                            })
-                        })
-                    };
-                    let effective_spec = dehydrated_spec.as_ref().unwrap_or(spec);
-                    let description = compact_mcp_tool_description(effective_spec, max_desc, spill);
-                    let est_wire_bytes =
-                        estimate_wire_tool_bytes(&spec.name, description.as_deref(), &schema_val);
-                    eligible.push(EligibleCandidate {
-                        orig_idx,
-                        kind: cand_kind,
-                        is_orchestrator,
-                        is_custom: false,
-                        unwrap_custom_key: None,
-                        description,
-                        input_schema: schema_val,
-                        parameters_json: (!parameters_json.trim().is_empty())
-                            .then(|| parameters_json.clone()),
-                        est_wire_bytes,
-                    });
-                } else {
-                    ineligible_indices.insert(orig_idx);
-                }
+                normalize_mcp_object_schema(parameters_json).map(|schema_val| {
+                    let raw_opt =
+                        (!parameters_json.trim().is_empty()).then(|| parameters_json.clone());
+                    (schema_val, false, None, raw_opt)
+                })
             }
-        }
+        };
+
+        let Some((schema_val, is_custom, unwrap_custom_key, parameters_json)) = resolved_schema
+        else {
+            ineligible_indices.insert(orig_idx);
+            continue;
+        };
+
+        let (cand_kind, is_orchestrator) = match placement {
+            ToolPlacement::Orchestrator { .. } => (CandidateKind::Orchestrator, true),
+            ToolPlacement::CoreDirect { rank } => (CandidateKind::CoreDirect { rank }, false),
+            ToolPlacement::Namespaced { namespace, action } => (
+                CandidateKind::Namespaced {
+                    namespace: namespace.into_owned(),
+                    action: action.into_owned(),
+                },
+                false,
+            ),
+            ToolPlacement::Standalone { backfill_rank } => {
+                (CandidateKind::Standalone { backfill_rank }, false)
+            }
+        };
+
+        let max_desc = if is_orchestrator {
+            budget.max_orchestrator_desc_bytes
+        } else {
+            budget.max_standard_desc_bytes
+        };
+        let dehydrated_spec = if is_orchestrator {
+            None
+        } else {
+            spec.description.as_deref().and_then(|raw| {
+                let (prose, ts) = profile.dehydrate_description(raw, false);
+                ts.is_some().then(|| CanonicalToolSpec {
+                    name: spec.name.clone(),
+                    description: Some(prose.to_owned()),
+                    kind: spec.kind.clone(),
+                })
+            })
+        };
+        let effective_spec = dehydrated_spec.as_ref().unwrap_or(spec);
+        let description = compact_mcp_tool_description(effective_spec, max_desc, spill);
+        let est_wire_bytes =
+            estimate_wire_tool_bytes(&spec.name, description.as_deref(), &schema_val);
+        eligible.push(EligibleCandidate {
+            orig_idx,
+            kind: cand_kind,
+            is_orchestrator,
+            is_custom,
+            unwrap_custom_key,
+            description,
+            input_schema: schema_val,
+            parameters_json,
+            est_wire_bytes,
+        });
     }
 
     let non_orch_wire_bytes: usize = eligible

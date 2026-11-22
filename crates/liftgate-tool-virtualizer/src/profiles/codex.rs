@@ -61,13 +61,14 @@ impl HarnessToolProfile for CodexToolProfile {
         match name {
             "exec_command" => return ToolPlacement::CoreDirect { rank: 0 },
             "write_stdin" => return ToolPlacement::CoreDirect { rank: 1 },
+            "apply_patch" => return ToolPlacement::CoreDirect { rank: 2 },
             "__codex_local_shell" | "shell" | "shell_command" | "container.exec" => {
-                return ToolPlacement::CoreDirect { rank: 2 };
+                return ToolPlacement::CoreDirect { rank: 3 };
             }
-            "view_image" => return ToolPlacement::CoreDirect { rank: 3 },
-            "update_plan" => return ToolPlacement::CoreDirect { rank: 4 },
+            "view_image" => return ToolPlacement::CoreDirect { rank: 4 },
+            "update_plan" => return ToolPlacement::CoreDirect { rank: 5 },
             "tool_search" | "__codex_tool_search" => {
-                return ToolPlacement::CoreDirect { rank: 5 };
+                return ToolPlacement::CoreDirect { rank: 6 };
             }
             _ => {}
         }
