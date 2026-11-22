@@ -101,6 +101,7 @@ export interface GatewayTelemetryState {
   refreshLowCacheHits: () => Promise<void>;
   closeIdleSession: (sessionId: string) => Promise<boolean>;
   toggleVisionOffload: (enabled?: boolean) => Promise<boolean | null>;
+  toggleMcpToolBridge: (enabled?: boolean) => Promise<boolean | null>;
   updateCacheConfig: (
     maxLowCacheRecords: number,
     lowCacheThresholdPct: number,
@@ -233,6 +234,26 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
       await refreshSnapshot();
       return typeof body.vision_offload_enabled === "boolean"
         ? body.vision_offload_enabled
+        : null;
+    },
+    [authHeaders, buildUrl, refreshSnapshot],
+  );
+
+  const toggleMcpToolBridge = useCallback(
+    async (enabled?: boolean): Promise<boolean | null> => {
+      const query =
+        typeof enabled === "boolean" ? `?enabled=${enabled ? "true" : "false"}` : "";
+      const resp = await fetch(buildUrl(`/api/telemetry/mcp-tool-bridge${query}`), {
+        method: "POST",
+        headers: authHeaders,
+      });
+      if (!resp.ok) {
+        return null;
+      }
+      const body = (await resp.json()) as { mcp_tool_bridge_enabled?: boolean };
+      await refreshSnapshot();
+      return typeof body.mcp_tool_bridge_enabled === "boolean"
+        ? body.mcp_tool_bridge_enabled
         : null;
     },
     [authHeaders, buildUrl, refreshSnapshot],
@@ -397,11 +418,18 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
               (parsed.cache_telemetry?.revision ?? 0) ===
                 (prev.cache_telemetry?.revision ?? 0) &&
               parsed.vision_offload_enabled === prev.vision_offload_enabled &&
+              parsed.mcp_tool_bridge_enabled === prev.mcp_tool_bridge_enabled &&
               parsed.acp_process.connected === prev.acp_process.connected &&
               parsed.acp_process.recent_stderr.length ===
                 prev.acp_process.recent_stderr.length &&
               parsed.session_pool.sessions.length ===
                 prev.session_pool.sessions.length &&
+              parsed.session_pool.idle_cached_sessions ===
+                prev.session_pool.idle_cached_sessions &&
+              (parsed.session_pool.suspended_mcp_sessions ?? 0) ===
+                (prev.session_pool.suspended_mcp_sessions ?? 0) &&
+              (parsed.session_pool.mcp_continuations ?? 0) ===
+                (prev.session_pool.mcp_continuations ?? 0) &&
               parsed.available_models.length === prev.available_models.length &&
               parsed.acp_process.uptime_secs - prev.acp_process.uptime_secs < 10
             ) {
@@ -457,6 +485,7 @@ export function useGatewayTelemetry(): GatewayTelemetryState {
     refreshLowCacheHits,
     closeIdleSession,
     toggleVisionOffload,
+    toggleMcpToolBridge,
     updateCacheConfig,
     toggleLowCacheCapturePayload,
     fetchLowCacheHitDetail,

@@ -63,7 +63,7 @@ lg completions zsh              # generate shell completions (bash, zsh, fish, p
 liftgate serve                  # run in the foreground
 ```
 
-In `lg tui`, press `3` to open Models, select a model, and press `t` to save it for future titles. The default is `gemini-4-hydrogen-low`.
+In `lg tui`, press `3` to open Models, select a model, and press `t` to save it for future titles (default `gemini-4-hydrogen-low`), or press `b` / `v` to live-toggle the Hybrid MCP Tool Bridge and `>=150k` vision offload.
 
 ## Antigravity CLI (`lg agy`) & Proxy Management (`lg proxy`)
 
@@ -213,6 +213,35 @@ policy, and genuine context-window overflows emit standard
 auto-compactable errors (`context_length_exceeded` for Codex and `prompt is too
 long: N tokens > M maximum` for Claude Code). Client `/compact` reuses a
 matching warm session before retiring it.
+
+## Hybrid MCP Tool Bridge
+
+By default (`--mcp-tool-bridge`, `AGY_MCP_TOOL_BRIDGE=true`, or
+`mcp_tool_bridge: true` in `~/.liftgate/settings.json`), Liftgate runs an
+authenticated loopback-only (`127.0.0.1`) HTTP MCP server with a per-session
+256-bit token and registers the caller's Code Mode orchestrators (`exec`,
+`wait`, `REPL`) plus up to 64 prioritized JSON `Function` tools natively on
+each `agy acp` session:
+
+- **Single-prompt native suspension**: when the model invokes a bridged client
+  tool, Liftgate parks the live `session/prompt` turn on the loopback MCP
+  call, immediately streams standard OpenAI `function_call` / `custom_tool_call`
+  or Anthropic `tool_use` items to the client, and resumes the parked MCP
+  channel as soon as the next HTTP request supplies matching tool results
+  (whether via stateful `previous_response_id` or stateless `input` / `messages`
+  arrays)—keeping multi-step tool cascades inside one `session/prompt` turn for
+  consistent ~93%+ prompt KV cache hits without replica-sharding misses.
+- **Seamless XML coexistence & clean unwind**: freeform `Custom` tools (such as
+  raw multi-line `apply_patch` diffs), tools beyond the 64-tool eager cap, and
+  mid-session `ToolSearch` additions automatically use the coexisting
+  `<agy_tool_call_...>` XML channel in the same session. User `Esc` interrupts,
+  new user messages without tool results, mid-session model switches, and
+  `/compact` unwind suspended turns non-destructively via `session/cancel` so
+  the warm session stays reusable.
+- **Live toggle**: pass `--no-mcp-tool-bridge` (`AGY_MCP_TOOL_BRIDGE=false`) at
+  startup, press `b` in `lg top`, click **MCP 原生工具挂起桥接** in the Web
+  Dashboard, or `POST /api/telemetry/mcp-tool-bridge` to switch between Hybrid
+  MCP Suspension and XML-only mode at runtime with zero restart.
 
 ## Configure local or global client files (`liftgate config`)
 
@@ -377,8 +406,9 @@ Messages client at `http://127.0.0.1:8787` ([API](api.md)).
 Liftgate serves the observability dashboard directly at `http://127.0.0.1:8787/`
 (embedded inside release binaries at compile time, or opened via `liftgate ui`):
 in-flight and recent turns with their tool calls and token counts, the session
-pool (idle sessions can be closed by hand), the model catalog and the last lines
-of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
+pool (idle or MCP-suspended sessions can be closed by hand, and the Hybrid MCP
+Tool Bridge and `>=150k` vision offload can be toggled live), the model catalog
+and the last lines of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
 (or enter it in the dashboard's connection settings). Serve an extra dedicated
 UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir>`.
 
@@ -392,6 +422,7 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--agy-bin` | `AGY_BIN` | found on `PATH` or in standard install paths |
 | `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
+| `--mcp-tool-bridge` / `--no-mcp-tool-bridge` | `AGY_MCP_TOOL_BRIDGE` | `true` (or `mcp_tool_bridge` in `~/.liftgate/settings.json`; also live-toggleable via `POST /api/telemetry/mcp-tool-bridge`, Web UI & `b` in `lg top`) |
 | `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true` (or `vision_offload` in `~/.liftgate/settings.json`; also live-toggleable in Web UI & `lg top`) |
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000` (`0..=50000`; persisted in `~/.liftgate/cache-telemetry.json`, live-configurable in Web UI) |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50` (`0..=100%`; turns below threshold are persisted as low-cache-hit records) |

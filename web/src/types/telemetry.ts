@@ -33,7 +33,7 @@ export interface AcpProcessTelemetry {
   recent_stderr: StderrLogEntry[];
 }
 
-export type SessionSlotState = "running" | "idle";
+export type SessionSlotState = "running" | "suspended" | "idle";
 
 export type PromptCacheWarmth = "active" | "hot" | "warm" | "cold" | "unknown";
 
@@ -55,12 +55,14 @@ export interface SessionSummary {
 
 export interface SessionPoolTelemetry {
   active_leased_sessions: number;
+  suspended_mcp_sessions?: number;
   idle_cached_sessions: number;
   max_idle_sessions: number;
   stored_responses: number;
   max_stored_responses: number;
   total_sessions_created: number;
   total_sessions_reused: number;
+  mcp_continuations?: number;
   total_sessions_closed_or_evicted: number;
   sessions: SessionSummary[];
 }
@@ -133,6 +135,7 @@ export type LowCacheDiagnosticCause =
 export type LowCacheRoutingStrategy =
   | "previous_response_id"
   | "prefix_hash"
+  | "mcp_suspended_continuation"
   | "compaction_dialogue_hash"
   | "cold_new_session"
   | "cold_mid_conversation_rebuild"
@@ -349,6 +352,7 @@ export interface GatewayTelemetrySnapshot {
   generated_at_unix_ms: number;
   gateway_version: string;
   vision_offload_enabled?: boolean;
+  mcp_tool_bridge_enabled?: boolean;
   acp_process: AcpProcessTelemetry;
   session_pool: SessionPoolTelemetry;
   metrics: GatewayMetricsSummary;

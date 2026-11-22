@@ -48,7 +48,7 @@ lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh�
 liftgate serve                  # 前台运行网关
 ```
 
-在 `lg tui` 中按 `3` 进入 Models，选中模型后按 `t` 保存。从下一次生成标题开始生效，默认使用 `gemini-4-hydrogen-low`。
+在 `lg tui` 中按 `3` 进入 Models，选中模型后按 `t` 保存为标题生成模型（默认 `gemini-4-hydrogen-low`）；按 `b` 或 `v` 可分别实时热切换「混合原生 MCP 工具挂起桥接」与「`>=150k` 视觉子会话卸载」。
 
 ## Antigravity CLI 管理（`lg agy`）与代理配置（`lg proxy`）
 
@@ -137,6 +137,14 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 实测上游 `agy acp` 在 Gemini 会话达到 `524,288` token（`1,048,576` `usage_update` 窗口的 `50%`）时会立即在轮末触发内部自动摘要压缩；将客户端窗口设为 `500,000 / 425,000` 可在上游清栈前稳妥在热会话上完成客户端 `/compact`。Codex 按模型目录读取配置；Claude Code 使用逐模型 `modelSettings.autoCompactWindow`（需 v2.1.288 或更新版本）。多个网关模型映射到同一个 Claude canonical 名称时取较小阈值，因此可能早于表中数值压缩。参考[Claude 官方上下文配置](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)。
 
 每次 ACP `session/prompt` 有 `176,000` 字节的单轮文本预算（留有安全余量，低于上游单轮 `191,579` 字节的截断边界）。当任何工具调用输出、单轮输入、系统指令、工具 Schema、冷历史归档或 `web_fetch` 网页内容发生截断或省略时，Liftgate 都会先将 100% 原始无损内容原子落盘到 `~/.liftgate/spills/`，再按水位线分配算法仅对超长块做按行对齐的首尾保留中间截断（保留约 55% 开头与 45% 结尾），并在省略提示中精确附带本地文件路径与省略行号范围以便客户端工具按需读取，同时保持同轮其它小工具输出完整无损、不影响后续轮次的 `SessionPool` 热会话前缀命中。真正发生上下文窗口溢出时，网关会返回客户端标准可自动触发压缩的错误格式（Codex 为 `context_length_exceeded`，Claude Code 为 `prompt is too long: N tokens > M maximum`）。客户端 `/compact` 会优先复用匹配的热会话完成总结，再释放旧会话。
+
+## 混合本地回环 MCP 工具挂起桥接
+
+默认情况下（`--mcp-tool-bridge`、`AGY_MCP_TOOL_BRIDGE=true` 或 `~/.liftgate/settings.json` 中的 `mcp_tool_bridge: true`），Liftgate 会在本地仅绑定 `127.0.0.1` 的受鉴权回环 HTTP MCP 服务（每会话独立 256-bit 随机令牌），将客户端的 Code Mode 编排工具（`exec`、`wait`、`REPL`）及最多 64 个高优标准 JSON `Function` 工具以原生 MCP 工具身份注册进 `agy acp` 会话：
+
+- **单次 `session/prompt` 挂起原生续接**：模型调用桥接工具时，网关挂起当前 `session/prompt` 回环调用并立即向客户端流式返回标准 OpenAI `function_call` / `custom_tool_call` 或 Anthropic `tool_use`；下一轮客户端携带工具结果返回时（无论使用有状态 `previous_response_id` 还是无状态全量 `input` / `messages` 数组），直接唤醒挂起通道继续推理，使多步工具链始终驻留在同一 `session/prompt` 内，稳定保持 ~93%+ 的上游 Prompt KV 缓存命中率并彻底消除跨轮副本分片掉缓存与 XML 幻觉。
+- **XML 混合共存与无损退栈**：自由文本 `Custom` 工具（如多行裸 `apply_patch` 补丁）、超出 64 个即时上限的工具以及会话中途 `ToolSearch` 动态新增的工具自动在同一会话内通过 `<agy_tool_call_...>` XML 通道协同工作；若用户在工具等待期间按 `Esc` 打断、发送新提示词、切换模型或触发 `/compact`，网关会先通过 `session/cancel` 无损退栈并继续复用原热会话。
+- **零重启实时热切换**：启动时可传 `--no-mcp-tool-bridge`（`AGY_MCP_TOOL_BRIDGE=false`）关闭，运行中也可随时在 `lg top` 按 `b`、在 Web 监控面板「ACP 会话池与监管」页点击开关或调用 `POST /api/telemetry/mcp-tool-bridge` 在线热切换。
 
 ## 快捷生成本地或全局配置文件（`liftgate config`）
 
@@ -266,7 +274,7 @@ OpenAI Responses 客户端指向 `http://127.0.0.1:8787/v1`，Anthropic Messages
 
 ## 监控面板
 
-Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含工具调用与 Token 明细）、会话池（可手动关闭空闲会话）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
+Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含工具调用与 Token 明细）、会话池（可手动释放空闲或 MCP 挂起会话，并在线热切换 MCP 原生工具桥接与 `>=150k` 视觉卸载）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
 
 ## 参数与环境变量
 
@@ -278,6 +286,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--agy-bin` | `AGY_BIN` | 从 `PATH` 或标准安装位置查找 |
 | `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
+| `--mcp-tool-bridge` / `--no-mcp-tool-bridge` | `AGY_MCP_TOOL_BRIDGE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `mcp_tool_bridge`，亦可通过 `POST /api/telemetry/mcp-tool-bridge`、Web 面板与 `lg top` 按 `b` 实时切换） |
 | `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true`（或读取 `~/.liftgate/settings.json` 中的 `vision_offload`，亦可在 Web 面板与 `lg top` 按 `v` 实时切换） |
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000`（`0..=50000`；原子持久化至 `~/.liftgate/cache-telemetry.json`，可在 Web 面板实时调整） |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50`（`0..=100%`；低于该命中率阈值的请求自动持久化归档） |

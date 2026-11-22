@@ -121,6 +121,8 @@ function formatRoutingStrategy(
       return "previous_response_id 续接";
     case "prefix_hash":
       return "前缀 SHA-256 哈希命中";
+    case "mcp_suspended_continuation":
+      return "MCP 挂起原生续接";
     case "compaction_dialogue_hash":
       return "压缩对话哈希命中";
     case "cold_new_session":
@@ -318,6 +320,7 @@ export function App(): React.JSX.Element {
     refreshLowCacheHits,
     closeIdleSession,
     toggleVisionOffload,
+    toggleMcpToolBridge,
     updateCacheConfig,
     toggleLowCacheCapturePayload,
     fetchLowCacheHitDetail,
@@ -392,6 +395,9 @@ export function App(): React.JSX.Element {
   const activeTasks = snapshot?.active_tasks ?? [];
   const recentTasks = snapshot?.recent_tasks ?? [];
   const models = snapshot?.available_models ?? [];
+  const mcpBridgeEnabled = snapshot?.mcp_tool_bridge_enabled ?? true;
+  const suspendedMcpCount = pool?.suspended_mcp_sessions ?? 0;
+  const mcpContinuationCount = pool?.mcp_continuations ?? 0;
 
   // Keep config inputs synchronized with live server values unless user is editing
   useEffect(() => {
@@ -476,10 +482,8 @@ export function App(): React.JSX.Element {
 
   const idlePoolPercent = useMemo(() => {
     if (!pool || pool.max_idle_sessions === 0) return 0;
-    return Math.min(
-      100,
-      Math.round((pool.idle_cached_sessions / pool.max_idle_sessions) * 100),
-    );
+    const parked = pool.idle_cached_sessions + (pool.suspended_mcp_sessions ?? 0);
+    return Math.min(100, Math.round((parked / pool.max_idle_sessions) * 100));
   }, [pool]);
 
   const filteredRecentTasks = useMemo(() => {
@@ -1021,6 +1025,13 @@ claude`,
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`sf-pill ${mcpBridgeEnabled ? "sf-pill--ok" : ""}`}
+                    title="本地回环原生 MCP 工具挂起桥接 + XML 混合共存策略（可在「ACP 会话池与监管」页实时切换）"
+                  >
+                    <Wrench className="h-3 w-3" />
+                    MCP 工具桥接: {mcpBridgeEnabled ? "已开启" : "已关闭"}
+                  </span>
                   {acp && (
                     <span className="sf-tag">
                       运行时长 {formatUptime(acp.uptime_secs)}
@@ -1127,12 +1138,14 @@ claude`,
                     </div>
                     <div className="sf-kpi__foot flex justify-between gap-2">
                       <span>
-                        空闲 {pool?.idle_cached_sessions ?? 0}/
-                        {pool?.max_idle_sessions ?? 0}
+                        {suspendedMcpCount > 0
+                          ? `挂起 ${suspendedMcpCount} · 空闲 ${pool?.idle_cached_sessions ?? 0}/${pool?.max_idle_sessions ?? 0}`
+                          : `空闲 ${pool?.idle_cached_sessions ?? 0}/${pool?.max_idle_sessions ?? 0}`}
                       </span>
                       <span>
-                        复用 {pool?.total_sessions_reused ?? 0} · 新建{" "}
-                        {pool?.total_sessions_created ?? 0}
+                        {mcpContinuationCount > 0
+                          ? `复用 ${pool?.total_sessions_reused ?? 0} (MCP ${mcpContinuationCount})`
+                          : `复用 ${pool?.total_sessions_reused ?? 0} · 新建 ${pool?.total_sessions_created ?? 0}`}
                       </span>
                     </div>
                   </div>
@@ -1224,9 +1237,16 @@ claude`,
                       实时呈现活跃请求的思考进度、原生联网检索、客户端工具调用与流式输出预览
                     </p>
                   </div>
-                  <span className="sf-tag">
-                    活跃子进程 {pool?.active_leased_sessions ?? 0}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="sf-tag">
+                      活跃子进程 {pool?.active_leased_sessions ?? 0}
+                    </span>
+                    {suspendedMcpCount > 0 && (
+                      <span className="sf-tag">
+                        MCP 挂起 {suspendedMcpCount}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className="sf-card__body">
                   {activeTasks.length === 0 ? (
@@ -2138,8 +2158,8 @@ claude`,
                   <p className="sf-eyebrow">INFRASTRUCTURE · ACP SUPERVISION</p>
                   <h1 className="sf-title">ACP 会话池与跨平台进程监管</h1>
                   <p className="sf-desc">
-                    监管 <code>agy acp --process-per-session</code> 主控与独立工作子进程树，支持热会话前缀匹配、45
-                    分钟冷空闲自动回收及 &ge;150k 长上下文视觉旁路卸载热开关。
+                    监管 <code>agy acp --process-per-session</code> 主控与独立工作子进程树，支持原生本地回环
+                    MCP 工具挂起续接、热会话前缀匹配、45 分钟冷空闲自动回收及 &ge;150k 长上下文视觉旁路卸载热开关。
                   </p>
                 </div>
                 {acp && (
@@ -2167,32 +2187,55 @@ claude`,
                     </p>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`sf-pill ${
-                        (snapshot?.vision_offload_enabled ?? true)
-                          ? "sf-pill--ok"
-                          : ""
-                      }`}
-                    >
-                      &ge;150k 视觉子会话卸载:{" "}
-                      {(snapshot?.vision_offload_enabled ?? true)
-                        ? "已开启"
-                        : "已关闭"}
-                    </span>
-                    <button
-                      id="btn-toggle-vision-offload"
-                      type="button"
-                      className="sf-btn sf-btn--sm"
-                      onClick={() => {
-                        const current = snapshot?.vision_offload_enabled ?? true;
-                        void toggleVisionOffload(!current);
-                      }}
-                    >
-                      {(snapshot?.vision_offload_enabled ?? true)
-                        ? "关闭子会话卸载"
-                        : "开启子会话卸载"}
-                    </button>
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <div className="inline-flex items-center gap-1.5">
+                      <span
+                        className={`sf-pill ${
+                          mcpBridgeEnabled ? "sf-pill--ok" : ""
+                        }`}
+                      >
+                        MCP 原生工具挂起桥接:{" "}
+                        {mcpBridgeEnabled ? "已开启" : "已关闭"}
+                      </span>
+                      <button
+                        id="btn-toggle-mcp-tool-bridge"
+                        type="button"
+                        className="sf-btn sf-btn--sm"
+                        onClick={() => {
+                          void toggleMcpToolBridge(!mcpBridgeEnabled);
+                        }}
+                      >
+                        {mcpBridgeEnabled ? "关闭 MCP 桥接" : "开启 MCP 桥接"}
+                      </button>
+                    </div>
+
+                    <div className="inline-flex items-center gap-1.5">
+                      <span
+                        className={`sf-pill ${
+                          (snapshot?.vision_offload_enabled ?? true)
+                            ? "sf-pill--ok"
+                            : ""
+                        }`}
+                      >
+                        &ge;150k 视觉子会话卸载:{" "}
+                        {(snapshot?.vision_offload_enabled ?? true)
+                          ? "已开启"
+                          : "已关闭"}
+                      </span>
+                      <button
+                        id="btn-toggle-vision-offload"
+                        type="button"
+                        className="sf-btn sf-btn--sm"
+                        onClick={() => {
+                          const current = snapshot?.vision_offload_enabled ?? true;
+                          void toggleVisionOffload(!current);
+                        }}
+                      >
+                        {(snapshot?.vision_offload_enabled ?? true)
+                          ? "关闭子会话卸载"
+                          : "开启子会话卸载"}
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -2280,8 +2323,26 @@ claude`,
                       {pool?.total_sessions_closed_or_evicted ?? 0} 个）
                     </h2>
                     <p className="sf-card__sub">
-                      展示各会话的实时上游 KV 缓存温区、单会话实测缓存命中率与上下文窗口占用
+                      展示各会话的实时上游 KV 缓存温区、MCP 原生工具挂起状态、单会话实测缓存命中率与上下文窗口占用
                     </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={`sf-tag${
+                        suspendedMcpCount > 0
+                          ? " border-[var(--info)] text-[var(--info)]"
+                          : ""
+                      }`}
+                    >
+                      MCP 挂起等待 {suspendedMcpCount}
+                    </span>
+                    <span className="sf-tag">
+                      MCP 原生续接 {formatNumber(mcpContinuationCount)} 次
+                    </span>
+                    <span className="sf-tag">
+                      空闲驻留 {pool?.idle_cached_sessions ?? 0} /{" "}
+                      {pool?.max_idle_sessions ?? 0}
+                    </span>
                   </div>
                 </div>
                 <div className="sf-card__body sf-card__body--flush">
@@ -2327,6 +2388,19 @@ claude`,
                                   <span className="sf-pill sf-pill--accent sf-pill--live">
                                     执行中 (Leased)
                                   </span>
+                                ) : sess.state === "suspended" ? (
+                                  <div className="inline-flex items-center gap-1.5">
+                                    <span className="sf-pill sf-pill--info sf-pill--live">
+                                      挂起等工具 (MCP)
+                                    </span>
+                                    <span className="sf-tag">
+                                      {sess.cache_warmth === "hot"
+                                        ? "<1m 热"
+                                        : sess.cache_warmth === "warm"
+                                          ? "1–5m 温"
+                                          : "≥5m 冷"}
+                                    </span>
+                                  </div>
                                 ) : sess.cache_warmth === "hot" ? (
                                   <span className="sf-pill sf-pill--ok">
                                     热缓存 (&lt;1m)
@@ -2372,7 +2446,8 @@ claude`,
                                 {formatTimestamp(sess.last_active_unix_ms)}
                               </td>
                               <td className="num">
-                                {sess.state === "idle" && (
+                                {(sess.state === "idle" ||
+                                  sess.state === "suspended") && (
                                   <button
                                     type="button"
                                     className="sf-btn sf-btn--danger sf-btn--sm"
