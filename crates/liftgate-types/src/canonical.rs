@@ -251,17 +251,22 @@ pub fn detect_auxiliary_task(
     if trimmed_user.starts_with("The user stepped away and is coming back. Recap in")
         || trimmed_user.contains("<prompt_suggestion>")
         || sys.contains("Suggest what the user might")
+        || sys.contains(
+            "Summarize what was done in this conversation. Write like a pull request description.",
+        )
     {
         return Some(AuxiliaryTaskKind::AwayRecapOrSuggestion);
     }
 
-    // 3. Session title / topic / branch name generator (Claude Code & OpenAI Codex TUI)
+    // 3. Session title / topic / branch name generator (Claude Code, OpenAI Codex & OpenCode TUI)
     if conv_len <= 2
         && (trimmed_user.starts_with("Generate a concise, single-line task title")
             || sys.contains("Generate a concise, single-line task title")
             || trimmed_user.contains("Write the title in the predominant language of the session")
             || sys.contains("Write the title in the predominant language of the session")
             || sys.contains("isNewTopic")
+            || sys.contains("You name conversations so the user can find them later")
+            || sys.contains("You are a title generator")
             || (trimmed_user.starts_with("<session>")
                 && trimmed_user.contains("</session>")
                 && trimmed_user.contains("title")))
@@ -553,6 +558,38 @@ mod tests {
         assert_eq!(
             detect_auxiliary_task(None, &normal_chat, &[], false, false),
             None
+        );
+
+        // OpenCode v2 `PROMPT_TITLE` and `PROMPT_SUMMARY` route to ephemeral fast lanes
+        let oc_title_msg = vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "debug 500 errors in production".to_owned(),
+            )],
+        }];
+        assert_eq!(
+            detect_auxiliary_task(
+                Some(
+                    "You name conversations so the user can find them later in a list of past sessions."
+                ),
+                &oc_title_msg,
+                &[],
+                false,
+                false,
+            ),
+            Some(AuxiliaryTaskKind::SessionTitleOrTopic)
+        );
+        assert_eq!(
+            detect_auxiliary_task(
+                Some(
+                    "Summarize what was done in this conversation. Write like a pull request description."
+                ),
+                &oc_title_msg,
+                &[],
+                false,
+                false,
+            ),
+            Some(AuxiliaryTaskKind::AwayRecapOrSuggestion)
         );
     }
 

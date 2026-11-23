@@ -9356,6 +9356,270 @@ async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_he
 }
 
 #[tokio::test]
+async fn opencode_profile_virtualizes_codemode_execute_heals_patchtext_and_routes_mcp_hubs() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            // Step 1: Model calls OpenCode `@opencode/codemode` `execute` directly
+            McpMockStep::CallTool {
+                usage_used: 8_000,
+                thoughts: vec!["Running Code Mode script via execute.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "execute".to_owned(),
+                arguments: json!({
+                    "code": "const rows = await tools.playwright.browser_op_02({ selector: '#app' }); return rows;",
+                    "toolSummary": "Inspect app selector"
+                }),
+                expect_reply_substrings: vec!["matched 1 element"],
+            },
+            // Step 2: Model calls `patch` with malformed hunk line (caught in 0-RTT preflight!)
+            McpMockStep::CallTool {
+                usage_used: 8_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "patch".to_owned(),
+                arguments: json!({
+                    "patchText": "*** Begin Patch\n*** Update File: src/app.ts\n@@\nmissing_prefix_line()\n*** End Patch"
+                }),
+                expect_reply_substrings: vec!["Invalid `apply_patch` syntax at line 4"],
+            },
+            // Step 3: Model retries `patch` with duplicate file sections & line-number header (auto-healed!)
+            McpMockStep::CallTool {
+                usage_used: 8_900,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "patch".to_owned(),
+                arguments: json!({
+                    "patchText": "*** Begin Patch\n*** Update File: src/app.ts\n@@ -1,2 +1,2 @@\n const x = 1;\n\n-oldCall();\n+newCall();\n*** Update File: src/app.ts\n@@\n-export const v = 1;\n+export const v = 2;\n*** End Patch"
+                }),
+                expect_reply_substrings: vec!["patched src/app.ts"],
+            },
+            // Step 4: Model dispatches an `<server>_<tool>` MCP call via `ns__playwright`
+            McpMockStep::CallTool {
+                usage_used: 9_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__playwright".to_owned(),
+                arguments: json!({
+                    "action": "browser_op_02",
+                    "args": { "selector": "#submit" }
+                }),
+                expect_reply_substrings: vec!["clicked #submit"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 9_800,
+                thoughts: vec![],
+                chunks_template: vec!["OpenCode workflow verified.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 9_800,
+                    output_tokens: 60,
+                    cached_read_tokens: 9_200,
+                    cached_write_tokens: 0,
+                    thought_tokens: 40,
+                    total_tokens: 9_900,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let mut tools = vec![
+        json!({
+            "name": "execute",
+            "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "code": { "type": "string" } },
+                "required": ["code"]
+            }
+        }),
+        json!({"name": "shell", "description": "Run shell", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}),
+        json!({"name": "read", "description": "Read file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
+        json!({"name": "edit", "description": "Edit file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
+        json!({"name": "write", "description": "Write file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
+        json!({"name": "patch", "description": "Apply V4A patch", "input_schema": {"type": "object", "properties": {"patchText": {"type": "string"}}, "required": ["patchText"]}}),
+        json!({"name": "grep", "description": "Search contents", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}),
+        json!({"name": "glob", "description": "Match files", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}),
+        json!({"name": "subagent", "description": "Run subagent", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}),
+        json!({"name": "question", "description": "Ask user", "input_schema": {"type": "object", "properties": {"questions": {"type": "array"}}, "required": ["questions"]}}),
+    ];
+    for idx in 0..25 {
+        tools.push(json!({
+            "name": format!("playwright_browser_op_{idx:02}"),
+            "description": "Playwright browser action",
+            "input_schema": {
+                "type": "object",
+                "properties": { "selector": { "type": "string" } },
+                "required": ["selector"]
+            }
+        }));
+    }
+
+    let mut messages = vec![json!({ "role": "user", "content": "Update app.ts with OpenCode." })];
+
+    // Turn 1 -> `execute`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 2048,
+                        "tools": tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let j1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu1 = j1["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("execute tool_use");
+    assert_eq!(tu1["name"], "execute");
+    assert!(tu1["input"].get("toolSummary").is_none());
+    let tu1_id = tu1["id"].as_str().unwrap().to_owned();
+    messages.push(json!({ "role": "assistant", "content": j1["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu1_id, "content": "matched 1 element" }]
+    }));
+
+    // Turn 2 -> 0-RTT preflight catches malformed `patch` in-memory, then returns healed `patch`!
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 2048,
+                        "tools": tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let j2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu2 = j2["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("healed patch tool_use");
+    assert_eq!(tu2["name"], "patch");
+    let patch_text = tu2["input"]["patchText"]
+        .as_str()
+        .expect("patchText string");
+    assert_eq!(patch_text.matches("*** Update File: src/app.ts").count(), 1);
+    assert!(!patch_text.contains("@@ -1,2 +1,2 @@"));
+    let tu2_id = tu2["id"].as_str().unwrap().to_owned();
+    messages.push(json!({ "role": "assistant", "content": j2["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu2_id, "content": "patched src/app.ts" }]
+    }));
+
+    // Turn 3 -> `ns__playwright` unwraps to `playwright_browser_op_02`
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 2048,
+                        "tools": tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let j3: Value =
+        serde_json::from_slice(&r3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu3 = j3["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("playwright tool_use");
+    assert_eq!(tu3["name"], "playwright_browser_op_02");
+    assert_eq!(tu3["input"]["selector"], "#submit");
+    let tu3_id = tu3["id"].as_str().unwrap().to_owned();
+    messages.push(json!({ "role": "assistant", "content": j3["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu3_id, "content": "clicked #submit" }]
+    }));
+
+    // Turn 4 -> Final completion in the exact same single ACP session
+    let r4 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 2048,
+                        "tools": tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+    let j4: Value =
+        serde_json::from_slice(&r4.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let final_text = j4["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "text")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(final_text, "OpenCode workflow verified.");
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 3);
+}
+
+#[tokio::test]
 async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve_single_session() {
     let backend = Arc::new(MockAcpBackend::new(vec![
         // Turn 1 (0 client tools, e.g. Plan mode) + in-flight `mcp_lg_gateway_web_fetch` in 1 prompt!

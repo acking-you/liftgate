@@ -137,6 +137,7 @@ impl Drop for TerminalSession {
 pub enum CockpitAction {
     LaunchCodex,
     LaunchClaude,
+    LaunchOpenCode,
     LaunchCodexApp,
     LaunchClaudeDesktop,
     OpenTop,
@@ -170,6 +171,12 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         label: "Launch Claude Code",
         desc: "Start Claude Code in current dir (auto-starts gateway, 0 file side effects)",
         action: CockpitAction::LaunchClaude,
+    },
+    CockpitItem {
+        hotkey: 'o',
+        label: "Launch OpenCode",
+        desc: "Start OpenCode TUI in current dir (auto-starts gateway, 0 file side effects)",
+        action: CockpitAction::LaunchOpenCode,
     },
     CockpitItem {
         hotkey: 'w',
@@ -222,13 +229,13 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
     CockpitItem {
         hotkey: 'g',
         label: "Configure Client Files",
-        desc: "Non-destructively sync .claude & .codex project configuration",
+        desc: "Non-destructively sync .claude, .codex & opencode.json project configuration",
         action: CockpitAction::SyncConfig,
     },
     CockpitItem {
         hotkey: 'd',
         label: "Environment Doctor",
-        desc: "Check agy, claude, codex, network proxy & login readiness",
+        desc: "Check agy, claude, codex, opencode, network proxy & login readiness",
         action: CockpitAction::Doctor,
     },
     CockpitItem {

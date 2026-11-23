@@ -9,6 +9,8 @@ pub use liftgate_types::parser::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::profile::V4aPatchContract;
+
 /// Wire tool descriptor serialized in MCP `tools/list` responses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpWireTool {
@@ -26,6 +28,7 @@ pub struct McpBridgedTool {
     pub client_name: String,
     pub is_custom: bool,
     pub unwrap_custom_key: Option<&'static str>,
+    pub v4a_patch: Option<V4aPatchContract>,
     pub parameters_json: Option<String>,
 }
 

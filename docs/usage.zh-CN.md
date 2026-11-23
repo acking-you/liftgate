@@ -2,7 +2,7 @@
 
 [English](usage.md) · 中文
 
-启动 Liftgate，然后把 Codex CLI、Claude Code 或任意 OpenAI / Anthropic 客户端指向它。下文地址均以默认的 `http://127.0.0.1:8787` 为例。
+启动 Liftgate，然后把 Codex CLI、Claude Code、OpenCode 或任意 OpenAI / Anthropic 客户端指向它。下文地址均以默认的 `http://127.0.0.1:8787` 为例。
 
 ## 准备工作
 
@@ -39,7 +39,7 @@ lg st                           # 查看健康状态、PID、会话池、Token �
 lg l -n 100 -f                  # 查看并实时跟随后台日志（全称：logs，加 --acp 查看 agy stderr）
 lg web                          # 打开 Web 监控面板（全称：ui，加 --print 仅输出地址）
 lg m -i                         # 交互式搜索并热切换默认模型（全称：models --pick）
-lg doc                          # 自检 agy、claude、codex、代理、内嵌面板与登录模型就绪状态（全称：doctor）
+lg doc                          # 自检 agy、claude、codex、opencode、代理、内嵌面板与登录模型就绪状态（全称：doctor）
 lg r                            # 重启后台网关（全称：restart）
 lg down                         # 优雅停止后台网关并清理 ACP 子进程树（全称：stop）
 lg upgrade                      # 检查 GitHub Releases（-c / --check）并自动校验升级 lg 与 liftgate（别名：update、self-update）
@@ -84,9 +84,9 @@ lg agy mcp -- --help                    # 透传任意官方子命令（`mcp`、
 - **默认零代理直连**：Liftgate 默认**不设置任何代理**，并在拉起 `agy` 时清理父进程残留的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（也不会自动注入系统注册表代理）。只有当你通过 `lg proxy`（持久化于 `~/.liftgate/settings.json`）或 `--agy-proxy` / `AGY_PROXY` 显式配置后，Liftgate 才会在每次启动 `agy` 时强制注入代理环境变量，并自动将 `127.0.0.1,localhost,::1` 写入 `NO_PROXY`。
 - **空闲无感自动热更新**：网关运行时默认开启 `agy` 自动更新（`true`）。后台任务会定期检查官方 Antigravity 清单；发现新版本时**绝不打断进行中的请求**，而是等待网关完全空闲（0 活跃请求、0 活跃流且会话池静置），排空缓存空闲会话并优雅释放旧 `agy` 进程文件锁（含 Windows `.exe` 锁），完成 SHA-512 校验替换后立即拉起新进程——若新版本握手异常还会自动回滚旧二进制。
 
-## 零副作用临时启动（`lg cx` / `lg cc` / `lg cxa` / `lg cd`）
+## 零副作用临时启动（`lg cx` / `lg cc` / `lg oc` / `lg cxa` / `lg cd`）
 
-跨 Windows、macOS、Linux 在**任意目录**下零污染启动 Codex CLI、Claude Code、**Codex App** 或 **Claude Desktop**，退出后**完全 0 残留**（不改动当前项目、`~/.claude/settings.json`、`~/.codex/config.toml`、官方桌面端配置或父终端环境）：
+跨 Windows、macOS、Linux 在**任意目录**下零污染启动 Codex CLI、Claude Code、**OpenCode**、**Codex App** 或 **Claude Desktop**，退出后**完全 0 残留**（不改动当前项目、`~/.claude/settings.json`、`~/.codex/config.toml`、`~/.config/opencode/opencode.json`、官方桌面端配置或父终端环境）：
 
 ```bash
 cd /path/to/your/project
@@ -94,8 +94,12 @@ liftgate codex                              # 在当前目录启动交互式 Cod
 liftgate codex --code-mode-only             # 启动纯 Code Mode（仅暴露 `exec` + `wait`）的 Codex CLI
 liftgate codex --no-code-mode               # 当前会话关闭 Code Mode，恢复直连工具模式（`direct`）
 liftgate claude                             # 在当前目录启动交互式 Claude Code（默认注入 `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`）
+liftgate opencode                           # 在当前目录启动交互式 OpenCode TUI（短别名 `lg oc`；默认开启 `@opencode/codemode`）
+liftgate opencode --full-code-mode          # 开启 OpenCode 全量 Code Mode（注入 `OPENCODE_FLAGS=full_codemode`）
+liftgate opencode --no-code-mode            # 关闭 Code Mode，由 Liftgate `OpenCodeToolProfile` 虚拟化直连全部工具
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
 liftgate claude --model gemini-4-hydrogen-low -p "总结最近一次提交"
+liftgate opencode run "运行 cargo test"      # 非交互式执行单次 OpenCode 任务（支持 `lg oc run -c "..."`）
 
 # 原生会话查看、恢复、分叉、Git Worktree 与后台任务管理
 lg cx resume                                # 打开 Codex 交互式会话列表（加 `--all` 跨目录查看；兼容别名 `lg cx -r`）
@@ -108,6 +112,10 @@ lg cc -c                                    # 继续当前目录最近一次 Cla
 lg cc fork --last                           # 分叉最近一次 Claude 会话（自动映射 `--continue --fork-session`）
 lg cc -w feat-auth                          # 在独立 Git Worktree 中启动 Claude Code
 lg cc --bg "重构解析器"                      # 启动后台会话（`lg cc agents`、`attach`、`logs`、`stop`、`rm` 等均原生可用）
+lg oc -c                                    # 继续最近一次 OpenCode 会话（兼容 `lg oc continue`、`lg oc resume`）
+lg oc -s ses_42                             # 继续或创建指定 ID 的 OpenCode 会话（兼容 `lg oc resume ses_42`）
+lg oc models                                # 查看已配置的 Provider 与实时 Antigravity 模型列表
+lg oc session list                          # 查看当前项目会话列表（支持 `delete`、`export`、`import`、`web`、`serve`、`acp`）
 
 # 全平台桌面客户端（适配 Windows MSIX/Squirrel/独立安装、macOS .app、Linux .deb/Flatpak/AppImage）
 lg codex-app                                # 短别名 `lg cxa` 或 `lg cx --app`（隔离 CODEX_HOME + --user-data-dir）
@@ -117,7 +125,8 @@ lg claude-desktop --restart-app             # 若 Claude Desktop 已在运行，
 lg claude-desktop --restore                 # 手动立即执行回滚日志恢复（断电/强杀亦会在下次启动自动恢复）
 ```
 
-- 若后台网关尚未启动，`liftgate codex`、`liftgate claude` 及桌面端命令会自动在后台拉起它。
+- 若后台网关尚未启动，`liftgate codex`、`liftgate claude`、`liftgate opencode` 及桌面端命令会自动在后台拉起它。
+- **OpenCode（`lg oc` / `lg opencode`）**：通过纯内存环境变量 `OPENCODE_CONFIG_CONTENT` 无损合并注入 `provider.agy` 与实时模型目录（不写入任何项目或全局文件），并在检测到 OpenCode v2（`>= 2.0.0`）时自动附加 `--standalone` 启动私有隔离服务，避免复用到未携带网关配置的后台守护进程。
 - 注入的环境变量与临时配置目录（位于 `~/.liftgate/ephemeral/`）仅对子进程生效，进程退出时立即自动删除。
 - **Codex App（`lg cxa`）**：在 `~/.liftgate/desktop/sessions/` 下合成独立物理 `CODEX_HOME`（只读合并 `~/.codex/config.toml`，强制设置 `cli_auth_credentials_store = "file"`、`forced_login_method = "api"` 并生成独立 API Key 模式 `auth.json`，绝不混入个人 ChatGPT OAuth 登录态、也绝不触碰 `~/.codex`），同时通过 `--user-data-dir`（`~/.liftgate/desktop/codex-app-isolated`）隔离桌面端数据目录；Windows Microsoft Store MSIX 包通过无窗口容器内启动器（`conhost --headless` + `Invoke-CommandInDesktopPackage -PreventBreakaway`）跨 COM 边界完整注入 `CODEX_HOME`，且不篡改 `HOME` / `USERPROFILE` / `APPDATA`，确保内置终端中的 `git`、`cargo`、`ssh` 完全正常。
 - **Claude Desktop（`lg cd`）**：修改前先写入原子回滚日志（`~/.liftgate/desktop-journals/`），覆盖标准目录、Windows MSIX `LocalCache` 与 Linux Flatpak 沙箱目录注入临时第三方推理配置（`deploymentMode: "3p"`，指向本地 `/claude-desktop` 路由），后台守护进程监听窗口关闭后自动精准还原原始 `deploymentMode` 与 Profile 列表，同时完整保留会话期间新增的 `mcpServers` 或偏好设置。
@@ -152,9 +161,10 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 如果你希望直接输入裸命令 `claude` 或 `codex` 使用网关，可用 `liftgate config`（别名 `liftgate setup`）一键生成或无损合并本地/全局配置文件：
 
 ```bash
-liftgate config                     # 在当前项目生成/合并 .claude/settings.local.json 与 .codex/{config.toml,agy-models.json}
+liftgate config                     # 在当前项目生成/合并 .claude/settings.local.json、.codex/{config.toml,agy-models.json} 与 opencode.json
 liftgate config claude --global     # 无损合并到全局 ~/.claude/settings.json
 liftgate config codex --global      # 无损合并 [model_providers.agy] 与模型目录到全局 ~/.codex/
+liftgate config opencode --global   # 无损合并 provider.agy 到全局 ~/.config/opencode/opencode.json（短别名 `oc`）
 liftgate config --print             # 仅在终端预览将生成的配置内容，不写盘
 liftgate config --uninstall         # 精准清理 Liftgate 写入的配置项（加 --global 清理全局）
 ```
@@ -268,6 +278,48 @@ claude
 网关未设置 `--api-key` 时，任意非空的 `ANTHROPIC_AUTH_TOKEN` 都能通过 Claude Code 的本地检查；设置了 `--api-key <密钥>` 时，请填对应密钥。
 
 > **关于 Claude Code Mode（`REPL`）的说明**：Liftgate 的 `/v1/messages` 协议层已完整适配 `REPL` 沙箱工具定义保留与引号容错解析、`claude-fable-*` 模型族映射、`container` / `allowed_callers` / `caller` 字段以及 Auto Mode 代码审查分类器分流。但需要注意：Claude Code 官方客户端（`v2.1.323+`）目前在本地硬性限制了设置 `ANTHROPIC_BASE_URL` 或 `ANTHROPIC_AUTH_TOKEN` 时不启用客户端 Code Mode（详见[官方文档](https://code.claude.com/docs/en/code-mode)）；待上游放开自定义网关限制后即可直接无缝使用。
+
+## OpenCode
+
+推荐使用 `lg oc`（`liftgate opencode`）零副作用自动配置（同时兼容 OpenCode v1.x 与 OpenCode v2.x），或执行 `lg config opencode --global` 无损写入全局 `~/.config/opencode/opencode.json`（自动识别 `OPENCODE_CONFIG_DIR` 与 `XDG_CONFIG_HOME`）。
+
+若需手工配置，编辑 `~/.config/opencode/opencode.json`（或项目根目录 `./opencode.json`）：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "agy/gemini-4-carbon-high",
+  "small_model": "agy/gemini-4-hydrogen-low",
+  "provider": {
+    "agy": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Antigravity (Liftgate)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "local-agy",
+        "timeout": 1800000
+      },
+      "models": {
+        "gemini-4-carbon-high": {
+          "name": "Gemini 4 Carbon (High)",
+          "tool_call": true,
+          "limit": { "context": 500000, "output": 64000 },
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        },
+        "gemini-4-hydrogen-low": {
+          "name": "Gemini 4 Hydrogen (Low)",
+          "tool_call": true,
+          "limit": { "context": 500000, "output": 64000 },
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        }
+      }
+    }
+  }
+}
+```
+
+- **Code Mode（`@opencode/codemode`）**：OpenCode v2 默认已对外部 MCP 与二级命名空间工具开启基于 `psychoscript` 的 `execute` Code Mode；加 `lg oc --full-code-mode` 可将内置文件/终端工具与 `Bun.file` / `Bun.write` 一并纳入 `execute`，加 `lg oc --no-code-mode` 则将全部 MCP 与命名空间工具切换为直连调用（由 Liftgate 零开销 `OpenCodeToolProfile` 自动折叠至 `<= 24` 个 Eager 槽位）。
+- **上下文校准与补丁预检自愈**：`limit.context = 500000` 配合 OpenCode 默认 `15%` 余量恰好在 `425,000` token 稳妥触发自动压缩（避开上游 `524,288` 内部压缩线）；OpenCode 的 `patch`（`{ "patchText": "..." }`）享受网关侧 0-RTT Lark V4A 语法预检自愈与同文件自动合并，会话标题与摘要自动分流至轻量临时会话。
 
 ## 其它客户端
 

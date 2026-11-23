@@ -22,7 +22,7 @@
 > [!WARNING]
 > Liftgate 尚未发布 1.0：参数、接口和默认值都可能不经通知而变化。欢迎反馈缺陷和意见。
 
-Liftgate 在本机把 Google Antigravity 接到标准 OpenAI Responses 与 Anthropic Messages API 后面。Codex CLI、Codex App、Claude Code、Claude Desktop 或你自己的 SDK 代码无需任何改动，每一轮对话都严格通过官方 `agy acp` 协议在本地转发与流式应答。
+Liftgate 在本机把 Google Antigravity 接到标准 OpenAI Responses 与 Anthropic Messages API 后面。Codex CLI、Codex App、Claude Code、Claude Desktop、OpenCode 或你自己的 SDK 代码无需任何改动，每一轮对话都严格通过官方 `agy acp` 协议在本地转发与流式应答。
 
 在终端使用 **`lg`** / **`liftgate`**（CLI、全屏实时 TUI 与内嵌 Web 监控面板）即可一键完成安装、网关守护与零污染拉起智能体。
 
@@ -30,10 +30,11 @@ Liftgate 在本机把 Google Antigravity 接到标准 OpenAI Responses 与 Anthr
 
 <table>
   <tr>
-    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI / App</b></a><br><sub>OpenAI Responses</sub></td>
-    <td align="center" width="25%"><a href="docs/usage.zh-CN.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code / Desktop</b></a><br><sub>Anthropic Messages</sub></td>
-    <td align="center" width="25%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDK</b></a><br><sub><code>/v1/responses</code></sub></td>
-    <td align="center" width="25%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDK</b></a><br><sub><code>/v1/messages</code></sub></td>
+    <td align="center" width="20%"><a href="docs/usage.zh-CN.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI / App</b></a><br><sub>OpenAI Responses</sub></td>
+    <td align="center" width="20%"><a href="docs/usage.zh-CN.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code / Desktop</b></a><br><sub>Anthropic Messages</sub></td>
+    <td align="center" width="20%"><a href="docs/usage.zh-CN.md#opencode"><img src="assets/readme/opencode.svg" width="36" alt=""><br><b>OpenCode</b></a><br><sub><code>lg oc</code> · Code Mode</sub></td>
+    <td align="center" width="20%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDK</b></a><br><sub><code>/v1/responses</code></sub></td>
+    <td align="center" width="20%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDK</b></a><br><sub><code>/v1/messages</code></sub></td>
   </tr>
 </table>
 
@@ -90,6 +91,8 @@ lg cxa                                  # 跨 Win/macOS/Linux 启动 Codex App�
 lg cc                                   # 在当前目录直接启动 Claude Code（退出后 0 副作用）
 lg cc -r                                # 浏览并恢复 Claude 会话（支持 `lg cc resume`、`-c`、`fork`、`agents`）
 lg cd                                   # 跨 Win/macOS/Linux 启动 Claude Desktop（退出自动无损还原）
+lg oc                                   # 在当前目录直接启动 OpenCode（退出后 0 副作用）
+lg oc -c                                # 继续最近一次 OpenCode 会话（支持 `-s <ID>`、`--full-code-mode`、`run`）
 ```
 
 在任意目录下监控实时流量、热切换模型，或同步全局/项目级客户端配置：
@@ -100,7 +103,7 @@ lg top                   # 打开全屏实时终端仪表盘（实时请求、�
 lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
 lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板
 lg st                    # 查看健康状态、PID、会话池、Token 统计与进行中轮次
-lg cfg -g                # 无损合并 ~/.claude & ~/.codex 全局配置（--uninstall 卸载）
+lg cfg -g                # 无损合并 ~/.claude、~/.codex 与 ~/.config/opencode 全局配置（--uninstall 卸载）
 lg upgrade               # 检查 GitHub Releases（--check）并自动校验升级 `lg` + `liftgate`
 lg down                  # 优雅停止后台网关服务
 ```
@@ -112,9 +115,9 @@ lg down                  # 优雅停止后台网关服务
 - **只走官方接口**：只通过 `agy acp`（CLI 为编辑器提供的 Agent Client Protocol）与 Antigravity 通信，登录、Token、配额与 TLS 都留在 `agy` 内部（[为什么是 ACP](docs/architecture.md#why-acp)）。
 - **内置 `agy` 一键安装、代理注入与空闲自动更新**：缺失 `agy` 时用 `lg agy install` 跨平台自动下载并做 SHA-512 校验，用 `lg agy login` 完成交互登录；默认**不设置任何代理**，需要时一条 `lg proxy <端口|URL>` 即可在 `agy` 启动时强制注入代理；网关运行期间默认在空闲时自动检测并无感热更新 `agy`（可通过 `lg agy auto-update` 随时开关）。
 - **两套标准 API**：OpenAI Responses 与 Anthropic Messages，支持流式输出、工具调用、思考过程、图片与 Token 计数（[API](docs/api.md)）。
-- **工具留在你的智能体里**：ACP 会话运行在空目录且不挂任何 MCP 服务，文件编辑与命令执行仍由 Codex 或 Claude Code 完成；联网搜索与防 SSRF 的网页抓取由网关处理（[纯推理会话](docs/architecture.md#inference-only-sessions)）。
+- **工具留在你的智能体里**：ACP 会话运行在隔离空目录中，文件编辑与命令执行仍由 Codex、Claude Code 或 OpenCode 完成；联网搜索与防 SSRF 的网页抓取由网关处理（[纯推理会话](docs/architecture.md#inference-only-sessions)）。
 - **会话预热复用**：按每次请求的历史匹配池中已预热的 ACP 会话，只发送本轮新增内容（[会话复用](docs/architecture.md#session-reuse)）。
-- **实测校准的上下文窗口**：Codex 与 Claude Code 在上游 `agy acp` 强制内部压缩线（Gemini `524,288` token）前按 `500k / 425k` 稳妥触发客户端 `/compact`，纯单轮请求配合热会话复用，零后台重放副作用（[上下文策略](docs/usage.zh-CN.md#上下文窗口与单轮预算)）。
+- **实测校准的上下文窗口**：Codex、Claude Code 与 OpenCode 在上游 `agy acp` 强制内部压缩线（Gemini `524,288` token）前按 `500k / 425k` 稳妥触发客户端 `/compact`，纯单轮请求配合热会话复用，零后台重放副作用（[上下文策略](docs/usage.zh-CN.md#上下文窗口与单轮预算)）。
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **拒绝静默降级与 Flash 快车道**：上游 `429` 限流立即返回，绝不暗中偷换模型；标题、摘要与 Auto Mode 分类走独立的 Flash 会话，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
 - **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
@@ -132,7 +135,7 @@ lg down                  # 优雅停止后台网关服务
 
 | | |
 | --- | --- |
-| **使用** | [使用指南](docs/usage.zh-CN.md) · [Codex CLI](docs/usage.zh-CN.md#codex-cli) · [Claude Code](docs/usage.zh-CN.md#claude-code) · [监控面板](docs/usage.zh-CN.md#监控面板) · [参数](docs/usage.zh-CN.md#参数与环境变量) |
+| **使用** | [使用指南](docs/usage.zh-CN.md) · [Codex CLI](docs/usage.zh-CN.md#codex-cli) · [Claude Code](docs/usage.zh-CN.md#claude-code) · [OpenCode](docs/usage.zh-CN.md#opencode) · [监控面板](docs/usage.zh-CN.md#监控面板) · [参数](docs/usage.zh-CN.md#参数与环境变量) |
 | **参考** | [API](docs/api.md) · [架构](docs/architecture.md) |
 | **项目** | [更新日志](CHANGELOG.md) · [Rust 规范](docs/2026-11-09-RUST.md) · [AGENTS.md](AGENTS.md) |
 

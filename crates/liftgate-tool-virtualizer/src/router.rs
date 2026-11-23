@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
+    parser::ApplyPatchPreflightError,
     session_key::is_code_mode_custom_exec,
 };
 use serde_json::Value;
@@ -12,7 +13,7 @@ use serde_json::Value;
 use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
     budget::VirtualizerBudget,
-    profile::{HarnessToolProfile, ToolPlacement, count_fallback_prefix_stems},
+    profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract, count_fallback_prefix_stems},
     schema::{
         McpBridgedTool, code_mode_exec_input_schema, coerce_stringified_container_fields,
         extract_custom_tool_input, extract_schema_metadata, normalize_apply_patch_text,
@@ -55,6 +56,7 @@ pub(crate) struct IndexedClientTool {
     pub(crate) invoke_via_mcp_name: String,
     pub(crate) is_custom: bool,
     pub(crate) unwrap_custom_key: Option<&'static str>,
+    pub(crate) v4a_patch: Option<V4aPatchContract>,
     pub(crate) prose_description: String,
     pub(crate) ts_declaration: Option<String>,
     pub(crate) parameters_json: Option<String>,
@@ -210,6 +212,7 @@ impl McpRoutingTable {
         let mut all_indexed_tools = Vec::with_capacity(client_tools.len());
         for spec in client_tools {
             let placement = profile.classify_tool(spec, &stem_counts);
+            let profile_v4a_patch = profile.v4a_patch_contract(spec);
             let is_orchestrator = matches!(placement, ToolPlacement::Orchestrator { .. });
             let custom_bridge = match &spec.kind {
                 CanonicalToolKind::Custom { .. } => match &placement {
@@ -246,7 +249,7 @@ impl McpRoutingTable {
             let (required_fields, declares_tool_summary, has_root_combinator, prop_names_joined) =
                 extract_schema_metadata(params_json.as_deref());
 
-            let (namespace, short_action, invoke_via_mcp_name, is_custom, unwrap_key) =
+            let (namespace, short_action, invoke_via_mcp_name, is_custom, unwrap_key, v4a_patch) =
                 if let Some(direct) = direct_by_client.get(spec.name.as_str()) {
                     let opt_ns = match &placement {
                         ToolPlacement::Namespaced { namespace, .. } => {
@@ -262,6 +265,7 @@ impl McpRoutingTable {
                         direct.mcp_name.clone(),
                         direct.is_custom,
                         direct.unwrap_custom_key,
+                        direct.v4a_patch,
                     )
                 } else if let ToolPlacement::Namespaced { namespace, action } = placement {
                     let ns_owned = namespace.into_owned();
@@ -276,6 +280,7 @@ impl McpRoutingTable {
                         via,
                         is_custom_eligible,
                         custom_unwrap_key,
+                        profile_v4a_patch,
                     )
                 } else {
                     (
@@ -284,6 +289,7 @@ impl McpRoutingTable {
                         CALL_CLIENT_TOOL_MCP_NAME.to_owned(),
                         is_custom_eligible,
                         custom_unwrap_key,
+                        profile_v4a_patch,
                     )
                 };
 
@@ -305,6 +311,7 @@ impl McpRoutingTable {
                 invoke_via_mcp_name: invoke_via_mcp_name.clone(),
                 is_custom,
                 unwrap_custom_key: unwrap_key,
+                v4a_patch,
                 prose_description: prose.to_owned(),
                 ts_declaration: ts_decl.map(str::to_owned),
                 parameters_json: params_json,
@@ -412,9 +419,13 @@ impl McpRoutingTable {
                     &bridged.client_name,
                     arguments,
                     bridged.unwrap_custom_key,
+                    bridged.v4a_patch,
                 );
             }
-            let serialized = format_direct_tool_arguments(arguments, bridged);
+            let serialized = match format_direct_tool_arguments(arguments, bridged) {
+                Ok(s) => s,
+                Err(preflight_err) => return preflight_error_decision(preflight_err.to_string()),
+            };
             return VirtualizedCallDecision::ForwardToClient {
                 client_name: bridged.client_name.clone(),
                 arguments: serialized,
@@ -754,9 +765,10 @@ fn resolve_custom_tool_call(
     client_name: &str,
     raw_args: &Value,
     unwrap_custom_key: Option<&'static str>,
+    v4a_patch: Option<V4aPatchContract>,
 ) -> VirtualizedCallDecision {
     let extracted = extract_custom_tool_input(raw_args, unwrap_custom_key);
-    if client_name.eq_ignore_ascii_case("apply_patch") {
+    if matches!(v4a_patch, Some(V4aPatchContract::CustomFreeform)) {
         let normalized = normalize_apply_patch_text(&extracted);
         if let Err(err) = validate_apply_patch_preflight(&normalized) {
             return preflight_error_decision(err.to_string());
@@ -774,9 +786,30 @@ fn resolve_custom_tool_call(
     }
 }
 
-fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> String {
+fn heal_and_validate_json_patch_field(
+    v4a_patch: Option<V4aPatchContract>,
+    map: &mut serde_json::Map<String, Value>,
+) -> Result<(), ApplyPatchPreflightError> {
+    let Some(V4aPatchContract::JsonField(field_key)) = v4a_patch else {
+        return Ok(());
+    };
+    if let Some(Value::String(raw_patch)) = map.get_mut(field_key) {
+        let normalized = normalize_apply_patch_text(raw_patch);
+        validate_apply_patch_preflight(&normalized)?;
+        *raw_patch = normalized;
+    }
+    Ok(())
+}
+
+fn format_direct_tool_arguments(
+    raw_args: &Value,
+    bridged: &McpBridgedTool,
+) -> Result<String, ApplyPatchPreflightError> {
     if bridged.is_custom {
-        return extract_custom_tool_input(raw_args, bridged.unwrap_custom_key);
+        return Ok(extract_custom_tool_input(
+            raw_args,
+            bridged.unwrap_custom_key,
+        ));
     }
     let mut args_val = raw_args.clone();
     if args_val.is_null() {
@@ -793,8 +826,9 @@ fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> S
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
+        heal_and_validate_json_patch_field(bridged.v4a_patch, map)?;
     }
-    serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned())
+    Ok(serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned()))
 }
 
 enum InnerArgsError {
@@ -864,6 +898,7 @@ fn finalize_indexed_tool_call(
             &indexed.client_name,
             inner_args,
             indexed.unwrap_custom_key,
+            indexed.v4a_patch,
         );
     }
 
@@ -876,6 +911,9 @@ fn finalize_indexed_tool_call(
     }
     if let Some(ref params_json) = indexed.parameters_json {
         let _ = coerce_stringified_container_fields(&mut map, params_json);
+    }
+    if let Err(preflight_err) = heal_and_validate_json_patch_field(indexed.v4a_patch, &mut map) {
+        return preflight_error_decision(preflight_err.to_string());
     }
 
     if enforce_required_preflight

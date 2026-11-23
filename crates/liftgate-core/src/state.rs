@@ -87,6 +87,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn config_sync_ledger_file(&self) -> PathBuf {
+        self.root.join("config-sync-ledger.json")
+    }
+
+    #[must_use]
     pub fn log_file(&self) -> PathBuf {
         self.root.join("gateway.log")
     }

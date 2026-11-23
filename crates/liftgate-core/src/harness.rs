@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use liftgate_server::platform::{
     canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
@@ -11,12 +12,13 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::cli::{
-    ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, PLACEHOLDER_API_KEY,
+    ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, OpencodeArgs, PLACEHOLDER_API_KEY,
     normalize_optional_api_key,
 };
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
-    resolve_fast_model,
+    merged_opencode_config_into, parse_opencode_env_config_content, resolve_fast_model,
+    strip_agy_provider_prefix,
 };
 use crate::daemon::ensure_gateway_ready;
 use crate::error::CliError;
@@ -63,6 +65,20 @@ enum CodexInvocationKind {
     InteractiveSession,
     /// Run an agent session non-interactively.
     ExecSession,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCodeInvocationKind {
+    /// Local/credential/plugin/MCP/upgrade/help/version invocation executed directly without
+    /// starting the gateway or injecting `OPENCODE_CONFIG_CONTENT`.
+    DirectPassthrough,
+    /// Interactive TUI (`opencode`, `-c`, `-s <ID>`), `run`, `models`, `session`, or server
+    /// subcommands (`web`, `serve`, `acp`, `attach`) routed through Liftgate.
+    GatewaySession {
+        /// Whether OpenCode v2 (`>= 2.0.0`) accepts `--standalone` on this command so a private
+        /// server reads `OPENCODE_CONFIG_CONTENT` instead of attaching to an older background daemon.
+        supports_v2_standalone: bool,
+    },
 }
 
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
@@ -327,6 +343,244 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     let exit_code = spawn_and_wait_interactive("codex", &spec.program, cmd).await?;
     drop(ephemeral_guard);
     Ok(exit_code)
+}
+
+pub async fn run_opencode(state_paths: &StatePaths, args: OpencodeArgs) -> Result<i32, CliError> {
+    let spec = build_opencode_invocation(state_paths, &args, None, false).await?;
+    let cmd = command_from_terminal_spec(&spec);
+    spawn_and_wait_interactive("opencode", &spec.program, cmd).await
+}
+
+/// Prepares an isolated [`TerminalLaunchSpec`] for launching OpenCode in a native terminal
+/// window with zero project/global config file side effects.
+pub async fn prepare_opencode_terminal_spec(
+    state_paths: &StatePaths,
+    args: &OpencodeArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
+    build_opencode_invocation(state_paths, args, cwd, hold_open).await
+}
+
+async fn build_opencode_invocation(
+    state_paths: &StatePaths,
+    args: &OpencodeArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
+    let resolved_cmd = resolve_opencode_command(args.opencode_bin.as_deref())?;
+    let invocation = classify_opencode_invocation(&args.passthrough_args);
+
+    if let OpenCodeInvocationKind::DirectPassthrough = invocation {
+        let mut full_args: Vec<OsString> = resolved_cmd
+            .prefix_args
+            .iter()
+            .map(OsString::from)
+            .collect();
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+        return Ok(TerminalLaunchSpec {
+            title: "Liftgate · OpenCode".to_owned(),
+            program: resolved_cmd.program,
+            args: full_args,
+            cwd,
+            env_set: Vec::new(),
+            env_remove: Vec::new(),
+            cleanup_files: Vec::new(),
+            hold_open_on_exit: hold_open,
+        });
+    }
+
+    let OpenCodeInvocationKind::GatewaySession {
+        supports_v2_standalone,
+    } = invocation
+    else {
+        unreachable!("DirectPassthrough handled above");
+    };
+
+    let requested_model = args
+        .model
+        .as_deref()
+        .map(strip_agy_provider_prefix)
+        .filter(|s| !s.is_empty());
+
+    let (target, v2_runtime) = tokio::join!(
+        ensure_gateway_ready(
+            state_paths,
+            args.listen,
+            args.api_key.clone(),
+            requested_model,
+            true,
+        ),
+        detect_opencode_v2(&resolved_cmd),
+    );
+    let target = target?;
+
+    let primary_model = requested_model
+        .map(str::to_owned)
+        .unwrap_or_else(|| target.default_model.clone());
+    let discovered_models = target.client.fetch_models().await.unwrap_or_default();
+    let fast_model = resolve_fast_model(
+        args.fast_model.as_deref().map(strip_agy_provider_prefix),
+        &primary_model,
+        &discovered_models,
+    );
+    let auth_token = normalize_optional_api_key(target.api_key.as_deref())
+        .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
+
+    let sync_params = HarnessSyncParams {
+        gateway_base_url: target.client.base_url().to_owned(),
+        api_key: auth_token,
+        primary_model: primary_model.clone(),
+        fast_model,
+        no_bypass: args.no_bypass,
+        no_code_mode: args.no_code_mode,
+        discovered_models,
+    };
+
+    let raw_env_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    let mut cfg_map = parse_opencode_env_config_content(raw_env_config.as_deref())?;
+    merged_opencode_config_into(&mut cfg_map, &sync_params, v2_runtime);
+    let config_content =
+        serde_json::to_string(&Value::Object(cfg_map)).map_err(|source| CliError::StateJson {
+            path: PathBuf::from("OPENCODE_CONFIG_CONTENT"),
+            source,
+        })?;
+
+    let no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+    let mut env_set = vec![
+        ("OPENCODE_CONFIG_CONTENT".to_owned(), config_content),
+        ("NO_PROXY".to_owned(), no_proxy.clone()),
+        ("no_proxy".to_owned(), no_proxy),
+    ];
+    if args.full_code_mode {
+        let flags = merge_opencode_flag(
+            std::env::var("OPENCODE_FLAGS").ok().as_deref(),
+            "full_codemode",
+        );
+        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
+    } else if args.no_code_mode
+        && let Ok(existing_flags) = std::env::var("OPENCODE_FLAGS")
+        && existing_flags
+            .split(',')
+            .any(|item| item.trim() == "full_codemode")
+    {
+        let flags = strip_opencode_flag(Some(existing_flags.as_str()), "full_codemode");
+        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
+    }
+
+    let has_server_flag = args
+        .passthrough_args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--standalone" | "--server") || a.starts_with("--server="));
+    let mut full_args: Vec<OsString> = resolved_cmd
+        .prefix_args
+        .iter()
+        .map(OsString::from)
+        .collect();
+    if v2_runtime && supports_v2_standalone && !has_server_flag {
+        full_args.push(OsString::from("--standalone"));
+    }
+    full_args.extend(args.passthrough_args.iter().map(OsString::from));
+
+    Ok(TerminalLaunchSpec {
+        title: format!("Liftgate · OpenCode ({primary_model})"),
+        program: resolved_cmd.program,
+        args: full_args,
+        cwd,
+        env_set,
+        env_remove: Vec::new(),
+        cleanup_files: Vec::new(),
+        hold_open_on_exit: hold_open,
+    })
+}
+
+fn classify_opencode_invocation(passthrough_args: &[String]) -> OpenCodeInvocationKind {
+    if passthrough_args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-h" | "--help" | "-V" | "-v" | "--version"))
+    {
+        return OpenCodeInvocationKind::DirectPassthrough;
+    }
+    let first_non_flag = passthrough_args.first().filter(|a| !a.starts_with('-'));
+    match first_non_flag.map(String::as_str) {
+        Some(
+            "upgrade" | "update" | "uninstall" | "auth" | "login" | "logout" | "mcp" | "plugin"
+            | "completion" | "stats" | "export" | "import" | "debug" | "service",
+        ) => OpenCodeInvocationKind::DirectPassthrough,
+        Some("web" | "serve" | "acp" | "attach") => OpenCodeInvocationKind::GatewaySession {
+            supports_v2_standalone: false,
+        },
+        Some("run" | "models" | "session") | Some(_) | None => {
+            OpenCodeInvocationKind::GatewaySession {
+                supports_v2_standalone: true,
+            }
+        }
+    }
+}
+
+fn merge_opencode_flag(existing: Option<&str>, flag: &str) -> String {
+    let mut items: Vec<&str> = existing
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != format!("-{flag}"))
+        .collect();
+    if !items.contains(&flag) {
+        items.push(flag);
+    }
+    items.join(",")
+}
+
+fn strip_opencode_flag(existing: Option<&str>, flag: &str) -> String {
+    let neg = format!("-{flag}");
+    let mut items: Vec<&str> = existing
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != flag)
+        .collect();
+    if !items.iter().any(|s| *s == neg) {
+        items.push(&neg);
+    }
+    items.join(",")
+}
+
+async fn detect_opencode_v2(resolved: &ResolvedCommand) -> bool {
+    let mut cmd = Command::new(&resolved.program);
+    cmd.args(&resolved.prefix_args)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_millis(600), cmd.output()).await else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    parse_opencode_major_version(&stdout)
+        .or_else(|| parse_opencode_major_version(&stderr))
+        .is_some_and(|major| major >= 2)
+}
+
+fn parse_opencode_major_version(text: &str) -> Option<u32> {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_start_matches('v');
+        let Some((major_str, rest)) = trimmed.split_once('.') else {
+            continue;
+        };
+        if rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && let Ok(major) = major_str.parse::<u32>()
+        {
+            return Some(major);
+        }
+    }
+    None
 }
 
 /// Prepares an isolated [`TerminalLaunchSpec`] for launching Codex CLI in a native terminal
@@ -1058,6 +1312,99 @@ pub fn resolve_codex_command(explicit: Option<&Path>) -> Result<ResolvedCommand,
     })
 }
 
+pub fn resolve_opencode_command(explicit: Option<&Path>) -> Result<ResolvedCommand, CliError> {
+    if let Some(p) = explicit {
+        if is_executable_file(p) {
+            return Ok(ResolvedCommand {
+                program: canonicalize_clean(p),
+                prefix_args: Vec::new(),
+            });
+        }
+        return Err(CliError::HarnessNotFound {
+            tool: "opencode",
+            hint: "explicit `--opencode-bin` path does not exist or is not executable",
+        });
+    }
+
+    let path_dirs = split_expanded_path_var();
+
+    #[cfg(windows)]
+    {
+        if let Some(exe) = find_in_dirs(&path_dirs, &["opencode.exe"]) {
+            return Ok(ResolvedCommand {
+                program: exe,
+                prefix_args: Vec::new(),
+            });
+        }
+        for cand in windows_opencode_exe_candidates() {
+            if is_executable_file(&cand) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&cand),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+        if let Some(node_cmd) = resolve_windows_npm_script(
+            &path_dirs,
+            &["node_modules", "opencode-ai", "bin", "opencode"],
+        ) {
+            return Ok(node_cmd);
+        }
+        if let Some(shim) = find_in_dirs(&path_dirs, &["opencode.cmd", "opencode.bat"]) {
+            return Ok(ResolvedCommand {
+                program: PathBuf::from(
+                    std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe")),
+                ),
+                prefix_args: vec![PathBuf::from("/d"), PathBuf::from("/c"), shim],
+            });
+        }
+        if let Some(ps1) = find_in_dirs(&path_dirs, &["opencode.ps1"]) {
+            return Ok(ResolvedCommand {
+                program: PathBuf::from("powershell.exe"),
+                prefix_args: vec![
+                    PathBuf::from("-NoProfile"),
+                    PathBuf::from("-ExecutionPolicy"),
+                    PathBuf::from("Bypass"),
+                    PathBuf::from("-File"),
+                    ps1,
+                ],
+            });
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(bin) = find_in_dirs(&path_dirs, &["opencode"]) {
+            return Ok(ResolvedCommand {
+                program: bin,
+                prefix_args: Vec::new(),
+            });
+        }
+        if let Ok(home) = user_home_dir() {
+            let oc_home_bin = home.join(".opencode").join("bin").join("opencode");
+            if is_executable_file(&oc_home_bin) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&oc_home_bin),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+        for cand in unix_extra_bin_candidates("opencode") {
+            if is_executable_file(&cand) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&cand),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+    }
+
+    Err(CliError::HarnessNotFound {
+        tool: "opencode",
+        hint: "install OpenCode (`npm i -g opencode-ai` or `curl -fsSL https://opencode.ai/install | bash`) or pass `--opencode-bin <path>`",
+    })
+}
+
 fn find_in_dirs(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
     for dir in dirs {
         if dir.as_os_str().is_empty() {
@@ -1099,6 +1446,34 @@ fn windows_claude_exe_candidates() -> Vec<PathBuf> {
                 .join("Programs")
                 .join("claude")
                 .join("claude.exe"),
+        );
+    }
+    out
+}
+
+#[cfg(windows)]
+fn windows_opencode_exe_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(home) = user_home_dir() {
+        out.push(home.join(".opencode").join("bin").join("opencode.exe"));
+        out.push(home.join(".local").join("bin").join("opencode.exe"));
+        out.push(home.join(".bun").join("bin").join("opencode.exe"));
+        out.push(home.join("scoop").join("shims").join("opencode.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local_path = PathBuf::from(local);
+        out.push(
+            local_path
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("opencode.exe"),
+        );
+        out.push(
+            local_path
+                .join("Programs")
+                .join("opencode")
+                .join("opencode.exe"),
         );
     }
     out
@@ -1493,5 +1868,36 @@ mod tests {
         assert_eq!(command.as_std().get_envs().count(), 0);
         assert!(catalog.is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn opencode_direct_passthrough_subcommands_do_not_start_gateway()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state_paths =
+            StatePaths::resolve(Some(PathBuf::from("unused-opencode-passthrough-state")))?;
+        let args = OpencodeArgs {
+            opencode_bin: Some(std::env::current_exe()?),
+            passthrough_args: vec!["mcp".to_owned(), "list".to_owned()],
+            ..OpencodeArgs::default_interactive()
+        };
+        let spec = build_opencode_invocation(&state_paths, &args, None, false).await?;
+        assert_eq!(
+            spec.args,
+            vec![OsString::from("mcp"), OsString::from("list")]
+        );
+        assert!(spec.env_set.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_opencode_major_versions_and_merges_flags() {
+        assert_eq!(parse_opencode_major_version("2.3.2\n"), Some(2));
+        assert_eq!(parse_opencode_major_version("opencode v1.4.12"), Some(1));
+        assert_eq!(parse_opencode_major_version("dev-snapshot"), None);
+        assert_eq!(merge_opencode_flag(None, "full_codemode"), "full_codemode");
+        assert_eq!(
+            merge_opencode_flag(Some("sqlite_fts,-full_codemode"), "full_codemode"),
+            "sqlite_fts,full_codemode"
+        );
     }
 }

@@ -13,10 +13,10 @@ use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, NAMESPACE_HUB_MCP_PREFIX,
     SEARCH_CLIENT_TOOLS_MCP_NAME,
     profile::{
-        DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement,
+        DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
         count_fallback_prefix_stems, detect_harness,
     },
-    profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile},
+    profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OpenCodeToolProfile},
     router::McpRoutingTable,
     schema::{
         McpBridgedTool, McpWireTool, code_mode_exec_input_schema, estimate_wire_tool_bytes,
@@ -96,6 +96,12 @@ pub fn partition_tools_for_mcp_session<S: TruncationSpillSink>(
             enable_gateway_web_fetch,
             spill,
         ),
+        DetectedHarness::OpenCode => plan_virtualization_with_options(
+            OpenCodeToolProfile,
+            client_tools,
+            enable_gateway_web_fetch,
+            spill,
+        ),
         DetectedHarness::Generic => plan_virtualization_with_options(
             GenericToolProfile,
             client_tools,
@@ -118,6 +124,9 @@ pub fn partition_tools_for_harness<S: TruncationSpillSink>(
         }
         DetectedHarness::ClaudeCode => {
             plan_virtualization_with_options(ClaudeCodeToolProfile, client_tools, false, spill)
+        }
+        DetectedHarness::OpenCode => {
+            plan_virtualization_with_options(OpenCodeToolProfile, client_tools, false, spill)
         }
         DetectedHarness::Generic => {
             plan_virtualization_with_options(GenericToolProfile, client_tools, false, spill)
@@ -165,6 +174,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         is_orchestrator: bool,
         is_custom: bool,
         unwrap_custom_key: Option<&'static str>,
+        v4a_patch: Option<V4aPatchContract>,
         description: Option<String>,
         input_schema: Value,
         parameters_json: Option<String>,
@@ -176,6 +186,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
 
     for (orig_idx, spec) in client_tools.iter().enumerate() {
         let placement = profile.classify_tool(spec, &stem_counts);
+        let v4a_patch = profile.v4a_patch_contract(spec);
         let (schema_val, is_custom, unwrap_custom_key, parameters_json) = match &spec.kind {
             CanonicalToolKind::Custom { .. } => {
                 let (unwrap_key, schema_val) = match &placement {
@@ -238,6 +249,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
             is_orchestrator,
             is_custom,
             unwrap_custom_key,
+            v4a_patch,
             description,
             input_schema: schema_val,
             parameters_json,
@@ -291,6 +303,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     client_name: spec.name.clone(),
                     is_custom: c.is_custom,
                     unwrap_custom_key: c.unwrap_custom_key,
+                    v4a_patch: c.v4a_patch,
                     parameters_json: c.parameters_json,
                 },
             );
@@ -469,6 +482,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     client_name: spec.name.clone(),
                     is_custom: c.is_custom,
                     unwrap_custom_key: c.unwrap_custom_key,
+                    v4a_patch: c.v4a_patch,
                     parameters_json: c.parameters_json.clone(),
                 },
             );

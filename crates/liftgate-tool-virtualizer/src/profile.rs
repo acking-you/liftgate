@@ -44,6 +44,73 @@ pub enum ToolPlacement<'a> {
     },
 }
 
+/// V4A (`*** Begin Patch` ... `*** End Patch`) contract recognized for a client tool.
+///
+/// Ordinary client tools named `patch` (such as unified-diff or RFC-6902 JSON Patch tools) return
+/// `None` from [`HarnessToolProfile::v4a_patch_contract`] so their payloads are forwarded verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V4aPatchContract {
+    /// Freeform `CanonicalToolKind::Custom` V4A patch tool.
+    CustomFreeform,
+    /// JSON `CanonicalToolKind::Function` V4A patch tool storing V4A text in the named property.
+    JsonField(&'static str),
+}
+
+/// Default V4A contract detector matching `apply_patch` across Codex and generic harnesses.
+#[must_use]
+pub fn default_apply_patch_v4a_contract(spec: &CanonicalToolSpec) -> Option<V4aPatchContract> {
+    if !spec.name.eq_ignore_ascii_case("apply_patch") {
+        return None;
+    }
+    match &spec.kind {
+        CanonicalToolKind::Custom { .. } => Some(V4aPatchContract::CustomFreeform),
+        CanonicalToolKind::Function { parameters_json } => {
+            if json_schema_declares_property(parameters_json, "patchText") {
+                Some(V4aPatchContract::JsonField("patchText"))
+            } else if json_schema_declares_property(parameters_json, "patch") {
+                Some(V4aPatchContract::JsonField("patch"))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Returns `true` when a tool named `patch` carries OpenCode's V4A `patchText` / `*** Begin Patch`
+/// contract rather than a generic unified-diff or JSON-Patch schema.
+#[must_use]
+pub fn is_opencode_v4a_patch_spec(spec: &CanonicalToolSpec) -> bool {
+    if spec.name != "patch" {
+        return false;
+    }
+    let desc_has_v4a = spec
+        .description
+        .as_deref()
+        .is_some_and(|d| d.contains("*** Begin Patch"));
+    match &spec.kind {
+        CanonicalToolKind::Function { parameters_json } => {
+            json_schema_declares_property(parameters_json, "patchText")
+                || (desc_has_v4a && json_schema_declares_property(parameters_json, "patch"))
+        }
+        CanonicalToolKind::Custom { format_json } => {
+            let grammar_has_v4a = format_json
+                .as_deref()
+                .is_some_and(|g| g.contains("*** Begin Patch"));
+            desc_has_v4a || grammar_has_v4a
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn json_schema_declares_property(parameters_json: &str, prop_name: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
+        return false;
+    };
+    val.get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|props| props.contains_key(prop_name))
+}
+
 /// Zero-cost compile-time adapter tailoring 3-tier MCP tool virtualization to a coding harness.
 ///
 /// Implementations are zero-sized unit structs (`Copy + 'static`) monomorphized directly into
@@ -81,6 +148,13 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         ""
     }
 
+    /// Identifies whether `spec` uses the V4A `*** Begin Patch` grammar so the router can heal and
+    /// preflight-validate V4A hunks without touching generic unified-diff `patch` tools.
+    #[inline]
+    fn v4a_patch_contract(self, spec: &CanonicalToolSpec) -> Option<V4aPatchContract> {
+        default_apply_patch_v4a_contract(spec)
+    }
+
     /// Returns `(unwrap_key, input_schema)` exposing any freeform `CanonicalToolKind::Custom` tool
     /// natively over JSON MCP and unwrapping its single string property back to raw freeform text
     /// on dispatch, eliminating any need for `<agy_tool_call>` XML simulation in MCP sessions.
@@ -89,7 +163,10 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         if is_code_mode_custom_exec(spec) || spec.name.eq_ignore_ascii_case("js_repl") {
             return ("code", crate::schema::code_mode_exec_input_schema());
         }
-        if spec.name.eq_ignore_ascii_case("apply_patch") {
+        if matches!(
+            self.v4a_patch_contract(spec),
+            Some(V4aPatchContract::CustomFreeform)
+        ) {
             return ("patch", crate::schema::apply_patch_input_schema());
         }
         ("input", crate::schema::freeform_custom_input_schema())
@@ -114,6 +191,7 @@ pub enum ProtocolHint {
 pub enum DetectedHarness {
     Codex,
     ClaudeCode,
+    OpenCode,
     Generic,
 }
 
@@ -123,6 +201,7 @@ impl DetectedHarness {
         match self {
             Self::Codex => crate::profiles::CodexToolProfile::ID,
             Self::ClaudeCode => crate::profiles::ClaudeCodeToolProfile::ID,
+            Self::OpenCode => crate::profiles::OpenCodeToolProfile::ID,
             Self::Generic => crate::profiles::GenericToolProfile::ID,
         }
     }
@@ -133,10 +212,11 @@ impl DetectedHarness {
 pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) -> DetectedHarness {
     let mut codex_score: u32 = 0;
     let mut claude_score: u32 = 0;
+    let mut opencode_score: u32 = 0;
 
     for spec in client_tools {
         let name = spec.name.as_str();
-        if is_code_mode_custom_exec(spec)
+        if (is_code_mode_custom_exec(spec) && name != "execute")
             || matches!(
                 name,
                 "exec_command"
@@ -207,12 +287,44 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
         ) {
             claude_score = claude_score.saturating_add(2);
         }
+
+        if matches!(
+            name,
+            "execute"
+                | "subagent"
+                | "question"
+                | "webfetch"
+                | "websearch"
+                | "todowrite"
+                | "todoread"
+                | "codesearch"
+                | "multiedit"
+        ) || is_opencode_v4a_patch_spec(spec)
+            || name.starts_with("opencode_")
+            || name.starts_with("opencode.")
+            || name.starts_with("automation_")
+            || name.starts_with("machine_")
+            || spec
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Code Mode runtime") || d.contains("Code Mode catalog"))
+        {
+            opencode_score = opencode_score.saturating_add(4);
+        } else if matches!(
+            name,
+            "shell" | "bash" | "read" | "edit" | "write" | "glob" | "grep" | "skill" | "lsp"
+        ) {
+            opencode_score = opencode_score.saturating_add(2);
+        }
     }
 
-    if codex_score > claude_score {
+    if opencode_score > codex_score && opencode_score > claude_score {
+        return DetectedHarness::OpenCode;
+    }
+    if codex_score > claude_score && codex_score >= opencode_score && codex_score > 0 {
         return DetectedHarness::Codex;
     }
-    if claude_score > codex_score {
+    if claude_score > codex_score && claude_score >= opencode_score && claude_score > 0 {
         return DetectedHarness::ClaudeCode;
     }
 
@@ -299,6 +411,9 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
     let mut counts: HashMap<String, usize> = HashMap::new();
     for spec in tools {
         let name = spec.name.as_str();
+        if matches!(name, "todowrite" | "todoread") {
+            *counts.entry("todo_pair".to_owned()).or_insert(0) += 1;
+        }
         if let Some(after_mcp) = name.strip_prefix("mcp__") {
             if split_mcp_server_and_action(after_mcp).is_none()
                 && let Some((srv, rest)) = after_mcp.split_once('_')
@@ -314,7 +429,7 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
             continue;
         }
         if let Some((stem, rest)) = name.split_once('_')
-            && stem.len() >= 3
+            && stem.len() >= 2
             && !rest.is_empty()
         {
             let key = stem.to_ascii_lowercase();
