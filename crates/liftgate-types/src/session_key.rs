@@ -604,11 +604,36 @@ fn canonicalize_tool_call_for_hash(name: &str, raw: &str) -> String {
                 !(v.is_null() || k == "env" && v.as_object().is_some_and(serde_json::Map::is_empty))
             });
         }
+        sort_json_object_keys_recursive(&mut val);
         if let Ok(compact) = serde_json::to_string(&val) {
             return compact;
         }
     }
     raw.trim().to_owned()
+}
+
+fn sort_json_object_keys_recursive(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                std::mem::take(map).into_iter().collect();
+            for child in sorted.values_mut() {
+                sort_json_object_keys_recursive(child);
+            }
+            for (k, v) in sorted {
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sort_json_object_keys_recursive(item);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
 }
 
 /// Strips ONLY non-semantic billing/attribution noise (`x-anthropic-billing-header`, `cch=...`,

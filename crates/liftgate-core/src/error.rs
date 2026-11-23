@@ -340,6 +340,19 @@ pub enum CliError {
         source: serde_json::Error,
     },
 
+    #[error("configuration file `{}` must contain a top-level JSON object (`{{ ... }}`)", path.display())]
+    ConfigRootNotObject { path: PathBuf },
+
+    #[error("invalid JSON/JSONC in environment variable `{var}`")]
+    InvalidEnvConfigJson {
+        var: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("environment variable `{var}` must evaluate to a top-level JSON object (`{{ ... }}`)")]
+    EnvConfigNotObject { var: &'static str },
+
     #[error("configuration file `{}` exceeds {limit} byte safety limit", path.display())]
     ConfigFileTooLarge { path: PathBuf, limit: u64 },
 
@@ -557,6 +570,11 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::DesktopAppNotFound { .. } => Some(format!(
             "Run `{bin} doctor` to inspect detected desktop installations, or specify an explicit path via `--codex-app-bin` / `--claude-desktop-bin`."
         )),
+        CliError::InvalidEnvConfigJson { var, .. } | CliError::EnvConfigNotObject { var } => {
+            Some(format!(
+                "Fix `{var}` so it contains a valid JSON/JSONC object (`{{ ... }}`), or unset `{var}` before launching."
+            ))
+        }
         _ => None,
     }
 }

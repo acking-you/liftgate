@@ -17,14 +17,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use liftgate_types::{
-    canonical::CanonicalToolSpec,
+    canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
 };
 
 use crate::{
     budget::VirtualizerBudget,
     profile::{
-        HarnessToolProfile, ToolPlacement, normalize_namespace_slug, split_mcp_server_and_action,
+        HarnessToolProfile, ToolPlacement, V4aPatchContract, default_apply_patch_v4a_contract,
+        is_opencode_v4a_patch_spec, json_schema_declares_property, normalize_namespace_slug,
+        split_mcp_server_and_action,
     },
 };
 
@@ -209,6 +211,27 @@ impl HarnessToolProfile for OpenCodeToolProfile {
             Some("github" | "gh") => "git repo pull request pr issue commit review",
             Some("linear") => "ticket issue sprint project roadmap",
             _ => "",
+        }
+    }
+
+    fn v4a_patch_contract(self, spec: &CanonicalToolSpec) -> Option<V4aPatchContract> {
+        if let Some(contract) = default_apply_patch_v4a_contract(spec) {
+            return Some(contract);
+        }
+        if !is_opencode_v4a_patch_spec(spec) {
+            return None;
+        }
+        match &spec.kind {
+            CanonicalToolKind::Custom { .. } => Some(V4aPatchContract::CustomFreeform),
+            CanonicalToolKind::Function { parameters_json } => {
+                if json_schema_declares_property(parameters_json, "patchText") {
+                    Some(V4aPatchContract::JsonField("patchText"))
+                } else if json_schema_declares_property(parameters_json, "patch") {
+                    Some(V4aPatchContract::JsonField("patch"))
+                } else {
+                    None
+                }
+            }
         }
     }
 }

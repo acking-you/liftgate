@@ -20,7 +20,8 @@ pub use planner::{
     plan_virtualization_with_options,
 };
 pub use profile::{
-    DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, detect_harness,
+    DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
+    default_apply_patch_v4a_contract, detect_harness, is_opencode_v4a_patch_spec,
 };
 pub use profiles::{
     ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OpenCodeToolProfile,
@@ -785,6 +786,132 @@ mod tests {
             VirtualizedCallDecision::ForwardToClient {
                 client_name: "playwright_browser_op_04".to_owned(),
                 arguments: "{\"selector\":\"#login\"}".to_owned(),
+                is_custom: false,
+            }
+        );
+    }
+
+    #[test]
+    fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
+        let unified_diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n fn main() {\n-    println!(\"old\");\n+    println!(\"new\");\n }\n";
+
+        // 1. Generic Function `patch` tool with `{ "patch": "<unified diff>" }` (direct + virtualized)
+        let mut fn_tools = vec![fn_tool(
+            "patch",
+            "Apply a standard unified diff patch to workspace files.",
+            json!({
+                "type": "object",
+                "properties": { "patch": { "type": "string" } },
+                "required": ["patch"]
+            }),
+        )];
+        for idx in 0..30 {
+            fn_tools.push(fn_tool(
+                &format!("extra_tool_{idx:02}"),
+                "Extra tool",
+                json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+            ));
+        }
+
+        assert_eq!(
+            detect_harness(ProtocolHint::OpenAiResponses, &fn_tools[..1]),
+            DetectedHarness::Codex
+        );
+        assert_eq!(
+            detect_harness(ProtocolHint::AnthropicMessages, &fn_tools[..1]),
+            DetectedHarness::ClaudeCode
+        );
+        assert_eq!(
+            detect_harness(ProtocolHint::Unknown, &fn_tools[..1]),
+            DetectedHarness::Generic
+        );
+
+        let mut spill = NoopSpillSink;
+        let direct_cat =
+            partition_tools_for_mcp_with_hint(ProtocolHint::Unknown, &fn_tools[..1], &mut spill);
+        assert_eq!(direct_cat.profile_id, "generic");
+        let expected_json = json!({ "patch": unified_diff }).to_string();
+        assert_eq!(
+            direct_cat.routing_table.resolve_call(
+                "patch",
+                &json!({ "patch": unified_diff }),
+                &fn_tools[..1],
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "patch".to_owned(),
+                arguments: expected_json.clone(),
+                is_custom: false,
+            }
+        );
+
+        let virt_cat =
+            partition_tools_for_mcp_with_hint(ProtocolHint::Unknown, &fn_tools, &mut spill);
+        assert_eq!(
+            virt_cat.routing_table.resolve_call(
+                CALL_CLIENT_TOOL_MCP_NAME,
+                &json!({ "name": "patch", "arguments": { "patch": unified_diff } }),
+                &fn_tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "patch".to_owned(),
+                arguments: expected_json.clone(),
+                is_custom: false,
+            }
+        );
+
+        // 2. Generic Custom freeform `patch` tool with unified diff payload
+        let custom_patch_tools = vec![CanonicalToolSpec {
+            name: "patch".to_owned(),
+            description: Some("Apply patch text directly".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        }];
+        let custom_cat = partition_tools_for_mcp_with_hint(
+            ProtocolHint::OpenAiResponses,
+            &custom_patch_tools,
+            &mut spill,
+        );
+        assert_eq!(custom_cat.profile_id, "codex");
+        assert_eq!(
+            custom_cat.routing_table.resolve_call(
+                "patch",
+                &json!({ "input": unified_diff }),
+                &custom_patch_tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "patch".to_owned(),
+                arguments: unified_diff.to_owned(),
+                is_custom: true,
+            }
+        );
+
+        // 3. Even inside an OpenCode session, a non-V4A MCP/custom `patch` tool without `patchText`
+        // or `*** Begin Patch` forwards unified diffs verbatim instead of rewriting to V4A!
+        let oc_with_custom_patch = vec![
+            fn_tool(
+                "execute",
+                "Run JavaScript in a confined Code Mode runtime.",
+                json!({"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}),
+            ),
+            fn_tool(
+                "patch",
+                "Apply unified diff via custom plugin",
+                json!({"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]}),
+            ),
+        ];
+        let oc_cat = partition_tools_for_harness(
+            DetectedHarness::OpenCode,
+            &oc_with_custom_patch,
+            &mut spill,
+        );
+        assert_eq!(
+            oc_cat.routing_table.resolve_call(
+                "patch",
+                &json!({ "patch": unified_diff }),
+                &oc_with_custom_patch,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "patch".to_owned(),
+                arguments: expected_json,
                 is_custom: false,
             }
         );

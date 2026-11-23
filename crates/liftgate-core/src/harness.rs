@@ -17,7 +17,8 @@ use crate::cli::{
 };
 use crate::config_sync::{
     HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
-    merged_opencode_config_into, resolve_fast_model, strip_agy_provider_prefix,
+    merged_opencode_config_into, parse_opencode_env_config_content, resolve_fast_model,
+    strip_agy_provider_prefix,
 };
 use crate::daemon::ensure_gateway_ready;
 use crate::error::CliError;
@@ -436,14 +437,8 @@ async fn build_opencode_invocation(
         discovered_models,
     };
 
-    let mut cfg_map = std::env::var("OPENCODE_CONFIG_CONTENT")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| match v {
-            Value::Object(m) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let raw_env_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    let mut cfg_map = parse_opencode_env_config_content(raw_env_config.as_deref())?;
     merged_opencode_config_into(&mut cfg_map, &sync_params, v2_runtime);
     let config_content =
         serde_json::to_string(&Value::Object(cfg_map)).map_err(|source| CliError::StateJson {
@@ -467,6 +462,14 @@ async fn build_opencode_invocation(
             std::env::var("OPENCODE_FLAGS").ok().as_deref(),
             "full_codemode",
         );
+        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
+    } else if args.no_code_mode
+        && let Ok(existing_flags) = std::env::var("OPENCODE_FLAGS")
+        && existing_flags
+            .split(',')
+            .any(|item| item.trim() == "full_codemode")
+    {
+        let flags = strip_opencode_flag(Some(existing_flags.as_str()), "full_codemode");
         env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
     }
 
@@ -529,6 +532,20 @@ fn merge_opencode_flag(existing: Option<&str>, flag: &str) -> String {
         .collect();
     if !items.contains(&flag) {
         items.push(flag);
+    }
+    items.join(",")
+}
+
+fn strip_opencode_flag(existing: Option<&str>, flag: &str) -> String {
+    let neg = format!("-{flag}");
+    let mut items: Vec<&str> = existing
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != flag)
+        .collect();
+    if !items.iter().any(|s| *s == neg) {
+        items.push(&neg);
     }
     items.join(",")
 }

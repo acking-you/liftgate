@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
@@ -34,7 +34,7 @@ libc = { version = "0.2.191", default-features = false }
 owo-colors = { version = "4.4.0", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std", "rc"] }
-serde_json = { version = "1.0.154", default-features = false, features = ["std", "raw_value"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std", "raw_value", "preserve_order"] }
 sha2 = { version = "0.11.1", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }

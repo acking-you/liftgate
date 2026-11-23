@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.9] - 2026-11-23
 
 ### Added
 - **First-class OpenCode support (`lg opencode` / `lg oc`, `lg config opencode`, `OpenCodeToolProfile`)**:

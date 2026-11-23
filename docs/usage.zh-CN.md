@@ -304,13 +304,13 @@ claude
           "name": "Gemini 4 Carbon (High)",
           "tool_call": true,
           "limit": { "context": 500000, "output": 64000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
         },
         "gemini-4-hydrogen-low": {
           "name": "Gemini 4 Hydrogen (Low)",
           "tool_call": true,
           "limit": { "context": 500000, "output": 64000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
         }
       }
     }
