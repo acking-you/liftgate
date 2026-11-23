@@ -3,7 +3,9 @@ README.md and README.zh-CN.md. Path data is copied verbatim from Simple Icons
 15.22.0 (https://simpleicons.org, https://github.com/simple-icons/simple-icons),
 icons "openai", "claude" and "anthropic", released under CC0 1.0 Universal
 (https://creativecommons.org/publicdomain/zero/1.0/); "opencode.svg" is adapted
-from the OpenCode mark (https://github.com/anomalyco/opencode, MIT License).
+from the OpenCode mark (https://github.com/anomalyco/opencode, MIT License); and
+"omp.svg" is adapted from the Oh My Pi mark (https://github.com/can1357/oh-my-pi,
+MIT License, Copyright (c) Mario Zechner, Can Bölük, Stencil Labs, Inc.).
 Only the fill was changed
 to follow the reader's light or dark theme. Brand names and marks belong to
 their owners and are used only to identify each client.

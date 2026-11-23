@@ -73,6 +73,16 @@ impl VirtualizerBudget {
         ..Self::DEFAULT_AGY_ACP
     };
 
+    /// Budget tuned for Oh My Pi (`omp` — `eval` polyglot Python/Bun Code Mode kernel + `wait`
+    /// + 14-18 default built-in tools in 1:1 passthrough + `mcp__<server>_<tool>` hubs).
+    pub const OMP_AGY_ACP: Self = Self {
+        max_eager_wire_bytes: 34 * 1024,
+        direct_passthrough_max_tools: 21,
+        direct_passthrough_max_non_orchestrator_bytes: 30 * 1024,
+        max_direct_core_tools: 13,
+        ..Self::DEFAULT_AGY_ACP
+    };
+
     /// Compile-time invariant check relating all budget thresholds.
     pub const fn assert_valid(&self) {
         assert!(
@@ -106,3 +116,4 @@ const _: () = VirtualizerBudget::DEFAULT_AGY_ACP.assert_valid();
 const _: () = VirtualizerBudget::CODEX_AGY_ACP.assert_valid();
 const _: () = VirtualizerBudget::CLAUDE_CODE_AGY_ACP.assert_valid();
 const _: () = VirtualizerBudget::OPENCODE_AGY_ACP.assert_valid();
+const _: () = VirtualizerBudget::OMP_AGY_ACP.assert_valid();

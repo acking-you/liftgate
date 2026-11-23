@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
-    session_key::{is_code_mode_custom_exec, split_code_mode_ts_declaration},
+    session_key::{
+        is_code_mode_custom_exec, is_omp_eval_orchestrator_tool, split_code_mode_ts_declaration,
+    },
 };
 
 use crate::budget::VirtualizerBudget;
@@ -192,6 +194,7 @@ pub enum DetectedHarness {
     Codex,
     ClaudeCode,
     OpenCode,
+    Omp,
     Generic,
 }
 
@@ -202,7 +205,25 @@ impl DetectedHarness {
             Self::Codex => crate::profiles::CodexToolProfile::ID,
             Self::ClaudeCode => crate::profiles::ClaudeCodeToolProfile::ID,
             Self::OpenCode => crate::profiles::OpenCodeToolProfile::ID,
+            Self::Omp => crate::profiles::OmpToolProfile::ID,
             Self::Generic => crate::profiles::GenericToolProfile::ID,
+        }
+    }
+}
+
+/// Returns `true` when an `edit` tool carries Oh My Pi (`omp`)'s `{ input: string }` or custom
+/// Lark grammar shape (`hashline` / `sloppy` / `magic` / `apply_patch`).
+#[must_use]
+pub fn is_omp_input_edit_spec(spec: &CanonicalToolSpec) -> bool {
+    if spec.name != "edit" {
+        return false;
+    }
+    match &spec.kind {
+        CanonicalToolKind::Custom { .. } => true,
+        CanonicalToolKind::Function { parameters_json } => {
+            json_schema_declares_property(parameters_json, "input")
+                && !json_schema_declares_property(parameters_json, "oldString")
+                && !json_schema_declares_property(parameters_json, "old_string")
         }
     }
 }
@@ -213,10 +234,11 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
     let mut codex_score: u32 = 0;
     let mut claude_score: u32 = 0;
     let mut opencode_score: u32 = 0;
+    let mut omp_score: u32 = 0;
 
     for spec in client_tools {
         let name = spec.name.as_str();
-        if (is_code_mode_custom_exec(spec) && name != "execute")
+        if (is_code_mode_custom_exec(spec) && !matches!(name, "execute" | "eval"))
             || matches!(
                 name,
                 "exec_command"
@@ -299,6 +321,8 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
                 | "todoread"
                 | "codesearch"
                 | "multiedit"
+                | "shell"
+                | "skill"
         ) || is_opencode_v4a_patch_spec(spec)
             || name.starts_with("opencode_")
             || name.starts_with("opencode.")
@@ -312,12 +336,70 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
             opencode_score = opencode_score.saturating_add(4);
         } else if matches!(
             name,
-            "shell" | "bash" | "read" | "edit" | "write" | "glob" | "grep" | "skill" | "lsp"
+            "bash" | "read" | "edit" | "write" | "glob" | "grep" | "lsp"
         ) {
             opencode_score = opencode_score.saturating_add(2);
         }
+
+        if is_omp_eval_orchestrator_tool(spec)
+            || is_omp_input_edit_spec(spec)
+            || matches!(
+                name,
+                "ast_edit"
+                    | "ast_grep"
+                    | "context_notes"
+                    | "new_context"
+                    | "manage_skill"
+                    | "memory_edit"
+                    | "security_scan"
+                    | "checkpoint"
+                    | "rewind"
+            )
+            || spec.description.as_deref().is_some_and(|d| {
+                d.contains("help://")
+                    || d.contains("omp://")
+                    || d.contains("Copy `[FILENAME#TAG]`")
+                    || d.contains("Copy [FILENAME#TAG]")
+                    || d.contains("Put line ranges in `path`")
+            })
+        {
+            omp_score = omp_score.saturating_add(5);
+        } else if matches!(
+            name,
+            "ask"
+                | "web_search"
+                | "retain"
+                | "recall"
+                | "reflect"
+                | "learn"
+                | "find"
+                | "debug"
+                | "yield"
+        ) || name.starts_with("hindsight_")
+            || name.starts_with("mnemopi_")
+            || name.starts_with("irc_")
+            || (name.starts_with("mcp__")
+                && !name.starts_with("mcp__codex")
+                && !name.starts_with("mcp__node_repl")
+                && !name.starts_with("mcp__cua_repl")
+                && !name.starts_with("mcp__claude_ai_")
+                && !name.starts_with("mcp__plugin_")
+                && name.strip_prefix("mcp__").is_some_and(|rest| {
+                    split_mcp_server_and_action(rest).is_none() && rest.contains('_')
+                }))
+        {
+            omp_score = omp_score.saturating_add(3);
+        } else if matches!(
+            name,
+            "bash" | "read" | "edit" | "write" | "glob" | "grep" | "lsp" | "task" | "todo"
+        ) {
+            omp_score = omp_score.saturating_add(2);
+        }
     }
 
+    if omp_score > codex_score && omp_score > claude_score && omp_score > opencode_score {
+        return DetectedHarness::Omp;
+    }
     if opencode_score > codex_score && opencode_score > claude_score {
         return DetectedHarness::OpenCode;
     }
@@ -414,6 +496,20 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
         if matches!(name, "todowrite" | "todoread") {
             *counts.entry("todo_pair".to_owned()).or_insert(0) += 1;
         }
+        if matches!(
+            name,
+            "retain" | "recall" | "reflect" | "memory_edit" | "learn"
+        ) || name.starts_with("hindsight_")
+            || name.starts_with("mnemopi_")
+        {
+            *counts.entry("omp_memory".to_owned()).or_insert(0) += 1;
+        }
+        if matches!(
+            name,
+            "checkpoint" | "rewind" | "context_notes" | "new_context"
+        ) {
+            *counts.entry("omp_session_state".to_owned()).or_insert(0) += 1;
+        }
         if let Some(after_mcp) = name.strip_prefix("mcp__") {
             if split_mcp_server_and_action(after_mcp).is_none()
                 && let Some((srv, rest)) = after_mcp.split_once('_')
@@ -422,6 +518,14 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
             {
                 let key = format!("mcp1:{}", srv.to_ascii_lowercase());
                 *counts.entry(key).or_insert(0) += 1;
+                if let Some((seg2, rest2)) = rest.split_once('_')
+                    && seg2.len() >= 2
+                    && !rest2.is_empty()
+                    && let Some(two_seg) = after_mcp.get(..srv.len() + 1 + seg2.len())
+                {
+                    let key2 = format!("mcp2:{}", two_seg.to_ascii_lowercase());
+                    *counts.entry(key2).or_insert(0) += 1;
+                }
             }
             continue;
         }

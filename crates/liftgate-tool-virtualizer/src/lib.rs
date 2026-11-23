@@ -21,10 +21,12 @@ pub use planner::{
 };
 pub use profile::{
     DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
-    default_apply_patch_v4a_contract, detect_harness, is_opencode_v4a_patch_spec,
+    default_apply_patch_v4a_contract, detect_harness, is_omp_input_edit_spec,
+    is_opencode_v4a_patch_spec,
 };
 pub use profiles::{
-    ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OpenCodeToolProfile,
+    ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OmpToolProfile,
+    OpenCodeToolProfile,
 };
 pub use router::{LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
 pub use schema::{
@@ -912,6 +914,285 @@ mod tests {
             VirtualizedCallDecision::ForwardToClient {
                 client_name: "patch".to_owned(),
                 arguments: expected_json,
+                is_custom: false,
+            }
+        );
+    }
+
+    #[test]
+    fn omp_default_16_builtin_tools_pass_through_1_to_1_with_full_eval_prelude() {
+        let mut spill = NoopSpillSink;
+        let eval_prelude = format!(
+            "Run persistent Python (`py`) or JavaScript (`js`) cells; top-level state persists.\n<prelude>\nawait tool.read({{ path: 'src/lib.rs' }});\n</prelude>\n<browser>\n{}</browser>",
+            "page.goto('https://example.com');\n".repeat(320)
+        );
+        assert!(eval_prelude.len() > 10_000);
+
+        let mut tools = vec![
+            fn_tool(
+                "eval",
+                &eval_prelude,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "language": { "type": "string", "enum": ["py", "js"] },
+                        "code": { "type": "string" }
+                    },
+                    "required": ["language", "code"]
+                }),
+            ),
+            fn_tool(
+                "wait",
+                "Wait for background jobs",
+                json!({ "type": "object", "properties": { "jobs": { "type": "array" } } }),
+            ),
+            fn_tool(
+                "edit",
+                "Edit files in place using hashline envelopes (`*** Begin Patch` + `[path#TAG]`).",
+                json!({
+                    "type": "object",
+                    "properties": { "input": { "type": "string" } },
+                    "required": ["input"]
+                }),
+            ),
+        ];
+        for name in [
+            "read",
+            "write",
+            "bash",
+            "grep",
+            "glob",
+            "find",
+            "task",
+            "todo",
+            "ask",
+            "web_search",
+            "lsp",
+            "ast_edit",
+            "debug",
+        ] {
+            tools.push(fn_tool(
+                name,
+                &format!("OMP built-in {name} tool"),
+                json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+            ));
+        }
+        assert_eq!(tools.len(), 16);
+
+        assert_eq!(
+            detect_harness(ProtocolHint::OpenAiResponses, &tools),
+            DetectedHarness::Omp
+        );
+        let cat = partition_tools_for_mcp_session(
+            ProtocolHint::OpenAiResponses,
+            &tools,
+            true,
+            &mut spill,
+        );
+        assert!(
+            cat.virtualized_hubs.is_empty(),
+            "16 default omp tools must bypass hub folding"
+        );
+        assert_eq!(
+            cat.bridged_pairs.len(),
+            tools.len(),
+            "every default omp built-in tool must mount 1:1 as Direct Eager"
+        );
+        let wire_eval = cat
+            .wire_tools
+            .iter()
+            .find(|t| t.name == "eval")
+            .expect("eval mounted 1:1");
+        assert_eq!(
+            wire_eval.description.as_deref(),
+            Some(eval_prelude.trim()),
+            "64 KiB orchestrator budget must preserve <prelude> and <browser> docs intact"
+        );
+    }
+
+    #[test]
+    fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit() {
+        let mut spill = NoopSpillSink;
+        let mut tools = vec![
+            fn_tool(
+                "eval",
+                "Persistent kernels (`py` / `js`); call `await tool.bash(...)`.\n<prelude>helpers</prelude>",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "language": { "type": "string", "enum": ["py", "js"] },
+                        "code": { "type": "string" }
+                    },
+                    "required": ["language", "code"]
+                }),
+            ),
+            fn_tool(
+                "wait",
+                "Wait for background jobs",
+                json!({"type": "object"}),
+            ),
+            fn_tool("bash", "Execute shell commands", json!({"type": "object"})),
+            fn_tool(
+                "read",
+                "Read files and omp:// URLs",
+                json!({"type": "object"}),
+            ),
+            fn_tool("write", "Write files", json!({"type": "object"})),
+            fn_tool(
+                "edit",
+                "Hashline edit (`*** Begin Patch` + `[path#TAG]` + `PUT`)",
+                json!({
+                    "type": "object",
+                    "properties": { "input": { "type": "string" } },
+                    "required": ["input"]
+                }),
+            ),
+            fn_tool(
+                "apply_patch",
+                "OpenAI V4A `*** Begin Patch` / `*** Update File:` patch tool",
+                json!({
+                    "type": "object",
+                    "properties": { "input": { "type": "string" } },
+                    "required": ["input"]
+                }),
+            ),
+            fn_tool("grep", "Regex search", json!({"type": "object"})),
+            fn_tool("glob", "Glob search", json!({"type": "object"})),
+            fn_tool("task", "Subagents", json!({"type": "object"})),
+            fn_tool("lsp", "LSP intelligence", json!({"type": "object"})),
+            fn_tool("todo", "Todo tracker", json!({"type": "object"})),
+            fn_tool("ask", "Ask user", json!({"type": "object"})),
+        ];
+        for mem in ["retain", "recall", "reflect", "memory_edit", "learn"] {
+            tools.push(fn_tool(
+                mem,
+                "Long-term memory op",
+                json!({"type": "object"}),
+            ));
+        }
+        for st in ["checkpoint", "rewind", "context_notes", "new_context"] {
+            tools.push(fn_tool(st, "Session state op", json!({"type": "object"})));
+        }
+        for irc in ["irc_send", "irc_join", "irc_history"] {
+            tools.push(fn_tool(irc, "IRC collab op", json!({"type": "object"})));
+        }
+        for idx in 0..20 {
+            tools.push(fn_tool(
+                &format!("mcp__github_issue_op_{idx:02}"),
+                "GitHub MCP op",
+                json!({
+                    "type": "object",
+                    "properties": { "repo": { "type": "string" } },
+                    "required": ["repo"]
+                }),
+            ));
+            tools.push(fn_tool(
+                &format!("mcp__google_drive_file_op_{idx:02}"),
+                "Google Drive MCP op",
+                json!({
+                    "type": "object",
+                    "properties": { "fileId": { "type": "string" } },
+                    "required": ["fileId"]
+                }),
+            ));
+        }
+
+        let cat = partition_tools_for_mcp_session(
+            ProtocolHint::OpenAiResponses,
+            &tools,
+            true,
+            &mut spill,
+        );
+        assert!(cat.has_virtualized_dispatch);
+        assert!(cat.wire_tools.len() <= 24);
+
+        let wire_names: Vec<&str> = cat.wire_tools.iter().map(|t| t.name.as_str()).collect();
+        for direct in ["eval", "wait", "bash", "read", "edit", "apply_patch"] {
+            assert!(
+                wire_names.contains(&direct),
+                "expected `{direct}` to remain Tier 0/1 Direct Eager, got {wire_names:?}"
+            );
+        }
+        for hub in [
+            "ns__memory",
+            "ns__session_state",
+            "ns__irc",
+            "ns__github",
+            "ns__google_drive",
+        ] {
+            assert!(
+                wire_names.contains(&hub),
+                "expected hub `{hub}` in wire_tools, got {wire_names:?}"
+            );
+        }
+
+        // 1. Hashline `edit` MUST pass through untouched without V4A preflight rejection!
+        let hashline_payload = "*** Begin Patch\n[src/main.rs#A1B2]\nPUT 12.=14:\n    println!(\"ok\");\n*** End Patch";
+        assert_eq!(
+            cat.routing_table.resolve_call(
+                "edit",
+                &json!({ "input": hashline_payload, "toolSummary": "Edit main.rs" }),
+                &tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "edit".to_owned(),
+                arguments: json!({ "input": hashline_payload }).to_string(),
+                is_custom: false,
+            }
+        );
+
+        // 2. Custom Lark-grammar `edit` also unwraps `{ input }` verbatim without V4A rejection!
+        let custom_edit_tools = vec![
+            tools[0].clone(),
+            CanonicalToolSpec {
+                name: "edit".to_owned(),
+                description: Some("Custom Lark hashline grammar".to_owned()),
+                kind: CanonicalToolKind::Custom {
+                    format_json: Some(r#"{"type":"grammar","syntax":"lark"}"#.to_owned()),
+                },
+            },
+        ];
+        let custom_cat =
+            partition_tools_for_harness(DetectedHarness::Omp, &custom_edit_tools, &mut spill);
+        assert_eq!(
+            custom_cat.routing_table.resolve_call(
+                "edit",
+                &json!({ "input": hashline_payload }),
+                &custom_edit_tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "edit".to_owned(),
+                arguments: hashline_payload.to_owned(),
+                is_custom: true,
+            }
+        );
+
+        // 3. `apply_patch` (`input` field) DOES heal V4A duplicate file sections & reject bad hunks!
+        let bad_v4a =
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\nbad_unprefixed_line\n*** End Patch";
+        assert!(matches!(
+            cat.routing_table
+                .resolve_call("apply_patch", &json!({ "input": bad_v4a }), &tools),
+            VirtualizedCallDecision::LocalReply {
+                is_error: true,
+                kind: LocalReplyKind::PreflightError,
+                ..
+            }
+        ));
+
+        // 4. Two-segment single-underscore MCP server (`mcp__google_drive_file_op_03`) routes cleanly!
+        assert_eq!(
+            cat.routing_table.resolve_call(
+                "ns__google_drive",
+                &json!({
+                    "action": "file_op_03",
+                    "args": { "fileId": "doc-77" }
+                }),
+                &tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "mcp__google_drive_file_op_03".to_owned(),
+                arguments: json!({ "fileId": "doc-77" }).to_string(),
                 is_custom: false,
             }
         );

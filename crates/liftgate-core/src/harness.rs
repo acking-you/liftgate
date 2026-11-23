@@ -12,12 +12,14 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::cli::{
-    ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, OpencodeArgs, PLACEHOLDER_API_KEY,
-    normalize_optional_api_key,
+    ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, OmpArgs, OpencodeArgs,
+    PLACEHOLDER_API_KEY, normalize_optional_api_key,
 };
 use crate::config_sync::{
-    HarnessSyncParams, build_claude_settings_map, build_offline_codex_catalog_bytes_with_mode,
-    merged_opencode_config_into, parse_opencode_env_config_content, resolve_fast_model,
+    HarnessSyncParams, OMP_EPHEMERAL_API_KEY_ENV, OmpCodeModePolicy, build_claude_settings_map,
+    build_offline_codex_catalog_bytes_with_mode, build_omp_ephemeral_overlay_yaml,
+    build_omp_provider_extension_ts, extract_omp_yaml_extensions, merged_opencode_config_into,
+    parse_opencode_env_config_content, resolve_fast_model, resolve_omp_paths,
     strip_agy_provider_prefix,
 };
 use crate::daemon::ensure_gateway_ready;
@@ -79,6 +81,16 @@ enum OpenCodeInvocationKind {
         /// server reads `OPENCODE_CONFIG_CONTENT` instead of attaching to an older background daemon.
         supports_v2_standalone: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OmpInvocationKind {
+    /// Local/credential/plugin/stats/update/help/version invocation executed directly without
+    /// starting the gateway or injecting `PI_CONFIG_FILES`.
+    DirectPassthrough,
+    /// Interactive TUI (`omp`, `-c`, `-r`, `--fork`), `-p`, `models`, `commit`, `session`,
+    /// `acp`, or `stream` routed through Liftgate via ephemeral `PI_CONFIG_FILES`.
+    GatewaySession,
 }
 
 pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i32, CliError> {
@@ -581,6 +593,222 @@ fn parse_opencode_major_version(text: &str) -> Option<u32> {
         }
     }
     None
+}
+
+pub async fn run_omp(state_paths: &StatePaths, args: OmpArgs) -> Result<i32, CliError> {
+    let (spec, ephemeral_guards) = build_omp_invocation(state_paths, &args, None, false).await?;
+    let cmd = command_from_terminal_spec(&spec);
+    let exit_code = spawn_and_wait_interactive("omp", &spec.program, cmd).await?;
+    drop(ephemeral_guards);
+    Ok(exit_code)
+}
+
+/// Prepares an isolated [`TerminalLaunchSpec`] for launching Oh My Pi (`omp`) in a native terminal
+/// window with zero project or `~/.omp/agent` side effects.
+pub async fn prepare_omp_terminal_spec(
+    state_paths: &StatePaths,
+    args: &OmpArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<TerminalLaunchSpec, CliError> {
+    let (mut spec, guards) = build_omp_invocation(state_paths, args, cwd, hold_open).await?;
+    for guard in guards {
+        spec.cleanup_files.push(guard.disarm());
+    }
+    Ok(spec)
+}
+
+async fn build_omp_invocation(
+    state_paths: &StatePaths,
+    args: &OmpArgs,
+    cwd: Option<PathBuf>,
+    hold_open: bool,
+) -> Result<(TerminalLaunchSpec, Vec<EphemeralFileGuard>), CliError> {
+    let resolved_cmd = resolve_omp_command(args.omp_bin.as_deref())?;
+    let invocation = classify_omp_invocation(&args.passthrough_args);
+
+    if matches!(invocation, OmpInvocationKind::DirectPassthrough) {
+        let mut full_args: Vec<OsString> = resolved_cmd
+            .prefix_args
+            .iter()
+            .map(OsString::from)
+            .collect();
+        full_args.extend(args.passthrough_args.iter().map(OsString::from));
+        return Ok((
+            TerminalLaunchSpec {
+                title: "Liftgate · Oh My Pi (omp)".to_owned(),
+                program: resolved_cmd.program,
+                args: full_args,
+                cwd,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                cleanup_files: Vec::new(),
+                hold_open_on_exit: hold_open,
+            },
+            Vec::new(),
+        ));
+    }
+
+    let requested_model = args
+        .model
+        .as_deref()
+        .map(strip_agy_provider_prefix)
+        .filter(|s| !s.is_empty());
+
+    let target = ensure_gateway_ready(
+        state_paths,
+        args.listen,
+        args.api_key.clone(),
+        requested_model,
+        true,
+    )
+    .await?;
+
+    let primary_model = requested_model
+        .map(str::to_owned)
+        .unwrap_or_else(|| target.default_model.clone());
+    let discovered_models = target.client.fetch_models().await.unwrap_or_default();
+    let fast_model = resolve_fast_model(
+        args.fast_model.as_deref().map(strip_agy_provider_prefix),
+        &primary_model,
+        &discovered_models,
+    );
+    let auth_token = normalize_optional_api_key(target.api_key.as_deref())
+        .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
+
+    let sync_params = HarnessSyncParams {
+        gateway_base_url: target.client.base_url().to_owned(),
+        api_key: auth_token.clone(),
+        primary_model: primary_model.clone(),
+        fast_model,
+        no_bypass: args.no_bypass,
+        no_code_mode: args.no_code_mode,
+        discovered_models,
+    };
+
+    let code_mode = if args.no_code_mode {
+        OmpCodeModePolicy::Disabled
+    } else if args.full_code_mode {
+        OmpCodeModePolicy::FullEvalNamespaces
+    } else {
+        OmpCodeModePolicy::Standard
+    };
+
+    let inherited_extensions = collect_existing_omp_extensions(cwd.as_deref());
+    let provider_ts =
+        build_omp_provider_extension_ts(&sync_params, Some(OMP_EPHEMERAL_API_KEY_ENV))?;
+    let provider_guard =
+        EphemeralFileGuard::create(state_paths, "omp-provider", "ts", provider_ts.as_bytes())?;
+
+    let overlay_yaml = build_omp_ephemeral_overlay_yaml(
+        &sync_params,
+        code_mode,
+        provider_guard.path(),
+        &inherited_extensions,
+    );
+    let overlay_guard =
+        EphemeralFileGuard::create(state_paths, "omp-overlay", "yml", overlay_yaml.as_bytes())?;
+
+    let pi_config_files = merge_omp_config_files_env(
+        std::env::var_os("PI_CONFIG_FILES").as_deref(),
+        overlay_guard.path(),
+    );
+    let no_proxy = merge_loopback_no_proxy(
+        std::env::var("NO_PROXY")
+            .ok()
+            .or_else(|| std::env::var("no_proxy").ok())
+            .as_deref(),
+    );
+
+    let mut env_set = vec![
+        (OMP_EPHEMERAL_API_KEY_ENV.to_owned(), auth_token),
+        ("PI_CONFIG_FILES".to_owned(), pi_config_files),
+        ("NO_PROXY".to_owned(), no_proxy.clone()),
+        ("no_proxy".to_owned(), no_proxy),
+    ];
+    let mut env_remove = Vec::new();
+    if args.no_code_mode {
+        env_set.push(("PI_PY".to_owned(), "0".to_owned()));
+        env_set.push(("PI_JS".to_owned(), "0".to_owned()));
+    } else {
+        env_remove.push("PI_PY".to_owned());
+        env_remove.push("PI_JS".to_owned());
+    }
+
+    let mut full_args: Vec<OsString> = resolved_cmd
+        .prefix_args
+        .iter()
+        .map(OsString::from)
+        .collect();
+    full_args.extend(args.passthrough_args.iter().map(OsString::from));
+
+    Ok((
+        TerminalLaunchSpec {
+            title: format!("Liftgate · Oh My Pi ({primary_model})"),
+            program: resolved_cmd.program,
+            args: full_args,
+            cwd,
+            env_set,
+            env_remove,
+            cleanup_files: Vec::new(),
+            hold_open_on_exit: hold_open,
+        },
+        vec![provider_guard, overlay_guard],
+    ))
+}
+
+fn classify_omp_invocation(passthrough_args: &[String]) -> OmpInvocationKind {
+    if passthrough_args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-h" | "--help" | "-v" | "--version" | "--license"
+        )
+    }) {
+        return OmpInvocationKind::DirectPassthrough;
+    }
+    let first_non_flag = passthrough_args.first().filter(|a| !a.starts_with('-'));
+    match first_non_flag.map(String::as_str) {
+        Some(
+            "help" | "auth" | "auth-broker" | "auth-gateway" | "login" | "plugin" | "plugins"
+            | "install" | "update" | "completions" | "__complete" | "stats" | "toks" | "token"
+            | "usage" | "config" | "gc" | "cleanse" | "anonymize" | "ps" | "ssh" | "worktree"
+            | "wt" | "skill" | "skills" | "tiny-models",
+        ) => OmpInvocationKind::DirectPassthrough,
+        Some(_) | None => OmpInvocationKind::GatewaySession,
+    }
+}
+
+fn collect_existing_omp_extensions(cwd: Option<&Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(global_paths) = resolve_omp_paths(true, cwd)
+        && let Ok(text) = std::fs::read_to_string(&global_paths.config_path)
+    {
+        out.extend(extract_omp_yaml_extensions(&text));
+    }
+    if let Ok(local_paths) = resolve_omp_paths(false, cwd)
+        && let Ok(text) = std::fs::read_to_string(&local_paths.config_path)
+    {
+        for item in extract_omp_yaml_extensions(&text) {
+            if !out.iter().any(|existing| existing == &item) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn merge_omp_config_files_env(existing: Option<&std::ffi::OsStr>, overlay_path: &Path) -> String {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut parts: Vec<String> = existing
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .split(sep)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    parts.push(overlay_path.display().to_string());
+    parts.join(&sep.to_string())
 }
 
 /// Prepares an isolated [`TerminalLaunchSpec`] for launching Codex CLI in a native terminal
@@ -1405,6 +1633,93 @@ pub fn resolve_opencode_command(explicit: Option<&Path>) -> Result<ResolvedComma
     })
 }
 
+pub fn resolve_omp_command(explicit: Option<&Path>) -> Result<ResolvedCommand, CliError> {
+    if let Some(p) = explicit {
+        if is_executable_file(p) {
+            return Ok(ResolvedCommand {
+                program: canonicalize_clean(p),
+                prefix_args: Vec::new(),
+            });
+        }
+        return Err(CliError::HarnessNotFound {
+            tool: "omp",
+            hint: "explicit `--omp-bin` path does not exist or is not executable",
+        });
+    }
+
+    let path_dirs = split_expanded_path_var();
+
+    #[cfg(windows)]
+    {
+        if let Some(exe) = find_in_dirs(&path_dirs, &["omp.exe"]) {
+            return Ok(ResolvedCommand {
+                program: exe,
+                prefix_args: Vec::new(),
+            });
+        }
+        for cand in windows_omp_exe_candidates() {
+            if is_executable_file(&cand) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&cand),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+        if let Some(shim) = find_in_dirs(&path_dirs, &["omp.cmd", "omp.bat"]) {
+            return Ok(ResolvedCommand {
+                program: PathBuf::from(
+                    std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe")),
+                ),
+                prefix_args: vec![PathBuf::from("/d"), PathBuf::from("/c"), shim],
+            });
+        }
+        if let Some(ps1) = find_in_dirs(&path_dirs, &["omp.ps1"]) {
+            return Ok(ResolvedCommand {
+                program: PathBuf::from("powershell.exe"),
+                prefix_args: vec![
+                    PathBuf::from("-NoProfile"),
+                    PathBuf::from("-ExecutionPolicy"),
+                    PathBuf::from("Bypass"),
+                    PathBuf::from("-File"),
+                    ps1,
+                ],
+            });
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(bin) = find_in_dirs(&path_dirs, &["omp"]) {
+            return Ok(ResolvedCommand {
+                program: bin,
+                prefix_args: Vec::new(),
+            });
+        }
+        if let Ok(home) = user_home_dir() {
+            let omp_home_bin = home.join(".omp").join("bin").join("omp");
+            if is_executable_file(&omp_home_bin) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&omp_home_bin),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+        for cand in unix_extra_bin_candidates("omp") {
+            if is_executable_file(&cand) {
+                return Ok(ResolvedCommand {
+                    program: canonicalize_clean(&cand),
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+    }
+
+    Err(CliError::HarnessNotFound {
+        tool: "omp",
+        hint: "install Oh My Pi (`bun install -g @oh-my-pi/pi-coding-agent` or `curl -fsSL https://omp.sh/install | sh`) or pass `--omp-bin <path>`",
+    })
+}
+
 fn find_in_dirs(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
     for dir in dirs {
         if dir.as_os_str().is_empty() {
@@ -1475,6 +1790,29 @@ fn windows_opencode_exe_candidates() -> Vec<PathBuf> {
                 .join("opencode")
                 .join("opencode.exe"),
         );
+    }
+    out
+}
+
+#[cfg(windows)]
+fn windows_omp_exe_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(home) = user_home_dir() {
+        out.push(home.join(".omp").join("bin").join("omp.exe"));
+        out.push(home.join(".bun").join("bin").join("omp.exe"));
+        out.push(home.join(".local").join("bin").join("omp.exe"));
+        out.push(home.join("scoop").join("shims").join("omp.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local_path = PathBuf::from(local);
+        out.push(
+            local_path
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("omp.exe"),
+        );
+        out.push(local_path.join("Programs").join("omp").join("omp.exe"));
     }
     out
 }
@@ -1898,6 +2236,46 @@ mod tests {
         assert_eq!(
             merge_opencode_flag(Some("sqlite_fts,-full_codemode"), "full_codemode"),
             "sqlite_fts,full_codemode"
+        );
+    }
+
+    #[tokio::test]
+    async fn omp_direct_passthrough_subcommands_do_not_start_gateway()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state_paths = StatePaths::resolve(Some(PathBuf::from("unused-omp-passthrough-state")))?;
+        for sub_args in [
+            vec!["stats".to_owned()],
+            vec!["plugin".to_owned(), "list".to_owned()],
+            vec!["--version".to_owned()],
+        ] {
+            let args = OmpArgs {
+                omp_bin: Some(std::env::current_exe()?),
+                passthrough_args: sub_args.clone(),
+                ..OmpArgs::default_interactive()
+            };
+            let (spec, guards) = build_omp_invocation(&state_paths, &args, None, false).await?;
+            assert!(guards.is_empty());
+            assert_eq!(
+                spec.args,
+                sub_args.into_iter().map(OsString::from).collect::<Vec<_>>()
+            );
+            assert!(spec.env_set.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merges_pi_config_files_preserving_existing_entries() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let overlay = Path::new("omp-overlay-test.yml");
+        assert_eq!(
+            merge_omp_config_files_env(None, overlay),
+            "omp-overlay-test.yml"
+        );
+        let existing = OsString::from(format!("first.yml{sep}second.yml"));
+        assert_eq!(
+            merge_omp_config_files_env(Some(existing.as_os_str()), overlay),
+            format!("first.yml{sep}second.yml{sep}omp-overlay-test.yml")
         );
     }
 }

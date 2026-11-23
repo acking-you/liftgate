@@ -57,6 +57,11 @@ pub struct ConfigSyncInspection {
     pub opencode_exists: bool,
     pub opencode_managed: bool,
     pub opencode_model: Option<String>,
+    pub omp_path: PathBuf,
+    pub omp_auxiliary_path: PathBuf,
+    pub omp_exists: bool,
+    pub omp_managed: bool,
+    pub omp_model: Option<String>,
 }
 
 pub const OPENCODE_PROVIDER_ID: &str = "agy";
@@ -64,6 +69,27 @@ const OPENCODE_MANAGED_PROVIDER_NAME: &str = "Antigravity (Liftgate)";
 const OPENCODE_MANAGED_PROVIDER_NPM: &str = "@ai-sdk/anthropic";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
+pub const OMP_PROVIDER_ID: &str = "agy";
+pub const OMP_EPHEMERAL_API_KEY_ENV: &str = "AGY_OMP_API_KEY";
+const OMP_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
+const OMP_LOCAL_EXTENSION_REL_PATH: &str = "./.omp/liftgate-agy-provider.ts";
+const OMP_LOCAL_EXTENSION_FILENAME: &str = "liftgate-agy-provider.ts";
+const OMP_MANAGED_EXTENSION_SENTINEL: &str = "// Managed by Liftgate (`lg config omp`)";
+const OMP_PRIMARY_ROLE_KEYS: &[&str] = &["default", "slow", "plan", "task"];
+const OMP_FAST_ROLE_KEYS: &[&str] = &["smol", "commit", "tiny", "memory", "widget"];
+
+/// Code Mode policy applied when generating Oh My Pi (`omp`) configuration or ephemeral overlays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OmpCodeModePolicy {
+    /// Keep persistent `eval` (`py` + `js`) and `tools.commands` enabled with top-level/virtualized MCP tools.
+    #[default]
+    Standard,
+    /// Mount MCP servers directly into `eval` global namespaces (`mcp.evalNamespaces: true`).
+    FullEvalNamespaces,
+    /// Disable `eval` Python/JS kernels (`eval.py: false`, `eval.js: false`, `mcp.evalNamespaces: false`).
+    Disabled,
+}
 
 const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -824,6 +850,56 @@ fn has_liftgate_managed_opencode_provider(map: &Map<String, Value>) -> bool {
 struct ConfigSyncLedger {
     #[serde(default)]
     opencode: std::collections::BTreeMap<String, OpenCodeManagedRecord>,
+    #[serde(default)]
+    omp: std::collections::BTreeMap<String, OmpManagedRecord>,
+}
+
+impl ConfigSyncLedger {
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        let Self { opencode, omp } = self;
+        opencode.is_empty() && omp.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct OmpManagedRecord {
+    global: bool,
+    config_existed_before_sync: bool,
+    #[serde(default)]
+    aux_existed_before_sync: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_providers_agy_yaml: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrote_providers_agy_yaml: Option<String>,
+    #[serde(default)]
+    previous_model_roles: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    wrote_model_roles: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    model_roles_was_absent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    added_extension_entry: Option<String>,
+    #[serde(default)]
+    extensions_was_absent: bool,
+    #[serde(default)]
+    previous_tools_entries: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    wrote_tools_entries: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    tools_was_absent: bool,
+    #[serde(default)]
+    previous_eval_entries: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    wrote_eval_entries: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    eval_was_absent: bool,
+    #[serde(default)]
+    previous_mcp_entries: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    wrote_mcp_entries: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    mcp_was_absent: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -893,7 +969,7 @@ fn write_config_sync_ledger(
 ) -> Result<(), CliError> {
     state_paths.ensure_root_dir()?;
     let path = state_paths.config_sync_ledger_file();
-    if ledger.opencode.is_empty() {
+    if ledger.is_empty() {
         return match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1233,6 +1309,1421 @@ pub fn uninstall_opencode_config_with_state(
         write_file_atomic(target_path, rendered.as_bytes(), true)?;
     }
     Ok(true)
+}
+
+/// Resolved configuration paths for Oh My Pi (`omp`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmpResolvedPaths {
+    /// Target `config.yml` (or existing `config.yaml`) path.
+    pub config_path: PathBuf,
+    /// Auxiliary provider path: `~/.omp/agent/models.yml` when `global`, or
+    /// `<project>/.omp/liftgate-agy-provider.ts` when project-scoped.
+    pub auxiliary_path: PathBuf,
+}
+
+/// Resolves Oh My Pi (`omp`) configuration paths, mirroring `@oh-my-pi/pi-utils/dirs`
+/// (`OMP_PROFILE` / `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and Linux/macOS XDG roots).
+pub fn resolve_omp_paths(
+    global: bool,
+    project_dir: Option<&Path>,
+) -> Result<OmpResolvedPaths, CliError> {
+    if !global {
+        let omp_dir = resolve_base_dir(project_dir)?.join(".omp");
+        return Ok(OmpResolvedPaths {
+            config_path: omp_dir.join("config.yml"),
+            auxiliary_path: omp_dir.join(OMP_LOCAL_EXTENSION_FILENAME),
+        });
+    }
+
+    let home = user_home_dir()?;
+    let omp_profile = std::env::var("OMP_PROFILE").ok();
+    let pi_profile = std::env::var("PI_PROFILE").ok();
+    let raw_profile = match omp_profile.as_deref() {
+        Some(v) => Some(v),
+        None => pi_profile.as_deref(),
+    };
+    let active_profile = raw_profile.and_then(normalize_omp_profile_name);
+
+    let config_dir_name = std::env::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".omp".to_owned());
+    let base_root = home.join(config_dir_name);
+    let config_root = match &active_profile {
+        Some(prof) => base_root.join("profiles").join(prof),
+        None => base_root,
+    };
+    let default_agent_dir = config_root.join("agent");
+
+    let agent_override = if active_profile.is_none() {
+        std::env::var_os("PI_CODING_AGENT_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+
+    let agent_dir = if let Some(override_dir) = agent_override {
+        override_dir
+    } else if cfg!(any(target_os = "linux", target_os = "macos"))
+        && let Some(xdg_data) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty())
+    {
+        let xdg_app = PathBuf::from(xdg_data).join("omp");
+        let candidate_root = match &active_profile {
+            Some(prof) => xdg_app.join("profiles").join(prof),
+            None => xdg_app,
+        };
+        if candidate_root.exists() {
+            candidate_root.join("agent")
+        } else {
+            default_agent_dir
+        }
+    } else {
+        default_agent_dir
+    };
+
+    let config_yml = agent_dir.join("config.yml");
+    let config_yaml = agent_dir.join("config.yaml");
+    let config_path = if !config_yml.exists() && config_yaml.is_file() {
+        config_yaml
+    } else {
+        config_yml
+    };
+    let models_yml = agent_dir.join("models.yml");
+    let models_yaml = agent_dir.join("models.yaml");
+    let auxiliary_path = if !models_yml.exists() && models_yaml.is_file() {
+        models_yaml
+    } else {
+        models_yml
+    };
+    Ok(OmpResolvedPaths {
+        config_path,
+        auxiliary_path,
+    })
+}
+
+fn normalize_omp_profile_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed == "default"
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.ends_with('.')
+        || trimmed.len() > 64
+    {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    let upper = stem.to_ascii_uppercase();
+    let is_windows_reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|rest| rest.len() == 1 && rest.chars().all(|c| c.is_ascii_digit()));
+    (!is_windows_reserved).then(|| trimmed.to_owned())
+}
+
+#[derive(Clone, Debug)]
+struct OmpCatalogEntry {
+    id: String,
+    name: String,
+    context_window: u64,
+    supports_images: bool,
+    default_effort: &'static str,
+}
+
+fn collect_omp_catalog_entries(params: &HarnessSyncParams) -> Vec<OmpCatalogEntry> {
+    let primary = strip_agy_provider_prefix(&params.primary_model);
+    let fast = strip_agy_provider_prefix(&params.fast_model);
+    let mut entries: Vec<OmpCatalogEntry> = Vec::new();
+
+    for dm in &params.discovered_models {
+        let id = dm.id.trim();
+        if id.is_empty() || entries.iter().any(|e| e.id == id) {
+            continue;
+        }
+        let (window, _) = dm.context_limits();
+        let name = if dm.display_name.trim().is_empty() {
+            id.to_owned()
+        } else {
+            dm.display_name.trim().to_owned()
+        };
+        entries.push(OmpCatalogEntry {
+            id: id.to_owned(),
+            name,
+            context_window: window,
+            supports_images: omp_model_supports_images(id),
+            default_effort: omp_default_effort_for_model(id),
+        });
+    }
+
+    for req in [primary, fast] {
+        if !req.is_empty() && !entries.iter().any(|e| e.id == req) {
+            let (window, _) = context_limits(req);
+            entries.push(OmpCatalogEntry {
+                id: req.to_owned(),
+                name: req.to_owned(),
+                context_window: window,
+                supports_images: omp_model_supports_images(req),
+                default_effort: omp_default_effort_for_model(req),
+            });
+        }
+    }
+    entries
+}
+
+fn omp_model_supports_images(model_id: &str) -> bool {
+    !model_id.trim().to_ascii_lowercase().starts_with("gpt-oss")
+}
+
+fn omp_default_effort_for_model(model_id: &str) -> &'static str {
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.ends_with("-low")
+        || lower.contains("flash-low")
+        || lower.contains("hydrogen-low")
+        || lower.contains("neon-low")
+        || lower.contains("haiku")
+    {
+        "low"
+    } else if lower.ends_with("-medium") {
+        "medium"
+    } else {
+        "high"
+    }
+}
+
+/// Builds the JSON representation of Oh My Pi's `ProviderConfig` (`providers.agy`) matching
+/// `@oh-my-pi/pi-coding-agent`'s `ModelsConfigSchema` and `pi.registerProvider("agy", ...)`.
+#[must_use]
+pub fn build_omp_provider_json(
+    params: &HarnessSyncParams,
+    api_key_override: Option<&str>,
+) -> Value {
+    let base_v1_url = format!("{}/v1", params.gateway_base_url.trim_end_matches('/'));
+    let timeout_ms = DEFAULT_TURN_TIMEOUT_SECS.saturating_mul(1_000);
+    let api_key = api_key_override.unwrap_or(&params.api_key);
+    let models: Vec<Value> = collect_omp_catalog_entries(params)
+        .into_iter()
+        .map(|entry| {
+            let input = if entry.supports_images {
+                json!(["text", "image"])
+            } else {
+                json!(["text"])
+            };
+            json!({
+                "id": entry.id,
+                "name": entry.name,
+                "api": "openai-responses",
+                "reasoning": true,
+                "thinking": {
+                    "mode": "effort",
+                    "efforts": ["low", "medium", "high"],
+                    "defaultLevel": entry.default_effort,
+                },
+                "input": input,
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                },
+                "contextWindow": entry.context_window,
+                "maxTokens": OMP_DEFAULT_MAX_OUTPUT_TOKENS,
+                "preferWebsockets": false,
+            })
+        })
+        .collect();
+
+    json!({
+        "baseUrl": base_v1_url,
+        "apiKey": api_key,
+        "api": "openai-responses",
+        "authHeader": true,
+        "compat": {
+            "supportsStore": false,
+            "statefulResponses": false,
+            "supportsDeveloperRole": true,
+            "supportsReasoningEffort": true,
+            "supportsReasoningSummary": true,
+            "supportsToolChoice": true,
+            "streamIdleTimeoutMs": timeout_ms,
+        },
+        "models": models,
+    })
+}
+
+/// Builds a self-contained Oh My Pi TypeScript extension registering the `agy` provider via
+/// `pi.registerProvider("agy", ...)` (used by `lg omp` ephemeral launch and project `.omp/`).
+pub fn build_omp_provider_extension_ts(
+    params: &HarnessSyncParams,
+    api_key_override: Option<&str>,
+) -> Result<String, CliError> {
+    let provider_val = build_omp_provider_json(params, api_key_override);
+    let pretty_json =
+        serde_json::to_string_pretty(&provider_val).map_err(|source| CliError::StateJson {
+            path: PathBuf::from(OMP_LOCAL_EXTENSION_FILENAME),
+            source,
+        })?;
+    Ok(format!(
+        "{OMP_MANAGED_EXTENSION_SENTINEL}\nexport default function liftgateAgyProvider(pi: {{ registerProvider(name: string, config: Record<string, unknown>): void }}): void {{\n  pi.registerProvider({OMP_PROVIDER_ID:?}, {pretty_json});\n}}\n"
+    ))
+}
+
+fn yaml_quote_scalar(s: &str) -> String {
+    if !s.is_empty()
+        && !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
+        )
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
+        && !s.starts_with('.')
+        && !s.starts_with('-')
+        && s.parse::<f64>().is_err()
+    {
+        return s.to_owned();
+    }
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s.replace('"', "\\\"")))
+}
+
+/// Renders `providers.agy` as a 2-space indented YAML block (`  agy:\n    ...`) suitable for
+/// surgical insertion under `providers:` in `~/.omp/agent/models.yml`.
+#[must_use]
+pub fn render_omp_provider_agy_yaml_block(
+    params: &HarnessSyncParams,
+    api_key_override: Option<&str>,
+) -> String {
+    let base_v1_url = format!("{}/v1", params.gateway_base_url.trim_end_matches('/'));
+    let timeout_ms = DEFAULT_TURN_TIMEOUT_SECS.saturating_mul(1_000);
+    let api_key = api_key_override.unwrap_or(&params.api_key);
+    let mut out = String::new();
+    out.push_str(&format!("  {OMP_PROVIDER_ID}:\n"));
+    out.push_str(&format!(
+        "    baseUrl: {}\n",
+        yaml_quote_scalar(&base_v1_url)
+    ));
+    out.push_str(&format!("    apiKey: {}\n", yaml_quote_scalar(api_key)));
+    out.push_str("    api: openai-responses\n");
+    out.push_str("    authHeader: true\n");
+    out.push_str("    compat:\n");
+    out.push_str("      supportsStore: false\n");
+    out.push_str("      statefulResponses: false\n");
+    out.push_str("      supportsDeveloperRole: true\n");
+    out.push_str("      supportsReasoningEffort: true\n");
+    out.push_str("      supportsReasoningSummary: true\n");
+    out.push_str("      supportsToolChoice: true\n");
+    out.push_str(&format!("      streamIdleTimeoutMs: {timeout_ms}\n"));
+    out.push_str("    models:\n");
+    for entry in collect_omp_catalog_entries(params) {
+        out.push_str(&format!("      - id: {}\n", yaml_quote_scalar(&entry.id)));
+        out.push_str(&format!(
+            "        name: {}\n",
+            yaml_quote_scalar(&entry.name)
+        ));
+        out.push_str("        api: openai-responses\n");
+        out.push_str("        reasoning: true\n");
+        out.push_str("        thinking:\n");
+        out.push_str("          mode: effort\n");
+        out.push_str("          efforts:\n");
+        out.push_str("            - low\n");
+        out.push_str("            - medium\n");
+        out.push_str("            - high\n");
+        out.push_str(&format!(
+            "          defaultLevel: {}\n",
+            yaml_quote_scalar(entry.default_effort)
+        ));
+        out.push_str("        input:\n");
+        out.push_str("          - text\n");
+        if entry.supports_images {
+            out.push_str("          - image\n");
+        }
+        out.push_str("        cost:\n");
+        out.push_str("          input: 0\n");
+        out.push_str("          output: 0\n");
+        out.push_str("          cacheRead: 0\n");
+        out.push_str("          cacheWrite: 0\n");
+        out.push_str(&format!(
+            "        contextWindow: {}\n",
+            entry.context_window
+        ));
+        out.push_str(&format!(
+            "        maxTokens: {OMP_DEFAULT_MAX_OUTPUT_TOKENS}\n"
+        ));
+        out.push_str("        preferWebsockets: false\n");
+    }
+    out
+}
+
+/// Builds an ephemeral `omp-overlay-<uuid>.yml` document loaded via `PI_CONFIG_FILES` for `lg omp`.
+#[must_use]
+pub fn build_omp_ephemeral_overlay_yaml(
+    params: &HarnessSyncParams,
+    code_mode: OmpCodeModePolicy,
+    provider_ext_path: &Path,
+    inherited_extensions: &[String],
+) -> String {
+    let mut merged = String::new();
+    let mut ext_list: Vec<String> = Vec::with_capacity(inherited_extensions.len() + 1);
+    for item in inherited_extensions {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && !ext_list.iter().any(|existing| existing == trimmed) {
+            ext_list.push(trimmed.to_owned());
+        }
+    }
+    let provider_str = provider_ext_path.to_string_lossy().replace('\\', "/");
+    if !ext_list.iter().any(|existing| existing == &provider_str) {
+        ext_list.push(provider_str);
+    }
+    let _ = merge_omp_config_yaml_with_record(&mut merged, params, code_mode, Some(&ext_list));
+    merged
+}
+
+/// Extracts any `extensions:` string entries declared in an existing `omp` YAML config file so an
+/// ephemeral `PI_CONFIG_FILES` overlay can append Liftgate's provider without shadowing user extensions.
+#[must_use]
+pub fn extract_omp_yaml_extensions(yaml_text: &str) -> Vec<String> {
+    let trimmed_bom = yaml_text.strip_prefix('\u{feff}').unwrap_or(yaml_text);
+    if trimmed_bom.trim_start().starts_with('{')
+        && let Ok(Value::Object(map)) =
+            serde_json::from_str::<Value>(&strip_jsonc_to_json(trimmed_bom))
+        && let Some(Value::Array(arr)) = map.get("extensions")
+    {
+        return arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+    let sections = parse_yaml_top_sections(trimmed_bom);
+    let Some(ext_sec) = sections
+        .iter()
+        .find(|sec| sec.key.as_deref() == Some("extensions"))
+    else {
+        return Vec::new();
+    };
+    parse_yaml_string_list_section(&ext_sec.lines)
+}
+
+#[derive(Clone, Debug)]
+struct YamlTopSection {
+    key: Option<String>,
+    lines: Vec<String>,
+}
+
+fn line_indent(line: &str) -> usize {
+    line.bytes().take_while(|b| *b == b' ').count()
+}
+
+fn strip_yaml_inline_comment(s: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut prev_ws = true;
+    for (idx, ch) in s.char_indices() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            prev_ws = false;
+            continue;
+        }
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            prev_ws = false;
+            continue;
+        }
+        match ch {
+            '\'' => {
+                in_single = true;
+                prev_ws = false;
+            }
+            '"' => {
+                in_double = true;
+                prev_ws = false;
+            }
+            '#' if prev_ws => return s.get(..idx).unwrap_or("").trim_end(),
+            c => prev_ws = c.is_whitespace(),
+        }
+    }
+    s.trim_end()
+}
+
+fn parse_yaml_mapping_key_at_indent(line: &str, expected_indent: usize) -> Option<(&str, &str)> {
+    let clean = line.trim_end_matches(['\r', '\n']);
+    if line_indent(clean) != expected_indent {
+        return None;
+    }
+    let rest = clean.get(expected_indent..)?;
+    if rest.is_empty() || rest.starts_with('#') || rest.starts_with('-') {
+        return None;
+    }
+    let uncommented = strip_yaml_inline_comment(rest);
+    let (raw_key, rhs) = uncommented.split_once(':')?;
+    if !rhs.is_empty() && !rhs.starts_with(' ') && !rhs.starts_with('\t') {
+        return None;
+    }
+    let key = raw_key.trim().trim_matches('"').trim_matches('\'');
+    (!key.is_empty()).then_some((key, rhs.trim()))
+}
+
+fn unquote_yaml_scalar(raw: &str) -> String {
+    let trimmed = strip_yaml_inline_comment(raw).trim();
+    if trimmed.starts_with('"')
+        && trimmed.ends_with('"')
+        && let Ok(s) = serde_json::from_str::<String>(trimmed)
+    {
+        return s;
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
+        return inner.replace("''", "'");
+    }
+    trimmed.to_owned()
+}
+
+fn parse_yaml_top_sections(content: &str) -> Vec<YamlTopSection> {
+    let mut sections: Vec<YamlTopSection> = Vec::new();
+    let mut pending_comments: Vec<String> = Vec::new();
+
+    for raw_line in content.split_inclusive('\n') {
+        let trimmed = raw_line.trim();
+        if let Some((key, _)) = parse_yaml_mapping_key_at_indent(raw_line, 0) {
+            if !pending_comments.is_empty() {
+                sections.push(YamlTopSection {
+                    key: None,
+                    lines: std::mem::take(&mut pending_comments),
+                });
+            }
+            sections.push(YamlTopSection {
+                key: Some(key.to_owned()),
+                lines: vec![ensure_lf(raw_line)],
+            });
+        } else if trimmed.is_empty() || (line_indent(raw_line) == 0 && trimmed.starts_with('#')) {
+            if sections.is_empty() {
+                pending_comments.push(ensure_lf(raw_line));
+            } else if let Some(last) = sections.last_mut() {
+                last.lines.push(ensure_lf(raw_line));
+            }
+        } else if let Some(last) = sections.last_mut() {
+            last.lines.push(ensure_lf(raw_line));
+        } else {
+            pending_comments.push(ensure_lf(raw_line));
+        }
+    }
+
+    if !pending_comments.is_empty() {
+        sections.push(YamlTopSection {
+            key: None,
+            lines: pending_comments,
+        });
+    }
+    sections
+}
+
+fn ensure_lf(line: &str) -> String {
+    let clean = line.trim_end_matches(['\r', '\n']);
+    let mut s = String::with_capacity(clean.len() + 1);
+    s.push_str(clean);
+    s.push('\n');
+    s
+}
+
+#[derive(Clone, Debug)]
+struct YamlSubEntry {
+    key: Option<String>,
+    lines: Vec<String>,
+}
+
+fn split_yaml_mapping_children(
+    section_lines: &[String],
+    child_indent: usize,
+) -> (String, Vec<YamlSubEntry>, Vec<String>) {
+    let header = section_lines.first().cloned().unwrap_or_default();
+    let mut trailing_blanks: Vec<String> = Vec::new();
+    let body_slice = section_lines.get(1..).unwrap_or(&[]);
+    let mut end = body_slice.len();
+    while let Some(last) = end.checked_sub(1).and_then(|i| body_slice.get(i)) {
+        if last.trim().is_empty() {
+            trailing_blanks.push(last.clone());
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    trailing_blanks.reverse();
+
+    let mut children: Vec<YamlSubEntry> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for line in body_slice.get(..end).unwrap_or(&[]) {
+        if let Some((k, _)) = parse_yaml_mapping_key_at_indent(line, child_indent) {
+            if !pending.is_empty() {
+                children.push(YamlSubEntry {
+                    key: None,
+                    lines: std::mem::take(&mut pending),
+                });
+            }
+            children.push(YamlSubEntry {
+                key: Some(k.to_owned()),
+                lines: vec![line.clone()],
+            });
+        } else if let Some(last) = children.last_mut() {
+            last.lines.push(line.clone());
+        } else {
+            pending.push(line.clone());
+        }
+    }
+    if !pending.is_empty() {
+        children.push(YamlSubEntry {
+            key: None,
+            lines: pending,
+        });
+    }
+    (header, children, trailing_blanks)
+}
+
+fn parse_yaml_string_list_section(section_lines: &[String]) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(first) = section_lines.first()
+        && let Some((_, rhs)) = parse_yaml_mapping_key_at_indent(first, 0)
+        && rhs.starts_with('[')
+        && rhs.ends_with(']')
+        && let Ok(arr) = serde_json::from_str::<Vec<String>>(rhs)
+    {
+        return arr;
+    }
+    for line in section_lines.get(1..).unwrap_or(&[]) {
+        let trimmed = strip_yaml_inline_comment(line).trim();
+        if let Some(rest) = trimmed.strip_prefix('-') {
+            let val = unquote_yaml_scalar(rest);
+            if !val.is_empty() {
+                items.push(val);
+            }
+        }
+    }
+    items
+}
+
+fn render_yaml_sections(sections: &[YamlTopSection]) -> String {
+    let mut out = String::new();
+    for sec in sections {
+        for l in &sec.lines {
+            out.push_str(l);
+        }
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    out
+}
+
+/// Non-destructively merges `providers.agy` into `~/.omp/agent/models.yml`, preserving all sibling
+/// providers and comments while returning `(previous_agy_block, wrote_agy_block)` for `--uninstall`.
+pub fn merge_omp_models_yaml(
+    existing: &str,
+    params: &HarnessSyncParams,
+    api_key_override: Option<&str>,
+) -> (String, Option<String>, String) {
+    let agy_block = render_omp_provider_agy_yaml_block(params, api_key_override);
+    let trimmed_bom = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    if trimmed_bom.trim().is_empty() {
+        let rendered = format!("providers:\n{agy_block}");
+        return (rendered, None, agy_block);
+    }
+
+    let mut sections = parse_yaml_top_sections(trimmed_bom);
+    let mut prev_agy: Option<String> = None;
+    let mut found_providers = false;
+
+    for sec in &mut sections {
+        if sec.key.as_deref() != Some("providers") {
+            continue;
+        }
+        found_providers = true;
+        if let Some(first) = sec.lines.first()
+            && let Some((_, rhs)) = parse_yaml_mapping_key_at_indent(first, 0)
+            && (rhs == "{}" || rhs == "null" || rhs == "~")
+        {
+            sec.lines = vec!["providers:\n".to_owned(), agy_block.clone()];
+            break;
+        }
+        let (header, children, trailing_blanks) = split_yaml_mapping_children(&sec.lines, 2);
+        let mut rebuilt: Vec<String> = vec![if header.trim().is_empty() {
+            "providers:\n".to_owned()
+        } else {
+            header
+        }];
+        let mut inserted = false;
+        for child in children {
+            if child.key.as_deref() == Some(OMP_PROVIDER_ID) {
+                let raw_prev: String = child.lines.concat();
+                prev_agy = Some(raw_prev);
+                if !inserted {
+                    rebuilt.push(agy_block.clone());
+                    inserted = true;
+                }
+            } else {
+                rebuilt.extend(child.lines);
+            }
+        }
+        if !inserted {
+            rebuilt.push(agy_block.clone());
+        }
+        rebuilt.extend(trailing_blanks);
+        sec.lines = rebuilt;
+        break;
+    }
+
+    if !found_providers {
+        if let Some(last) = sections.last_mut()
+            && last.lines.last().is_some_and(|l| !l.trim().is_empty())
+        {
+            last.lines.push("\n".to_owned());
+        }
+        sections.push(YamlTopSection {
+            key: Some("providers".to_owned()),
+            lines: vec!["providers:\n".to_owned(), agy_block.clone()],
+        });
+    }
+
+    (render_yaml_sections(&sections), prev_agy, agy_block)
+}
+
+fn revert_omp_models_yaml(
+    existing: &str,
+    wrote_agy_yaml: Option<&str>,
+    previous_agy_yaml: Option<&str>,
+) -> (String, bool) {
+    let trimmed_bom = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    if trimmed_bom.trim().is_empty() {
+        return (String::new(), false);
+    }
+    let mut sections = parse_yaml_top_sections(trimmed_bom);
+    let mut changed = false;
+    let mut keep_sections: Vec<YamlTopSection> = Vec::with_capacity(sections.len());
+
+    for mut sec in sections.drain(..) {
+        if sec.key.as_deref() != Some("providers") {
+            keep_sections.push(sec);
+            continue;
+        }
+        let (header, children, trailing_blanks) = split_yaml_mapping_children(&sec.lines, 2);
+        let mut kept_children: Vec<YamlSubEntry> = Vec::new();
+        for child in children {
+            if child.key.as_deref() == Some(OMP_PROVIDER_ID) {
+                let current_raw: String = child.lines.concat();
+                let matches_written = match wrote_agy_yaml {
+                    Some(wrote) => current_raw.trim() == wrote.trim(),
+                    None => {
+                        current_raw.contains("api: openai-responses")
+                            && current_raw.contains("preferWebsockets: false")
+                    }
+                };
+                if matches_written {
+                    changed = true;
+                    if let Some(prev) = previous_agy_yaml {
+                        kept_children.push(YamlSubEntry {
+                            key: Some(OMP_PROVIDER_ID.to_owned()),
+                            lines: prev.split_inclusive('\n').map(ensure_lf).collect(),
+                        });
+                    }
+                } else {
+                    kept_children.push(child);
+                }
+            } else {
+                kept_children.push(child);
+            }
+        }
+        let any_real_provider = kept_children.iter().any(|c| c.key.is_some());
+        if any_real_provider {
+            let mut rebuilt = vec![header];
+            for c in kept_children {
+                rebuilt.extend(c.lines);
+            }
+            rebuilt.extend(trailing_blanks);
+            sec.lines = rebuilt;
+            keep_sections.push(sec);
+        } else if !changed {
+            keep_sections.push(sec);
+        }
+    }
+
+    (render_yaml_sections(&keep_sections), changed)
+}
+
+#[derive(Clone, Debug)]
+enum OmpYamlScalar {
+    Bool(bool),
+    Str(String),
+}
+
+impl OmpYamlScalar {
+    fn render(&self) -> String {
+        match self {
+            Self::Bool(true) => "true".to_owned(),
+            Self::Bool(false) => "false".to_owned(),
+            Self::Str(s) => yaml_quote_scalar(s),
+        }
+    }
+}
+
+fn upsert_yaml_2level_scalars(
+    sections: &mut Vec<YamlTopSection>,
+    section_name: &str,
+    desired: &[(&str, OmpYamlScalar)],
+) -> (
+    bool,
+    std::collections::BTreeMap<String, Option<String>>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut prev_map = std::collections::BTreeMap::new();
+    let mut wrote_map = std::collections::BTreeMap::new();
+    for (k, v) in desired {
+        wrote_map.insert((*k).to_owned(), v.render());
+    }
+
+    if let Some(sec) = sections
+        .iter_mut()
+        .find(|s| s.key.as_deref() == Some(section_name))
+    {
+        let inline_empty = sec
+            .lines
+            .first()
+            .and_then(|l| parse_yaml_mapping_key_at_indent(l, 0))
+            .is_some_and(|(_, rhs)| matches!(rhs, "{}" | "null" | "~"));
+        if inline_empty {
+            let mut rebuilt = vec![format!("{section_name}:\n")];
+            for (k, v) in desired {
+                prev_map.insert((*k).to_owned(), None);
+                rebuilt.push(format!("  {k}: {}\n", v.render()));
+            }
+            sec.lines = rebuilt;
+            return (false, prev_map, wrote_map);
+        }
+
+        let (header, children, trailing_blanks) = split_yaml_mapping_children(&sec.lines, 2);
+        let mut rebuilt = vec![header];
+        let mut seen = std::collections::BTreeSet::new();
+        for child in children {
+            if let Some(ref ck) = child.key
+                && let Some((_, new_val)) = desired.iter().find(|(dk, _)| dk == ck)
+            {
+                let prev_raw_rhs = child
+                    .lines
+                    .first()
+                    .and_then(|l| parse_yaml_mapping_key_at_indent(l, 2))
+                    .map(|(_, rhs)| strip_yaml_inline_comment(rhs).trim().to_owned());
+                prev_map.insert(ck.clone(), prev_raw_rhs);
+                if seen.insert(ck.clone()) {
+                    rebuilt.push(format!("  {ck}: {}\n", new_val.render()));
+                }
+            } else {
+                rebuilt.extend(child.lines);
+            }
+        }
+        for (k, v) in desired {
+            if !seen.contains(*k) {
+                prev_map.insert((*k).to_owned(), None);
+                rebuilt.push(format!("  {k}: {}\n", v.render()));
+            }
+        }
+        rebuilt.extend(trailing_blanks);
+        sec.lines = rebuilt;
+        (false, prev_map, wrote_map)
+    } else {
+        if let Some(last) = sections.last_mut()
+            && last.lines.last().is_some_and(|l| !l.trim().is_empty())
+        {
+            last.lines.push("\n".to_owned());
+        }
+        let mut lines = vec![format!("{section_name}:\n")];
+        for (k, v) in desired {
+            prev_map.insert((*k).to_owned(), None);
+            lines.push(format!("  {k}: {}\n", v.render()));
+        }
+        sections.push(YamlTopSection {
+            key: Some(section_name.to_owned()),
+            lines,
+        });
+        (true, prev_map, wrote_map)
+    }
+}
+
+fn revert_yaml_2level_scalars(
+    sections: &mut Vec<YamlTopSection>,
+    section_name: &str,
+    was_absent: bool,
+    previous: &std::collections::BTreeMap<String, Option<String>>,
+    wrote: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    if wrote.is_empty() {
+        return false;
+    }
+    let Some(idx) = sections
+        .iter()
+        .position(|s| s.key.as_deref() == Some(section_name))
+    else {
+        return false;
+    };
+    let Some(sec) = sections.get_mut(idx) else {
+        return false;
+    };
+    let (header, children, trailing_blanks) = split_yaml_mapping_children(&sec.lines, 2);
+    let mut kept: Vec<YamlSubEntry> = Vec::new();
+    let mut changed = false;
+
+    for child in children {
+        if let Some(ref ck) = child.key
+            && let Some(wrote_val) = wrote.get(ck)
+        {
+            let current_raw_rhs = child
+                .lines
+                .first()
+                .and_then(|l| parse_yaml_mapping_key_at_indent(l, 2))
+                .map(|(_, rhs)| strip_yaml_inline_comment(rhs).trim());
+            let matches = current_raw_rhs.is_some_and(|cur| {
+                cur == wrote_val.as_str()
+                    || unquote_yaml_scalar(cur) == unquote_yaml_scalar(wrote_val)
+            });
+            if matches {
+                changed = true;
+                if let Some(Some(prev_raw_rhs)) = previous.get(ck) {
+                    kept.push(YamlSubEntry {
+                        key: Some(ck.clone()),
+                        lines: vec![format!("  {ck}: {prev_raw_rhs}\n")],
+                    });
+                }
+                continue;
+            }
+        }
+        kept.push(child);
+    }
+
+    let has_remaining_keys = kept.iter().any(|c| c.key.is_some());
+    if !has_remaining_keys && was_absent && changed {
+        let _ = sections.remove(idx);
+    } else if changed {
+        let mut rebuilt = vec![header];
+        for c in kept {
+            rebuilt.extend(c.lines);
+        }
+        rebuilt.extend(trailing_blanks);
+        if let Some(sec_after) = sections.get_mut(idx) {
+            sec_after.lines = rebuilt;
+        }
+    }
+    changed
+}
+
+fn merge_omp_config_yaml_with_record(
+    yaml_buf: &mut String,
+    params: &HarnessSyncParams,
+    code_mode: OmpCodeModePolicy,
+    explicit_extensions: Option<&[String]>,
+) -> OmpManagedRecord {
+    let trimmed_bom = yaml_buf
+        .strip_prefix('\u{feff}')
+        .unwrap_or(yaml_buf.as_str());
+    let mut sections = parse_yaml_top_sections(trimmed_bom);
+
+    let primary_id = strip_agy_provider_prefix(&params.primary_model);
+    let fast_id = strip_agy_provider_prefix(&params.fast_model);
+    let primary_sel = format!("{OMP_PROVIDER_ID}/{primary_id}");
+    let fast_sel = format!("{OMP_PROVIDER_ID}/{fast_id}");
+
+    let mut desired_roles: Vec<(&str, OmpYamlScalar)> = Vec::with_capacity(10);
+    for role in OMP_PRIMARY_ROLE_KEYS {
+        desired_roles.push((*role, OmpYamlScalar::Str(primary_sel.clone())));
+    }
+    if omp_model_supports_images(primary_id) {
+        desired_roles.push(("vision", OmpYamlScalar::Str(primary_sel.clone())));
+    }
+    for role in OMP_FAST_ROLE_KEYS {
+        desired_roles.push((*role, OmpYamlScalar::Str(fast_sel.clone())));
+    }
+    let (model_roles_was_absent, previous_model_roles, wrote_model_roles) =
+        upsert_yaml_2level_scalars(&mut sections, "modelRoles", &desired_roles);
+
+    let approval_mode = if params.no_bypass {
+        "always-ask"
+    } else {
+        "yolo"
+    };
+    let desired_tools = [
+        ("approvalMode", OmpYamlScalar::Str(approval_mode.to_owned())),
+        ("commands", OmpYamlScalar::Bool(true)),
+    ];
+    let (tools_was_absent, previous_tools_entries, wrote_tools_entries) =
+        upsert_yaml_2level_scalars(&mut sections, "tools", &desired_tools);
+
+    let (eval_enabled, eval_ns) = match code_mode {
+        OmpCodeModePolicy::Standard => (true, None),
+        OmpCodeModePolicy::FullEvalNamespaces => (true, Some(true)),
+        OmpCodeModePolicy::Disabled => (false, Some(false)),
+    };
+    let desired_eval = [
+        ("py", OmpYamlScalar::Bool(eval_enabled)),
+        ("js", OmpYamlScalar::Bool(eval_enabled)),
+    ];
+    let (eval_was_absent, previous_eval_entries, wrote_eval_entries) =
+        upsert_yaml_2level_scalars(&mut sections, "eval", &desired_eval);
+
+    let (mcp_was_absent, previous_mcp_entries, wrote_mcp_entries) = if let Some(ns_val) = eval_ns {
+        let desired_mcp = [("evalNamespaces", OmpYamlScalar::Bool(ns_val))];
+        upsert_yaml_2level_scalars(&mut sections, "mcp", &desired_mcp)
+    } else {
+        (
+            false,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+    };
+
+    let mut extensions_was_absent = false;
+    let mut added_extension_entry = None;
+    if let Some(ext_items) = explicit_extensions {
+        if let Some(sec) = sections
+            .iter_mut()
+            .find(|s| s.key.as_deref() == Some("extensions"))
+        {
+            let mut current = parse_yaml_string_list_section(&sec.lines);
+            for item in ext_items {
+                if !current.iter().any(|existing| existing == item) {
+                    current.push(item.clone());
+                    added_extension_entry = Some(item.clone());
+                }
+            }
+            let mut rebuilt = vec!["extensions:\n".to_owned()];
+            for item in &current {
+                rebuilt.push(format!("  - {}\n", yaml_quote_scalar(item)));
+            }
+            sec.lines = rebuilt;
+        } else if !ext_items.is_empty() {
+            extensions_was_absent = true;
+            if let Some(last) = sections.last_mut()
+                && last.lines.last().is_some_and(|l| !l.trim().is_empty())
+            {
+                last.lines.push("\n".to_owned());
+            }
+            let mut lines = vec!["extensions:\n".to_owned()];
+            for item in ext_items {
+                lines.push(format!("  - {}\n", yaml_quote_scalar(item)));
+                added_extension_entry = Some(item.clone());
+            }
+            sections.push(YamlTopSection {
+                key: Some("extensions".to_owned()),
+                lines,
+            });
+        }
+    }
+
+    *yaml_buf = render_yaml_sections(&sections);
+    OmpManagedRecord {
+        global: explicit_extensions.is_none(),
+        config_existed_before_sync: false,
+        aux_existed_before_sync: false,
+        previous_providers_agy_yaml: None,
+        wrote_providers_agy_yaml: None,
+        previous_model_roles,
+        wrote_model_roles,
+        model_roles_was_absent,
+        added_extension_entry,
+        extensions_was_absent,
+        previous_tools_entries,
+        wrote_tools_entries,
+        tools_was_absent,
+        previous_eval_entries,
+        wrote_eval_entries,
+        eval_was_absent,
+        previous_mcp_entries,
+        wrote_mcp_entries,
+        mcp_was_absent,
+    }
+}
+
+fn revert_omp_config_yaml_with_record(yaml_buf: &mut String, rec: &OmpManagedRecord) -> bool {
+    let trimmed_bom = yaml_buf
+        .strip_prefix('\u{feff}')
+        .unwrap_or(yaml_buf.as_str());
+    if trimmed_bom.trim().is_empty() {
+        return false;
+    }
+    let mut sections = parse_yaml_top_sections(trimmed_bom);
+    let mut changed = false;
+
+    if revert_yaml_2level_scalars(
+        &mut sections,
+        "modelRoles",
+        rec.model_roles_was_absent,
+        &rec.previous_model_roles,
+        &rec.wrote_model_roles,
+    ) {
+        changed = true;
+    }
+    if revert_yaml_2level_scalars(
+        &mut sections,
+        "tools",
+        rec.tools_was_absent,
+        &rec.previous_tools_entries,
+        &rec.wrote_tools_entries,
+    ) {
+        changed = true;
+    }
+    if revert_yaml_2level_scalars(
+        &mut sections,
+        "eval",
+        rec.eval_was_absent,
+        &rec.previous_eval_entries,
+        &rec.wrote_eval_entries,
+    ) {
+        changed = true;
+    }
+    if revert_yaml_2level_scalars(
+        &mut sections,
+        "mcp",
+        rec.mcp_was_absent,
+        &rec.previous_mcp_entries,
+        &rec.wrote_mcp_entries,
+    ) {
+        changed = true;
+    }
+    if let Some(ref ext_added) = rec.added_extension_entry
+        && let Some(idx) = sections
+            .iter()
+            .position(|s| s.key.as_deref() == Some("extensions"))
+        && let Some(sec) = sections.get(idx)
+    {
+        let mut current = parse_yaml_string_list_section(&sec.lines);
+        let before_len = current.len();
+        current.retain(|e| e != ext_added);
+        if current.len() != before_len {
+            changed = true;
+            if current.is_empty() && rec.extensions_was_absent {
+                let _ = sections.remove(idx);
+            } else if let Some(sec_mut) = sections.get_mut(idx) {
+                let mut rebuilt = vec!["extensions:\n".to_owned()];
+                for item in &current {
+                    rebuilt.push(format!("  - {}\n", yaml_quote_scalar(item)));
+                }
+                sec_mut.lines = rebuilt;
+            }
+        }
+    }
+
+    if changed {
+        *yaml_buf = render_yaml_sections(&sections);
+    }
+    changed
+}
+
+fn strip_omp_config_yaml_conservative(yaml_buf: &mut String) -> bool {
+    let trimmed_bom = yaml_buf
+        .strip_prefix('\u{feff}')
+        .unwrap_or(yaml_buf.as_str());
+    if trimmed_bom.trim().is_empty() {
+        return false;
+    }
+    let mut sections = parse_yaml_top_sections(trimmed_bom);
+    let mut changed = false;
+    let agy_prefix = format!("{OMP_PROVIDER_ID}/");
+
+    if let Some(idx) = sections
+        .iter()
+        .position(|s| s.key.as_deref() == Some("modelRoles"))
+        && let Some(sec) = sections.get(idx)
+    {
+        let (header, children, trailing_blanks) = split_yaml_mapping_children(&sec.lines, 2);
+        let mut kept: Vec<YamlSubEntry> = Vec::new();
+        for child in children {
+            let is_agy_role = child
+                .lines
+                .first()
+                .and_then(|l| parse_yaml_mapping_key_at_indent(l, 2))
+                .is_some_and(|(_, rhs)| unquote_yaml_scalar(rhs).starts_with(&agy_prefix));
+            if is_agy_role {
+                changed = true;
+            } else {
+                kept.push(child);
+            }
+        }
+        if !kept.iter().any(|c| c.key.is_some()) && changed {
+            let _ = sections.remove(idx);
+        } else if changed && let Some(sec_mut) = sections.get_mut(idx) {
+            let mut rebuilt = vec![header];
+            for c in kept {
+                rebuilt.extend(c.lines);
+            }
+            rebuilt.extend(trailing_blanks);
+            sec_mut.lines = rebuilt;
+        }
+    }
+
+    if let Some(idx) = sections
+        .iter()
+        .position(|s| s.key.as_deref() == Some("extensions"))
+        && let Some(sec) = sections.get(idx)
+    {
+        let mut current = parse_yaml_string_list_section(&sec.lines);
+        let before_len = current.len();
+        current.retain(|e| e != OMP_LOCAL_EXTENSION_REL_PATH);
+        if current.len() != before_len {
+            changed = true;
+            if current.is_empty() {
+                let _ = sections.remove(idx);
+            } else if let Some(sec_mut) = sections.get_mut(idx) {
+                let mut rebuilt = vec!["extensions:\n".to_owned()];
+                for item in &current {
+                    rebuilt.push(format!("  - {}\n", yaml_quote_scalar(item)));
+                }
+                sec_mut.lines = rebuilt;
+            }
+        }
+    }
+
+    if changed {
+        *yaml_buf = render_yaml_sections(&sections);
+    }
+    changed
+}
+
+fn read_optional_utf8_file(path: &Path) -> Result<(bool, String), CliError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let text = String::from_utf8(bytes).map_err(|source| CliError::StateUtf8 {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok((true, text))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((false, String::new())),
+        Err(source) => Err(CliError::StateIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+pub fn write_or_update_omp_config(
+    global: bool,
+    paths: &OmpResolvedPaths,
+    params: &HarnessSyncParams,
+    print_only: bool,
+) -> Result<String, CliError> {
+    write_or_update_omp_config_with_state(None, global, paths, params, print_only)
+}
+
+pub fn write_or_update_omp_config_with_state(
+    state_paths: Option<&StatePaths>,
+    global: bool,
+    paths: &OmpResolvedPaths,
+    params: &HarnessSyncParams,
+    print_only: bool,
+) -> Result<String, CliError> {
+    let (cfg_exists_now, mut cfg_text) = read_optional_utf8_file(&paths.config_path)?;
+    let (aux_exists_now, mut aux_text) = read_optional_utf8_file(&paths.auxiliary_path)?;
+
+    let mut ledger = match state_paths {
+        Some(sp) => Some((sp, read_config_sync_ledger(sp)?)),
+        None => None,
+    };
+    let ledger_key = ledger_key_for_path(&paths.config_path);
+
+    let (cfg_existed_before, aux_existed_before) = if let Some((_, ref lg)) = ledger
+        && let Some(prior) = lg.omp.get(&ledger_key)
+    {
+        if cfg_exists_now {
+            let _ = revert_omp_config_yaml_with_record(&mut cfg_text, prior);
+        }
+        if global && aux_exists_now {
+            let (reverted_models, _) = revert_omp_models_yaml(
+                &aux_text,
+                prior.wrote_providers_agy_yaml.as_deref(),
+                prior.previous_providers_agy_yaml.as_deref(),
+            );
+            aux_text = reverted_models;
+        }
+        (
+            prior.config_existed_before_sync,
+            prior.aux_existed_before_sync,
+        )
+    } else {
+        (cfg_exists_now, aux_exists_now)
+    };
+
+    let code_mode = if params.no_code_mode {
+        OmpCodeModePolicy::Disabled
+    } else {
+        OmpCodeModePolicy::Standard
+    };
+    let local_ext_slice = [OMP_LOCAL_EXTENSION_REL_PATH.to_owned()];
+    let mut rec = merge_omp_config_yaml_with_record(
+        &mut cfg_text,
+        params,
+        code_mode,
+        (!global).then_some(local_ext_slice.as_slice()),
+    );
+    rec.global = global;
+    rec.config_existed_before_sync = cfg_existed_before;
+    rec.aux_existed_before_sync = aux_existed_before;
+
+    let aux_rendered = if global {
+        let (merged_models, prev_agy, wrote_agy) = merge_omp_models_yaml(&aux_text, params, None);
+        rec.previous_providers_agy_yaml = prev_agy;
+        rec.wrote_providers_agy_yaml = Some(wrote_agy);
+        merged_models
+    } else {
+        build_omp_provider_extension_ts(params, None)?
+    };
+
+    if !print_only {
+        backup_once_if_exists(&paths.config_path)?;
+        write_file_atomic(&paths.config_path, cfg_text.as_bytes(), true)?;
+        if global {
+            backup_once_if_exists(&paths.auxiliary_path)?;
+        }
+        write_file_atomic(&paths.auxiliary_path, aux_rendered.as_bytes(), true)?;
+        if let Some((sp, ref mut lg)) = ledger {
+            lg.omp.insert(ledger_key, rec);
+            write_config_sync_ledger(sp, lg)?;
+        }
+    }
+
+    Ok(format!(
+        "{cfg_text}\n# --- {} ---\n{aux_rendered}",
+        paths.auxiliary_path.display()
+    ))
+}
+
+pub fn uninstall_omp_config(global: bool, paths: &OmpResolvedPaths) -> Result<bool, CliError> {
+    uninstall_omp_config_with_state(None, global, paths)
+}
+
+pub fn uninstall_omp_config_with_state(
+    state_paths: Option<&StatePaths>,
+    global: bool,
+    paths: &OmpResolvedPaths,
+) -> Result<bool, CliError> {
+    let ledger_key = ledger_key_for_path(&paths.config_path);
+    let mut any_changed = false;
+
+    if let Some(sp) = state_paths {
+        let mut lg = read_config_sync_ledger(sp)?;
+        if let Some(rec) = lg.omp.remove(&ledger_key) {
+            let (cfg_exists, mut cfg_text) = read_optional_utf8_file(&paths.config_path)?;
+            if cfg_exists && revert_omp_config_yaml_with_record(&mut cfg_text, &rec) {
+                any_changed = true;
+                if cfg_text.trim().is_empty() && !rec.config_existed_before_sync {
+                    let _ = fs::remove_file(&paths.config_path);
+                } else {
+                    write_file_atomic(&paths.config_path, cfg_text.as_bytes(), true)?;
+                }
+            }
+
+            if rec.global {
+                let (models_exists, models_text) = read_optional_utf8_file(&paths.auxiliary_path)?;
+                if models_exists {
+                    let (reverted, models_changed) = revert_omp_models_yaml(
+                        &models_text,
+                        rec.wrote_providers_agy_yaml.as_deref(),
+                        rec.previous_providers_agy_yaml.as_deref(),
+                    );
+                    if models_changed {
+                        any_changed = true;
+                        if reverted.trim().is_empty() && !rec.aux_existed_before_sync {
+                            let _ = fs::remove_file(&paths.auxiliary_path);
+                        } else {
+                            write_file_atomic(&paths.auxiliary_path, reverted.as_bytes(), true)?;
+                        }
+                    }
+                }
+            } else {
+                let (ext_exists, ext_text) = read_optional_utf8_file(&paths.auxiliary_path)?;
+                if ext_exists
+                    && !rec.aux_existed_before_sync
+                    && ext_text.starts_with(OMP_MANAGED_EXTENSION_SENTINEL)
+                {
+                    fs::remove_file(&paths.auxiliary_path).map_err(|source| CliError::StateIo {
+                        path: paths.auxiliary_path.clone(),
+                        source,
+                    })?;
+                    any_changed = true;
+                }
+            }
+
+            if let Some(parent) = paths.config_path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+            write_config_sync_ledger(sp, &lg)?;
+            return Ok(any_changed);
+        }
+    }
+
+    let (cfg_exists, mut cfg_text) = read_optional_utf8_file(&paths.config_path)?;
+    if cfg_exists && strip_omp_config_yaml_conservative(&mut cfg_text) {
+        any_changed = true;
+        if cfg_text.trim().is_empty() {
+            let _ = fs::remove_file(&paths.config_path);
+        } else {
+            write_file_atomic(&paths.config_path, cfg_text.as_bytes(), true)?;
+        }
+    }
+    if global {
+        let (models_exists, models_text) = read_optional_utf8_file(&paths.auxiliary_path)?;
+        if models_exists {
+            let (reverted, models_changed) = revert_omp_models_yaml(&models_text, None, None);
+            if models_changed {
+                any_changed = true;
+                if reverted.trim().is_empty() {
+                    let _ = fs::remove_file(&paths.auxiliary_path);
+                } else {
+                    write_file_atomic(&paths.auxiliary_path, reverted.as_bytes(), true)?;
+                }
+            }
+        }
+    } else {
+        let (ext_exists, ext_text) = read_optional_utf8_file(&paths.auxiliary_path)?;
+        if ext_exists && ext_text.starts_with(OMP_MANAGED_EXTENSION_SENTINEL) {
+            fs::remove_file(&paths.auxiliary_path).map_err(|source| CliError::StateIo {
+                path: paths.auxiliary_path.clone(),
+                source,
+            })?;
+            any_changed = true;
+        }
+    }
+    if let Some(parent) = paths.config_path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+    Ok(any_changed)
+}
+
+fn inspect_omp_default_model(cfg_text: &str) -> Option<String> {
+    let sections = parse_yaml_top_sections(cfg_text.strip_prefix('\u{feff}').unwrap_or(cfg_text));
+    let roles_sec = sections
+        .iter()
+        .find(|s| s.key.as_deref() == Some("modelRoles"))?;
+    let (_, children, _) = split_yaml_mapping_children(&roles_sec.lines, 2);
+    let default_entry = children
+        .iter()
+        .find(|c| c.key.as_deref() == Some("default"))?;
+    let (_, rhs) = parse_yaml_mapping_key_at_indent(default_entry.lines.first()?, 2)?;
+    let val = unquote_yaml_scalar(rhs);
+    (!val.is_empty()).then_some(val)
 }
 
 /// Builds fallback Codex model catalog bytes when the gateway is not queried, with an optional
@@ -1623,6 +3114,17 @@ pub fn inspect_config_sync(
         .and_then(Value::as_str)
         .map(str::to_owned);
 
+    let omp_paths = resolve_omp_paths(global, project_dir)?;
+    let omp_exists = omp_paths.config_path.is_file() || omp_paths.auxiliary_path.is_file();
+    let omp_cfg_text = fs::read_to_string(&omp_paths.config_path).unwrap_or_default();
+    let omp_aux_text = fs::read_to_string(&omp_paths.auxiliary_path).unwrap_or_default();
+    let omp_model = inspect_omp_default_model(&omp_cfg_text);
+    let omp_managed = omp_model
+        .as_deref()
+        .is_some_and(|m| m.starts_with(&format!("{OMP_PROVIDER_ID}/")))
+        || (global && omp_aux_text.contains("\n  agy:\n"))
+        || (!global && omp_aux_text.starts_with(OMP_MANAGED_EXTENSION_SENTINEL));
+
     Ok(ConfigSyncInspection {
         global,
         claude_path,
@@ -1639,6 +3141,11 @@ pub fn inspect_config_sync(
         opencode_exists,
         opencode_managed,
         opencode_model,
+        omp_path: omp_paths.config_path,
+        omp_auxiliary_path: omp_paths.auxiliary_path,
+        omp_exists,
+        omp_managed,
+        omp_model,
     })
 }
 
@@ -1649,7 +3156,8 @@ pub async fn execute_config_sync(
     let want_claude = matches!(args.target, ConfigTarget::All | ConfigTarget::Claude);
     let want_codex = matches!(args.target, ConfigTarget::All | ConfigTarget::Codex);
     let want_opencode = matches!(args.target, ConfigTarget::All | ConfigTarget::Opencode);
-    let mut results = Vec::with_capacity(3);
+    let want_omp = matches!(args.target, ConfigTarget::All | ConfigTarget::Omp);
+    let mut results = Vec::with_capacity(4);
 
     if args.uninstall {
         if want_claude {
@@ -1690,6 +3198,22 @@ pub async fn execute_config_sync(
                 action: if removed { "removed" } else { "not_present" },
                 config_path: opencode_path,
                 catalog_path: None,
+                primary_model: None,
+                fast_model: None,
+                rendered_preview: None,
+                project_untrusted_codex_note: false,
+                require_env_key_warn: false,
+            });
+        }
+        if want_omp {
+            let omp_paths = resolve_omp_paths(args.global, args.dir.as_deref())?;
+            let removed =
+                uninstall_omp_config_with_state(Some(state_paths), args.global, &omp_paths)?;
+            results.push(ConfigSyncTargetResult {
+                target: "omp",
+                action: if removed { "removed" } else { "not_present" },
+                config_path: omp_paths.config_path,
+                catalog_path: Some(omp_paths.auxiliary_path),
                 primary_model: None,
                 fast_model: None,
                 rendered_preview: None,
@@ -1844,7 +3368,7 @@ pub async fn execute_config_sync(
         let opencode_path = resolve_opencode_config_path(args.global, args.dir.as_deref())?;
         let params = HarnessSyncParams {
             gateway_base_url: gateway_base_url.clone(),
-            api_key: claude_auth_token,
+            api_key: claude_auth_token.clone(),
             primary_model: primary_model.clone(),
             fast_model: fast_model.clone(),
             no_bypass: args.no_bypass,
@@ -1862,6 +3386,37 @@ pub async fn execute_config_sync(
             action: if args.print { "printed" } else { "synced" },
             config_path: opencode_path,
             catalog_path: None,
+            primary_model: Some(primary_model.clone()),
+            fast_model: Some(fast_model.clone()),
+            rendered_preview: Some(rendered),
+            project_untrusted_codex_note: false,
+            require_env_key_warn: false,
+        });
+    }
+
+    if want_omp {
+        let omp_paths = resolve_omp_paths(args.global, args.dir.as_deref())?;
+        let params = HarnessSyncParams {
+            gateway_base_url,
+            api_key: claude_auth_token,
+            primary_model: primary_model.clone(),
+            fast_model: fast_model.clone(),
+            no_bypass: args.no_bypass,
+            no_code_mode: args.no_code_mode,
+            discovered_models,
+        };
+        let rendered = write_or_update_omp_config_with_state(
+            Some(state_paths),
+            args.global,
+            &omp_paths,
+            &params,
+            args.print,
+        )?;
+        results.push(ConfigSyncTargetResult {
+            target: "omp",
+            action: if args.print { "printed" } else { "synced" },
+            config_path: omp_paths.config_path,
+            catalog_path: Some(omp_paths.auxiliary_path),
             primary_model: Some(primary_model),
             fast_model: Some(fast_model),
             rendered_preview: Some(rendered),
@@ -3114,5 +4669,144 @@ command = \"npx\"
                 var: "OPENCODE_CONFIG_CONTENT",
             })
         ));
+    }
+
+    #[test]
+    fn omp_global_models_and_config_sync_and_uninstall_restore_displaced_agy_provider() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("liftgate-omp-global-test-{}", uuid::Uuid::new_v4()));
+        let state_paths = StatePaths::resolve(Some(tmp_root.join("state"))).unwrap();
+        let agent_dir = tmp_root.join("omp-agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let paths = OmpResolvedPaths {
+            config_path: agent_dir.join("config.yml"),
+            auxiliary_path: agent_dir.join("models.yml"),
+        };
+
+        let initial_models = "\
+# User custom models.yml
+providers:
+  ollama:
+    baseUrl: http://127.0.0.1:11434/v1
+    api: openai-completions
+  agy:
+    baseUrl: https://custom-agy.internal/v1
+    apiKey: user-original-secret
+    api: openai-responses
+";
+        let initial_config = "\
+# User global config
+theme: nord
+modelRoles:
+  default: anthropic/claude-sonnet-4-6
+  advisor: openai/o3
+tools:
+  approvalMode: write
+";
+        fs::write(&paths.auxiliary_path, initial_models).unwrap();
+        fs::write(&paths.config_path, initial_config).unwrap();
+
+        let params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-3.8-flash-low".to_owned(),
+            no_bypass: false,
+            no_code_mode: false,
+            discovered_models: vec![
+                DiscoveredModel {
+                    id: "gemini-4-carbon-high".to_owned(),
+                    display_name: "Gemini 4 Carbon (High)".to_owned(),
+                    context_window: 500_000,
+                    auto_compact_token_limit: 425_000,
+                },
+                DiscoveredModel {
+                    id: "claude-opus-4-6-thinking".to_owned(),
+                    display_name: "Claude Opus 4.6 (Thinking)".to_owned(),
+                    context_window: 200_000,
+                    auto_compact_token_limit: 170_000,
+                },
+            ],
+        };
+
+        // Sync twice to verify idempotency and preservation of the pre-sync displaced `agy:` block.
+        write_or_update_omp_config_with_state(Some(&state_paths), true, &paths, &params, false)
+            .unwrap();
+        write_or_update_omp_config_with_state(Some(&state_paths), true, &paths, &params, false)
+            .unwrap();
+
+        let synced_models = fs::read_to_string(&paths.auxiliary_path).unwrap();
+        let synced_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(synced_models.contains("# User custom models.yml"));
+        assert!(synced_models.contains("http://127.0.0.1:11434/v1"));
+        assert!(synced_models.contains("http://127.0.0.1:8787/v1"));
+        assert!(synced_models.contains("preferWebsockets: false"));
+        assert!(synced_models.contains("contextWindow: 500000"));
+        assert!(synced_models.contains("contextWindow: 200000"));
+        assert!(!synced_models.contains("user-original-secret"));
+
+        assert!(synced_cfg.contains("theme: nord"));
+        assert!(synced_cfg.contains("default: agy/gemini-4-carbon-high"));
+        assert!(synced_cfg.contains("smol: agy/gemini-3.8-flash-low"));
+        assert!(synced_cfg.contains("advisor: openai/o3"));
+        assert!(synced_cfg.contains("approvalMode: yolo"));
+
+        let removed = uninstall_omp_config_with_state(Some(&state_paths), true, &paths).unwrap();
+        assert!(removed);
+
+        let restored_models = fs::read_to_string(&paths.auxiliary_path).unwrap();
+        let restored_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(restored_models.contains("https://custom-agy.internal/v1"));
+        assert!(restored_models.contains("user-original-secret"));
+        assert!(restored_models.contains("http://127.0.0.1:11434/v1"));
+        assert!(restored_cfg.contains("theme: nord"));
+        assert!(restored_cfg.contains("default: anthropic/claude-sonnet-4-6"));
+        assert!(restored_cfg.contains("advisor: openai/o3"));
+        assert!(restored_cfg.contains("approvalMode: write"));
+        assert!(!restored_cfg.contains("agy/gemini-4-carbon-high"));
+
+        let _ = fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn omp_project_local_sync_writes_provider_ts_preserves_extensions_and_cleans_up() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("liftgate-omp-local-test-{}", uuid::Uuid::new_v4()));
+        let state_paths = StatePaths::resolve(Some(tmp_root.join("state"))).unwrap();
+        let proj_dir = tmp_root.join("proj");
+        fs::create_dir_all(proj_dir.join(".omp")).unwrap();
+        let paths = resolve_omp_paths(false, Some(&proj_dir)).unwrap();
+        fs::write(&paths.config_path, "extensions:\n  - ./.omp/user-ext.ts\n").unwrap();
+
+        let params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-3.8-flash-low".to_owned(),
+            no_bypass: true,
+            no_code_mode: true,
+            discovered_models: Vec::new(),
+        };
+
+        write_or_update_omp_config_with_state(Some(&state_paths), false, &paths, &params, false)
+            .unwrap();
+        let cfg_text = fs::read_to_string(&paths.config_path).unwrap();
+        let ext_ts = fs::read_to_string(&paths.auxiliary_path).unwrap();
+        assert!(cfg_text.contains("./.omp/user-ext.ts"));
+        assert!(cfg_text.contains(OMP_LOCAL_EXTENSION_REL_PATH));
+        assert!(cfg_text.contains("approvalMode: always-ask"));
+        assert!(cfg_text.contains("py: false"));
+        assert!(cfg_text.contains("js: false"));
+        assert!(ext_ts.contains("pi.registerProvider(\"agy\""));
+
+        let removed = uninstall_omp_config_with_state(Some(&state_paths), false, &paths).unwrap();
+        assert!(removed);
+        assert!(!paths.auxiliary_path.exists());
+        let restored_cfg = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(restored_cfg.contains("./.omp/user-ext.ts"));
+        assert!(!restored_cfg.contains(OMP_LOCAL_EXTENSION_REL_PATH));
+        assert!(!restored_cfg.contains("modelRoles:"));
+
+        let _ = fs::remove_dir_all(&tmp_root);
     }
 }

@@ -20,8 +20,8 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
         ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, ConfigArgs, DoctorArgs, LogsArgs,
-        ModelsArgs, OpencodeArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs,
-        UpgradeArgs, invoked_bin_name,
+        ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs,
+        StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
     },
     client::GatewayClient,
     config_sync::execute_config_sync,
@@ -719,6 +719,10 @@ pub async fn run_opencode_cli(
     harness::run_opencode(state_paths, args).await
 }
 
+pub async fn run_omp_cli(state_paths: &StatePaths, args: OmpArgs) -> Result<i32, CliError> {
+    harness::run_omp(state_paths, args).await
+}
+
 pub async fn run_claude_desktop_cli(
     state_paths: &StatePaths,
     args: ClaudeDesktopArgs,
@@ -811,12 +815,18 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
                     "claude" => "Updated Claude Code configuration",
                     "codex" => "Updated Codex CLI configuration",
                     "opencode" => "Updated OpenCode configuration",
+                    "omp" => "Updated Oh My Pi (omp) configuration",
                     _ => "Updated harness configuration",
                 };
                 ui::headline(Tone::Ok, label);
                 ui::kv_accent("Config File", &item.config_path.display().to_string());
                 if let Some(cat) = &item.catalog_path {
-                    ui::kv("Model Catalog", &cat.display().to_string());
+                    let aux_label = if item.target == "omp" {
+                        "Provider File"
+                    } else {
+                        "Model Catalog"
+                    };
+                    ui::kv(aux_label, &cat.display().to_string());
                 }
                 if let (Some(p), Some(f)) = (&item.primary_model, &item.fast_model) {
                     ui::kv("Model Routing", &format!("primary={p} · fast={f}"));

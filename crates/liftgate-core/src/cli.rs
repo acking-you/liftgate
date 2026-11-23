@@ -51,6 +51,8 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg cd                   Launch Claude Desktop GUI via Liftgate (auto-restores on exit)
   lg oc                   Launch OpenCode in current dir (0 side effects on exit)
   lg oc -c                Continue most recent OpenCode session (`lg oc -s <ID>`, `lg oc run`)
+  lg omp                  Launch Oh My Pi (`omp`) in current dir (0 side effects on exit)
+  lg omp -c               Continue latest `omp` session (`lg omp -r`, `--full-code-mode`, `models`)
   lg top                  Open real-time terminal observability dashboard (TUI)
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
@@ -100,6 +102,20 @@ Native OpenCode Commands & Session Examples:
   lg oc mcp | plugin | auth | upgrade ...
   lg oc -- --help                 Show full native `opencode --help`";
 
+const OMP_AFTER_HELP: &str = "\
+Native Oh My Pi (`omp`) Commands & Session Examples:
+  lg omp                          Start an interactive Oh My Pi TUI session in current directory
+  lg omp -c / lg omp continue     Continue most recent session (`lg omp resume --last`)
+  lg omp -r / lg omp resume       Open interactive session picker (`lg omp resume <ID>`)
+  lg omp --fork <ID>              Fork an existing session into a new branch
+  lg omp --full-code-mode         Mount MCP servers directly into `eval` globals (`mcp.evalNamespaces`)
+  lg omp --no-code-mode           Disable `eval` (`PI_PY=0 PI_JS=0`) and run direct tool calls
+  lg omp -p \"run cargo test\"      Run a non-interactive print prompt and exit
+  lg omp models [agy]             List configured providers and live Antigravity models
+  lg omp commit | session | acp   AI git commit, session manager, or ACP server
+  lg omp config | plugin | stats | update ...
+  lg omp -- --help                Show full native `omp --help`";
+
 /// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
 #[must_use]
 pub fn invoked_bin_name() -> String {
@@ -127,7 +143,7 @@ pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
     name = "liftgate",
     version,
     styles = clap_styles(),
-    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex / OpenCode manager (short alias: `lg`)",
+    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex / OpenCode / Oh My Pi manager (short alias: `lg`)",
     after_help = AFTER_HELP_TEXT
 )]
 pub struct Cli {
@@ -197,11 +213,15 @@ pub enum Commands {
     #[command(visible_alias = "oc", after_help = OPENCODE_AFTER_HELP)]
     Opencode(OpencodeArgs),
 
-    /// Generate, update, or uninstall project-local or global configuration files for Claude Code, Codex CLI, and/or OpenCode.
+    /// Launch Oh My Pi (`omp`) in the current directory via Liftgate with zero project/global file side effects.
+    #[command(visible_alias = "oh-my-pi", after_help = OMP_AFTER_HELP)]
+    Omp(OmpArgs),
+
+    /// Generate, update, or uninstall project-local or global configuration files for Claude Code, Codex CLI, OpenCode, and/or Oh My Pi (`omp`).
     #[command(visible_aliases = ["setup", "cfg"])]
     Config(ConfigArgs),
 
-    /// Diagnose `agy`, `claude`, `codex`, `opencode`, embedded Web UI, and live gateway readiness.
+    /// Diagnose `agy`, `claude`, `codex`, `opencode`, `omp`, embedded Web UI, and live gateway readiness.
     #[command(visible_alias = "doc")]
     Doctor(DoctorArgs),
 
@@ -1252,7 +1272,7 @@ impl CodexAppArgs {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum ConfigTarget {
-    /// Configure Claude Code, Codex CLI, and OpenCode.
+    /// Configure Claude Code, Codex CLI, OpenCode, and Oh My Pi (`omp`).
     #[default]
     All,
     /// Configure Claude Code (`.claude/settings.local.json` or `~/.claude/settings.json`).
@@ -1262,6 +1282,9 @@ pub enum ConfigTarget {
     /// Configure OpenCode (`./opencode.json` or `~/.config/opencode/opencode.json`).
     #[value(alias = "oc")]
     Opencode,
+    /// Configure Oh My Pi (`.omp/config.yml` + `liftgate-agy-provider.ts` or `~/.omp/agent/{models.yml,config.yml}`).
+    #[value(alias = "oh-my-pi")]
+    Omp,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1327,12 +1350,74 @@ impl OpencodeArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct OmpArgs {
+    /// Target gateway socket address (auto-starts background gateway if offline).
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+
+    /// Optional gateway API key.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Primary Antigravity model ID override for this session (`modelRoles.default`).
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// Fast/auxiliary model override (`modelRoles.smol`, `commit`, `tiny`, `memory`, `widget`).
+    #[arg(long)]
+    pub fast_model: Option<String>,
+
+    /// Require interactive confirmation for write/exec tools (`tools.approvalMode: always-ask`) instead of `yolo`.
+    #[arg(long)]
+    pub no_bypass: bool,
+
+    /// Mount MCP servers directly as global namespaces inside `eval` (`mcp.evalNamespaces: true`).
+    #[arg(
+        long,
+        visible_alias = "code-mode-only",
+        conflicts_with = "no_code_mode"
+    )]
+    pub full_code_mode: bool,
+
+    /// Disable Oh My Pi's `eval` Python/JS Code Mode (`PI_PY=0`, `PI_JS=0`) so all tools run as direct calls.
+    #[arg(long, conflicts_with = "full_code_mode")]
+    pub no_code_mode: bool,
+
+    /// Explicit path to `omp` executable.
+    #[arg(long, env = "OMP_BIN")]
+    pub omp_bin: Option<PathBuf>,
+
+    /// Arguments forwarded verbatim to `omp` (works with or without `--`).
+    #[arg(last = true, value_name = "OMP_ARGS")]
+    pub passthrough_args: Vec<String>,
+}
+
+impl OmpArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            fast_model: None,
+            no_bypass: false,
+            full_code_mode: false,
+            no_code_mode: false,
+            omp_bin: std::env::var_os("OMP_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct ConfigArgs {
-    /// Target CLI harness to configure (`all`, `claude`, `codex`, or `opencode`).
+    /// Target CLI harness to configure (`all`, `claude`, `codex`, `opencode`, or `omp`).
     #[arg(value_enum, default_value_t = ConfigTarget::All)]
     pub target: ConfigTarget,
 
-    /// Write to user-global config (`~/.claude/settings.json`, `~/.codex/config.toml`, `~/.config/opencode/opencode.json`) instead of current project.
+    /// Write to user-global config (`~/.claude/settings.json`, `~/.codex/config.toml`, `~/.config/opencode/opencode.json`, `~/.omp/agent/...`) instead of current project.
     #[arg(short = 'g', long)]
     pub global: bool,
 
@@ -1509,6 +1594,7 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
             HarnessSubcommand::Claude => rewrite_claude_session_aliases(&mut child_args),
             HarnessSubcommand::Codex => rewrite_codex_session_aliases(&mut child_args),
             HarnessSubcommand::Opencode => rewrite_opencode_session_aliases(&mut child_args),
+            HarnessSubcommand::Omp => rewrite_omp_session_aliases(&mut child_args),
             HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => {}
         }
     }
@@ -1532,6 +1618,7 @@ enum HarnessSubcommand {
     Codex,
     CodexApp,
     Opencode,
+    Omp,
 }
 
 impl HarnessSubcommand {
@@ -1542,6 +1629,7 @@ impl HarnessSubcommand {
             "codex" | "cx" | "x" => Some(Self::Codex),
             "codex-app" | "cxa" | "codex-desktop" => Some(Self::CodexApp),
             "opencode" | "oc" => Some(Self::Opencode),
+            "omp" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -1550,7 +1638,7 @@ impl HarnessSubcommand {
 fn detect_desktop_mode(kind: HarnessSubcommand, pre_dd: &[OsString]) -> bool {
     match kind {
         HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => true,
-        HarnessSubcommand::Opencode => false,
+        HarnessSubcommand::Opencode | HarnessSubcommand::Omp => false,
         HarnessSubcommand::Codex => pre_dd
             .iter()
             .any(|t| matches!(t.to_str(), Some("--app" | "--desktop"))),
@@ -1614,6 +1702,15 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--fast-model",
             "--opencode-bin",
         ],
+        HarnessSubcommand::Omp => &[
+            "--state-dir",
+            "--listen",
+            "--api-key",
+            "-m",
+            "--model",
+            "--fast-model",
+            "--omp-bin",
+        ],
     }
 }
 
@@ -1669,6 +1766,12 @@ fn harness_bool_flags(kind: HarnessSubcommand, is_desktop_mode: bool) -> &'stati
         }
         HarnessSubcommand::ClaudeDesktop => &["--restart-app", "--restore", "-w", "--wait"],
         HarnessSubcommand::Opencode => &[
+            "--no-bypass",
+            "--full-code-mode",
+            "--code-mode-only",
+            "--no-code-mode",
+        ],
+        HarnessSubcommand::Omp => &[
             "--no-bypass",
             "--full-code-mode",
             "--code-mode-only",
@@ -1754,6 +1857,47 @@ fn native_single_value_flags(kind: HarnessSubcommand) -> &'static [&'static str]
             "--env",
             "-n",
             "--max-count",
+        ],
+        HarnessSubcommand::Omp => &[
+            "--cwd",
+            "--add-dir",
+            "--profile",
+            "--alias",
+            "--provider",
+            "--config",
+            "--smol",
+            "--slow",
+            "--plan",
+            "--goal",
+            "--prewalk-into",
+            "--plan-yolo-into",
+            "--max-time",
+            "--warn-cost",
+            "--max-cost",
+            "--system-prompt",
+            "--system-prompt-template",
+            "--append-system-prompt",
+            "--thinking",
+            "--service-tier",
+            "--mode",
+            "--session-dir",
+            "--provider-session-id",
+            "--provider-prompt-cache-key",
+            "--fork",
+            "--models",
+            "--tools",
+            "--hook",
+            "-e",
+            "--extension",
+            "--trusted-extension",
+            "--plugin-dir",
+            "--export",
+            "--skills",
+            "--spinner-interval",
+            "--max-fps",
+            "--motion",
+            "--approval-mode",
+            "--kind",
         ],
         HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => &[],
     }
@@ -1902,6 +2046,56 @@ fn rewrite_opencode_session_aliases(child_args: &mut Vec<OsString>) {
             }
             _ => {
                 child_args.push(OsString::from("--continue"));
+                child_args.extend(tail);
+            }
+        },
+        _ => {}
+    }
+}
+
+fn rewrite_omp_session_aliases(child_args: &mut Vec<OsString>) {
+    let is_alias = matches!(
+        child_args.first().and_then(|s| s.to_str()),
+        Some("resume" | "continue")
+    );
+    if !is_alias {
+        return;
+    }
+    let tail = child_args.split_off(1);
+    let first_owned = child_args.pop().unwrap_or_default();
+    let Some(first) = first_owned.to_str() else {
+        return;
+    };
+    let second = tail.first().and_then(|s| s.to_str());
+    match first {
+        "continue" => {
+            if !matches!(second, Some("-h" | "--help")) {
+                child_args.push(OsString::from("--continue"));
+            }
+            child_args.extend(tail);
+        }
+        "resume" => match second {
+            Some("-h" | "--help") => {
+                child_args.extend(tail);
+            }
+            None => {
+                child_args.push(OsString::from("--resume"));
+            }
+            Some("--last") => {
+                child_args.push(OsString::from("--continue"));
+                if let Some(after_last) = tail.get(1..) {
+                    child_args.extend_from_slice(after_last);
+                }
+            }
+            Some(target) if !target.starts_with('-') => {
+                child_args.push(OsString::from("--resume"));
+                child_args.push(OsString::from(target));
+                if let Some(after_target) = tail.get(1..) {
+                    child_args.extend_from_slice(after_target);
+                }
+            }
+            _ => {
+                child_args.push(OsString::from("--resume"));
                 child_args.extend(tail);
             }
         },
@@ -2432,6 +2626,54 @@ mod tests {
         assert!(matches!(
             cfg_oc.command,
             Some(Commands::Config(c)) if c.target == ConfigTarget::Opencode && c.global
+        ));
+    }
+
+    #[test]
+    fn omp_subcommand_normalizes_flags_and_session_aliases() {
+        let omp_launch = parse_strs(&[
+            "lg",
+            "omp",
+            "-r",
+            "sess-99",
+            "-m",
+            "gemini-4-carbon-high",
+            "--full-code-mode",
+        ]);
+        match omp_launch.command {
+            Some(Commands::Omp(omp)) => {
+                assert_eq!(omp.model.as_deref(), Some("gemini-4-carbon-high"));
+                assert!(omp.full_code_mode);
+                assert!(!omp.no_code_mode);
+                assert_eq!(omp.passthrough_args, vec!["-r", "sess-99"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let omp_resume_id = parse_strs(&["lg", "omp", "resume", "sess-42"]);
+        assert!(matches!(
+            omp_resume_id.command,
+            Some(Commands::Omp(omp)) if omp.passthrough_args == vec!["--resume", "sess-42"]
+        ));
+        let omp_resume_last = parse_strs(&["lg", "omp", "resume", "--last"]);
+        assert!(matches!(
+            omp_resume_last.command,
+            Some(Commands::Omp(omp)) if omp.passthrough_args == vec!["--continue"]
+        ));
+        let omp_continue = parse_strs(&["lg", "oh-my-pi", "continue"]);
+        assert!(matches!(
+            omp_continue.command,
+            Some(Commands::Omp(omp)) if omp.passthrough_args == vec!["--continue"]
+        ));
+        let cfg_omp = parse_strs(&["lg", "config", "omp", "--global"]);
+        assert!(matches!(
+            cfg_omp.command,
+            Some(Commands::Config(c)) if c.target == ConfigTarget::Omp && c.global
+        ));
+        let cfg_alias = parse_strs(&["lg", "config", "oh-my-pi"]);
+        assert!(matches!(
+            cfg_alias.command,
+            Some(Commands::Config(c)) if c.target == ConfigTarget::Omp && !c.global
         ));
     }
 }

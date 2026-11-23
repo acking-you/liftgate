@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **First-class Oh My Pi (`omp`) support (`lg omp`, `lg config omp`, `OmpToolProfile`)**:
+  - Added `lg omp` (alias `lg oh-my-pi`) zero-side-effect launcher injecting an ephemeral TypeScript `pi.registerProvider("agy", ...)` extension (`openai-responses` over `/v1/responses`, `preferWebsockets: false`, calibrated `500k` Gemini / `200k` Claude context windows, `64k` output tokens, `effort` thinking levels) and `PI_CONFIG_FILES` YAML overlay (`modelRoles`, `--full-code-mode` via `mcp.evalNamespaces: true`, `--no-code-mode` via `PI_PY=0 PI_JS=0`, `--no-bypass` via `tools.approvalMode: always-ask`) without touching `~/.omp/agent/` or `.omp/`, plus `[y] Launch Oh My Pi (omp)` in the interactive `lg` cockpit and `omp` detection in `lg doctor`.
+  - Extended `lg config` (`all` and `omp` / `oh-my-pi`) to non-destructively merge and ledger-restore `~/.omp/agent/{models.yml,config.yml}` (`OMP_PROFILE` / `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and `$XDG_DATA_HOME/omp` aware) and project-local `.omp/{config.yml,liftgate-agy-provider.ts}`, restoring any displaced `providers.agy` block and prior `modelRoles` on `--uninstall`.
+  - Added zero-cost `OmpToolProfile` (`DetectedHarness::Omp`, `VirtualizerBudget::OMP_AGY_ACP`) preserving standard 16-tool `omp` sessions in 1:1 Direct Eager passthrough alongside polyglot `eval` (`py` + `js` persistent kernels with `<prelude>` / `<browser>` / `<computer>` / `<dsm>` docs and unprefixed `tool.<name>(args)` bridge rules) and `wait`, leaving `hashline` `edit` (`[path#TAG]` + `PUT` in both JSON `{ input }` and custom Lark grammar) untouched while V4A-healing `apply_patch` (`input`) and folding `mcp__<server>_<tool>`, `memory`, `session_state`, and `irc_*` into `mcp_lg_ns__*` hubs, plus auxiliary fast-lane routing for forked `<title-request>`, `tan-name`, `job-widget`, `job-caption`, and `omp` compaction summaries.
+
 ### Fixed
 - Restore an existing OpenCode `provider.agy` on uninstall after config sync, unless it was edited or removed afterward.
 

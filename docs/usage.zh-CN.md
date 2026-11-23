@@ -84,9 +84,9 @@ lg agy mcp -- --help                    # 透传任意官方子命令（`mcp`、
 - **默认零代理直连**：Liftgate 默认**不设置任何代理**，并在拉起 `agy` 时清理父进程残留的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（也不会自动注入系统注册表代理）。只有当你通过 `lg proxy`（持久化于 `~/.liftgate/settings.json`）或 `--agy-proxy` / `AGY_PROXY` 显式配置后，Liftgate 才会在每次启动 `agy` 时强制注入代理环境变量，并自动将 `127.0.0.1,localhost,::1` 写入 `NO_PROXY`。
 - **空闲无感自动热更新**：网关运行时默认开启 `agy` 自动更新（`true`）。后台任务会定期检查官方 Antigravity 清单；发现新版本时**绝不打断进行中的请求**，而是等待网关完全空闲（0 活跃请求、0 活跃流且会话池静置），排空缓存空闲会话并优雅释放旧 `agy` 进程文件锁（含 Windows `.exe` 锁），完成 SHA-512 校验替换后立即拉起新进程——若新版本握手异常还会自动回滚旧二进制。
 
-## 零副作用临时启动（`lg cx` / `lg cc` / `lg oc` / `lg cxa` / `lg cd`）
+## 零副作用临时启动（`lg cx` / `lg cc` / `lg oc` / `lg omp` / `lg cxa` / `lg cd`）
 
-跨 Windows、macOS、Linux 在**任意目录**下零污染启动 Codex CLI、Claude Code、**OpenCode**、**Codex App** 或 **Claude Desktop**，退出后**完全 0 残留**（不改动当前项目、`~/.claude/settings.json`、`~/.codex/config.toml`、`~/.config/opencode/opencode.json`、官方桌面端配置或父终端环境）：
+跨 Windows、macOS、Linux 在**任意目录**下零污染启动 Codex CLI、Claude Code、**OpenCode**、**Oh My Pi（`omp`）**、**Codex App** 或 **Claude Desktop**，退出后**完全 0 残留**（不改动当前项目、`~/.claude/settings.json`、`~/.codex/config.toml`、`~/.config/opencode/opencode.json`、`~/.omp/agent/`、官方桌面端配置或父终端环境）：
 
 ```bash
 cd /path/to/your/project
@@ -97,9 +97,13 @@ liftgate claude                             # 在当前目录启动交互式 Cla
 liftgate opencode                           # 在当前目录启动交互式 OpenCode TUI（短别名 `lg oc`；默认开启 `@opencode/codemode`）
 liftgate opencode --full-code-mode          # 开启 OpenCode 全量 Code Mode（注入 `OPENCODE_FLAGS=full_codemode`）
 liftgate opencode --no-code-mode            # 关闭 Code Mode，由 Liftgate `OpenCodeToolProfile` 虚拟化直连全部工具
+liftgate omp                                # 在当前目录启动交互式 Oh My Pi TUI（别名 `lg oh-my-pi`；开启双栈 `eval` + `tools.commands`）
+liftgate omp --full-code-mode               # 将 MCP Server 直接挂载为 `eval` 全局命名空间（`mcp.evalNamespaces: true`）
+liftgate omp --no-code-mode                 # 关闭 `eval`（`PI_PY=0 PI_JS=0`），切换为直连工具调用
 liftgate codex exec "运行 cargo test"        # 原生子命令与参数直接透传
 liftgate claude --model gemini-4-hydrogen-low -p "总结最近一次提交"
 liftgate opencode run "运行 cargo test"      # 非交互式执行单次 OpenCode 任务（支持 `lg oc run -c "..."`）
+liftgate omp -p "运行 cargo test"            # 非交互式执行单次 Oh My Pi 打印模式任务
 
 # 原生会话查看、恢复、分叉、Git Worktree 与后台任务管理
 lg cx resume                                # 打开 Codex 交互式会话列表（加 `--all` 跨目录查看；兼容别名 `lg cx -r`）
@@ -116,6 +120,10 @@ lg oc -c                                    # 继续最近一次 OpenCode 会话
 lg oc -s ses_42                             # 继续或创建指定 ID 的 OpenCode 会话（兼容 `lg oc resume ses_42`）
 lg oc models                                # 查看已配置的 Provider 与实时 Antigravity 模型列表
 lg oc session list                          # 查看当前项目会话列表（支持 `delete`、`export`、`import`、`web`、`serve`、`acp`）
+lg omp -c                                   # 继续最近一次 Oh My Pi 会话（兼容 `lg omp continue`、`lg omp resume --last`）
+lg omp -r                                   # 打开 Oh My Pi 交互式会话选择器（兼容 `lg omp resume`、`lg omp resume <ID>`）
+lg omp --fork <ID>                          # 基于已有会话分叉新分支
+lg omp models agy                           # 查看实时 Antigravity 模型目录（`commit`、`session`、`acp` 等均原生可用）
 
 # 全平台桌面客户端（适配 Windows MSIX/Squirrel/独立安装、macOS .app、Linux .deb/Flatpak/AppImage）
 lg codex-app                                # 短别名 `lg cxa` 或 `lg cx --app`（隔离 CODEX_HOME + --user-data-dir）
@@ -125,8 +133,9 @@ lg claude-desktop --restart-app             # 若 Claude Desktop 已在运行，
 lg claude-desktop --restore                 # 手动立即执行回滚日志恢复（断电/强杀亦会在下次启动自动恢复）
 ```
 
-- 若后台网关尚未启动，`liftgate codex`、`liftgate claude`、`liftgate opencode` 及桌面端命令会自动在后台拉起它。
+- 若后台网关尚未启动，`liftgate codex`、`liftgate claude`、`liftgate opencode`、`liftgate omp` 及桌面端命令会自动在后台拉起它。
 - **OpenCode（`lg oc` / `lg opencode`）**：通过纯内存环境变量 `OPENCODE_CONFIG_CONTENT` 无损合并注入 `provider.agy` 与实时模型目录（不写入任何项目或全局文件），并在检测到 OpenCode v2（`>= 2.0.0`）时自动附加 `--standalone` 启动私有隔离服务，避免复用到未携带网关配置的后台守护进程。
+- **Oh My Pi（`lg omp` / `lg oh-my-pi`）**：在 `~/.liftgate/ephemeral/` 生成一次性 TypeScript Provider 扩展（`pi.registerProvider("agy", ...)`）与 YAML Overlay 并通过 `PI_CONFIG_FILES` 注入（自动继承用户已配置的 `extensions` 列表），全程不触碰 `~/.omp/agent/` 与项目 `.omp/`，进程退出立即清理。
 - 注入的环境变量与临时配置目录（位于 `~/.liftgate/ephemeral/`）仅对子进程生效，进程退出时立即自动删除。
 - **Codex App（`lg cxa`）**：在 `~/.liftgate/desktop/sessions/` 下合成独立物理 `CODEX_HOME`（只读合并 `~/.codex/config.toml`，强制设置 `cli_auth_credentials_store = "file"`、`forced_login_method = "api"` 并生成独立 API Key 模式 `auth.json`，绝不混入个人 ChatGPT OAuth 登录态、也绝不触碰 `~/.codex`），同时通过 `--user-data-dir`（`~/.liftgate/desktop/codex-app-isolated`）隔离桌面端数据目录；Windows Microsoft Store MSIX 包通过无窗口容器内启动器（`conhost --headless` + `Invoke-CommandInDesktopPackage -PreventBreakaway`）跨 COM 边界完整注入 `CODEX_HOME`，且不篡改 `HOME` / `USERPROFILE` / `APPDATA`，确保内置终端中的 `git`、`cargo`、`ssh` 完全正常。
 - **Claude Desktop（`lg cd`）**：修改前先写入原子回滚日志（`~/.liftgate/desktop-journals/`），覆盖标准目录、Windows MSIX `LocalCache` 与 Linux Flatpak 沙箱目录注入临时第三方推理配置（`deploymentMode: "3p"`，指向本地 `/claude-desktop` 路由），后台守护进程监听窗口关闭后自动精准还原原始 `deploymentMode` 与 Profile 列表，同时完整保留会话期间新增的 `mcpServers` 或偏好设置。
@@ -161,10 +170,11 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 如果你希望直接输入裸命令 `claude` 或 `codex` 使用网关，可用 `liftgate config`（别名 `liftgate setup`）一键生成或无损合并本地/全局配置文件：
 
 ```bash
-liftgate config                     # 在当前项目生成/合并 .claude/settings.local.json、.codex/{config.toml,agy-models.json} 与 opencode.json
+liftgate config                     # 在当前项目无损同步 .claude、.codex、opencode.json 与 .omp
 liftgate config claude --global     # 无损合并到全局 ~/.claude/settings.json
 liftgate config codex --global      # 无损合并 [model_providers.agy] 与模型目录到全局 ~/.codex/
 liftgate config opencode --global   # 无损合并 provider.agy 到全局 ~/.config/opencode/opencode.json（短别名 `oc`）
+liftgate config omp --global        # 无损合并 providers.agy 与 modelRoles 到全局 ~/.omp/agent/{models.yml,config.yml}
 liftgate config --print             # 仅在终端预览将生成的配置内容，不写盘
 liftgate config --uninstall         # 精准清理 Liftgate 写入的配置项（加 --global 清理全局）
 ```
@@ -320,6 +330,47 @@ claude
 
 - **Code Mode（`@opencode/codemode`）**：OpenCode v2 默认已对外部 MCP 与二级命名空间工具开启基于 `psychoscript` 的 `execute` Code Mode；加 `lg oc --full-code-mode` 可将内置文件/终端工具与 `Bun.file` / `Bun.write` 一并纳入 `execute`，加 `lg oc --no-code-mode` 则将全部 MCP 与命名空间工具切换为直连调用（由 Liftgate 零开销 `OpenCodeToolProfile` 自动折叠至 `<= 24` 个 Eager 槽位）。
 - **上下文校准与补丁预检自愈**：`limit.context = 500000` 配合 OpenCode 默认 `15%` 余量恰好在 `425,000` token 稳妥触发自动压缩（避开上游 `524,288` 内部压缩线）；OpenCode 的 `patch`（`{ "patchText": "..." }`）享受网关侧 0-RTT Lark V4A 语法预检自愈与同文件自动合并，会话标题与摘要自动分流至轻量临时会话。
+
+## Oh My Pi（`omp`）
+
+推荐使用 `lg omp`（`liftgate omp`，别名 `lg oh-my-pi`）零副作用自动配置，或执行 `lg config omp --global` 无损写入全局 `~/.omp/agent/models.yml` 与 `~/.omp/agent/config.yml`（自动识别 `OMP_PROFILE` / `PI_PROFILE`、`PI_CONFIG_DIR`、`PI_CODING_AGENT_DIR` 与 `$XDG_DATA_HOME/omp`）。在项目目录执行 `lg config omp` 则生成 `.omp/liftgate-agy-provider.ts` 并无损合并 `.omp/config.yml`，完全不触碰全局配置。
+
+若需手工配置全局文件，可在 `~/.omp/agent/models.yml` 添加 `providers.agy` 并在 `~/.omp/agent/config.yml` 配置 `modelRoles`：
+
+```yaml
+# ~/.omp/agent/models.yml
+providers:
+  agy:
+    baseUrl: http://127.0.0.1:8787/v1
+    apiKey: local-agy
+    api: openai-responses
+    authHeader: true
+    compat:
+      supportsStore: false
+      statefulResponses: false
+      supportsDeveloperRole: true
+      supportsReasoningEffort: true
+      supportsReasoningSummary: true
+      supportsToolChoice: true
+      streamIdleTimeoutMs: 1800000
+    models:
+      - id: gemini-4-carbon-high
+        name: "Gemini 4 Carbon (High)"
+        api: openai-responses
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts: [low, medium, high]
+          defaultLevel: high
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 500000
+        maxTokens: 64000
+        preferWebsockets: false
+```
+
+- **双栈 Code Mode（`eval` + `wait` + `tools.commands`）**：`OmpToolProfile` 将常驻 Python（`py`）与 Bun JavaScript（`js`）双内核 `eval` 及后台作业屏障 `wait` 固定在 Tier 0（`64 KiB` 描述预算完整保留 `<prelude>` / `<browser>` / `<computer>` / `<dsm>` 帮助），并注入桥接规则引导模型在 `eval` 代码与 `bash` 工具命令内使用无前缀原始名 `tool.<name>(args)`；加 `lg omp --full-code-mode` 开启 `mcp.evalNamespaces: true`，加 `lg omp --no-code-mode` 关闭 `eval` 切换为直连调用。
+- **`hashline` 安全编辑与单下划线 MCP 虚拟化**：完整保留 `omp` 默认 `edit` 工具的 `hashline`（`[path#TAG]` + `PUT N.=M:`，含 JSON `{ input }` 与自定义 Lark 语法两种形态）原样透传而不被误判为 V4A 补丁；`apply_patch` 享受 0-RTT V4A 自愈校验，大规模 `mcp__<server>_<tool>`、`memory` 与 `session_state` 工具自动折叠至 `mcp_lg_ns__*` 路由中心。
 
 ## 其它客户端
 

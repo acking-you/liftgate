@@ -9356,6 +9356,299 @@ async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_he
 }
 
 #[tokio::test]
+async fn omp_profile_virtualizes_eval_codemode_preserves_hashline_edit_and_routes_mcp_hubs() {
+    let hashline_patch =
+        "*** Begin Patch\n[src/main.rs#A1B2]\nPUT 5.=7:\n    let port = 8787;\n*** End Patch";
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            // Step 1: Model calls `omp` polyglot `eval` (`py` cell)
+            McpMockStep::CallTool {
+                usage_used: 9_000,
+                thoughts: vec!["Running Python eval cell with unprefixed tool.read.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "eval".to_owned(),
+                arguments: json!({
+                    "language": "py",
+                    "code": "res = await tool.read({'path': 'src/main.rs'})\nprint(len(res))",
+                    "toolSummary": "Read main.rs via eval"
+                }),
+                expect_reply_substrings: vec!["1024"],
+            },
+            // Step 2: Model calls `omp` hashline `edit` (`[path#TAG]` + `PUT` inside `*** Begin Patch`)
+            McpMockStep::CallTool {
+                usage_used: 9_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "edit".to_owned(),
+                arguments: json!({
+                    "input": hashline_patch,
+                    "toolSummary": "Apply hashline edit"
+                }),
+                expect_reply_substrings: vec!["Updated src/main.rs"],
+            },
+            // Step 3: Model calls single-underscore MCP tool `mcp__github_issue_op_04` via `ns__github`
+            McpMockStep::CallTool {
+                usage_used: 9_800,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__github".to_owned(),
+                arguments: json!({
+                    "action": "issue_op_04",
+                    "args": { "repo": "can1357/oh-my-pi" }
+                }),
+                expect_reply_substrings: vec!["issue #128 open"],
+            },
+            // Step 4: Model calls `omp` memory tool `retain` via `ns__memory`
+            McpMockStep::CallTool {
+                usage_used: 10_200,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__memory".to_owned(),
+                arguments: json!({
+                    "action": "retain",
+                    "args": { "fact": "omp uses openai-responses with stateless history" }
+                }),
+                expect_reply_substrings: vec!["retained fact"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 10_600,
+                thoughts: vec![],
+                chunks_template: vec!["Oh My Pi workflow verified.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 10_600,
+                    output_tokens: 48,
+                    cached_read_tokens: 10_000,
+                    cached_write_tokens: 0,
+                    thought_tokens: 32,
+                    total_tokens: 10_680,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let mut tools = vec![
+        json!({
+            "type": "function",
+            "name": "eval",
+            "description": "Persistent kernels (`py` / `js`); top-level state persists.\n<prelude>await tool.read({ path: 'x' })</prelude>",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": { "type": "string", "enum": ["py", "js"] },
+                    "code": { "type": "string" }
+                },
+                "required": ["language", "code"]
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "wait",
+            "description": "Wait for background jobs",
+            "parameters": { "type": "object", "properties": { "jobs": { "type": "array" } } }
+        }),
+        json!({
+            "type": "function",
+            "name": "bash",
+            "description": "Execute shell commands",
+            "parameters": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "read",
+            "description": "Read files and omp:// URLs",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "edit",
+            "description": "Edit files in place with hashline (`[path#TAG]` + `PUT`)",
+            "parameters": { "type": "object", "properties": { "input": { "type": "string" } }, "required": ["input"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "write",
+            "description": "Write files",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "grep",
+            "description": "Search contents",
+            "parameters": { "type": "object", "properties": { "pattern": { "type": "string" } }, "required": ["pattern"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "glob",
+            "description": "Find files",
+            "parameters": { "type": "object", "properties": { "pattern": { "type": "string" } }, "required": ["pattern"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "task",
+            "description": "Launch subagents",
+            "parameters": { "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"] }
+        }),
+        json!({
+            "type": "function",
+            "name": "lsp",
+            "description": "LSP queries",
+            "parameters": { "type": "object", "properties": { "action": { "type": "string" } }, "required": ["action"] }
+        }),
+    ];
+    for mem in ["retain", "recall", "reflect", "memory_edit", "learn"] {
+        tools.push(json!({
+            "type": "function",
+            "name": mem,
+            "description": "Memory operation",
+            "parameters": {
+                "type": "object",
+                "properties": { "fact": { "type": "string" } },
+                "required": ["fact"]
+            }
+        }));
+    }
+    for idx in 0..20 {
+        tools.push(json!({
+            "type": "function",
+            "name": format!("mcp__github_issue_op_{idx:02}"),
+            "description": "GitHub MCP operation",
+            "parameters": {
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"]
+            }
+        }));
+    }
+
+    // Stateless `/v1/responses` history (`store: false`, matching `statefulResponses: false` in `omp`)
+    let mut input_items = vec![json!({
+        "role": "user",
+        "content": "Inspect main.rs, update port to 8787, check GitHub issues, and retain the fact."
+    })];
+
+    let send_turn = |items: Vec<Value>| {
+        let app_clone = app.clone();
+        let tools_clone = tools.clone();
+        async move {
+            let resp = app_clone
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "model": "gemini-4-carbon-high",
+                                "stream": false,
+                                "store": false,
+                                "instructions": "You are Oh My Pi.",
+                                "tools": tools_clone,
+                                "input": items
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_slice::<Value>(&resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap()
+        }
+    };
+
+    // Turn 1 -> `eval`
+    let r1 = send_turn(input_items.clone()).await;
+    let fc1 = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected eval function_call");
+    assert_eq!(fc1["name"], "eval");
+    let fc1_args: Value = serde_json::from_str(fc1["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(fc1_args["language"], "py");
+    assert!(fc1_args.get("toolSummary").is_none());
+    let cid1 = fc1["call_id"].as_str().unwrap().to_owned();
+    input_items.push(fc1.clone());
+    input_items.push(json!({ "type": "function_call_output", "call_id": cid1, "output": "1024" }));
+
+    // Turn 2 -> `edit` (hashline preserved verbatim!)
+    let r2 = send_turn(input_items.clone()).await;
+    let fc2 = r2["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected edit function_call");
+    assert_eq!(fc2["name"], "edit");
+    let fc2_args: Value = serde_json::from_str(fc2["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(fc2_args["input"], hashline_patch);
+    let cid2 = fc2["call_id"].as_str().unwrap().to_owned();
+    input_items.push(fc2.clone());
+    input_items.push(
+        json!({ "type": "function_call_output", "call_id": cid2, "output": "Updated src/main.rs" }),
+    );
+
+    // Turn 3 -> `mcp__github_issue_op_04` via `ns__github`
+    let r3 = send_turn(input_items.clone()).await;
+    let fc3 = r3["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected mcp__github_issue_op_04 function_call");
+    assert_eq!(fc3["name"], "mcp__github_issue_op_04");
+    let fc3_args: Value = serde_json::from_str(fc3["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(fc3_args["repo"], "can1357/oh-my-pi");
+    let cid3 = fc3["call_id"].as_str().unwrap().to_owned();
+    input_items.push(fc3.clone());
+    input_items.push(
+        json!({ "type": "function_call_output", "call_id": cid3, "output": "issue #128 open" }),
+    );
+
+    // Turn 4 -> `retain` via `ns__memory`
+    let r4 = send_turn(input_items.clone()).await;
+    let fc4 = r4["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected retain function_call");
+    assert_eq!(fc4["name"], "retain");
+    let fc4_args: Value = serde_json::from_str(fc4["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        fc4_args["fact"],
+        "omp uses openai-responses with stateless history"
+    );
+    let cid4 = fc4["call_id"].as_str().unwrap().to_owned();
+    input_items.push(fc4.clone());
+    input_items.push(
+        json!({ "type": "function_call_output", "call_id": cid4, "output": "retained fact" }),
+    );
+
+    // Turn 5 -> Final assistant message
+    let r5 = send_turn(input_items).await;
+    let msg5 = r5["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("expected final assistant message");
+    assert_eq!(msg5["content"][0]["text"], "Oh My Pi workflow verified.");
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 4);
+}
+
+#[tokio::test]
 async fn opencode_profile_virtualizes_codemode_execute_heals_patchtext_and_routes_mcp_hubs() {
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
         steps: vec![

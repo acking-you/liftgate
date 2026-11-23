@@ -24,13 +24,13 @@ pub use liftgate_tool_virtualizer::{
     CALL_CLIENT_TOOL_MCP_NAME, ClaudeCodeToolProfile, CodexToolProfile, DetectedHarness,
     GATEWAY_WEB_FETCH_MCP_NAME, GenericToolProfile, HarnessToolProfile, LocalReplyKind,
     MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog, McpWireTool,
-    NAMESPACE_HUB_MCP_PREFIX, OpenCodeToolProfile, ProtocolHint, SEARCH_CLIENT_TOOLS_MCP_NAME,
-    ToolPlacement, VirtualizedCallDecision, VirtualizerBudget, apply_patch_input_schema,
-    detect_harness, extract_custom_tool_input, freeform_custom_input_schema,
-    gateway_web_fetch_input_schema, normalize_apply_patch_text, partition_tools_for_harness,
-    partition_tools_for_mcp, partition_tools_for_mcp_session, partition_tools_for_mcp_with_hint,
-    plan_virtualization, plan_virtualization_with_options, sanitize_mcp_tool_name,
-    strip_call_prefix, validate_apply_patch_preflight,
+    NAMESPACE_HUB_MCP_PREFIX, OmpToolProfile, OpenCodeToolProfile, ProtocolHint,
+    SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement, VirtualizedCallDecision, VirtualizerBudget,
+    apply_patch_input_schema, detect_harness, extract_custom_tool_input,
+    freeform_custom_input_schema, gateway_web_fetch_input_schema, normalize_apply_patch_text,
+    partition_tools_for_harness, partition_tools_for_mcp, partition_tools_for_mcp_session,
+    partition_tools_for_mcp_with_hint, plan_virtualization, plan_virtualization_with_options,
+    sanitize_mcp_tool_name, strip_call_prefix, validate_apply_patch_preflight,
 };
 use liftgate_types::{acp::McpServerConfig, canonical::CanonicalToolSpec};
 use serde::{Deserialize, Serialize};

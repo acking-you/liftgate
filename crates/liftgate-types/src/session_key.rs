@@ -544,13 +544,22 @@ pub fn materialize_system_prompt_into_messages(
 
 /// Returns `true` when an `instructions` / `system` string is a harness compaction prompt
 /// (such as OpenAI Codex's `CONTEXT CHECKPOINT COMPACTION`, Claude Code's `/compact` prompt,
-/// or OpenCode's session compaction summary prompt).
+/// OpenCode's session compaction summary prompt, or Oh My Pi's structured handoff summary).
 #[must_use]
 pub fn is_compaction_instructions_prompt(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("context checkpoint compaction")
         || lower.contains("handoff summary for another llm")
         || (lower.contains("compaction") && lower.contains("another language model"))
+        || lower.contains("summarize user–ai coding-assistant conversations")
+        || lower.contains("summarize user-ai coding-assistant conversations")
+        || (lower.contains("complete history to summarize")
+            && lower.contains("replaces every message"))
+        || lower.contains("write a handoff document for another instance of yourself")
+        || (lower.contains("turn prefix too large")
+            && lower.contains("summarize prefix for retained suffix"))
+        || lower
+            .contains("structured summary of the conversation branch for context when returning")
         || lower.contains("create a detailed summary of the conversation so far")
         || lower.contains("tasked with summarizing conversations")
         || lower.contains("provide a detailed prompt for continuing our conversation above")
@@ -859,7 +868,37 @@ const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
 #[must_use]
 pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
     matches!(tool.kind, CanonicalToolKind::Custom { .. })
-        && (matches!(tool.name.as_str(), "exec" | "execute") || tool.name.ends_with(".exec"))
+        && (matches!(tool.name.as_str(), "exec" | "execute" | "eval")
+            || tool.name.ends_with(".exec"))
+}
+
+/// Returns `true` when `tool` is Oh My Pi (`omp`)'s persistent polyglot `eval` Code Mode
+/// orchestrator (`py` / `js` kernels with `tool.<name>(args)`, `mcp.evalNamespaces`, and preludes).
+#[must_use]
+pub fn is_omp_eval_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
+    if tool.name != "eval" {
+        return false;
+    }
+    if matches!(tool.kind, CanonicalToolKind::Custom { .. }) {
+        return true;
+    }
+    if tool.description.as_deref().is_some_and(|desc| {
+        desc.contains("<prelude>")
+            || desc.contains("await tool.")
+            || desc.contains("persistent kernels")
+            || desc.contains("top-level state persists")
+    }) {
+        return true;
+    }
+    if let CanonicalToolKind::Function { parameters_json } = &tool.kind
+        && parameters_json.contains("\"code\"")
+        && parameters_json.contains("\"language\"")
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(parameters_json)
+        && let Some(props) = val.get("properties").and_then(serde_json::Value::as_object)
+    {
+        return props.contains_key("code") && props.contains_key("language");
+    }
+    false
 }
 
 /// Splits a tool description into its primary prose and an optional trailing Codex Code Mode
@@ -889,7 +928,7 @@ pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
     if tool.name == "REPL" {
         return true;
     }
-    if is_code_mode_custom_exec(tool) {
+    if is_code_mode_custom_exec(tool) || is_omp_eval_orchestrator_tool(tool) {
         return true;
     }
     if tool.name == "execute"
@@ -1188,6 +1227,15 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
     {
         header_rules.push_str(&format!(
             "- File edits: invoke native `mcp_lg_{mcp_ap}` directly with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` (prefer native `mcp_lg_{mcp_ap}` over embedding multi-line patches inside `exec` JavaScript template literals; keep `@@` hunks surgical with 1-3 exact context lines and merge multiple edits to the same file under one `*** Update File:` header).\n"
+        ));
+    }
+    if let Some((_, mcp_eval)) = mcp_spec
+        .bridged_tools
+        .iter()
+        .find(|(client_name, _)| client_name == "eval")
+    {
+        header_rules.push_str(&format!(
+            "- Polyglot Code Mode (`mcp_lg_{mcp_eval}`): invoke native `mcp_lg_{mcp_eval}` for persistent Python (`py`) / JavaScript (`js`) cells; inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code).\n"
         ));
     }
 
@@ -5084,5 +5132,50 @@ mod tests {
         .expect("non-empty delta");
         assert!(!delta.contains("<agy_tool_call_"));
         assert!(delta.contains("sql_lark"));
+    }
+
+    #[test]
+    fn omp_eval_codemode_injects_unprefixed_bridge_rule_and_matches_compaction_prompts() {
+        assert!(is_compaction_instructions_prompt(
+            "You summarize user–AI coding-assistant conversations into structured handoffs."
+        ));
+        assert!(is_compaction_instructions_prompt(
+            "Write a handoff document for another instance of yourself to continue seamlessly."
+        ));
+
+        let eval_spec = CanonicalToolSpec {
+            name: "eval".to_owned(),
+            description: Some("Persistent kernels (`py` / `js`).\n<prelude>await tool.read()</prelude>".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: r#"{"type":"object","properties":{"language":{"type":"string"},"code":{"type":"string"}}}"#.to_owned(),
+            },
+        };
+        assert!(is_omp_eval_orchestrator_tool(&eval_spec));
+        assert!(is_code_mode_orchestrator_tool(&eval_spec));
+
+        let bridged = vec![
+            ("eval".to_owned(), "eval".to_owned()),
+            ("bash".to_owned(), "bash".to_owned()),
+            ("edit".to_owned(), "edit".to_owned()),
+        ];
+        let hubs = vec![("ns__github".to_owned(), "github".to_owned(), 12usize)];
+        let mcp_spec = McpBridgePromptSpec {
+            bridged_tools: &bridged,
+            virtualized_hubs: &hubs,
+            has_virtualized_dispatch: true,
+            has_gateway_web_fetch: true,
+        };
+        let mut spill = NoopSpillSink;
+        let (append, _) = build_session_system_append_for_mcp_with_spill_sink(
+            Some("You are Oh My Pi."),
+            mcp_spec,
+            WebToolBridgeConfig::default(),
+            "nonce_omp_test",
+            &mut spill,
+        );
+        assert!(append.contains("Polyglot Code Mode (`mcp_lg_eval`)"));
+        assert!(append.contains(
+            "call `tool.<name>(args)` and MCP eval globals by their unprefixed client names"
+        ));
     }
 }
