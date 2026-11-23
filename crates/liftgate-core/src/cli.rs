@@ -49,6 +49,8 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg cc                   Launch Claude Code in current dir (0 side effects on exit)
   lg cc -r                Browse & resume Claude sessions (`lg cc resume`, `lg cc -c`)
   lg cd                   Launch Claude Desktop GUI via Liftgate (auto-restores on exit)
+  lg oc                   Launch OpenCode in current dir (0 side effects on exit)
+  lg oc -c                Continue most recent OpenCode session (`lg oc -s <ID>`, `lg oc run`)
   lg top                  Open real-time terminal observability dashboard (TUI)
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
@@ -85,6 +87,19 @@ Native Codex CLI Commands & Session Examples:
   lg cx mcp | plugin | features | doctor | queue ...
   lg cx -- --help                 Show full native `codex --help`";
 
+const OPENCODE_AFTER_HELP: &str = "\
+Native OpenCode Commands & Session Examples:
+  lg oc                           Start an interactive OpenCode TUI session in current directory
+  lg oc -c / lg oc continue       Continue most recent session (alias: `lg oc resume`)
+  lg oc -s <ID> / lg oc resume <ID> Continue or create a specific session by ID
+  lg oc --full-code-mode          Enable full Code Mode (`OPENCODE_FLAGS=full_codemode`)
+  lg oc run \"run cargo test\"      Run a non-interactive prompt (`lg oc run -c \"...\"`)
+  lg oc models                    List configured providers and live Antigravity models
+  lg oc session list              List recent project sessions (`delete`, `export`, `import`)
+  lg oc web | serve | acp         Start OpenCode Web UI, headless HTTP server, or ACP server
+  lg oc mcp | plugin | auth | upgrade ...
+  lg oc -- --help                 Show full native `opencode --help`";
+
 /// Returns the short command name (`lg`, `liftgate`, or custom alias) used to invoke this process.
 #[must_use]
 pub fn invoked_bin_name() -> String {
@@ -112,7 +127,7 @@ pub fn normalize_optional_api_key(raw: Option<&str>) -> Option<String> {
     name = "liftgate",
     version,
     styles = clap_styles(),
-    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex CLI & Desktop manager (short alias: `lg`)",
+    about = "Antigravity ACP local API gateway, live TUI & web dashboard, and Claude / Codex / OpenCode manager (short alias: `lg`)",
     after_help = AFTER_HELP_TEXT
 )]
 pub struct Cli {
@@ -178,11 +193,15 @@ pub enum Commands {
     #[command(visible_aliases = ["cxa", "codex-desktop"])]
     CodexApp(CodexAppArgs),
 
-    /// Generate, update, or uninstall project-local or global configuration files for Claude Code and/or Codex CLI.
+    /// Launch OpenCode in the current directory via Liftgate with zero project/global file side effects.
+    #[command(visible_alias = "oc", after_help = OPENCODE_AFTER_HELP)]
+    Opencode(OpencodeArgs),
+
+    /// Generate, update, or uninstall project-local or global configuration files for Claude Code, Codex CLI, and/or OpenCode.
     #[command(visible_aliases = ["setup", "cfg"])]
     Config(ConfigArgs),
 
-    /// Diagnose `agy`, `claude`, `codex`, embedded Web UI, and live gateway readiness.
+    /// Diagnose `agy`, `claude`, `codex`, `opencode`, embedded Web UI, and live gateway readiness.
     #[command(visible_alias = "doc")]
     Doctor(DoctorArgs),
 
@@ -1233,22 +1252,87 @@ impl CodexAppArgs {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum ConfigTarget {
-    /// Configure both Claude Code and Codex CLI.
+    /// Configure Claude Code, Codex CLI, and OpenCode.
     #[default]
     All,
     /// Configure Claude Code (`.claude/settings.local.json` or `~/.claude/settings.json`).
     Claude,
     /// Configure Codex CLI (`.codex/config.toml` + `agy-models.json` or `~/.codex/...`).
     Codex,
+    /// Configure OpenCode (`./opencode.json` or `~/.config/opencode/opencode.json`).
+    #[value(alias = "oc")]
+    Opencode,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OpencodeArgs {
+    /// Target gateway socket address (auto-starts background gateway if offline).
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+
+    /// Optional gateway API key.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Primary Antigravity model ID override for this session.
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// Fast/title model override (`small_model` / `agents.title.model`).
+    #[arg(long)]
+    pub fast_model: Option<String>,
+
+    /// Keep OpenCode's standard permission prompts instead of auto-allowing tool permissions.
+    #[arg(long)]
+    pub no_bypass: bool,
+
+    /// Enable OpenCode's experimental full Code Mode (`OPENCODE_FLAGS=full_codemode`) for all built-in tools.
+    #[arg(
+        long,
+        visible_alias = "code-mode-only",
+        conflicts_with = "no_code_mode"
+    )]
+    pub full_code_mode: bool,
+
+    /// Disable OpenCode Code Mode (`execute: deny`) so all MCP and namespace tools run as direct tool calls.
+    #[arg(long, conflicts_with = "full_code_mode")]
+    pub no_code_mode: bool,
+
+    /// Explicit path to `opencode` executable.
+    #[arg(long, env = "OPENCODE_BIN")]
+    pub opencode_bin: Option<PathBuf>,
+
+    /// Arguments forwarded verbatim to `opencode` (works with or without `--`).
+    #[arg(last = true, value_name = "OPENCODE_ARGS")]
+    pub passthrough_args: Vec<String>,
+}
+
+impl OpencodeArgs {
+    #[must_use]
+    pub fn default_interactive() -> Self {
+        Self {
+            listen: None,
+            api_key: None,
+            model: None,
+            fast_model: None,
+            no_bypass: false,
+            full_code_mode: false,
+            no_code_mode: false,
+            opencode_bin: std::env::var_os("OPENCODE_BIN")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            passthrough_args: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct ConfigArgs {
-    /// Target CLI harness to configure (`all`, `claude`, or `codex`).
+    /// Target CLI harness to configure (`all`, `claude`, `codex`, or `opencode`).
     #[arg(value_enum, default_value_t = ConfigTarget::All)]
     pub target: ConfigTarget,
 
-    /// Write to user-global config (`~/.claude/settings.json`, `~/.codex/config.toml`) instead of current project.
+    /// Write to user-global config (`~/.claude/settings.json`, `~/.codex/config.toml`, `~/.config/opencode/opencode.json`) instead of current project.
     #[arg(short = 'g', long)]
     pub global: bool,
 
@@ -1424,6 +1508,7 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
         match kind {
             HarnessSubcommand::Claude => rewrite_claude_session_aliases(&mut child_args),
             HarnessSubcommand::Codex => rewrite_codex_session_aliases(&mut child_args),
+            HarnessSubcommand::Opencode => rewrite_opencode_session_aliases(&mut child_args),
             HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => {}
         }
     }
@@ -1446,6 +1531,7 @@ enum HarnessSubcommand {
     ClaudeDesktop,
     Codex,
     CodexApp,
+    Opencode,
 }
 
 impl HarnessSubcommand {
@@ -1455,6 +1541,7 @@ impl HarnessSubcommand {
             "claude-desktop" | "cd" | "claude-app" => Some(Self::ClaudeDesktop),
             "codex" | "cx" | "x" => Some(Self::Codex),
             "codex-app" | "cxa" | "codex-desktop" => Some(Self::CodexApp),
+            "opencode" | "oc" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -1463,6 +1550,7 @@ impl HarnessSubcommand {
 fn detect_desktop_mode(kind: HarnessSubcommand, pre_dd: &[OsString]) -> bool {
     match kind {
         HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => true,
+        HarnessSubcommand::Opencode => false,
         HarnessSubcommand::Codex => pre_dd
             .iter()
             .any(|t| matches!(t.to_str(), Some("--app" | "--desktop"))),
@@ -1516,6 +1604,15 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--model",
             "--codex-bin",
             "--codex-app-bin",
+        ],
+        HarnessSubcommand::Opencode => &[
+            "--state-dir",
+            "--listen",
+            "--api-key",
+            "-m",
+            "--model",
+            "--fast-model",
+            "--opencode-bin",
         ],
     }
 }
@@ -1571,6 +1668,12 @@ fn harness_bool_flags(kind: HarnessSubcommand, is_desktop_mode: bool) -> &'stati
             }
         }
         HarnessSubcommand::ClaudeDesktop => &["--restart-app", "--restore", "-w", "--wait"],
+        HarnessSubcommand::Opencode => &[
+            "--no-bypass",
+            "--full-code-mode",
+            "--code-mode-only",
+            "--no-code-mode",
+        ],
     }
 }
 
@@ -1632,6 +1735,25 @@ fn native_single_value_flags(kind: HarnessSubcommand) -> &'static [&'static str]
             "--settings",
             "--system-prompt",
             "--system-prompt-snapshot",
+        ],
+        HarnessSubcommand::Opencode => &[
+            "-s",
+            "--session",
+            "--prompt",
+            "--server",
+            "--url",
+            "--agent",
+            "--format",
+            "-f",
+            "--file",
+            "--title",
+            "--directory",
+            "--method",
+            "--answer",
+            "--header",
+            "--env",
+            "-n",
+            "--max-count",
         ],
         HarnessSubcommand::ClaudeDesktop | HarnessSubcommand::CodexApp => &[],
     }
@@ -1730,6 +1852,56 @@ fn rewrite_claude_session_aliases(child_args: &mut Vec<OsString>) {
             _ => {
                 child_args.push(OsString::from("--resume"));
                 child_args.push(OsString::from("--fork-session"));
+                child_args.extend(tail);
+            }
+        },
+        _ => {}
+    }
+}
+
+fn rewrite_opencode_session_aliases(child_args: &mut Vec<OsString>) {
+    let is_alias = matches!(
+        child_args.first().and_then(|s| s.to_str()),
+        Some("resume" | "continue")
+    );
+    if !is_alias {
+        return;
+    }
+    let tail = child_args.split_off(1);
+    let first_owned = child_args.pop().unwrap_or_default();
+    let Some(first) = first_owned.to_str() else {
+        return;
+    };
+    let second = tail.first().and_then(|s| s.to_str());
+    match first {
+        "continue" => {
+            if !matches!(second, Some("-h" | "--help")) {
+                child_args.push(OsString::from("--continue"));
+            }
+            child_args.extend(tail);
+        }
+        "resume" => match second {
+            Some("-h" | "--help") => {
+                child_args.extend(tail);
+            }
+            None => {
+                child_args.push(OsString::from("--continue"));
+            }
+            Some("--last") => {
+                child_args.push(OsString::from("--continue"));
+                if let Some(after_last) = tail.get(1..) {
+                    child_args.extend_from_slice(after_last);
+                }
+            }
+            Some(target) if !target.starts_with('-') => {
+                child_args.push(OsString::from("--session"));
+                child_args.push(OsString::from(target));
+                if let Some(after_target) = tail.get(1..) {
+                    child_args.extend_from_slice(after_target);
+                }
+            }
+            _ => {
+                child_args.push(OsString::from("--continue"));
                 child_args.extend(tail);
             }
         },
@@ -2226,5 +2398,40 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        // OpenCode (`lg oc` / `lg opencode`) argument hoisting & session aliases
+        let oc_run = parse_strs(&[
+            "lg",
+            "oc",
+            "run",
+            "fix failing tests",
+            "-m",
+            "gemini-4-carbon-high",
+            "--full-code-mode",
+        ]);
+        match oc_run.command {
+            Some(Commands::Opencode(oc)) => {
+                assert_eq!(oc.model.as_deref(), Some("gemini-4-carbon-high"));
+                assert!(oc.full_code_mode);
+                assert!(!oc.no_code_mode);
+                assert_eq!(oc.passthrough_args, vec!["run", "fix failing tests"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let oc_resume_id = parse_strs(&["lg", "oc", "resume", "ses_42"]);
+        assert!(matches!(
+            oc_resume_id.command,
+            Some(Commands::Opencode(oc)) if oc.passthrough_args == vec!["--session", "ses_42"]
+        ));
+        let oc_continue = parse_strs(&["lg", "opencode", "continue"]);
+        assert!(matches!(
+            oc_continue.command,
+            Some(Commands::Opencode(oc)) if oc.passthrough_args == vec!["--continue"]
+        ));
+        let cfg_oc = parse_strs(&["lg", "config", "opencode", "--global"]);
+        assert!(matches!(
+            cfg_oc.command,
+            Some(Commands::Config(c)) if c.target == ConfigTarget::Opencode && c.global
+        ));
     }
 }

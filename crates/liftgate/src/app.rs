@@ -15,7 +15,7 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs,
         ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs, DoctorArgs,
-        ModelsArgs, RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs,
+        ModelsArgs, OpencodeArgs, RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs, UpgradeArgs,
         invoked_bin_name, normalize_harness_args,
     },
     daemon, desktop,
@@ -152,6 +152,7 @@ async fn dispatch(
         }
         Some(Commands::Codex(args)) => render::run_codex_cli(&state_paths, args).await,
         Some(Commands::CodexApp(args)) => render::run_codex_app_cli(&state_paths, args).await,
+        Some(Commands::Opencode(args)) => render::run_opencode_cli(&state_paths, args).await,
         Some(Commands::InternalDesktopWatch(args)) => {
             desktop::run_desktop_watch(args).await?;
             Ok(0)
@@ -218,6 +219,9 @@ async fn dispatch_cockpit_action(
         }
         CockpitAction::LaunchClaude => {
             render::run_claude_cli(state_paths, ClaudeArgs::default_interactive()).await
+        }
+        CockpitAction::LaunchOpenCode => {
+            render::run_opencode_cli(state_paths, OpencodeArgs::default_interactive()).await
         }
         CockpitAction::LaunchCodexApp => {
             render::run_codex_app_cli(state_paths, CodexAppArgs::default_interactive()).await

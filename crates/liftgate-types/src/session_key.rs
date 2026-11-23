@@ -543,7 +543,8 @@ pub fn materialize_system_prompt_into_messages(
 }
 
 /// Returns `true` when an `instructions` / `system` string is a harness compaction prompt
-/// (such as OpenAI Codex's `CONTEXT CHECKPOINT COMPACTION` or Claude Code's `/compact` prompt).
+/// (such as OpenAI Codex's `CONTEXT CHECKPOINT COMPACTION`, Claude Code's `/compact` prompt,
+/// or OpenCode's session compaction summary prompt).
 #[must_use]
 pub fn is_compaction_instructions_prompt(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -552,6 +553,9 @@ pub fn is_compaction_instructions_prompt(text: &str) -> bool {
         || (lower.contains("compaction") && lower.contains("another language model"))
         || lower.contains("create a detailed summary of the conversation so far")
         || lower.contains("tasked with summarizing conversations")
+        || lower.contains("provide a detailed prompt for continuing our conversation above")
+        || (lower.contains("summarize only what the user and the assistant said and did")
+            && lower.contains("## work state"))
 }
 
 /// Detects whether an incoming turn is a local context-compaction summarization request
@@ -830,7 +834,7 @@ const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
 #[must_use]
 pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
     matches!(tool.kind, CanonicalToolKind::Custom { .. })
-        && (tool.name == "exec" || tool.name.ends_with(".exec"))
+        && (matches!(tool.name.as_str(), "exec" | "execute") || tool.name.ends_with(".exec"))
 }
 
 /// Splits a tool description into its primary prose and an optional trailing Codex Code Mode
@@ -861,6 +865,13 @@ pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
         return true;
     }
     if is_code_mode_custom_exec(tool) {
+        return true;
+    }
+    if tool.name == "execute"
+        && tool.description.as_deref().is_some_and(|desc| {
+            desc.contains("Code Mode runtime") || desc.contains("Code Mode catalog")
+        })
+    {
         return true;
     }
     tool.description.as_deref().is_some_and(|desc| {

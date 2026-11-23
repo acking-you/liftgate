@@ -66,6 +66,13 @@ impl VirtualizerBudget {
         ..Self::DEFAULT_AGY_ACP
     };
 
+    /// Budget tuned for OpenCode (`execute` `@opencode/codemode` orchestrator + lowercase core
+    /// coding primitives + `opencode_*`/`automation_*`/`<server>_*` hubs).
+    pub const OPENCODE_AGY_ACP: Self = Self {
+        max_direct_core_tools: 12,
+        ..Self::DEFAULT_AGY_ACP
+    };
+
     /// Compile-time invariant check relating all budget thresholds.
     pub const fn assert_valid(&self) {
         assert!(
@@ -98,3 +105,4 @@ impl VirtualizerBudget {
 const _: () = VirtualizerBudget::DEFAULT_AGY_ACP.assert_valid();
 const _: () = VirtualizerBudget::CODEX_AGY_ACP.assert_valid();
 const _: () = VirtualizerBudget::CLAUDE_CODE_AGY_ACP.assert_valid();
+const _: () = VirtualizerBudget::OPENCODE_AGY_ACP.assert_valid();

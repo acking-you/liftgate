@@ -89,7 +89,8 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         if is_code_mode_custom_exec(spec) || spec.name.eq_ignore_ascii_case("js_repl") {
             return ("code", crate::schema::code_mode_exec_input_schema());
         }
-        if spec.name.eq_ignore_ascii_case("apply_patch") {
+        if spec.name.eq_ignore_ascii_case("apply_patch") || spec.name.eq_ignore_ascii_case("patch")
+        {
             return ("patch", crate::schema::apply_patch_input_schema());
         }
         ("input", crate::schema::freeform_custom_input_schema())
@@ -114,6 +115,7 @@ pub enum ProtocolHint {
 pub enum DetectedHarness {
     Codex,
     ClaudeCode,
+    OpenCode,
     Generic,
 }
 
@@ -123,6 +125,7 @@ impl DetectedHarness {
         match self {
             Self::Codex => crate::profiles::CodexToolProfile::ID,
             Self::ClaudeCode => crate::profiles::ClaudeCodeToolProfile::ID,
+            Self::OpenCode => crate::profiles::OpenCodeToolProfile::ID,
             Self::Generic => crate::profiles::GenericToolProfile::ID,
         }
     }
@@ -133,10 +136,11 @@ impl DetectedHarness {
 pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) -> DetectedHarness {
     let mut codex_score: u32 = 0;
     let mut claude_score: u32 = 0;
+    let mut opencode_score: u32 = 0;
 
     for spec in client_tools {
         let name = spec.name.as_str();
-        if is_code_mode_custom_exec(spec)
+        if (is_code_mode_custom_exec(spec) && name != "execute")
             || matches!(
                 name,
                 "exec_command"
@@ -207,12 +211,44 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
         ) {
             claude_score = claude_score.saturating_add(2);
         }
+
+        if matches!(
+            name,
+            "execute"
+                | "subagent"
+                | "question"
+                | "webfetch"
+                | "websearch"
+                | "todowrite"
+                | "todoread"
+                | "codesearch"
+                | "multiedit"
+                | "patch"
+        ) || name.starts_with("opencode_")
+            || name.starts_with("opencode.")
+            || name.starts_with("automation_")
+            || name.starts_with("machine_")
+            || spec
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Code Mode runtime") || d.contains("Code Mode catalog"))
+        {
+            opencode_score = opencode_score.saturating_add(4);
+        } else if matches!(
+            name,
+            "shell" | "bash" | "read" | "edit" | "write" | "glob" | "grep" | "skill" | "lsp"
+        ) {
+            opencode_score = opencode_score.saturating_add(2);
+        }
     }
 
-    if codex_score > claude_score {
+    if opencode_score > codex_score && opencode_score > claude_score {
+        return DetectedHarness::OpenCode;
+    }
+    if codex_score > claude_score && codex_score >= opencode_score && codex_score > 0 {
         return DetectedHarness::Codex;
     }
-    if claude_score > codex_score {
+    if claude_score > codex_score && claude_score >= opencode_score && claude_score > 0 {
         return DetectedHarness::ClaudeCode;
     }
 
@@ -299,6 +335,9 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
     let mut counts: HashMap<String, usize> = HashMap::new();
     for spec in tools {
         let name = spec.name.as_str();
+        if matches!(name, "todowrite" | "todoread") {
+            *counts.entry("todo_pair".to_owned()).or_insert(0) += 1;
+        }
         if let Some(after_mcp) = name.strip_prefix("mcp__") {
             if split_mcp_server_and_action(after_mcp).is_none()
                 && let Some((srv, rest)) = after_mcp.split_once('_')
@@ -314,7 +353,7 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
             continue;
         }
         if let Some((stem, rest)) = name.split_once('_')
-            && stem.len() >= 3
+            && stem.len() >= 2
             && !rest.is_empty()
         {
             let key = stem.to_ascii_lowercase();

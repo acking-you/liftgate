@@ -25,8 +25,9 @@
 
 Liftgate puts Google Antigravity behind standard OpenAI Responses and Anthropic
 Messages APIs on your machine. Keep using Codex CLI, Codex App, Claude Code,
-Claude Desktop, or your own SDK code unchanged — Liftgate answers them locally
-and runs every turn exclusively through the official `agy acp` interface.
+Claude Desktop, OpenCode, or your own SDK code unchanged — Liftgate answers
+them locally and runs every turn exclusively through the official `agy acp`
+interface.
 
 Run it from the terminal with **`lg`** / **`liftgate`** (CLI + full-screen TUI +
 embedded Web observability dashboard).
@@ -35,10 +36,11 @@ embedded Web observability dashboard).
 
 <table>
   <tr>
-    <td align="center" width="25%"><a href="docs/usage.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI &amp; App</b></a><br><sub>OpenAI Responses</sub></td>
-    <td align="center" width="25%"><a href="docs/usage.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code &amp; Desktop</b></a><br><sub>Anthropic Messages</sub></td>
-    <td align="center" width="25%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDKs</b></a><br><sub><code>/v1/responses</code></sub></td>
-    <td align="center" width="25%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDKs</b></a><br><sub><code>/v1/messages</code></sub></td>
+    <td align="center" width="20%"><a href="docs/usage.md#codex-cli"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>Codex CLI &amp; App</b></a><br><sub>OpenAI Responses</sub></td>
+    <td align="center" width="20%"><a href="docs/usage.md#claude-code"><img src="assets/readme/claude.svg" width="36" alt=""><br><b>Claude Code &amp; Desktop</b></a><br><sub>Anthropic Messages</sub></td>
+    <td align="center" width="20%"><a href="docs/usage.md#opencode"><img src="assets/readme/opencode.svg" width="36" alt=""><br><b>OpenCode</b></a><br><sub><code>lg oc</code> · Code Mode</sub></td>
+    <td align="center" width="20%"><a href="docs/api.md#openai-responses"><img src="assets/readme/openai.svg" width="36" alt=""><br><b>OpenAI SDKs</b></a><br><sub><code>/v1/responses</code></sub></td>
+    <td align="center" width="20%"><a href="docs/api.md#anthropic-messages"><img src="assets/readme/anthropic.svg" width="36" alt=""><br><b>Anthropic SDKs</b></a><br><sub><code>/v1/messages</code></sub></td>
   </tr>
 </table>
 
@@ -102,6 +104,8 @@ lg cxa                                  # launch Codex App across Win/macOS/Linu
 lg cc                                   # launch Claude Code in current dir (0 side effects on exit)
 lg cc -r                                # browse & resume Claude sessions (`lg cc resume`, `-c`, `fork`, `agents`)
 lg cd                                   # launch Claude Desktop across Win/macOS/Linux (auto-restores on exit)
+lg oc                                   # launch OpenCode in current dir (0 side effects on exit)
+lg oc -c                                # continue latest OpenCode session (`-s <ID>`, `--full-code-mode`, `run`)
 ```
 
 Monitor live traffic, hot-switch models, or sync persistent configs from anywhere:
@@ -112,7 +116,7 @@ lg top                   # full-screen real-time terminal dashboard (turns, pool
 lg m -i                  # interactively filter & hot-switch default Antigravity model
 lg up --open             # start background gateway + open embedded Web dashboard
 lg st                    # health, PID, session pool, token metrics & active turns
-lg cfg -g                # losslessly merge ~/.claude & ~/.codex configs (--uninstall to remove)
+lg cfg -g                # losslessly merge ~/.claude, ~/.codex & ~/.config/opencode (--uninstall to remove)
 lg upgrade               # check GitHub Releases (--check) & self-upgrade `lg` + `liftgate`
 lg down                  # gracefully stop the background gateway
 ```
@@ -134,12 +138,13 @@ well. Full command reference and SDK examples:
 - **Two standard APIs** — OpenAI Responses and Anthropic Messages, streamed,
   with tool calls, thinking, images and token counting ([API](docs/api.md)).
 - **Your agent keeps the tools** — ACP sessions run in an empty directory with
-  no MCP servers, so file edits and shell commands stay in Codex or Claude
-  Code; web search and an SSRF-safe web fetch run in the gateway
+  no host workspace access, so file edits and shell commands stay in Codex,
+  Claude Code, or OpenCode; web search and an SSRF-safe web fetch run in the
+  gateway
   ([inference-only sessions](docs/architecture.md#inference-only-sessions)).
 - **Warm sessions** — each request's history is matched to a pooled ACP
   session and only the new turn is sent ([session reuse](docs/architecture.md#session-reuse)).
-- **Verified context windows** — Codex and Claude Code compact cleanly within
+- **Verified context windows** — Codex, Claude Code, and OpenCode compact cleanly within
   empirically verified ACP session windows (`500k / 425k` for Gemini, safely
   below Antigravity's `524,288`-token internal compaction threshold) with
   single-turn prompts and zero synthetic replay turns ([context policy](docs/usage.md#context-windows)).
@@ -171,7 +176,7 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 | | |
 | --- | --- |
-| **Use** | [Usage guide](docs/usage.md) · [Codex CLI](docs/usage.md#codex-cli) · [Claude Code](docs/usage.md#claude-code) · [Dashboard](docs/usage.md#dashboard) · [Flags](docs/usage.md#flags-and-environment) |
+| **Use** | [Usage guide](docs/usage.md) · [Codex CLI](docs/usage.md#codex-cli) · [Claude Code](docs/usage.md#claude-code) · [OpenCode](docs/usage.md#opencode) · [Dashboard](docs/usage.md#dashboard) · [Flags](docs/usage.md#flags-and-environment) |
 | **Reference** | [API](docs/api.md) · [Architecture](docs/architecture.md) |
 | **Project** | [Changelog](CHANGELOG.md) · [Rust standard](docs/2026-11-09-RUST.md) · [AGENTS.md](AGENTS.md) |
 

@@ -23,7 +23,7 @@ use crate::cli::{
 use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
 use crate::config_sync::resolve_fast_model;
 use crate::error::{CliError, DaemonStopError, GatewayTransportError};
-use crate::harness::{resolve_claude_command, resolve_codex_command};
+use crate::harness::{resolve_claude_command, resolve_codex_command, resolve_opencode_command};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
@@ -1048,6 +1048,20 @@ pub async fn inspect_doctor(
             status: "optional",
             tone: ReportTone::Muted,
             detail: "not detected in PATH (`npm i -g @openai/codex`)".to_owned(),
+        }),
+    }
+    match resolve_opencode_command(None) {
+        Ok(cmd) => checks.push(DoctorCheckItem {
+            name: "OpenCode CLI",
+            status: "found",
+            tone: ReportTone::Ok,
+            detail: cmd.program.display().to_string(),
+        }),
+        Err(_) => checks.push(DoctorCheckItem {
+            name: "OpenCode CLI",
+            status: "optional",
+            tone: ReportTone::Muted,
+            detail: "not detected in PATH (`npm i -g opencode-ai`)".to_owned(),
         }),
     }
     match crate::desktop::resolve_claude_desktop(None) {

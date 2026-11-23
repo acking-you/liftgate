@@ -131,7 +131,7 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | Path | Owns |
 | --- | --- |
 | `crates/liftgate-types` | protocol, wire and config types: no async runtime, HTTP or I/O |
-| `crates/liftgate-tool-virtualizer` | zero-cost, trait-driven (`HarnessToolProfile`) 3-tier MCP tool virtualizer, `CodexToolProfile` & `ClaudeCodeToolProfile` adapters, slack-slot backfill, 0-RTT search index, and preflight validator: no async runtime, HTTP or I/O |
+| `crates/liftgate-tool-virtualizer` | zero-cost, trait-driven (`HarnessToolProfile`) 3-tier MCP tool virtualizer, `CodexToolProfile`, `ClaudeCodeToolProfile` & `OpenCodeToolProfile` adapters, slack-slot backfill, 0-RTT search index, and preflight validator: no async runtime, HTTP or I/O |
 | `crates/liftgate-server` | HTTP/SSE routes, ACP transport, `SessionPool`, process supervision, `web_fetch`, telemetry |
 | `crates/liftgate-core` | shared control-plane library: daemon lifecycle, embedded `web/dist` assets, HTTP/SSE client, `agy` & proxy manager, zero-side-effect CLI/GUI launchers, system terminal spawner, non-destructive `config` sync, and verified self-upgrade |
 | `crates/liftgate` | the `liftgate` / `lg` CLI and interactive `ratatui` TUI binaries |

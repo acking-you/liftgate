@@ -16,7 +16,7 @@ use crate::{
         DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement,
         count_fallback_prefix_stems, detect_harness,
     },
-    profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile},
+    profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OpenCodeToolProfile},
     router::McpRoutingTable,
     schema::{
         McpBridgedTool, McpWireTool, code_mode_exec_input_schema, estimate_wire_tool_bytes,
@@ -96,6 +96,12 @@ pub fn partition_tools_for_mcp_session<S: TruncationSpillSink>(
             enable_gateway_web_fetch,
             spill,
         ),
+        DetectedHarness::OpenCode => plan_virtualization_with_options(
+            OpenCodeToolProfile,
+            client_tools,
+            enable_gateway_web_fetch,
+            spill,
+        ),
         DetectedHarness::Generic => plan_virtualization_with_options(
             GenericToolProfile,
             client_tools,
@@ -118,6 +124,9 @@ pub fn partition_tools_for_harness<S: TruncationSpillSink>(
         }
         DetectedHarness::ClaudeCode => {
             plan_virtualization_with_options(ClaudeCodeToolProfile, client_tools, false, spill)
+        }
+        DetectedHarness::OpenCode => {
+            plan_virtualization_with_options(OpenCodeToolProfile, client_tools, false, spill)
         }
         DetectedHarness::Generic => {
             plan_virtualization_with_options(GenericToolProfile, client_tools, false, spill)

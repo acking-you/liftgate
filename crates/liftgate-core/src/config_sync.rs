@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use liftgate_server::platform::{canonicalize_clean, merge_loopback_no_proxy};
 use liftgate_types::{
-    config::ModelId,
+    config::{DEFAULT_TURN_TIMEOUT_SECS, ModelId},
     model::{context_limits, resolve_model_id, select_fastest_gemini_model},
     openai::{build_codex_model_catalog_with_tool_mode, codex_truncation_limit_bytes},
 };
@@ -53,7 +53,15 @@ pub struct ConfigSyncInspection {
     pub codex_exists: bool,
     pub codex_managed: bool,
     pub codex_model: Option<String>,
+    pub opencode_path: PathBuf,
+    pub opencode_exists: bool,
+    pub opencode_managed: bool,
+    pub opencode_model: Option<String>,
 }
+
+pub const OPENCODE_PROVIDER_ID: &str = "agy";
+const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+const OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
 const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -125,6 +133,16 @@ pub struct HarnessSyncParams {
     pub no_bypass: bool,
     pub no_code_mode: bool,
     pub discovered_models: Vec<DiscoveredModel>,
+}
+
+/// Strips a leading `agy/` provider prefix if the caller supplied `agy/<model>` instead of `<model>`.
+#[must_use]
+pub fn strip_agy_provider_prefix(model: &str) -> &str {
+    let trimmed = model.trim();
+    trimmed
+        .strip_prefix("agy/")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(trimmed)
 }
 
 /// Resolves the fast/subagent model from the discovered live
@@ -559,6 +577,285 @@ pub fn uninstall_claude_config(target_path: &Path) -> Result<bool, CliError> {
     Ok(true)
 }
 
+/// Builds a complete OpenCode JSON configuration object compatible with both OpenCode v1.x and
+/// OpenCode v2.x (`ConfigNormalize` zero-diagnostic subset; used for `OPENCODE_CONFIG_CONTENT`
+/// and non-destructive `opencode.json` sync).
+#[must_use]
+pub fn build_opencode_config_map(
+    params: &HarnessSyncParams,
+    v2_runtime: bool,
+) -> Map<String, Value> {
+    let mut out = Map::new();
+    merged_opencode_config_into(&mut out, params, v2_runtime);
+    out
+}
+
+/// Non-destructively merges Liftgate's `agy` provider, calibrated context limits, default model
+/// selection, and permission / Code Mode policy into an existing OpenCode JSON object.
+pub fn merged_opencode_config_into(
+    existing: &mut Map<String, Value>,
+    params: &HarnessSyncParams,
+    v2_runtime: bool,
+) {
+    if !existing.contains_key("$schema") {
+        existing.insert(
+            "$schema".to_owned(),
+            Value::String(OPENCODE_SCHEMA_URL.to_owned()),
+        );
+    }
+
+    let primary = strip_agy_provider_prefix(&params.primary_model);
+    let fast = strip_agy_provider_prefix(&params.fast_model);
+    existing.insert(
+        "model".to_owned(),
+        Value::String(format!("{OPENCODE_PROVIDER_ID}/{primary}")),
+    );
+    existing.insert(
+        "small_model".to_owned(),
+        Value::String(format!("{OPENCODE_PROVIDER_ID}/{fast}")),
+    );
+
+    // Prevent v2 `ConfigNormalize` duplicate provider diagnostics if `providers.agy` also exists.
+    if let Some(Value::Object(v2_providers)) = existing.get_mut("providers") {
+        v2_providers.remove(OPENCODE_PROVIDER_ID);
+        if v2_providers.is_empty() {
+            existing.remove("providers");
+        }
+    }
+
+    let mut models_map = Map::new();
+    for dm in &params.discovered_models {
+        let (window, _) = dm.context_limits();
+        let display_name = if dm.display_name.is_empty() {
+            dm.id.as_str()
+        } else {
+            dm.display_name.as_str()
+        };
+        models_map.insert(dm.id.clone(), opencode_model_entry(display_name, window));
+    }
+    for required_id in [primary, fast] {
+        if !models_map.contains_key(required_id) {
+            let (window, _) = context_limits(required_id);
+            models_map.insert(
+                required_id.to_owned(),
+                opencode_model_entry(required_id, window),
+            );
+        }
+    }
+
+    let base_v1_url = format!("{}/v1", params.gateway_base_url.trim_end_matches('/'));
+    let timeout_ms = DEFAULT_TURN_TIMEOUT_SECS.saturating_mul(1_000);
+    let agy_provider = json!({
+        "npm": "@ai-sdk/anthropic",
+        "name": "Antigravity (Liftgate)",
+        "options": {
+            "baseURL": base_v1_url,
+            "apiKey": params.api_key,
+            "timeout": timeout_ms,
+        },
+        "models": Value::Object(models_map),
+    });
+
+    let provider_entry = existing
+        .entry("provider".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !provider_entry.is_object() {
+        *provider_entry = Value::Object(Map::new());
+    }
+    if let Value::Object(provider_map) = provider_entry {
+        provider_map.insert(OPENCODE_PROVIDER_ID.to_owned(), agy_provider);
+    }
+
+    apply_opencode_permission_policy(existing, params.no_bypass, params.no_code_mode);
+
+    if v2_runtime {
+        let compaction_entry = existing
+            .entry("compaction".to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !compaction_entry.is_object() {
+            *compaction_entry = Value::Object(Map::new());
+        }
+        if let Value::Object(comp_map) = compaction_entry {
+            comp_map
+                .entry("auto".to_owned())
+                .or_insert(Value::Bool(true));
+            comp_map.insert("background".to_owned(), Value::Bool(false));
+        }
+    }
+}
+
+fn opencode_model_entry(display_name: &str, context_window: u64) -> Value {
+    json!({
+        "name": display_name,
+        "tool_call": true,
+        "limit": {
+            "context": context_window,
+            "output": OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS,
+        },
+        "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"],
+        },
+    })
+}
+
+fn apply_opencode_permission_policy(
+    existing: &mut Map<String, Value>,
+    no_bypass: bool,
+    no_code_mode: bool,
+) {
+    if no_bypass && !no_code_mode {
+        if let Some(Value::Object(perm_map)) = existing.get_mut("permission") {
+            if perm_map.get("*").and_then(Value::as_str) == Some("allow") {
+                perm_map.remove("*");
+            }
+            if perm_map.get("execute").and_then(Value::as_str) == Some("deny") {
+                perm_map.remove("execute");
+            }
+            if perm_map.is_empty() {
+                existing.remove("permission");
+            }
+        }
+        return;
+    }
+
+    let next_perms = match existing.remove("permission") {
+        Some(Value::Object(mut m)) => {
+            m.remove("*");
+            m.remove("execute");
+            m
+        }
+        Some(Value::String(s)) if !s.is_empty() && no_bypass => {
+            let mut m = Map::new();
+            m.insert("*".to_owned(), Value::String(s));
+            m
+        }
+        _ => Map::new(),
+    };
+
+    // OpenCode evaluates permission entries in last-match-wins order: insert `"*"` first, then
+    // any user-preserved rules, and finally `"execute": "deny"` when `--no-code-mode` is active.
+    let mut ordered = Map::new();
+    if !no_bypass {
+        ordered.insert("*".to_owned(), Value::String("allow".to_owned()));
+    }
+    for (k, v) in next_perms {
+        ordered.insert(k, v);
+    }
+    if no_code_mode {
+        ordered.insert("execute".to_owned(), Value::String("deny".to_owned()));
+    }
+    if !ordered.is_empty() {
+        existing.insert("permission".to_owned(), Value::Object(ordered));
+    }
+}
+
+pub fn strip_opencode_config(existing: &mut Map<String, Value>) {
+    let prefix = format!("{OPENCODE_PROVIDER_ID}/");
+    for key in ["model", "small_model"] {
+        let managed = existing
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with(&prefix));
+        if managed {
+            existing.remove(key);
+        }
+    }
+    for prov_key in ["provider", "providers"] {
+        if let Some(Value::Object(prov_map)) = existing.get_mut(prov_key) {
+            prov_map.remove(OPENCODE_PROVIDER_ID);
+            if prov_map.is_empty() {
+                existing.remove(prov_key);
+            }
+        }
+    }
+    if let Some(Value::Object(perm_map)) = existing.get_mut("permission") {
+        if perm_map.get("*").and_then(Value::as_str) == Some("allow") {
+            perm_map.remove("*");
+        }
+        if perm_map.get("execute").and_then(Value::as_str) == Some("deny") {
+            perm_map.remove("execute");
+        }
+        if perm_map.is_empty() {
+            existing.remove("permission");
+        }
+    }
+    if existing.len() == 1
+        && existing.get("$schema").and_then(Value::as_str) == Some(OPENCODE_SCHEMA_URL)
+    {
+        existing.remove("$schema");
+    }
+}
+
+pub fn resolve_opencode_config_path(
+    global: bool,
+    project_dir: Option<&Path>,
+) -> Result<PathBuf, CliError> {
+    if global {
+        if let Some(dir) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|s| !s.is_empty()) {
+            return Ok(PathBuf::from(dir).join("opencode.json"));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+            return Ok(PathBuf::from(xdg).join("opencode").join("opencode.json"));
+        }
+        Ok(user_home_dir()?
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json"))
+    } else {
+        let base = resolve_base_dir(project_dir)?;
+        Ok(base.join("opencode.json"))
+    }
+}
+
+pub fn write_or_update_opencode_config(
+    target_path: &Path,
+    params: &HarnessSyncParams,
+    print_only: bool,
+) -> Result<String, CliError> {
+    let mut map = read_existing_json_object(target_path)?;
+    merged_opencode_config_into(&mut map, params, false);
+    let mut rendered = serde_json::to_string_pretty(&Value::Object(map)).map_err(|source| {
+        CliError::StateJson {
+            path: target_path.to_path_buf(),
+            source,
+        }
+    })?;
+    rendered.push('\n');
+    if !print_only {
+        backup_once_if_exists(target_path)?;
+        write_file_atomic(target_path, rendered.as_bytes(), true)?;
+    }
+    Ok(rendered)
+}
+
+pub fn uninstall_opencode_config(target_path: &Path) -> Result<bool, CliError> {
+    if !target_path.exists() {
+        return Ok(false);
+    }
+    let mut map = read_existing_json_object(target_path)?;
+    strip_opencode_config(&mut map);
+    if map.is_empty() {
+        fs::remove_file(target_path).map_err(|source| CliError::StateIo {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+        if let Some(parent) = target_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    } else {
+        let mut rendered = serde_json::to_string_pretty(&Value::Object(map)).map_err(|source| {
+            CliError::StateJson {
+                path: target_path.to_path_buf(),
+                source,
+            }
+        })?;
+        rendered.push('\n');
+        write_file_atomic(target_path, rendered.as_bytes(), true)?;
+    }
+    Ok(true)
+}
+
 /// Builds fallback Codex model catalog bytes when the gateway is not queried, with an optional
 /// `tool_mode` override (`None` defaults to `"code_mode"`).
 pub fn build_offline_codex_catalog_bytes_with_mode(
@@ -934,6 +1231,26 @@ pub fn inspect_config_sync(
         (!val.is_empty()).then(|| val.to_owned())
     });
 
+    let opencode_path = resolve_opencode_config_path(global, project_dir)?;
+    let opencode_exists = opencode_path.is_file();
+    let opencode_obj = if opencode_exists {
+        read_existing_json_object(&opencode_path).unwrap_or_default()
+    } else {
+        Map::new()
+    };
+    let opencode_managed = opencode_obj
+        .get("provider")
+        .and_then(Value::as_object)
+        .is_some_and(|p| p.contains_key(OPENCODE_PROVIDER_ID))
+        || opencode_obj
+            .get("providers")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key(OPENCODE_PROVIDER_ID));
+    let opencode_model = opencode_obj
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
     Ok(ConfigSyncInspection {
         global,
         claude_path,
@@ -946,6 +1263,10 @@ pub fn inspect_config_sync(
         codex_exists,
         codex_managed,
         codex_model,
+        opencode_path,
+        opencode_exists,
+        opencode_managed,
+        opencode_model,
     })
 }
 
@@ -955,7 +1276,8 @@ pub async fn execute_config_sync(
 ) -> Result<ConfigSyncOutcome, CliError> {
     let want_claude = matches!(args.target, ConfigTarget::All | ConfigTarget::Claude);
     let want_codex = matches!(args.target, ConfigTarget::All | ConfigTarget::Codex);
-    let mut results = Vec::with_capacity(2);
+    let want_opencode = matches!(args.target, ConfigTarget::All | ConfigTarget::Opencode);
+    let mut results = Vec::with_capacity(3);
 
     if args.uninstall {
         if want_claude {
@@ -981,6 +1303,21 @@ pub async fn execute_config_sync(
                 action: if removed { "removed" } else { "not_present" },
                 config_path: codex_cfg,
                 catalog_path: Some(codex_cat),
+                primary_model: None,
+                fast_model: None,
+                rendered_preview: None,
+                project_untrusted_codex_note: false,
+                require_env_key_warn: false,
+            });
+        }
+        if want_opencode {
+            let opencode_path = resolve_opencode_config_path(args.global, args.dir.as_deref())?;
+            let removed = uninstall_opencode_config(&opencode_path)?;
+            results.push(ConfigSyncTargetResult {
+                target: "opencode",
+                action: if removed { "removed" } else { "not_present" },
+                config_path: opencode_path,
+                catalog_path: None,
                 primary_model: None,
                 fast_model: None,
                 rendered_preview: None,
@@ -1036,7 +1373,7 @@ pub async fn execute_config_sync(
     let primary_model = args
         .model
         .as_deref()
-        .map(str::trim)
+        .map(strip_agy_provider_prefix)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .or_else(|| live_target.as_ref().map(|t| t.default_model.clone()))
@@ -1049,7 +1386,7 @@ pub async fn execute_config_sync(
         Vec::new()
     };
     let fast_model = resolve_fast_model(
-        args.fast_model.as_deref(),
+        args.fast_model.as_deref().map(strip_agy_provider_prefix),
         &primary_model,
         &discovered_models,
     );
@@ -1058,7 +1395,7 @@ pub async fn execute_config_sync(
         let claude_path = resolve_claude_config_path(args.global, args.dir.as_deref())?;
         let sync_params = HarnessSyncParams {
             gateway_base_url: gateway_base_url.clone(),
-            api_key: claude_auth_token,
+            api_key: claude_auth_token.clone(),
             primary_model: primary_model.clone(),
             fast_model: fast_model.clone(),
             no_bypass: args.no_bypass,
@@ -1124,10 +1461,35 @@ pub async fn execute_config_sync(
             config_path: codex_cfg,
             catalog_path: Some(codex_cat),
             primary_model: Some(primary_model.clone()),
-            fast_model: Some(fast_model),
+            fast_model: Some(fast_model.clone()),
             rendered_preview: Some(rendered),
             project_untrusted_codex_note: !args.global,
             require_env_key_warn: require_env_key,
+        });
+    }
+
+    if want_opencode {
+        let opencode_path = resolve_opencode_config_path(args.global, args.dir.as_deref())?;
+        let params = HarnessSyncParams {
+            gateway_base_url: gateway_base_url.clone(),
+            api_key: claude_auth_token,
+            primary_model: primary_model.clone(),
+            fast_model: fast_model.clone(),
+            no_bypass: args.no_bypass,
+            no_code_mode: args.no_code_mode,
+            discovered_models: discovered_models.clone(),
+        };
+        let rendered = write_or_update_opencode_config(&opencode_path, &params, args.print)?;
+        results.push(ConfigSyncTargetResult {
+            target: "opencode",
+            action: if args.print { "printed" } else { "synced" },
+            config_path: opencode_path,
+            catalog_path: None,
+            primary_model: Some(primary_model),
+            fast_model: Some(fast_model),
+            rendered_preview: Some(rendered),
+            project_untrusted_codex_note: false,
+            require_env_key_warn: false,
         });
     }
 
@@ -1795,5 +2157,89 @@ command = \"npx\"
         assert!(!rendered.contains("in_app_updates = true"));
         assert!(!rendered.contains("remote_plugin = true"));
         assert!(!rendered.contains("recommended_plugins = true"));
+    }
+
+    #[test]
+    fn opencode_config_merge_and_uninstall_preserve_unrelated_user_fields() {
+        let params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "local-agy".to_owned(),
+            primary_model: "agy/gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-4-hydrogen-low".to_owned(),
+            no_bypass: false,
+            no_code_mode: true,
+            discovered_models: vec![DiscoveredModel {
+                id: "gemini-4-carbon-high".to_owned(),
+                display_name: "Gemini 4 Carbon (High)".to_owned(),
+                context_window: 500_000,
+                auto_compact_token_limit: 425_000,
+            }],
+        };
+
+        let mut existing: Map<String, Value> = serde_json::from_value(json!({
+            "theme": "tokyonight",
+            "mcp": {
+                "playwright": { "type": "local", "command": ["npx", "@playwright/mcp"] }
+            },
+            "providers": {
+                "agy": { "name": "Stale v2 entry" },
+                "openrouter": { "name": "OpenRouter" }
+            },
+            "permission": {
+                "doom_loop": "ask"
+            }
+        }))
+        .expect("valid json object");
+
+        merged_opencode_config_into(&mut existing, &params, true);
+        assert_eq!(
+            existing.get("model").and_then(Value::as_str),
+            Some("agy/gemini-4-carbon-high")
+        );
+        assert_eq!(
+            existing.get("small_model").and_then(Value::as_str),
+            Some("agy/gemini-4-hydrogen-low")
+        );
+        assert_eq!(
+            existing.get("theme").and_then(Value::as_str),
+            Some("tokyonight")
+        );
+        assert!(existing.get("mcp").is_some());
+        // Stale `providers.agy` removed while `providers.openrouter` preserved
+        assert!(existing["providers"].get("agy").is_none());
+        assert!(existing["providers"].get("openrouter").is_some());
+        assert_eq!(
+            existing["provider"]["agy"]["npm"].as_str(),
+            Some("@ai-sdk/anthropic")
+        );
+        assert_eq!(
+            existing["provider"]["agy"]["options"]["baseURL"].as_str(),
+            Some("http://127.0.0.1:8787/v1")
+        );
+        assert_eq!(
+            existing["provider"]["agy"]["models"]["gemini-4-carbon-high"]["limit"]["context"]
+                .as_u64(),
+            Some(500_000)
+        );
+        // Last-match-wins permission ordering: `*` -> `doom_loop` -> `execute: deny`
+        let perm_keys: Vec<&str> = existing["permission"]
+            .as_object()
+            .expect("permission object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(perm_keys, vec!["*", "doom_loop", "execute"]);
+        assert_eq!(existing["compaction"]["background"].as_bool(), Some(false));
+
+        // Uninstall removes `agy` provider & managed keys while keeping `theme`, `mcp`, `openrouter`, `doom_loop`
+        existing.remove("compaction");
+        strip_opencode_config(&mut existing);
+        assert!(existing.get("model").is_none());
+        assert!(existing.get("small_model").is_none());
+        assert!(existing.get("provider").is_none());
+        assert!(existing["providers"].get("openrouter").is_some());
+        assert_eq!(existing["permission"]["doom_loop"].as_str(), Some("ask"));
+        assert!(existing["permission"].get("*").is_none());
+        assert!(existing["permission"].get("execute").is_none());
     }
 }

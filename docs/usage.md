@@ -2,8 +2,8 @@
 
 English · [中文](usage.zh-CN.md)
 
-Run Liftgate, then point Codex CLI, Claude Code or any OpenAI / Anthropic
-client at it. Every address below assumes the default
+Run Liftgate, then point Codex CLI, Claude Code, OpenCode or any OpenAI /
+Anthropic client at it. Every address below assumes the default
 `http://127.0.0.1:8787`.
 
 ## Before you start
@@ -54,7 +54,7 @@ lg st                           # live health, PID, session pool, tokens & activ
 lg l -n 100 -f                  # tail & follow ~/.liftgate/gateway.log (full: logs, --acp includes agy stderr)
 lg web                          # open the browser dashboard (full: ui, --print prints URL)
 lg m -i                         # interactively filter & switch default model (full: models --pick)
-lg doc                          # check agy, claude, codex, proxy, embedded UI & auth readiness (full: doctor)
+lg doc                          # check agy, claude, codex, opencode, proxy, embedded UI & auth readiness (full: doctor)
 lg r                            # restart preserving (or overriding) settings (full: restart)
 lg down                         # gracefully stop the background service and ACP process tree (full: stop)
 lg upgrade                      # check GitHub Releases (`-c` / `--check`) and self-upgrade `lg` + `liftgate` (aliases: update, self-update)
@@ -111,11 +111,12 @@ lg agy mcp -- --help                    # forwards to `agy mcp ...` (any subcomm
   (rolling back automatically if the new binary fails ACP handshake), and
   resumes serving without dropping configuration.
 
-## Zero-side-effect launch (`lg cx` / `lg cc` / `lg cxa` / `lg cd`)
+## Zero-side-effect launch (`lg cx` / `lg cc` / `lg oc` / `lg cxa` / `lg cd`)
 
-Run Codex CLI, Claude Code, **Codex App**, or **Claude Desktop** across Windows,
-macOS, and Linux without polluting project files, `~/.claude/settings.json`,
-`~/.codex/config.toml`, native desktop profiles, or your caller shell:
+Run Codex CLI, Claude Code, **OpenCode**, **Codex App**, or **Claude Desktop**
+across Windows, macOS, and Linux without polluting project files,
+`~/.claude/settings.json`, `~/.codex/config.toml`,
+`~/.config/opencode/opencode.json`, native desktop profiles, or your caller shell:
 
 ```bash
 cd /path/to/your/project
@@ -123,8 +124,12 @@ liftgate codex                              # interactive Codex CLI with Code Mo
 liftgate codex --code-mode-only             # strict Code Mode (`exec` + `wait` JavaScript orchestration only)
 liftgate codex --no-code-mode               # disable Code Mode (`tool_mode = "direct"`) for this session
 liftgate claude                             # interactive Claude Code (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` by default)
+liftgate opencode                           # interactive OpenCode TUI (alias: `lg oc`; `@opencode/codemode` active by default)
+liftgate opencode --full-code-mode          # enable OpenCode full Code Mode (`OPENCODE_FLAGS=full_codemode`)
+liftgate opencode --no-code-mode            # expose all OpenCode MCP & namespace tools directly (virtualized by Liftgate)
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
 liftgate claude --model gemini-4-hydrogen-low -p "summarize recent commits"
+liftgate opencode run "run cargo test"      # non-interactive OpenCode prompt (`lg oc run -c "..."`)
 
 # Native session browsing, resumption, forking, worktrees & background agents
 lg cx resume                                # interactive Codex session picker (`--all` across projects; alias: `lg cx -r`)
@@ -137,6 +142,10 @@ lg cc -c                                    # continue most recent Claude sessio
 lg cc fork --last                           # fork most recent Claude session (`--continue --fork-session`)
 lg cc -w feat-auth                          # start Claude Code in an isolated git worktree
 lg cc --bg "refactor parser"                # background session (`lg cc agents`, `attach`, `logs`, `stop`, `rm` all work)
+lg oc -c                                    # continue most recent OpenCode session (aliases: `lg oc continue`, `lg oc resume`)
+lg oc -s ses_42                             # continue or create a specific OpenCode session (alias: `lg oc resume ses_42`)
+lg oc models                                # list configured providers and live Antigravity models
+lg oc session list                          # list project sessions (`delete`, `export`, `import`, `web`, `serve`, `acp`)
 
 # Desktop GUI apps (Windows MSIX/Squirrel/standalone, macOS .app bundles, Linux .deb/Flatpak/AppImage)
 lg codex-app                                # alias: `lg cxa` or `lg cx --app` (isolated CODEX_HOME + --user-data-dir)
@@ -146,8 +155,15 @@ lg claude-desktop --restart-app             # gracefully restart a running Claud
 lg claude-desktop --restore                 # manually replay rollback journals if needed
 ```
 
-- If the background gateway is not running yet, `liftgate codex` and
-  `liftgate claude` (and their desktop counterparts) start it automatically.
+- If the background gateway is not running yet, `liftgate codex`,
+  `liftgate claude`, `liftgate opencode`, and the desktop launchers start it
+  automatically.
+- **OpenCode (`lg oc` / `lg opencode`)** injects an in-memory
+  `OPENCODE_CONFIG_CONTENT` overlay (non-destructively preserving any caller
+  `OPENCODE_CONFIG_CONTENT` keys) without touching `./opencode.json` or
+  `~/.config/opencode/opencode.json`, and automatically passes `--standalone` on
+  OpenCode v2 (`>= 2.0.0`) so a private server reads the session's gateway
+  routing instead of attaching to an older background daemon.
 - Scoped environment variables and temporary settings/catalog files (under
   `~/.liftgate/ephemeral/`) apply **only** to the spawned child process and are
   deleted immediately when the CLI exits.
@@ -256,14 +272,15 @@ evicts large coding tools (`exec`, `exec_command`, `Bash`):
 
 ## Configure local or global client files (`liftgate config`)
 
-If you prefer running bare `claude` or `codex` directly, let `liftgate config`
-(alias `liftgate setup`) generate or non-destructively merge the live model
-catalog and provider config for you:
+If you prefer running bare `claude`, `codex`, or `opencode` directly, let
+`liftgate config` (alias `liftgate setup` / `lg cfg`) generate or
+non-destructively merge the live model catalog and provider config for you:
 
 ```bash
-liftgate config                     # write .claude/settings.local.json + .codex/{config.toml,agy-models.json}
+liftgate config                     # write .claude/settings.local.json + .codex/{config.toml,agy-models.json} + opencode.json
 liftgate config claude --global     # merge into ~/.claude/settings.json
 liftgate config codex --global      # merge [model_providers.agy] + catalog into ~/.codex/
+liftgate config opencode --global   # merge provider.agy into ~/.config/opencode/opencode.json (alias: `oc`)
 liftgate config --print             # preview generated config without writing files
 liftgate config --uninstall         # remove only Liftgate-managed keys (--global for ~/)
 ```
@@ -406,6 +423,61 @@ local check; with `--api-key <key>`, set it to `<key>`.
 > is set ([official docs](https://code.claude.com/docs/en/code-mode)). Once
 > Anthropic lifts that client-side restriction for custom gateways, Code Mode
 > works over Liftgate automatically.
+
+## OpenCode
+
+Prefer `lg oc` (`liftgate opencode`) for zero-side-effect automatic setup across
+both OpenCode v1.x and OpenCode v2.x (`v2.3+`), or run
+`lg config opencode --global` to sync `~/.config/opencode/opencode.json`
+(respects `OPENCODE_CONFIG_DIR` and `XDG_CONFIG_HOME`).
+
+For manual setup, add the `agy` provider to `~/.config/opencode/opencode.json`
+(or `./opencode.json` in your project):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "agy/gemini-4-carbon-high",
+  "small_model": "agy/gemini-4-hydrogen-low",
+  "provider": {
+    "agy": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Antigravity (Liftgate)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "local-agy",
+        "timeout": 1800000
+      },
+      "models": {
+        "gemini-4-carbon-high": {
+          "name": "Gemini 4 Carbon (High)",
+          "tool_call": true,
+          "limit": { "context": 500000, "output": 64000 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+        },
+        "gemini-4-hydrogen-low": {
+          "name": "Gemini 4 Hydrogen (Low)",
+          "tool_call": true,
+          "limit": { "context": 500000, "output": 64000 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+        }
+      }
+    }
+  }
+}
+```
+
+- **Code Mode (`@opencode/codemode`)**: OpenCode v2 enables Code Mode (`execute`
+  over `psychoscript`) out of the box for MCP and namespace tools; pass
+  `lg oc --full-code-mode` to route built-in file/shell tools and `Bun.file` /
+  `Bun.write` into `execute` as well, or `lg oc --no-code-mode` to expose all
+  MCP and namespace tools directly (virtualized within `<= 24` Eager slots by
+  Liftgate's `OpenCodeToolProfile`).
+- **Calibrated compaction & fast lanes**: `limit.context = 500000` aligns
+  OpenCode's default `15%` buffer directly with `425,000` tokens (safely below
+  `agy acp`'s `524,288` internal ceiling), while OpenCode's `patch`
+  (`{ "patchText": "..." }`) receives 0-RTT Lark V4A preflight self-healing and
+  session titles / summaries route to ephemeral Flash sessions.
 
 ## Other clients
 

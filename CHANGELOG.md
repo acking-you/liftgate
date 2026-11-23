@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **First-class OpenCode support (`lg opencode` / `lg oc`, `lg config opencode`, `OpenCodeToolProfile`)**:
+  - Added `lg opencode` (short alias `lg oc`) zero-side-effect launcher injecting calibrated `OPENCODE_CONFIG_CONTENT` (`provider.agy` over `/v1/messages`, `500k` context / `64k` output limits, `small_model` fast routing, `--full-code-mode` via `OPENCODE_FLAGS=full_codemode`, `--no-code-mode`, and automatic OpenCode v2 `--standalone` private-server isolation without touching `./opencode.json` or `~/.config/opencode/opencode.json`), plus `[o] Launch OpenCode` in the interactive `lg` cockpit and OpenCode CLI detection in `lg doctor`.
+  - Extended `lg config` (`all` and `opencode` / `oc`) to non-destructively merge and `--uninstall` Liftgate's `agy` provider across `./opencode.json` and `~/.config/opencode/opencode.json` (`OPENCODE_CONFIG_DIR` / `XDG_CONFIG_HOME` aware) using a schema subset verified clean across both OpenCode v1.x and OpenCode v2.x (`ConfigNormalize`).
+  - Added zero-cost `OpenCodeToolProfile` (`DetectedHarness::OpenCode`) in `liftgate-tool-virtualizer` (Tier-0 `@opencode/codemode` `execute` orchestrator, Tier-1 `shell`/`bash`/`read`/`edit`/`write`/`patch`/`grep`/`glob`/`subagent`/`lsp`, Tier-2 `ns__session`/`ns__opencode`/`ns__automation`/`ns__machine`/`ns__todo`/`ns__<mcp_server>` hubs, and slack-slot backfill for `question`/`skill`/`websearch`/`webfetch`), 0-RTT Lark V4A preflight self-healing + duplicate-file coalescing on OpenCode `patch` (`{ patchText }`), and ephemeral fast-lane / warm compaction routing for OpenCode `PROMPT_TITLE`, `PROMPT_SUMMARY`, and session compaction turns.
+
 ## [0.2.8] - 2026-11-23
 
 ### Added

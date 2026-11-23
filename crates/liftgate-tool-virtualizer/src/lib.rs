@@ -22,7 +22,9 @@ pub use planner::{
 pub use profile::{
     DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, detect_harness,
 };
-pub use profiles::{ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile};
+pub use profiles::{
+    ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OpenCodeToolProfile,
+};
 pub use router::{LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
 pub use schema::{
     McpBridgedTool, McpWireTool, apply_patch_input_schema, code_mode_exec_input_schema,
@@ -582,6 +584,208 @@ mod tests {
                 client_name: "apply_patch".to_owned(),
                 arguments: "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch".to_owned(),
                 is_custom: true,
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_profile_virtualizes_namespaces_mcps_backfills_and_heals_patchtext() {
+        let mut tools = vec![
+            fn_tool(
+                "execute",
+                "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests.",
+                json!({
+                    "type": "object",
+                    "properties": { "code": { "type": "string" } },
+                    "required": ["code"]
+                }),
+            ),
+            fn_tool(
+                "shell",
+                "Execute shell command",
+                json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            ),
+            fn_tool(
+                "read",
+                "Read file",
+                json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            ),
+            fn_tool(
+                "edit",
+                "Edit file",
+                json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            ),
+            fn_tool(
+                "write",
+                "Write file",
+                json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            ),
+            fn_tool(
+                "patch",
+                "Apply V4A patch",
+                json!({"type":"object","properties":{"patchText":{"type":"string"}},"required":["patchText"]}),
+            ),
+            fn_tool(
+                "grep",
+                "Search file contents",
+                json!({"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}),
+            ),
+            fn_tool(
+                "glob",
+                "Find files",
+                json!({"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}),
+            ),
+            fn_tool(
+                "subagent",
+                "Spawn subagent",
+                json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}),
+            ),
+            fn_tool(
+                "question",
+                "Ask user question",
+                json!({"type":"object","properties":{"questions":{"type":"array"}},"required":["questions"]}),
+            ),
+            fn_tool(
+                "skill",
+                "Load skill",
+                json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+            ),
+            fn_tool(
+                "webfetch",
+                "Fetch URL",
+                json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+            ),
+            fn_tool(
+                "opencode_session_search",
+                "Search sessions",
+                json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+            ),
+            fn_tool(
+                "opencode_session_read",
+                "Read session",
+                json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}),
+            ),
+            fn_tool(
+                "opencode_mcp_resource_list",
+                "List MCP resources",
+                json!({"type":"object","properties":{}}),
+            ),
+            fn_tool(
+                "artifact_create",
+                "Create artifact",
+                json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}),
+            ),
+            fn_tool(
+                "automation_create",
+                "Create automation",
+                json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+            ),
+            fn_tool(
+                "automation_list",
+                "List automations",
+                json!({"type":"object","properties":{}}),
+            ),
+        ];
+        for idx in 0..32 {
+            tools.push(fn_tool(
+                &format!("playwright_browser_op_{idx:02}"),
+                "Playwright browser operation",
+                json!({"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}),
+            ));
+            tools.push(fn_tool(
+                &format!("github_repo_op_{idx:02}"),
+                "GitHub repository operation",
+                json!({"type":"object","properties":{"repo":{"type":"string"}},"required":["repo"]}),
+            ));
+        }
+
+        assert_eq!(
+            detect_harness(ProtocolHint::AnthropicMessages, &tools),
+            DetectedHarness::OpenCode
+        );
+        let mut spill = NoopSpillSink;
+        let catalog =
+            partition_tools_for_mcp_with_hint(ProtocolHint::AnthropicMessages, &tools, &mut spill);
+        assert_eq!(catalog.profile_id, "opencode");
+        assert!(catalog.has_virtualized_dispatch);
+        assert!(catalog.wire_tools.len() <= VirtualizerBudget::OPENCODE_AGY_ACP.max_eager_tools);
+
+        let wire_names: HashSet<&str> =
+            catalog.wire_tools.iter().map(|w| w.name.as_str()).collect();
+        for expected in [
+            "execute",
+            "shell",
+            "read",
+            "edit",
+            "write",
+            "patch",
+            "grep",
+            "glob",
+            "subagent",
+            "question",
+            "skill",
+            "ns__session",
+            "ns__opencode",
+            "ns__automation",
+            "ns__playwright",
+            "ns__github",
+            SEARCH_CLIENT_TOOLS_MCP_NAME,
+            CALL_CLIENT_TOOL_MCP_NAME,
+        ] {
+            assert!(
+                wire_names.contains(expected),
+                "expected `{expected}` in OpenCode Eager wire tools, got: {wire_names:?}"
+            );
+        }
+
+        // Verify OpenCode `patch` (`{ "patchText": "..." }`) auto-heals duplicate file blocks & blank lines
+        let unhealed_patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ -1,3 +1,3 @@\n fn a() {\n\n-    old();\n+    new();\n }\n*** Update File: src/lib.rs\n@@\n-fn b() {}\n+fn b_v2() {}\n*** End Patch";
+        match catalog.routing_table.resolve_call(
+            "patch",
+            &json!({ "patchText": unhealed_patch, "toolSummary": "Patch lib.rs" }),
+            &tools,
+        ) {
+            VirtualizedCallDecision::ForwardToClient {
+                client_name,
+                arguments,
+                is_custom,
+            } => {
+                assert_eq!(client_name, "patch");
+                assert!(!is_custom);
+                let parsed: Value = serde_json::from_str(&arguments).expect("valid JSON args");
+                let healed = parsed["patchText"].as_str().expect("patchText string");
+                assert_eq!(healed.matches("*** Update File: src/lib.rs").count(), 1);
+                assert!(!healed.contains("@@ -1,3 +1,3 @@"));
+                assert!(parsed.get("toolSummary").is_none());
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+
+        // Malformed `patchText` missing hunk line prefix fails 0-RTT preflight in-memory
+        match catalog.routing_table.resolve_call(
+            "patch",
+            &json!({ "patchText": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\noops_missing_prefix()\n*** End Patch" }),
+            &tools,
+        ) {
+            VirtualizedCallDecision::LocalReply {
+                is_error: true,
+                kind: LocalReplyKind::PreflightError,
+                ..
+            } => {}
+            other => panic!("expected 0-RTT preflight error on bad patchText, got: {other:?}"),
+        }
+
+        // `<server>_<tool>` hub dispatches back to exact OpenCode `playwright_browser_op_04`
+        assert_eq!(
+            catalog.routing_table.resolve_call(
+                "ns__playwright",
+                &json!({ "action": "browser_op_04", "args": { "selector": "#login" } }),
+                &tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "playwright_browser_op_04".to_owned(),
+                arguments: "{\"selector\":\"#login\"}".to_owned(),
+                is_custom: false,
             }
         );
     }

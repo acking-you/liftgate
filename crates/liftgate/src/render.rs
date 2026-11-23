@@ -20,8 +20,8 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
         ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, ConfigArgs, DoctorArgs, LogsArgs,
-        ModelsArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs,
-        invoked_bin_name,
+        ModelsArgs, OpencodeArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs,
+        UpgradeArgs, invoked_bin_name,
     },
     client::GatewayClient,
     config_sync::execute_config_sync,
@@ -712,6 +712,13 @@ pub async fn run_codex_cli(state_paths: &StatePaths, args: CodexArgs) -> Result<
     harness::run_codex(state_paths, args).await
 }
 
+pub async fn run_opencode_cli(
+    state_paths: &StatePaths,
+    args: OpencodeArgs,
+) -> Result<i32, CliError> {
+    harness::run_opencode(state_paths, args).await
+}
+
 pub async fn run_claude_desktop_cli(
     state_paths: &StatePaths,
     args: ClaudeDesktopArgs,
@@ -800,10 +807,11 @@ pub async fn run_config(state_paths: &StatePaths, args: ConfigArgs) -> Result<()
                 );
             }
             _ => {
-                let label = if item.target == "claude" {
-                    "Updated Claude Code configuration"
-                } else {
-                    "Updated Codex CLI configuration"
+                let label = match item.target {
+                    "claude" => "Updated Claude Code configuration",
+                    "codex" => "Updated Codex CLI configuration",
+                    "opencode" => "Updated OpenCode configuration",
+                    _ => "Updated harness configuration",
                 };
                 ui::headline(Tone::Ok, label);
                 ui::kv_accent("Config File", &item.config_path.display().to_string());

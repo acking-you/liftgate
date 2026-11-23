@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
+    parser::ApplyPatchPreflightError,
     session_key::is_code_mode_custom_exec,
 };
 use serde_json::Value;
@@ -414,7 +415,10 @@ impl McpRoutingTable {
                     bridged.unwrap_custom_key,
                 );
             }
-            let serialized = format_direct_tool_arguments(arguments, bridged);
+            let serialized = match format_direct_tool_arguments(arguments, bridged) {
+                Ok(s) => s,
+                Err(preflight_err) => return preflight_error_decision(preflight_err.to_string()),
+            };
             return VirtualizedCallDecision::ForwardToClient {
                 client_name: bridged.client_name.clone(),
                 arguments: serialized,
@@ -756,7 +760,7 @@ fn resolve_custom_tool_call(
     unwrap_custom_key: Option<&'static str>,
 ) -> VirtualizedCallDecision {
     let extracted = extract_custom_tool_input(raw_args, unwrap_custom_key);
-    if client_name.eq_ignore_ascii_case("apply_patch") {
+    if is_v4a_patch_tool_name(client_name) {
         let normalized = normalize_apply_patch_text(&extracted);
         if let Err(err) = validate_apply_patch_preflight(&normalized) {
             return preflight_error_decision(err.to_string());
@@ -774,9 +778,37 @@ fn resolve_custom_tool_call(
     }
 }
 
-fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> String {
+fn is_v4a_patch_tool_name(client_name: &str) -> bool {
+    client_name.eq_ignore_ascii_case("apply_patch") || client_name.eq_ignore_ascii_case("patch")
+}
+
+fn heal_and_validate_json_patch_field(
+    client_name: &str,
+    map: &mut serde_json::Map<String, Value>,
+) -> Result<(), ApplyPatchPreflightError> {
+    if !is_v4a_patch_tool_name(client_name) {
+        return Ok(());
+    }
+    for key in ["patchText", "patch"] {
+        if let Some(Value::String(raw_patch)) = map.get_mut(key) {
+            let normalized = normalize_apply_patch_text(raw_patch);
+            validate_apply_patch_preflight(&normalized)?;
+            *raw_patch = normalized;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn format_direct_tool_arguments(
+    raw_args: &Value,
+    bridged: &McpBridgedTool,
+) -> Result<String, ApplyPatchPreflightError> {
     if bridged.is_custom {
-        return extract_custom_tool_input(raw_args, bridged.unwrap_custom_key);
+        return Ok(extract_custom_tool_input(
+            raw_args,
+            bridged.unwrap_custom_key,
+        ));
     }
     let mut args_val = raw_args.clone();
     if args_val.is_null() {
@@ -793,8 +825,9 @@ fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> S
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
+        heal_and_validate_json_patch_field(&bridged.client_name, map)?;
     }
-    serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned())
+    Ok(serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned()))
 }
 
 enum InnerArgsError {
@@ -876,6 +909,9 @@ fn finalize_indexed_tool_call(
     }
     if let Some(ref params_json) = indexed.parameters_json {
         let _ = coerce_stringified_container_fields(&mut map, params_json);
+    }
+    if let Err(preflight_err) = heal_and_validate_json_patch_field(&indexed.client_name, &mut map) {
+        return preflight_error_decision(preflight_err.to_string());
     }
 
     if enforce_required_preflight
