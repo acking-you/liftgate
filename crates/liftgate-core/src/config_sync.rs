@@ -835,6 +835,12 @@ struct OpenCodeManagedRecord {
     previous_small_model: Option<Value>,
     wrote_small_model: String,
     wrote_provider_agy: Value,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    previous_provider_agy: Option<Value>,
     #[serde(default)]
     removed_v2_providers_agy: Option<Value>,
     #[serde(default)]
@@ -849,6 +855,14 @@ struct OpenCodeManagedRecord {
     previous_permission_execute: Option<Value>,
     #[serde(default)]
     wrote_permission_execute: Option<Value>,
+}
+
+// A missing field is a legacy/absent baseline; an explicit JSON null is a value.
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 fn ledger_key_for_path(target_path: &Path) -> String {
@@ -918,6 +932,11 @@ fn capture_opencode_managed_record(
         .and_then(|p| p.get(OPENCODE_PROVIDER_ID))
         .cloned()
         .unwrap_or(Value::Null);
+    let previous_provider_agy = baseline
+        .get("provider")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get(OPENCODE_PROVIDER_ID))
+        .cloned();
     let removed_v2_providers_agy = baseline
         .get("providers")
         .and_then(Value::as_object)
@@ -954,6 +973,7 @@ fn capture_opencode_managed_record(
         previous_small_model: baseline.get("small_model").cloned(),
         wrote_small_model,
         wrote_provider_agy,
+        previous_provider_agy,
         removed_v2_providers_agy,
         permission_was_absent,
         permission_was_shorthand,
@@ -984,12 +1004,16 @@ fn revert_opencode_managed_record(
             let _ = remove_key_preserving_order(map, "small_model");
         }
     }
-    if let Some(Value::Object(prov_map)) = map.get_mut("provider") {
-        if prov_map.get(OPENCODE_PROVIDER_ID) == Some(&rec.wrote_provider_agy) {
+    if let Some(Value::Object(prov_map)) = map.get_mut("provider")
+        && prov_map.get(OPENCODE_PROVIDER_ID) == Some(&rec.wrote_provider_agy)
+    {
+        if let Some(previous) = &rec.previous_provider_agy {
+            prov_map.insert(OPENCODE_PROVIDER_ID.to_owned(), previous.clone());
+        } else {
             let _ = remove_key_preserving_order(prov_map, OPENCODE_PROVIDER_ID);
-        }
-        if prov_map.is_empty() {
-            let _ = remove_key_preserving_order(map, "provider");
+            if prov_map.is_empty() {
+                let _ = remove_key_preserving_order(map, "provider");
+            }
         }
     }
     if let Some(ref prev_v2_agy) = rec.removed_v2_providers_agy {
@@ -2934,6 +2958,113 @@ command = \"npx\"
         assert_eq!(after_perms["execute"].as_str(), Some("deny"));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn opencode_uninstall_restores_previous_provider_unless_user_changed_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = std::env::temp_dir().join(format!(
+            "liftgate-oc-provider-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&tmp)?;
+        let state_paths = StatePaths::resolve(Some(tmp.join("state")))?;
+        let original = json!({
+            "name": "User gateway",
+            "options": { "baseURL": "https://gateway.example.invalid/v1", "apiKey": "test-only" }
+        });
+        let replacement = json!({ "name": "Edited after sync" });
+        let mut params = HarnessSyncParams {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            api_key: "generated-test-key".to_owned(),
+            primary_model: "gemini-4-carbon-high".to_owned(),
+            fast_model: "gemini-4-hydrogen-low".to_owned(),
+            no_bypass: true,
+            no_code_mode: false,
+            discovered_models: Vec::new(),
+        };
+
+        for (name, before, user_change, expected) in [
+            (
+                "restore",
+                Some(original.clone()),
+                None,
+                Some(original.clone()),
+            ),
+            (
+                "edit",
+                Some(original.clone()),
+                Some(Some(replacement.clone())),
+                Some(replacement),
+            ),
+            ("delete", Some(original.clone()), Some(None), None),
+            ("absent", None, None, None),
+            ("null", Some(Value::Null), None, Some(Value::Null)),
+            ("legacy-ledger", Some(original), None, None),
+        ] {
+            let path = tmp.join(format!("{name}.json"));
+            let mut provider = Map::new();
+            provider.insert("other".to_owned(), json!({ "name": "Other provider" }));
+            if let Some(before) = before {
+                provider.insert(OPENCODE_PROVIDER_ID.to_owned(), before);
+            }
+            fs::write(&path, serde_json::to_vec(&json!({ "provider": provider }))?)?;
+            write_or_update_opencode_config_with_state(Some(&state_paths), &path, &params, false)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(state_paths.config_sync_ledger_file())?
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            // A second sync must keep the original provider as the baseline, not the
+            // provider generated by the first sync.
+            params.api_key.push('x');
+            write_or_update_opencode_config_with_state(Some(&state_paths), &path, &params, false)?;
+            if let Some(user_change) = user_change {
+                let mut config = read_existing_opencode_json_object(&path)?;
+                if let Some(Value::Object(providers)) = config.get_mut("provider") {
+                    if let Some(edited) = user_change {
+                        providers.insert(OPENCODE_PROVIDER_ID.to_owned(), edited);
+                    } else {
+                        let _ = remove_key_preserving_order(providers, OPENCODE_PROVIDER_ID);
+                    }
+                }
+                fs::write(&path, serde_json::to_vec(&config)?)?;
+            }
+            if name == "legacy-ledger" {
+                let ledger_path = state_paths.config_sync_ledger_file();
+                let mut ledger: Value = serde_json::from_slice(&fs::read(&ledger_path)?)?;
+                let key = ledger_key_for_path(&path);
+                if let Some(Value::Object(record)) = ledger
+                    .get_mut("opencode")
+                    .and_then(|entries| entries.get_mut(&key))
+                {
+                    let _ = remove_key_preserving_order(record, "previous_provider_agy");
+                }
+                write_file_atomic(&ledger_path, &serde_json::to_vec(&ledger)?, true)?;
+            }
+            assert!(uninstall_opencode_config_with_state(
+                Some(&state_paths),
+                &path
+            )?);
+            let config = read_existing_opencode_json_object(&path)?;
+            assert_eq!(
+                config
+                    .get("provider")
+                    .and_then(|p| p.get(OPENCODE_PROVIDER_ID)),
+                expected.as_ref(),
+                "{name}",
+            );
+            assert_eq!(
+                config.get("provider").and_then(|p| p.get("other")),
+                Some(&json!({ "name": "Other provider" })),
+            );
+            assert!(!state_paths.config_sync_ledger_file().exists());
+        }
+        fs::remove_dir_all(tmp)?;
+        Ok(())
     }
 
     #[test]

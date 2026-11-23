@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Restore an existing OpenCode `provider.agy` on uninstall after config sync, unless it was edited or removed afterward.
+
 ## [0.2.9] - 2026-11-23
 
 ### Added
