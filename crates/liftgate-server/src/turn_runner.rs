@@ -44,7 +44,7 @@ use crate::{
     mcp_bridge::{
         ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LocalReplyKind, LoopbackMcpServer,
         McpContentItem, McpSessionHandle, McpToolCallReply, ProtocolHint, ResolvedMcpIncoming,
-        partition_tools_for_mcp_with_hint, strip_call_prefix,
+        partition_tools_for_mcp_session, strip_call_prefix,
     },
     session_pool::{
         CommittedSessionTurn, IdleCheckoutGuard, IdleSessionEntry, McpDriverCommand,
@@ -500,7 +500,11 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     })
             });
             if let Some(checkout) = resp_checkout_opt {
-                if !mcp_enabled && checkout.entry().mcp_handle.is_some() {
+                let mcp_mode_mismatch = (!mcp_enabled && checkout.entry().mcp_handle.is_some())
+                    || (mcp_enabled
+                        && cfg.mcp_server.is_some()
+                        && checkout.entry().mcp_handle.is_none());
+                if mcp_mode_mismatch {
                     let (retired_lease, mut saved_history) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
                     if !saved_history.is_empty() {
@@ -627,7 +631,11 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             });
 
             if let Some((checkout, prefix_hash, delta_start)) = matched_prefix_checkout {
-                if !mcp_enabled && checkout.entry().mcp_handle.is_some() {
+                let mcp_mode_mismatch = (!mcp_enabled && checkout.entry().mcp_handle.is_some())
+                    || (mcp_enabled
+                        && cfg.mcp_server.is_some()
+                        && checkout.entry().mcp_handle.is_none());
+                if mcp_mode_mismatch {
                     let (retired_lease, _) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
                 } else if let Some(delta_slice) = req.messages.get(delta_start..) {
@@ -776,39 +784,32 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         let mut mcp_session_handle: Option<Arc<McpSessionHandle>> = None;
         let (system_append, initial_tools_spill) = if !is_ephemeral_aux
             && mcp_enabled
-            && !req.client_tools.is_empty()
             && let Some(ref mcp_srv) = cfg.mcp_server
         {
             let proto_hint = match protocol {
                 TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
                 TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
             };
-            let catalog =
-                partition_tools_for_mcp_with_hint(proto_hint, &req.client_tools, &mut spill_store);
-            if catalog.is_empty() {
-                build_session_system_append_with_spill_sink(
-                    req.system_instructions.as_deref(),
-                    &req.client_tools,
-                    web_cfg,
-                    &nonce,
-                    &mut spill_store,
-                )
-            } else {
-                let out = build_session_system_append_for_mcp_with_spill_sink(
-                    req.system_instructions.as_deref(),
-                    McpBridgePromptSpec {
-                        bridged_tools: &catalog.bridged_pairs,
-                        xml_tools: &catalog.xml_only_tools,
-                        virtualized_hubs: &catalog.virtualized_hubs,
-                        has_virtualized_dispatch: catalog.has_virtualized_dispatch,
-                    },
-                    web_cfg,
-                    &nonce,
-                    &mut spill_store,
-                );
-                mcp_session_handle = Some(mcp_srv.register_session(catalog));
-                out
-            }
+            let catalog = partition_tools_for_mcp_session(
+                proto_hint,
+                &req.client_tools,
+                web_cfg.enable_native_web_fetch,
+                &mut spill_store,
+            );
+            let out = build_session_system_append_for_mcp_with_spill_sink(
+                req.system_instructions.as_deref(),
+                McpBridgePromptSpec {
+                    bridged_tools: &catalog.bridged_pairs,
+                    virtualized_hubs: &catalog.virtualized_hubs,
+                    has_virtualized_dispatch: catalog.has_virtualized_dispatch,
+                    has_gateway_web_fetch: catalog.has_gateway_web_fetch,
+                },
+                web_cfg,
+                &nonce,
+                &mut spill_store,
+            );
+            mcp_session_handle = Some(mcp_srv.register_session(catalog));
+            out
         } else {
             build_session_system_append_with_spill_sink(
                 req.system_instructions.as_deref(),
@@ -1659,7 +1660,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                             &task_guard,
                             &mut banner_filter,
                             &mut filter_out,
-                            &mut parser,
+                            Some(&mut parser),
                             &mut state,
                             &events_tx,
                             &cancel,
@@ -1801,7 +1802,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     &task_guard,
                     &mut banner_filter,
                     &mut filter_out,
-                    &mut parser,
+                    Some(&mut parser),
                     &mut state,
                     &events_tx,
                     &cancel,
@@ -2372,7 +2373,7 @@ async fn forward_acp_update(
     task_guard: &ActiveTaskGuard,
     banner_filter: &mut AcpBannerFilter,
     filter_out: &mut String,
-    parser: &mut IncrementalToolParser,
+    parser: Option<&mut IncrementalToolParser>,
     state: &mut TurnStreamState,
     events_tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
@@ -2524,7 +2525,13 @@ async fn forward_acp_update(
                 return true;
             }
             state.parsed_buf.clear();
-            parser.feed(filter_out, &mut state.parsed_buf);
+            if let Some(xml_parser) = parser {
+                xml_parser.feed(filter_out, &mut state.parsed_buf);
+            } else {
+                state
+                    .parsed_buf
+                    .push(ParsedStreamItem::TextDelta(std::mem::take(filter_out)));
+            }
             emit_parsed_items(req, task_guard, state, events_tx, cancel).await
         }
         SessionUpdatePayload::Error { message, error } => {
@@ -3765,11 +3772,8 @@ fn sync_and_build_warm_tools_delta<S: liftgate_types::session_key::TruncationSpi
     tool_nonce: &str,
     spill: &mut S,
 ) -> Option<String> {
-    let use_virtualized_delta = mcp_handle.is_some_and(|handle| {
+    if let Some(handle) = mcp_handle {
         handle.sync_client_tools(next_tools);
-        handle.has_virtualized_dispatch()
-    });
-    if use_virtualized_delta {
         build_mcp_virtualized_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
     } else {
         build_client_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
@@ -4290,7 +4294,6 @@ async fn run_mcp_session_driver<B: AcpBackend>(
         return;
     };
     let session_id = initial_lease.session_id().clone();
-    let active_tool_nonce = initial_lease.tool_nonce().to_owned();
     let initial_context_used = initial_lease.last_context_used();
 
     let mut call_rx_guard = mcp_handle.call_rx().lock().await;
@@ -4379,13 +4382,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
         loop {
             let step_started_ms = unix_timestamp_ms();
             let step_deadline = Instant::now() + Duration::from_secs(cur_timeout_secs);
-            let has_xml_tools = !cur_req.client_tools.is_empty() || cur_req.enable_native_web_fetch;
-            let mut parser = IncrementalToolParser::new(&active_tool_nonce, has_xml_tools);
-            let mut banner_filter = if has_xml_tools {
-                AcpBannerFilter::with_tool_nonce(&active_tool_nonce)
-            } else {
-                AcpBannerFilter::new()
-            };
+            let mut banner_filter = AcpBannerFilter::new();
             let mut filter_out = String::new();
             let mut state = TurnStreamState::new(latest_context_used);
             state.peak_context_used = peak_context_used;
@@ -4531,7 +4528,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                         &cur_task_guard,
                                         &mut banner_filter,
                                         &mut filter_out,
-                                        &mut parser,
+                                        None,
                                         &mut state,
                                         &cur_events_tx,
                                         &cur_cancel,
@@ -4638,7 +4635,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             &cur_task_guard,
                             &mut banner_filter,
                             &mut filter_out,
-                            &mut parser,
+                            None,
                             &mut state,
                             &cur_events_tx,
                             &cur_cancel,
@@ -4728,38 +4725,25 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     return;
                 }
 
-                if !state.halted_post_tool_runaway {
-                    if !filter_out.is_empty() && state.truncated_tool_abort.is_none() {
-                        state.parsed_buf.clear();
-                        parser.feed(&filter_out, &mut state.parsed_buf);
-                        if !emit_parsed_items(
-                            &cur_req,
-                            &cur_task_guard,
-                            &mut state,
-                            &cur_events_tx,
-                            &cur_cancel,
-                        )
-                        .await
-                        {
-                            cur_lease.finish_ephemeral();
-                            return;
-                        }
-                    }
-                    if state.truncated_tool_abort.is_none() {
-                        state.parsed_buf.clear();
-                        parser.finish(&mut state.parsed_buf);
-                        if !emit_parsed_items(
-                            &cur_req,
-                            &cur_task_guard,
-                            &mut state,
-                            &cur_events_tx,
-                            &cur_cancel,
-                        )
-                        .await
-                        {
-                            cur_lease.finish_ephemeral();
-                            return;
-                        }
+                if !state.halted_post_tool_runaway
+                    && !filter_out.is_empty()
+                    && state.truncated_tool_abort.is_none()
+                {
+                    state.parsed_buf.clear();
+                    state
+                        .parsed_buf
+                        .push(ParsedStreamItem::TextDelta(std::mem::take(&mut filter_out)));
+                    if !emit_parsed_items(
+                        &cur_req,
+                        &cur_task_guard,
+                        &mut state,
+                        &cur_events_tx,
+                        &cur_cancel,
+                    )
+                    .await
+                    {
+                        cur_lease.finish_ephemeral();
+                        return;
                     }
                 }
 
@@ -4830,6 +4814,79 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     arguments,
                                     is_custom,
                                     reply_tx,
+                                });
+                            }
+                            ResolvedMcpIncoming::GatewayWebFetch { url, reply_tx } => {
+                                disabled_mcp_rejections = 0;
+                                preflight_mcp_rejections = 0;
+                                let fetch_call_id =
+                                    format!("srvtoolu_{}", uuid::Uuid::new_v4().simple());
+                                if !send_cancel_safe(
+                                    &cur_events_tx,
+                                    TurnEvent::WebFetchStart {
+                                        call_id: fetch_call_id.clone(),
+                                        url: url.clone(),
+                                    },
+                                    &cur_cancel,
+                                )
+                                .await
+                                {
+                                    cur_lease.finish_ephemeral();
+                                    return;
+                                }
+                                let max_fetch_uses =
+                                    cur_req.web_fetch_max_uses.unwrap_or(5).clamp(1, 10) as usize;
+                                let outcome = if completed_web_fetches >= max_fetch_uses {
+                                    WebFetchOutcome::from_error(
+                                        url.clone(),
+                                        &WebFetchError::MaxUsesExceeded {
+                                            max_uses: max_fetch_uses,
+                                        },
+                                    )
+                                } else {
+                                    completed_web_fetches = completed_web_fetches.saturating_add(1);
+                                    cur_task_guard.record_web_fetch();
+                                    let fetch_fut = backend.fetch_web_url(
+                                        &url,
+                                        &cur_req.web_fetch_allowed_domains,
+                                        &cur_req.web_fetch_blocked_domains,
+                                    );
+                                    tokio::select! {
+                                        biased;
+                                        () = cur_cancel.cancelled() => {
+                                            cur_lease.finish_ephemeral();
+                                            return;
+                                        }
+                                        timed = timeout_at(step_deadline, fetch_fut) => {
+                                            match timed {
+                                                Ok(out) => out,
+                                                Err(_) => WebFetchOutcome::from_error(
+                                                    url.clone(),
+                                                    &WebFetchError::TurnDeadlineExceeded,
+                                                ),
+                                            }
+                                        }
+                                    }
+                                };
+                                let mut formatted = String::new();
+                                format_web_fetch_continuation(&mut formatted, &outcome);
+                                let is_err = matches!(outcome, WebFetchOutcome::Error { .. });
+                                if !send_cancel_safe(
+                                    &cur_events_tx,
+                                    TurnEvent::WebFetchComplete {
+                                        call_id: fetch_call_id,
+                                        outcome,
+                                    },
+                                    &cur_cancel,
+                                )
+                                .await
+                                {
+                                    cur_lease.finish_ephemeral();
+                                    return;
+                                }
+                                let _ = reply_tx.send(McpToolCallReply {
+                                    content: vec![McpContentItem::Text { text: formatted }],
+                                    is_error: is_err,
                                 });
                             }
                         }

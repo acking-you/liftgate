@@ -10,7 +10,7 @@ use liftgate_types::{
 use serde_json::Value;
 
 use crate::{
-    CALL_CLIENT_TOOL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
+    CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
     budget::VirtualizerBudget,
     profile::{HarnessToolProfile, ToolPlacement, count_fallback_prefix_stems},
     schema::{
@@ -43,6 +43,8 @@ pub enum VirtualizedCallDecision {
         is_error: bool,
         kind: LocalReplyKind,
     },
+    /// Execute server-managed URL fetch inside the gateway and reply in-flight.
+    GatewayWebFetch { url: String },
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +96,7 @@ type RebuildRoutingFn = fn(
     HashMap<String, McpBridgedTool>,
     HashMap<String, String>,
     bool,
+    bool,
 ) -> McpRoutingTable;
 
 /// Live routing and 0-RTT search snapshot for an ACP session's active client tools.
@@ -111,6 +114,7 @@ pub struct McpRoutingTable {
     hubs_by_mcp: HashMap<String, HubNamespaceTable>,
     all_indexed_tools: Vec<IndexedClientTool>,
     has_virtualized_dispatch: bool,
+    has_gateway_web_fetch: bool,
     rebuild_fn: RebuildRoutingFn,
 }
 
@@ -125,6 +129,7 @@ impl Default for McpRoutingTable {
             hubs_by_mcp: HashMap::new(),
             all_indexed_tools: Vec::new(),
             has_virtualized_dispatch: false,
+            has_gateway_web_fetch: false,
             rebuild_fn: build_routing_table_for_profile::<crate::profiles::GenericToolProfile>,
         }
     }
@@ -135,13 +140,15 @@ pub(crate) fn build_routing_table_for_profile<P: HarnessToolProfile>(
     direct_by_mcp: HashMap<String, McpBridgedTool>,
     hub_names_by_namespace: HashMap<String, String>,
     has_virtualized_dispatch: bool,
+    has_gateway_web_fetch: bool,
 ) -> McpRoutingTable {
-    McpRoutingTable::build_with_profile(
+    McpRoutingTable::build_with_profile_and_options(
         P::default(),
         client_tools,
         direct_by_mcp,
         hub_names_by_namespace,
         has_virtualized_dispatch,
+        has_gateway_web_fetch,
     )
 }
 
@@ -154,6 +161,26 @@ impl McpRoutingTable {
         direct_by_mcp: HashMap<String, McpBridgedTool>,
         hub_names_by_namespace: HashMap<String, String>,
         has_virtualized_dispatch: bool,
+    ) -> Self {
+        Self::build_with_profile_and_options(
+            profile,
+            client_tools,
+            direct_by_mcp,
+            hub_names_by_namespace,
+            has_virtualized_dispatch,
+            false,
+        )
+    }
+
+    /// Builds a live routing and search index with optional gateway `gateway_web_fetch` support.
+    #[must_use]
+    pub fn build_with_profile_and_options<P: HarnessToolProfile>(
+        profile: P,
+        client_tools: &[CanonicalToolSpec],
+        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        hub_names_by_namespace: HashMap<String, String>,
+        has_virtualized_dispatch: bool,
+        has_gateway_web_fetch: bool,
     ) -> Self {
         assert_eq!(
             std::mem::size_of::<P>(),
@@ -192,25 +219,25 @@ impl McpRoutingTable {
                     ToolPlacement::Orchestrator { .. }
                     | ToolPlacement::CoreDirect { .. }
                     | ToolPlacement::Namespaced { .. }
-                    | ToolPlacement::Standalone { .. } => profile.custom_tool_mcp_bridge(spec),
+                    | ToolPlacement::Standalone { .. } => {
+                        Some(profile.custom_tool_mcp_bridge(spec))
+                    }
                 },
                 CanonicalToolKind::Function { .. } => None,
             };
             let custom_unwrap_key = custom_bridge.as_ref().map(|(k, _)| *k);
             let is_custom_eligible = custom_bridge.is_some();
 
-            if matches!(spec.kind, CanonicalToolKind::Custom { .. }) && !is_custom_eligible {
-                continue;
-            }
             let params_json = match &spec.kind {
                 CanonicalToolKind::Custom { .. } => {
                     custom_bridge.map(|(_, schema_val)| schema_val.to_string())
                 }
                 CanonicalToolKind::Function { parameters_json } => {
-                    if normalize_mcp_object_schema(parameters_json).is_none() {
-                        continue;
+                    if parameters_json.trim().is_empty() {
+                        Some(normalize_mcp_object_schema(parameters_json).to_string())
+                    } else {
+                        Some(parameters_json.clone())
                     }
-                    (!parameters_json.trim().is_empty()).then(|| parameters_json.clone())
                 }
             };
 
@@ -302,6 +329,7 @@ impl McpRoutingTable {
             hubs_by_mcp,
             all_indexed_tools,
             has_virtualized_dispatch,
+            has_gateway_web_fetch,
             rebuild_fn: build_routing_table_for_profile::<P>,
         }
     }
@@ -330,6 +358,7 @@ impl McpRoutingTable {
             self.direct_by_mcp.clone(),
             self.hub_names_by_namespace.clone(),
             self.has_virtualized_dispatch,
+            self.has_gateway_web_fetch,
         ))
     }
 
@@ -349,6 +378,22 @@ impl McpRoutingTable {
         arguments: &Value,
         active_tools: &[CanonicalToolSpec],
     ) -> VirtualizedCallDecision {
+        if self.has_gateway_web_fetch && mcp_name == GATEWAY_WEB_FETCH_MCP_NAME {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if url.is_empty() {
+                return preflight_error_decision(
+                    "Missing non-empty `url` string for `mcp_lg_gateway_web_fetch`.".to_owned(),
+                );
+            }
+            return VirtualizedCallDecision::GatewayWebFetch {
+                url: url.to_owned(),
+            };
+        }
+
         if self.has_virtualized_dispatch && mcp_name == SEARCH_CLIENT_TOOLS_MCP_NAME {
             let text = self.execute_search(arguments, active_tools);
             return VirtualizedCallDecision::LocalReply {

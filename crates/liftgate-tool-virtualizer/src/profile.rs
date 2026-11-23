@@ -81,21 +81,18 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         ""
     }
 
-    /// Returns `Some((unwrap_key, input_schema))` when a freeform `CanonicalToolKind::Custom` tool
-    /// (such as Codex `exec` or `apply_patch`) should be exposed natively over JSON MCP and
-    /// unwrapped back to its raw freeform string on dispatch.
+    /// Returns `(unwrap_key, input_schema)` exposing any freeform `CanonicalToolKind::Custom` tool
+    /// natively over JSON MCP and unwrapping its single string property back to raw freeform text
+    /// on dispatch, eliminating any need for `<agy_tool_call>` XML simulation in MCP sessions.
     #[inline]
-    fn custom_tool_mcp_bridge(
-        self,
-        spec: &CanonicalToolSpec,
-    ) -> Option<(&'static str, serde_json::Value)> {
-        if is_code_mode_custom_exec(spec) {
-            return Some(("code", crate::schema::code_mode_exec_input_schema()));
+    fn custom_tool_mcp_bridge(self, spec: &CanonicalToolSpec) -> (&'static str, serde_json::Value) {
+        if is_code_mode_custom_exec(spec) || spec.name.eq_ignore_ascii_case("js_repl") {
+            return ("code", crate::schema::code_mode_exec_input_schema());
         }
-        if spec.name == "apply_patch" {
-            return Some(("patch", crate::schema::apply_patch_input_schema()));
+        if spec.name.eq_ignore_ascii_case("apply_patch") {
+            return ("patch", crate::schema::apply_patch_input_schema());
         }
-        None
+        ("input", crate::schema::freeform_custom_input_schema())
     }
 }
 

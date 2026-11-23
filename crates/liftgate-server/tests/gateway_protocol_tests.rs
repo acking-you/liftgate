@@ -6922,8 +6922,8 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
     assert_eq!(disc_status, 200);
     assert_eq!(disc_json.unwrap()["error"]["code"], -32601);
 
-    // 3. `tools/list` exposes `exec` (`{code: string}`) + `apply_patch` (`{patch: string}`)
-    //    natively and omits arbitrary unbridged custom grammars (`sql_lark`)
+    // 3. `tools/list` bridges 100% of custom tools natively (`exec` -> `{code}`,
+    //    `apply_patch` -> `{patch}`, `sql_lark` -> `{input}`) plus `call_client_tool` + `search_client_tools`
     let (list_status, list_json) = post_loopback_mcp_json(
         &url,
         &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
@@ -6934,7 +6934,7 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(wire_tools.len(), 2);
+    assert_eq!(wire_tools.len(), 5);
     assert_eq!(wire_tools[0]["name"], "exec");
     assert_eq!(
         wire_tools[0]["inputSchema"]["properties"]["code"]["type"],
@@ -6945,6 +6945,13 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
         wire_tools[1]["inputSchema"]["properties"]["patch"]["type"],
         "string"
     );
+    assert_eq!(wire_tools[2]["name"], "sql_lark");
+    assert_eq!(
+        wire_tools[2]["inputSchema"]["properties"]["input"]["type"],
+        "string"
+    );
+    assert_eq!(wire_tools[3]["name"], "call_client_tool");
+    assert_eq!(wire_tools[4]["name"], "search_client_tools");
 
     // 4. Dropping `McpSessionHandle` immediately revokes the capability token
     drop(handle);
@@ -7498,8 +7505,9 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
     let raw_patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-fn old() {}\n+fn new_fn() {}\n*** End Patch";
 
     let backend = Arc::new(MockAcpBackend::new(vec![
-        // Prompt 1: Step 1 calls native `mcp_lg_exec` (`Custom`), Step 2 receives `<client_tools_update>`
-        // and calls native `mcp_lg_wait` (`Function`), Step 3 emits freeform XML `apply_patch` (`Custom`)!
+        // Single uninterrupted `session/prompt`: `exec` -> dynamic `mcp__slack__post_message` sync
+        // -> `wait` -> native 1:1 `apply_patch` -> dynamically added `call_client_tool` -> final reply
+        // (with literal `<agy_tool_call_...>` text in prose passing through unintercepted!).
         MockScript::McpInteractive {
             steps: vec![
                 McpMockStep::CallTool {
@@ -7525,28 +7533,14 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
                     arguments: json!({ "cell_id": "cell_42" }),
                     expect_reply_substrings: vec!["fn old() {}"],
                 },
-                McpMockStep::FinalReply {
+                McpMockStep::CallTool {
                     usage_used: 13_000,
                     thoughts: vec![],
-                    chunks_template: vec![format!(
-                        "<agy_tool_call_{{NONCE}} name=\"apply_patch\">{raw_patch}</agy_tool_call_{{NONCE}}>"
-                    )],
-                    final_usage: AcpUsage {
-                        input_tokens: 11_800,
-                        output_tokens: 450,
-                        cached_read_tokens: 23_850,
-                        cached_write_tokens: 0,
-                        thought_tokens: 0,
-                        total_tokens: 36_100,
-                    },
+                    pre_text_templates: vec![],
+                    mcp_name: "apply_patch".to_owned(),
+                    arguments: json!({ "patch": raw_patch }),
+                    expect_reply_substrings: vec!["Updated the following files"],
                 },
-            ],
-            cancelled_usage: AcpUsage::default(),
-        },
-        // Prompt 2: Warm continuation after XML `apply_patch` result -> can still call native `mcp_lg_exec`
-        // AND complete cleanly!
-        MockScript::McpInteractive {
-            steps: vec![
                 McpMockStep::CallTool {
                     usage_used: 14_000,
                     thoughts: vec![],
@@ -7559,7 +7553,7 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
                     usage_used: 14_500,
                     thoughts: vec![],
                     chunks_template: vec![
-                        "CodeMode + apply_patch coexistence complete.".to_owned(),
+                        "Pure MCP complete (literal `<agy_tool_call_demo>ignored</agy_tool_call_demo>` intact).".to_owned(),
                     ],
                     final_usage: AcpUsage {
                         input_tokens: 2_100,
@@ -7693,7 +7687,7 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
     assert_eq!(fc_wait["name"], "wait");
     let wait_call_id = fc_wait["call_id"].as_str().unwrap();
 
-    // Step 3: Client returns `wait` output -> model emits freeform `<agy_tool_call>` `apply_patch`!
+    // Step 3: Client returns `wait` output -> model calls native 1:1 `mcp_lg_apply_patch`!
     let t3 = app
         .clone()
         .oneshot(
@@ -7730,11 +7724,11 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
     assert_eq!(ctc_patch["input"], raw_patch);
     let patch_call_id = ctc_patch["call_id"].as_str().unwrap();
 
-    // Session is now `Idle` (still retaining `mcp_handle`!) after only 1 `start_prompt`!
+    // Session stays `Suspended` inside the SAME 1 `start_prompt` (zero prompt restart)!
     assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
-    assert_eq!(state.pool.snapshot().idle_cached_sessions, 1);
+    assert_eq!(state.pool.snapshot().suspended_mcp_sessions, 1);
 
-    // Step 4 & 5: Client returns `apply_patch` output -> warm session starts Prompt 2, suspends on `exec`, and finishes!
+    // Step 4 & 5: Client returns `apply_patch` output -> resumes the SAME suspended `session/prompt`, calls `exec`, and finishes!
     let t4 = app
         .clone()
         .oneshot(
@@ -7797,9 +7791,10 @@ async fn code_mode_exec_wait_and_custom_apply_patch_xml_coexistence_plus_dynamic
         serde_json::from_slice(&t5.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(
         t5_json["output"][0]["content"][0]["text"],
-        "CodeMode + apply_patch coexistence complete."
+        "Pure MCP complete (literal `<agy_tool_call_demo>ignored</agy_tool_call_demo>` intact)."
     );
-    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 2);
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
+    assert_eq!(state.pool.snapshot().mcp_continuations, 4);
     assert_eq!(state.pool.snapshot().total_sessions_created, 1);
 }
 
@@ -9358,6 +9353,207 @@ async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_he
     let pool_snap = state.pool.snapshot();
     assert_eq!(pool_snap.total_sessions_created, 1);
     assert_eq!(pool_snap.mcp_continuations, 3);
+}
+
+#[tokio::test]
+async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve_single_session() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1 (0 client tools, e.g. Plan mode) + in-flight `mcp_lg_gateway_web_fetch` in 1 prompt!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 4_200,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "gateway_web_fetch".to_owned(),
+                    arguments: json!({ "url": "https://www.weather.gov.sg/weather-forecast-24hrforecast/" }),
+                    expect_reply_substrings: vec!["<gateway_web_fetch_result"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 4_800,
+                    thoughts: vec![],
+                    chunks_template: vec!["Plan ready from fetched spec.".to_owned()],
+                    final_usage: AcpUsage {
+                        input_tokens: 4_200,
+                        output_tokens: 120,
+                        cached_read_tokens: 0,
+                        cached_write_tokens: 0,
+                        thought_tokens: 0,
+                        total_tokens: 4_320,
+                    },
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Turn 2 (Execute mode attaches `apply_patch` + `exec_command`): reuses `sess_1` with 100%
+        // prefix cache preservation (zero cold session creation, zero `<agy_tool_call_>` XML)!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 5_100,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "call_client_tool".to_owned(),
+                    arguments: json!({
+                        "name": "apply_patch",
+                        "arguments": {
+                            "patch": "*** Update File: src/plan.rs\n@@\n-old_plan()\n+new_plan()"
+                        }
+                    }),
+                    expect_reply_substrings: vec!["Applied cleanly"],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 5_400,
+                    thoughts: vec![],
+                    chunks_template: vec!["Execution complete on warm session.".to_owned()],
+                    final_usage: AcpUsage {
+                        input_tokens: 400,
+                        output_tokens: 90,
+                        cached_read_tokens: 4_320,
+                        cached_write_tokens: 0,
+                        thought_tokens: 0,
+                        total_tokens: 4_810,
+                    },
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    // Turn 1: `tools: []` (0 client tools) -> still mounts pure MCP + in-flight `gateway_web_fetch`
+    let t1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "instructions": "Plan carefully.",
+                        "tools": [],
+                        "input": "Read the spec URL and propose a plan."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t1.status(), StatusCode::OK);
+    let t1_json: Value =
+        serde_json::from_slice(&t1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_1 = t1_json["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        t1_json["output"][0]["content"][0]["text"],
+        "Plan ready from fetched spec."
+    );
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    assert_eq!(backend.recorded_prompts.lock().unwrap().len(), 1);
+    // System append must be 100% free of `<agy_tool_call_` XML simulation
+    let sys_append = backend.recorded_system_appends.lock().unwrap()[0].clone();
+    assert!(!sys_append.contains("<agy_tool_call_"));
+    assert!(sys_append.contains("mcp_lg_gateway_web_fetch"));
+
+    // Turn 2: Client switches from 0 tools to `[apply_patch, exec_command]` via `previous_response_id`
+    let exec_tools = json!([
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply V4A patch."
+        },
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run command.",
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        }
+    ]);
+    let t2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_1,
+                        "tools": exec_tools,
+                        "input": "Proceed and apply the plan."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2.status(), StatusCode::OK);
+    let t2_json: Value =
+        serde_json::from_slice(&t2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp_2 = t2_json["id"].as_str().unwrap().to_owned();
+    let ctc = &t2_json["output"][0];
+    assert_eq!(ctc["type"], "custom_tool_call");
+    assert_eq!(ctc["name"], "apply_patch");
+    assert_eq!(
+        ctc["input"],
+        "*** Begin Patch\n*** Update File: src/plan.rs\n@@\n-old_plan()\n+new_plan()\n*** End Patch"
+    );
+    let patch_cid = ctc["call_id"].as_str().unwrap();
+    // Warm session `sess_1` was preserved across 0 -> 2 tool upgrade without cold eviction!
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
+    let turn2_prompt_text = backend.recorded_prompts.lock().unwrap()[1]
+        .text_joined
+        .clone();
+    assert!(turn2_prompt_text.contains("<client_tools_update>"));
+    assert!(!turn2_prompt_text.contains("<agy_tool_call_"));
+
+    let t3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp_2,
+                        "tools": exec_tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": patch_cid,
+                            "output": "Applied cleanly"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3.status(), StatusCode::OK);
+    let t3_json: Value =
+        serde_json::from_slice(&t3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        t3_json["output"][0]["content"][0]["text"],
+        "Execution complete on warm session."
+    );
+    assert_eq!(state.pool.snapshot().total_sessions_created, 1);
 }
 
 #[tokio::test]
