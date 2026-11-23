@@ -22,13 +22,15 @@ use axum::{
 };
 pub use liftgate_tool_virtualizer::{
     CALL_CLIENT_TOOL_MCP_NAME, ClaudeCodeToolProfile, CodexToolProfile, DetectedHarness,
-    GenericToolProfile, HarnessToolProfile, LocalReplyKind, MAX_NATIVE_MCP_TOOLS, McpBridgedTool,
-    McpRoutingTable, McpSessionCatalog, McpWireTool, NAMESPACE_HUB_MCP_PREFIX, ProtocolHint,
-    SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement, VirtualizedCallDecision, VirtualizerBudget,
-    apply_patch_input_schema, detect_harness, extract_custom_tool_input,
+    GATEWAY_WEB_FETCH_MCP_NAME, GenericToolProfile, HarnessToolProfile, LocalReplyKind,
+    MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog, McpWireTool,
+    NAMESPACE_HUB_MCP_PREFIX, ProtocolHint, SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement,
+    VirtualizedCallDecision, VirtualizerBudget, apply_patch_input_schema, detect_harness,
+    extract_custom_tool_input, freeform_custom_input_schema, gateway_web_fetch_input_schema,
     normalize_apply_patch_text, partition_tools_for_harness, partition_tools_for_mcp,
-    partition_tools_for_mcp_with_hint, plan_virtualization, sanitize_mcp_tool_name,
-    strip_call_prefix, validate_apply_patch_preflight,
+    partition_tools_for_mcp_session, partition_tools_for_mcp_with_hint, plan_virtualization,
+    plan_virtualization_with_options, sanitize_mcp_tool_name, strip_call_prefix,
+    validate_apply_patch_preflight,
 };
 use liftgate_types::{acp::McpServerConfig, canonical::CanonicalToolSpec};
 use serde::{Deserialize, Serialize};
@@ -101,6 +103,11 @@ pub enum ResolvedMcpIncoming {
         client_name: String,
         arguments: String,
         is_custom: bool,
+        reply_tx: oneshot::Sender<McpToolCallReply>,
+    },
+    /// Server-managed `gateway_web_fetch` executed inside the gateway in-flight.
+    GatewayWebFetch {
+        url: String,
         reply_tx: oneshot::Sender<McpToolCallReply>,
     },
 }
@@ -220,6 +227,12 @@ impl McpSessionHandle {
                 is_custom,
                 reply_tx: incoming.reply_tx,
             },
+            VirtualizedCallDecision::GatewayWebFetch { url } => {
+                ResolvedMcpIncoming::GatewayWebFetch {
+                    url,
+                    reply_tx: incoming.reply_tx,
+                }
+            }
         }
     }
 
@@ -346,7 +359,6 @@ impl LoopbackMcpServer {
     /// an RAII [`McpSessionHandle`] whose `Drop` unregisters the endpoint.
     #[must_use]
     pub fn register_session(&self, mut catalog: McpSessionCatalog) -> Arc<McpSessionHandle> {
-        catalog.xml_only_tools = Vec::new();
         let routing = RwLock::new(Arc::clone(&catalog.routing_table));
         catalog.routing_table = Arc::new(McpRoutingTable::default());
         let slot_id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
@@ -712,7 +724,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn register_session_clears_xml_overflow_and_accounts_schema_bytes() {
+    async fn register_session_bridges_all_custom_and_function_tools_and_accounts_schema_bytes() {
         let srv = LoopbackMcpServer::bind(
             NonZeroUsize::new(1024 * 1024).expect("nonzero"),
             NonZeroUsize::new(16).expect("nonzero"),
@@ -739,10 +751,10 @@ mod tests {
             },
         ];
         let cat = partition_tools_for_mcp(&tools, &mut NoopSpillSink);
-        assert_eq!(cat.xml_only_tools.len(), 1);
+        assert_eq!(cat.bridged_pairs.len(), 2);
 
         let handle = srv.register_session(cat);
-        assert!(handle.catalog().xml_only_tools.is_empty());
+        assert!(handle.has_virtualized_dispatch());
         assert!(handle.estimated_retained_bytes() >= desc.len() + params.len());
     }
 }

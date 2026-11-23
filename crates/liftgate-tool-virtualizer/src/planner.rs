@@ -10,7 +10,8 @@ use liftgate_types::{
 use serde_json::{Value, json};
 
 use crate::{
-    CALL_CLIENT_TOOL_MCP_NAME, NAMESPACE_HUB_MCP_PREFIX, SEARCH_CLIENT_TOOLS_MCP_NAME,
+    CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, NAMESPACE_HUB_MCP_PREFIX,
+    SEARCH_CLIENT_TOOLS_MCP_NAME,
     profile::{
         DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement,
         count_fallback_prefix_stems, detect_harness,
@@ -19,7 +20,7 @@ use crate::{
     router::McpRoutingTable,
     schema::{
         McpBridgedTool, McpWireTool, code_mode_exec_input_schema, estimate_wire_tool_bytes,
-        normalize_mcp_object_schema, sanitize_mcp_tool_name,
+        gateway_web_fetch_input_schema, normalize_mcp_object_schema, sanitize_mcp_tool_name,
     },
 };
 
@@ -35,8 +36,8 @@ pub struct McpSessionCatalog {
     pub virtualized_hubs: Vec<(String, String, usize)>,
     /// Whether `search_client_tools` and `call_client_tool` are mounted on `lg`.
     pub has_virtualized_dispatch: bool,
-    /// Freeform `Custom` tools (e.g. `apply_patch`) and non-object schema tools routed via XML.
-    pub xml_only_tools: Vec<CanonicalToolSpec>,
+    /// Whether server-managed `gateway_web_fetch` (`mcp_lg_gateway_web_fetch`) is mounted on `lg`.
+    pub has_gateway_web_fetch: bool,
     /// Pure zero-IO routing and 0-RTT search table retained by `McpSessionHandle`.
     pub routing_table: Arc<McpRoutingTable>,
 }
@@ -69,8 +70,39 @@ pub fn partition_tools_for_mcp_with_hint<S: TruncationSpillSink>(
     client_tools: &[CanonicalToolSpec],
     spill: &mut S,
 ) -> McpSessionCatalog {
+    partition_tools_for_mcp_session(hint, client_tools, false, spill)
+}
+
+/// Auto-detects the caller harness and partitions `client_tools` plus optional server-side
+/// `gateway_web_fetch` onto the loopback MCP server.
+#[must_use]
+pub fn partition_tools_for_mcp_session<S: TruncationSpillSink>(
+    hint: ProtocolHint,
+    client_tools: &[CanonicalToolSpec],
+    enable_gateway_web_fetch: bool,
+    spill: &mut S,
+) -> McpSessionCatalog {
     let harness = detect_harness(hint, client_tools);
-    partition_tools_for_harness(harness, client_tools, spill)
+    match harness {
+        DetectedHarness::Codex => plan_virtualization_with_options(
+            CodexToolProfile,
+            client_tools,
+            enable_gateway_web_fetch,
+            spill,
+        ),
+        DetectedHarness::ClaudeCode => plan_virtualization_with_options(
+            ClaudeCodeToolProfile,
+            client_tools,
+            enable_gateway_web_fetch,
+            spill,
+        ),
+        DetectedHarness::Generic => plan_virtualization_with_options(
+            GenericToolProfile,
+            client_tools,
+            enable_gateway_web_fetch,
+            spill,
+        ),
+    }
 }
 
 /// Partitions `client_tools` for an explicit [`DetectedHarness`] without `dyn` dispatch.
@@ -81,11 +113,15 @@ pub fn partition_tools_for_harness<S: TruncationSpillSink>(
     spill: &mut S,
 ) -> McpSessionCatalog {
     match harness {
-        DetectedHarness::Codex => plan_virtualization(CodexToolProfile, client_tools, spill),
-        DetectedHarness::ClaudeCode => {
-            plan_virtualization(ClaudeCodeToolProfile, client_tools, spill)
+        DetectedHarness::Codex => {
+            plan_virtualization_with_options(CodexToolProfile, client_tools, false, spill)
         }
-        DetectedHarness::Generic => plan_virtualization(GenericToolProfile, client_tools, spill),
+        DetectedHarness::ClaudeCode => {
+            plan_virtualization_with_options(ClaudeCodeToolProfile, client_tools, false, spill)
+        }
+        DetectedHarness::Generic => {
+            plan_virtualization_with_options(GenericToolProfile, client_tools, false, spill)
+        }
     }
 }
 
@@ -94,6 +130,17 @@ pub fn partition_tools_for_harness<S: TruncationSpillSink>(
 pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
     profile: P,
     client_tools: &[CanonicalToolSpec],
+    spill: &mut S,
+) -> McpSessionCatalog {
+    plan_virtualization_with_options(profile, client_tools, false, spill)
+}
+
+/// Monomorphized zero-cost 3-tier virtualization planner with optional `gateway_web_fetch` mounting.
+#[must_use]
+pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpillSink>(
+    profile: P,
+    client_tools: &[CanonicalToolSpec],
+    enable_gateway_web_fetch: bool,
     spill: &mut S,
 ) -> McpSessionCatalog {
     assert_eq!(
@@ -126,36 +173,27 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
 
     let stem_counts = count_fallback_prefix_stems(client_tools);
     let mut eligible: Vec<EligibleCandidate> = Vec::with_capacity(client_tools.len());
-    let mut ineligible_indices: HashSet<usize> = HashSet::new();
 
     for (orig_idx, spec) in client_tools.iter().enumerate() {
         let placement = profile.classify_tool(spec, &stem_counts);
-        let resolved_schema = match &spec.kind {
+        let (schema_val, is_custom, unwrap_custom_key, parameters_json) = match &spec.kind {
             CanonicalToolKind::Custom { .. } => {
-                let bridged = match &placement {
+                let (unwrap_key, schema_val) = match &placement {
                     ToolPlacement::Orchestrator {
                         custom_unwrap_key: Some(key),
-                    } => Some((*key, code_mode_exec_input_schema())),
+                    } => (*key, code_mode_exec_input_schema()),
                     ToolPlacement::Orchestrator { .. }
                     | ToolPlacement::CoreDirect { .. }
                     | ToolPlacement::Namespaced { .. }
                     | ToolPlacement::Standalone { .. } => profile.custom_tool_mcp_bridge(spec),
                 };
-                bridged.map(|(unwrap_key, schema_val)| (schema_val, true, Some(unwrap_key), None))
+                (schema_val, true, Some(unwrap_key), None)
             }
             CanonicalToolKind::Function { parameters_json } => {
-                normalize_mcp_object_schema(parameters_json).map(|schema_val| {
-                    let raw_opt =
-                        (!parameters_json.trim().is_empty()).then(|| parameters_json.clone());
-                    (schema_val, false, None, raw_opt)
-                })
+                let schema_val = normalize_mcp_object_schema(parameters_json);
+                let raw_opt = (!parameters_json.trim().is_empty()).then(|| parameters_json.clone());
+                (schema_val, false, None, raw_opt)
             }
-        };
-
-        let Some((schema_val, is_custom, unwrap_custom_key, parameters_json)) = resolved_schema
-        else {
-            ineligible_indices.insert(orig_idx);
-            continue;
         };
 
         let (cand_kind, is_orchestrator) = match placement {
@@ -211,22 +249,29 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
         .iter()
         .filter(|c| !c.is_orchestrator)
         .fold(0usize, |acc, c| acc.saturating_add(c.est_wire_bytes));
-    let should_virtualize = eligible.len() > budget.direct_passthrough_max_tools
+    let reserved_slots: usize = 2usize.saturating_add(usize::from(enable_gateway_web_fetch));
+    let passthrough_max_tools = budget
+        .direct_passthrough_max_tools
+        .min(budget.max_eager_tools.saturating_sub(reserved_slots));
+    let should_virtualize = eligible.len() > passthrough_max_tools
         || non_orch_wire_bytes > budget.direct_passthrough_max_non_orchestrator_bytes;
 
     let mut used_mcp_names: HashSet<String> =
         HashSet::with_capacity(budget.max_eager_tools.saturating_add(4));
-    if should_virtualize {
-        used_mcp_names.insert(SEARCH_CLIENT_TOOLS_MCP_NAME.to_owned());
-        used_mcp_names.insert(CALL_CLIENT_TOOL_MCP_NAME.to_owned());
+    used_mcp_names.insert(SEARCH_CLIENT_TOOLS_MCP_NAME.to_owned());
+    used_mcp_names.insert(CALL_CLIENT_TOOL_MCP_NAME.to_owned());
+    if enable_gateway_web_fetch {
+        used_mcp_names.insert(GATEWAY_WEB_FETCH_MCP_NAME.to_owned());
     }
 
-    let mut wire_tools: Vec<McpWireTool> =
-        Vec::with_capacity(eligible.len().min(budget.max_eager_tools));
+    let mut wire_tools: Vec<McpWireTool> = Vec::with_capacity(budget.max_eager_tools);
     let mut by_mcp_name: HashMap<String, McpBridgedTool> = HashMap::new();
     let mut bridged_pairs: Vec<(String, String)> = Vec::new();
     let mut virtualized_hubs: Vec<(String, String, usize)> = Vec::new();
     let mut hub_names_by_namespace: HashMap<String, String> = HashMap::new();
+    let call_tool_wire = build_call_client_tool_wire_tool();
+    let search_tool_wire = build_search_client_tools_wire_tool(&budget);
+    let web_fetch_wire = enable_gateway_web_fetch.then(build_gateway_web_fetch_wire_tool);
 
     if !should_virtualize {
         for c in eligible {
@@ -251,6 +296,11 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
             );
             bridged_pairs.push((spec.name.clone(), mcp_name));
         }
+        if let Some(wf_wire) = web_fetch_wire {
+            wire_tools.push(wf_wire);
+        }
+        wire_tools.push(call_tool_wire);
+        wire_tools.push(search_tool_wire);
     } else {
         let mut core_indices: Vec<(u8, u8, usize)> = eligible
             .iter()
@@ -266,7 +316,7 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
         });
         let max_core = budget
             .max_direct_core_tools
-            .min(budget.max_eager_tools.saturating_sub(2));
+            .min(budget.max_eager_tools.saturating_sub(reserved_slots));
         let selected_direct_set: HashSet<usize> = core_indices
             .into_iter()
             .take(max_core)
@@ -315,7 +365,7 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
         let core_slots = selected_direct_set.len();
         let max_hub_slots = budget
             .max_eager_tools
-            .saturating_sub(core_slots.saturating_add(2));
+            .saturating_sub(core_slots.saturating_add(reserved_slots));
         if hub_order.len() > max_hub_slots {
             let mut indexed_hubs: Vec<(usize, PendingHub)> =
                 hub_order.into_iter().enumerate().collect();
@@ -330,9 +380,7 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
             hub_order = indexed_hubs.into_iter().map(|(_, grp)| grp).collect();
         }
 
-        let call_tool_wire = build_call_client_tool_wire_tool();
-        let search_tool_wire = build_search_client_tools_wire_tool(&budget);
-        let reserved_dispatch_bytes = estimate_wire_tool_bytes(
+        let mut reserved_dispatch_bytes = estimate_wire_tool_bytes(
             &call_tool_wire.name,
             call_tool_wire.description.as_deref(),
             &call_tool_wire.input_schema,
@@ -342,6 +390,14 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
             search_tool_wire.description.as_deref(),
             &search_tool_wire.input_schema,
         ));
+        if let Some(ref wf_wire) = web_fetch_wire {
+            reserved_dispatch_bytes =
+                reserved_dispatch_bytes.saturating_add(estimate_wire_tool_bytes(
+                    &wf_wire.name,
+                    wf_wire.description.as_deref(),
+                    &wf_wire.input_schema,
+                ));
+        }
 
         let mut built_hub_wires: Vec<(String, String, usize, McpWireTool)> =
             Vec::with_capacity(hub_order.len());
@@ -377,7 +433,7 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
             let occupied_slots = final_direct_set
                 .len()
                 .saturating_add(built_hub_wires.len())
-                .saturating_add(2);
+                .saturating_add(reserved_slots);
             if occupied_slots >= budget.max_eager_tools {
                 break;
             }
@@ -425,23 +481,20 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
             hub_names_by_namespace.insert(namespace, hub_mcp_name);
         }
 
+        if let Some(wf_wire) = web_fetch_wire {
+            wire_tools.push(wf_wire);
+        }
         wire_tools.push(call_tool_wire);
         wire_tools.push(search_tool_wire);
     }
 
-    let mut xml_only_tools = Vec::with_capacity(ineligible_indices.len());
-    for (idx, spec) in client_tools.iter().enumerate() {
-        if ineligible_indices.contains(&idx) {
-            xml_only_tools.push(spec.clone());
-        }
-    }
-
-    let routing_table = Arc::new(McpRoutingTable::build_with_profile(
+    let routing_table = Arc::new(McpRoutingTable::build_with_profile_and_options(
         profile,
         client_tools,
         by_mcp_name.clone(),
         hub_names_by_namespace,
-        should_virtualize,
+        true,
+        enable_gateway_web_fetch,
     ));
 
     McpSessionCatalog {
@@ -450,8 +503,8 @@ pub fn plan_virtualization<P: HarnessToolProfile, S: TruncationSpillSink>(
         by_mcp_name,
         bridged_pairs,
         virtualized_hubs,
-        has_virtualized_dispatch: should_virtualize,
-        xml_only_tools,
+        has_virtualized_dispatch: true,
+        has_gateway_web_fetch: enable_gateway_web_fetch,
         routing_table,
     }
 }
@@ -526,6 +579,16 @@ fn build_call_client_tool_wire_tool() -> McpWireTool {
             },
             "required": ["name"]
         }),
+    }
+}
+
+fn build_gateway_web_fetch_wire_tool() -> McpWireTool {
+    McpWireTool {
+        name: GATEWAY_WEB_FETCH_MCP_NAME.to_owned(),
+        description: Some(
+            "Fetch the live content of an http:// or https:// URL server-side via the gateway and return extracted readable text/markdown in the current step.".to_owned(),
+        ),
+        input_schema: gateway_web_fetch_input_schema(),
     }
 }
 

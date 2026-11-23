@@ -16,7 +16,8 @@ pub mod schema;
 pub use budget::VirtualizerBudget;
 pub use planner::{
     McpSessionCatalog, partition_tools_for_harness, partition_tools_for_mcp,
-    partition_tools_for_mcp_with_hint, plan_virtualization,
+    partition_tools_for_mcp_session, partition_tools_for_mcp_with_hint, plan_virtualization,
+    plan_virtualization_with_options,
 };
 pub use profile::{
     DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, detect_harness,
@@ -26,8 +27,9 @@ pub use router::{LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
 pub use schema::{
     McpBridgedTool, McpWireTool, apply_patch_input_schema, code_mode_exec_input_schema,
     coerce_stringified_container_fields, estimate_wire_tool_bytes, extract_custom_tool_input,
-    normalize_apply_patch_text, normalize_mcp_object_schema, sanitize_mcp_tool_name,
-    strip_call_prefix, validate_apply_patch_preflight,
+    freeform_custom_input_schema, gateway_web_fetch_input_schema, normalize_apply_patch_text,
+    normalize_mcp_object_schema, sanitize_mcp_tool_name, strip_call_prefix,
+    validate_apply_patch_preflight,
 };
 
 /// Default hard ceiling on MCP tools exposed per session on `lg`.
@@ -38,6 +40,9 @@ pub const SEARCH_CLIENT_TOOLS_MCP_NAME: &str = "search_client_tools";
 
 /// Universal dispatcher MCP tool mounted on `lg` (`mcp_lg_call_client_tool`).
 pub const CALL_CLIENT_TOOL_MCP_NAME: &str = "call_client_tool";
+
+/// Server-managed URL fetch MCP tool mounted on `lg` (`mcp_lg_gateway_web_fetch`).
+pub const GATEWAY_WEB_FETCH_MCP_NAME: &str = "gateway_web_fetch";
 
 /// Prefix for namespace action hub MCP tools (`mcp_lg_ns__<namespace>`).
 pub const NAMESPACE_HUB_MCP_PREFIX: &str = "ns__";
@@ -162,8 +167,20 @@ mod tests {
         assert_eq!(cat.profile_id, "codex");
         assert!(cat.has_virtualized_dispatch);
         assert!(cat.wire_tools.len() <= MAX_NATIVE_MCP_TOOLS);
-        assert_eq!(cat.xml_only_tools.len(), 1);
-        assert_eq!(cat.xml_only_tools[0].name, "sql_lark");
+        // Arbitrary custom grammar tool `sql_lark` is also bridged over MCP via `call_client_tool` (`{input: string}`)!
+        let lark_res = cat.routing_table.resolve_call(
+            CALL_CLIENT_TOOL_MCP_NAME,
+            &json!({ "name": "sql_lark", "arguments": { "input": "SELECT 1;" } }),
+            &tools,
+        );
+        assert_eq!(
+            lark_res,
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "sql_lark".to_owned(),
+                arguments: "SELECT 1;".to_owned(),
+                is_custom: true,
+            }
+        );
 
         for must_direct in [
             "exec",
@@ -190,7 +207,8 @@ mod tests {
                 assert_eq!(kind, LocalReplyKind::PreflightError);
                 assert!(text.contains("line 4"), "got: {text}");
             }
-            VirtualizedCallDecision::ForwardToClient { .. } => {
+            VirtualizedCallDecision::ForwardToClient { .. }
+            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
                 panic!("malformed apply_patch must be caught in 0-RTT preflight")
             }
         }
@@ -210,6 +228,9 @@ mod tests {
             }
             VirtualizedCallDecision::LocalReply { text, .. } => {
                 panic!("expected coalesced ForwardToClient, got LocalReply: {text}")
+            }
+            VirtualizedCallDecision::GatewayWebFetch { .. } => {
+                panic!("unexpected GatewayWebFetch")
             }
         }
         let exec_cmd_wire = cat
@@ -253,7 +274,8 @@ mod tests {
                 assert!(text.contains("mcp__codex_apps__github._action_42"));
                 assert!(text.contains("declare const tools:"));
             }
-            VirtualizedCallDecision::ForwardToClient { .. } => {
+            VirtualizedCallDecision::ForwardToClient { .. }
+            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
                 panic!("search_client_tools must resolve locally in 0-RTT")
             }
         }
@@ -396,7 +418,8 @@ mod tests {
                 assert!(!is_custom);
                 assert_eq!(arguments, r#"{"id":"t-1"}"#);
             }
-            VirtualizedCallDecision::LocalReply { .. } => {
+            VirtualizedCallDecision::LocalReply { .. }
+            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
                 panic!("valid TaskCreate hub call must forward to client")
             }
         }
@@ -417,7 +440,8 @@ mod tests {
                 );
                 assert_eq!(arguments, r##"{"selector":"#submit"}"##);
             }
-            VirtualizedCallDecision::LocalReply { .. } => {
+            VirtualizedCallDecision::LocalReply { .. }
+            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
                 panic!("valid playwright plugin hub call must forward to client")
             }
         }
@@ -486,7 +510,8 @@ mod tests {
             VirtualizedCallDecision::ForwardToClient { client_name, .. } => {
                 assert_eq!(client_name, "lsp_op_99");
             }
-            VirtualizedCallDecision::LocalReply { .. } => {
+            VirtualizedCallDecision::LocalReply { .. }
+            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
                 panic!("dynamically synced tool must route through custom profile's `ns__lsp` hub")
             }
         }
@@ -506,5 +531,58 @@ mod tests {
             r#"{"toolSummary":"Execute JS"}"#
         );
         assert_eq!(extract_custom_tool_input(&Value::Null, None), "");
+    }
+
+    #[test]
+    fn zero_tool_session_with_gateway_web_fetch_hot_syncs_dynamic_tools_without_recreating_session()
+    {
+        let cat = partition_tools_for_mcp_session(
+            ProtocolHint::OpenAiResponses,
+            &[],
+            true,
+            &mut NoopSpillSink,
+        );
+        assert!(cat.has_virtualized_dispatch);
+        assert!(cat.has_gateway_web_fetch);
+        assert_eq!(cat.wire_tools.len(), 3);
+        assert_eq!(
+            cat.routing_table.resolve_call(
+                GATEWAY_WEB_FETCH_MCP_NAME,
+                &json!({ "url": "https://example.com/docs" }),
+                &[],
+            ),
+            VirtualizedCallDecision::GatewayWebFetch {
+                url: "https://example.com/docs".to_owned()
+            }
+        );
+
+        let hot_tools = vec![
+            CanonicalToolSpec {
+                name: "apply_patch".to_owned(),
+                description: Some("Apply V4A patch.".to_owned()),
+                kind: CanonicalToolKind::Custom { format_json: None },
+            },
+            fn_tool(
+                "exec_command",
+                "Run shell command.",
+                json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}),
+            ),
+        ];
+        let rebuilt = cat
+            .routing_table
+            .rebuild_if_changed(&hot_tools)
+            .expect("must detect hot-loaded tools");
+        assert_eq!(
+            rebuilt.resolve_call(
+                CALL_CLIENT_TOOL_MCP_NAME,
+                &json!({ "name": "apply_patch", "arguments": { "patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch" } }),
+                &hot_tools,
+            ),
+            VirtualizedCallDecision::ForwardToClient {
+                client_name: "apply_patch".to_owned(),
+                arguments: "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch".to_owned(),
+                is_custom: true,
+            }
+        );
     }
 }

@@ -79,18 +79,54 @@ pub fn apply_patch_input_schema() -> Value {
     })
 }
 
-/// Normalizes a caller tool's JSON Schema string into a valid root `{"type": "object", ...}` MCP schema.
+/// Input JSON Schema synthesized for arbitrary freeform `Custom` client tools exposed over JSON MCP.
 #[must_use]
-pub fn normalize_mcp_object_schema(parameters_json: &str) -> Option<Value> {
+pub fn freeform_custom_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "Raw freeform text input for this custom tool (do not JSON-escape or wrap in markdown code fences)."
+            }
+        },
+        "required": ["input"]
+    })
+}
+
+/// Input JSON Schema for the gateway-managed server-side `gateway_web_fetch` MCP tool.
+#[must_use]
+pub fn gateway_web_fetch_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Full http:// or https:// URL to fetch server-side."
+            }
+        },
+        "required": ["url"]
+    })
+}
+
+/// Normalizes a caller tool's JSON Schema string into a valid root `{"type": "object", ...}` MCP schema.
+///
+/// Always returns a valid object schema so 100% of `Function` tools are bridged natively over MCP
+/// without ever falling back to XML text simulation.
+#[must_use]
+pub fn normalize_mcp_object_schema(parameters_json: &str) -> Value {
     let trimmed = parameters_json.trim();
     if trimmed.is_empty() {
-        return Some(json!({
+        return json!({
             "type": "object",
             "properties": {}
-        }));
+        });
     }
-    let Value::Object(mut map) = serde_json::from_str::<Value>(trimmed).ok()? else {
-        return None;
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(trimmed) else {
+        return json!({
+            "type": "object",
+            "properties": {}
+        });
     };
     let _ = map.remove("$schema");
 
@@ -102,22 +138,23 @@ pub fn normalize_mcp_object_schema(parameters_json: &str) -> Option<Value> {
                     Value::Object(serde_json::Map::new()),
                 );
             }
-            Some(Value::Object(map))
+            Value::Object(map)
         }
-        Some(_) => None,
-        None => {
-            if map.contains_key("properties") || map.is_empty() {
-                map.insert("type".to_owned(), Value::String("object".to_owned()));
-                if !map.contains_key("properties") {
-                    map.insert(
-                        "properties".to_owned(),
-                        Value::Object(serde_json::Map::new()),
-                    );
-                }
-                Some(Value::Object(map))
-            } else {
-                None
+        Some(_) => json!({
+            "type": "object",
+            "properties": {
+                "value": Value::Object(map)
             }
+        }),
+        None => {
+            map.insert("type".to_owned(), Value::String("object".to_owned()));
+            if !map.contains_key("properties") {
+                map.insert(
+                    "properties".to_owned(),
+                    Value::Object(serde_json::Map::new()),
+                );
+            }
+            Value::Object(map)
         }
     }
 }

@@ -129,5 +129,5 @@ When resolving `ns__<namespace>` or `call_client_tool`:
 | Client-declared tools | `128` (`183.7 KB`) | `128` (`183.7 KB`) |
 | `lg` `tools/list` count | `64` (exceeded `agy` 50-tool Eager limit) | `16` (`34` Eager slots of headroom) |
 | `lg` `tools/list` wire bytes | `94.4 KB` | `~12.0 KB` (`-87%`) |
-| Cold XML overflow (`<client_tools>` + spill) | `64` tools (`~21.4 KB`) | `1` tool (`apply_patch`, `~0.6 KB`, `-97%`) |
+| Cold XML overflow (`<client_tools>` + spill) | `64` tools (`~21.4 KB`) | **`0` tools (`0 KB`, `-100%` — 100% pure native MCP)** |
 | `exec` / `exec_command` / `spawn_agent` availability | Evicted by `agy` size sort | **100% Eager / Natively Reachable** |
