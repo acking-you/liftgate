@@ -4817,6 +4817,24 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 });
                             }
                             ResolvedMcpIncoming::GatewayWebFetch { url, reply_tx } => {
+                                if !cur_req.enable_native_web_fetch {
+                                    disabled_mcp_rejections =
+                                        disabled_mcp_rejections.saturating_add(1);
+                                    if disabled_mcp_rejections
+                                        > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS
+                                    {
+                                        exceeded_rejection_reason =
+                                            Some("\"model repeatedly invoked disabled MCP tool\"");
+                                    } else {
+                                        let _ = reply_tx.send(McpToolCallReply {
+                                            content: vec![McpContentItem::Text {
+                                                text: "Tool `gateway_web_fetch` is disabled for this turn; do not call it.".to_owned(),
+                                            }],
+                                            is_error: true,
+                                        });
+                                    }
+                                    continue;
+                                }
                                 disabled_mcp_rejections = 0;
                                 preflight_mcp_rejections = 0;
                                 let fetch_call_id =

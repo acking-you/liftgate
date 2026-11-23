@@ -9423,7 +9423,7 @@ async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve
     let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
     let app = build_router(state.clone());
 
-    // Turn 1: `tools: []` (0 client tools) -> still mounts pure MCP + in-flight `gateway_web_fetch`
+    // Turn 1: 0 client tools + hosted `web_search` (`external_web_access: true`) -> mounts pure MCP + in-flight `gateway_web_fetch`
     let t1 = app
         .clone()
         .oneshot(
@@ -9437,7 +9437,7 @@ async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve
                         "stream": false,
                         "store": true,
                         "instructions": "Plan carefully.",
-                        "tools": [],
+                        "tools": [{ "type": "web_search", "external_web_access": true }],
                         "input": "Read the spec URL and propose a plan."
                     })
                     .to_string(),
@@ -9450,8 +9450,15 @@ async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve
     let t1_json: Value =
         serde_json::from_slice(&t1.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let resp_1 = t1_json["id"].as_str().unwrap().to_owned();
+    assert_eq!(t1_json["output"][0]["type"], "web_search_call");
+    let t1_msg = t1_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("assistant message output item");
     assert_eq!(
-        t1_json["output"][0]["content"][0]["text"],
+        t1_msg["content"][0]["text"],
         "Plan ready from fetched spec."
     );
     assert_eq!(state.pool.snapshot().total_sessions_created, 1);
@@ -9463,6 +9470,10 @@ async fn pure_mcp_zero_tool_warm_upgrade_and_inflight_gateway_web_fetch_preserve
 
     // Turn 2: Client switches from 0 tools to `[apply_patch, exec_command]` via `previous_response_id`
     let exec_tools = json!([
+        {
+            "type": "web_search",
+            "external_web_access": true
+        },
         {
             "type": "custom",
             "name": "apply_patch",
