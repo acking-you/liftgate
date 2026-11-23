@@ -140,10 +140,11 @@ lg claude-desktop --restore                 # 手动立即执行回滚日志恢�
 
 ## 混合本地回环 MCP 工具挂起桥接
 
-默认情况下（`--mcp-tool-bridge`、`AGY_MCP_TOOL_BRIDGE=true` 或 `~/.liftgate/settings.json` 中的 `mcp_tool_bridge: true`），Liftgate 会在本地仅绑定 `127.0.0.1` 的受鉴权回环 HTTP MCP 服务（每会话独立 256-bit 随机令牌），将客户端的 Code Mode 编排工具（`exec`、`wait`、`REPL`）及最多 64 个高优标准 JSON `Function` 工具以原生 MCP 工具身份注册进 `agy acp` 会话：
+默认情况下（`--mcp-tool-bridge`、`AGY_MCP_TOOL_BRIDGE=true` 或 `~/.liftgate/settings.json` 中的 `mcp_tool_bridge: true`），Liftgate 会在本地仅绑定 `127.0.0.1` 的受鉴权回环 HTTP MCP 服务（每会话独立 256-bit 随机令牌），以严格契合 `agy acp` 50 工具 Eager 上限的安全预算（`<= 24` 个原生 MCP 槽位）挂载客户端工具，确保 `exec`、`exec_command`、`Bash` 等大体积核心编程工具 100% 保留在 Eager 原生声明中：
 
 - **单次 `session/prompt` 挂起原生续接**：模型调用桥接工具时，网关挂起当前 `session/prompt` 回环调用并立即向客户端流式返回标准 OpenAI `function_call` / `custom_tool_call` 或 Anthropic `tool_use`；下一轮客户端携带工具结果返回时（无论使用有状态 `previous_response_id` 还是无状态全量 `input` / `messages` 数组），直接唤醒挂起通道继续推理，使多步工具链始终驻留在同一 `session/prompt` 内，稳定保持 ~93%+ 的上游 Prompt KV 缓存命中率并彻底消除跨轮副本分片掉缓存与 XML 幻觉。
-- **XML 混合共存与无损退栈**：自由文本 `Custom` 工具（如多行裸 `apply_patch` 补丁）、超出 64 个即时上限的工具以及会话中途 `ToolSearch` 动态新增的工具自动在同一会话内通过 `<agy_tool_call_...>` XML 通道协同工作；若用户在工具等待期间按 `Esc` 打断、发送新提示词、切换模型或触发 `/compact`，网关会先通过 `session/cancel` 无损退栈并继续复用原热会话。
+- **自适应命名空间聚合 Hub 与 0-RTT 内存检索（`search_client_tools`）**：轻量会话（`<= 20` 个工具且总定义体积 `<= 22 KiB`）保持 1:1 全量直通；当挂载大规模连接器（如 128+ 个 GitHub / TUI / 多智能体工具）时，核心编程工具（`exec`、`wait`、`REPL`、`exec_command`、`write_stdin`、`Bash`、`Read`、`Edit` 等）保持 1:1 原生直通，其余同源工具族自动折叠为 `mcp_lg_ns__<namespace>` 聚合入口 + `mcp_lg_call_client_tool` 通用分发器，并配合网关内存级 `< 0.1ms` 零客户端往返检索 `mcp_lg_search_client_tools` 与必填参数预检自愈（详见 [MCP 工具虚拟化设计](mcp-tool-virtualization.md)）。
+- **XML 混合共存、动态工具热同步与无损退栈**：自由文本 `Custom` 工具（如多行裸 `apply_patch` 补丁）在同一会话内走无转义 `<agy_tool_call_...>` XML 通道协同工作；会话中途动态新增连接器工具时实时热更新内存路由表，避免注入大体积 XML Schema；若用户在工具等待期间按 `Esc` 打断、发送新提示词、切换模型或触发 `/compact`，网关会先通过 `session/cancel` 无损退栈并继续复用原热会话。
 - **零重启实时热切换**：启动时可传 `--no-mcp-tool-bridge`（`AGY_MCP_TOOL_BRIDGE=false`）关闭，运行中也可随时在 `lg top` 按 `b`、在 Web 监控面板「ACP 会话池与监管」页点击开关或调用 `POST /api/telemetry/mcp-tool-bridge` 在线热切换。
 
 ## 快捷生成本地或全局配置文件（`liftgate config`）

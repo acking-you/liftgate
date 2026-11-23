@@ -19,6 +19,7 @@ use liftgate_types::{
         ConversationHash, INTERNAL_GATEWAY_WEB_FETCH_TOOL, MAX_ACP_PROMPT_TEXT_BYTES,
         McpBridgePromptSpec, WebToolBridgeConfig, build_acp_prompt_plan_with_spill,
         build_client_tools_delta_xml_with_spill, build_compaction_directive_xml_with_spill,
+        build_mcp_virtualized_tools_delta_xml_with_spill,
         build_session_system_append_for_mcp_with_spill_sink,
         build_session_system_append_with_spill_sink, compute_routing_plan,
         format_conversation_hash_hex, hash_conversation_state, hash_conversation_with_reply,
@@ -41,9 +42,9 @@ use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
     mcp_bridge::{
-        ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LoopbackMcpServer, McpContentItem,
-        McpSessionHandle, McpToolCallReply, extract_custom_tool_input, partition_tools_for_mcp,
-        strip_call_prefix,
+        ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LocalReplyKind, LoopbackMcpServer,
+        McpContentItem, McpSessionHandle, McpToolCallReply, ProtocolHint, ResolvedMcpIncoming,
+        partition_tools_for_mcp_with_hint, strip_call_prefix,
     },
     session_pool::{
         CommittedSessionTurn, IdleCheckoutGuard, IdleSessionEntry, McpDriverCommand,
@@ -517,7 +518,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         .accumulated_messages
                         .len()
                         .saturating_add(req.messages.len());
-                    let tools_delta = build_client_tools_delta_xml_with_spill(
+                    let tools_delta = sync_and_build_warm_tools_delta(
+                        checkout.entry().mcp_handle.as_ref(),
                         &checkout.entry().declared_tools,
                         &req.client_tools,
                         &checkout.entry().tool_nonce,
@@ -630,7 +632,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     retired_lease.finish_ephemeral();
                 } else if let Some(delta_slice) = req.messages.get(delta_start..) {
                     let previous_session_context_tokens = checkout.entry().last_context_used;
-                    let tools_delta = build_client_tools_delta_xml_with_spill(
+                    let tools_delta = sync_and_build_warm_tools_delta(
+                        checkout.entry().mcp_handle.as_ref(),
                         &checkout.entry().declared_tools,
                         &req.client_tools,
                         &checkout.entry().tool_nonce,
@@ -701,7 +704,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 && let Some(delta_slice) = req.messages.get(delta_start..)
             {
                 let previous_session_context_tokens = checkout.entry().last_context_used;
-                let tools_delta = build_client_tools_delta_xml_with_spill(
+                let tools_delta = sync_and_build_warm_tools_delta(
+                    checkout.entry().mcp_handle.as_ref(),
                     &checkout.entry().declared_tools,
                     &req.client_tools,
                     &checkout.entry().tool_nonce,
@@ -775,7 +779,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             && !req.client_tools.is_empty()
             && let Some(ref mcp_srv) = cfg.mcp_server
         {
-            let catalog = partition_tools_for_mcp(&req.client_tools, &mut spill_store);
+            let proto_hint = match protocol {
+                TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
+                TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
+            };
+            let catalog =
+                partition_tools_for_mcp_with_hint(proto_hint, &req.client_tools, &mut spill_store);
             if catalog.is_empty() {
                 build_session_system_append_with_spill_sink(
                     req.system_instructions.as_deref(),
@@ -790,6 +799,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     McpBridgePromptSpec {
                         bridged_tools: &catalog.bridged_pairs,
                         xml_tools: &catalog.xml_only_tools,
+                        virtualized_hubs: &catalog.virtualized_hubs,
+                        has_virtualized_dispatch: catalog.has_virtualized_dispatch,
                     },
                     web_cfg,
                     &nonce,
@@ -2918,16 +2929,25 @@ fn normalize_emitted_tool_arguments(
     matched_spec: Option<&liftgate_types::canonical::CanonicalToolSpec>,
 ) -> String {
     if is_custom {
+        let is_apply_patch = matched_spec.is_some_and(|s| s.name == "apply_patch");
         if !is_raw_input
             && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments)
         {
             for key in ["input", "patch", "diff"] {
                 if let Some(serde_json::Value::String(inner)) = map.get(key) {
-                    return inner.clone();
+                    return if is_apply_patch {
+                        liftgate_types::parser::normalize_apply_patch_text(inner)
+                    } else {
+                        inner.clone()
+                    };
                 }
             }
         }
-        return arguments;
+        return if is_apply_patch {
+            liftgate_types::parser::normalize_apply_patch_text(&arguments)
+        } else {
+            arguments
+        };
     }
 
     if !is_raw_input {
@@ -2963,111 +2983,11 @@ fn normalize_emitted_tool_arguments(
     serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_owned())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExpectedJsonContainer {
-    Array,
-    Object,
-}
-
-fn schema_declares_container(prop_schema: &serde_json::Value) -> Option<ExpectedJsonContainer> {
-    if let Some(ty) = prop_schema.get("type") {
-        match ty {
-            serde_json::Value::String(s) => match s.as_str() {
-                "array" => return Some(ExpectedJsonContainer::Array),
-                "object" => return Some(ExpectedJsonContainer::Object),
-                _ => {}
-            },
-            serde_json::Value::Array(arr) => {
-                let has_string = arr.iter().any(|v| v.as_str() == Some("string"));
-                if !has_string {
-                    if arr.iter().any(|v| v.as_str() == Some("array")) {
-                        return Some(ExpectedJsonContainer::Array);
-                    }
-                    if arr.iter().any(|v| v.as_str() == Some("object")) {
-                        return Some(ExpectedJsonContainer::Object);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for union_key in ["anyOf", "oneOf"] {
-        if let Some(serde_json::Value::Array(branches)) = prop_schema.get(union_key) {
-            let allows_string = branches
-                .iter()
-                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("string"));
-            if !allows_string {
-                for branch in branches {
-                    if let Some(kind) = schema_declares_container(branch) {
-                        return Some(kind);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Unwraps JSON-stringified `array` or `object` fields (e.g. `"edits": "[{\"path\":\"a.rs\"}]"`
-/// emitted by Gemini/Antigravity on nested tool calls) ONLY when the client tool's JSON Schema
-/// explicitly declares that property as an `array` or `object` (and not a `string`).
 fn coerce_stringified_container_fields(
     map: &mut serde_json::Map<String, serde_json::Value>,
     parameters_json: &str,
 ) -> bool {
-    let has_candidate = map.values().any(|v| {
-        v.as_str().is_some_and(|s| {
-            let t = s.trim();
-            (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('{') && t.ends_with('}'))
-        })
-    });
-    if !has_candidate {
-        return false;
-    }
-
-    let Ok(schema) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
-        return false;
-    };
-    let Some(props) = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-
-    let mut mutated = false;
-    for (prop_name, prop_schema) in props {
-        let Some(expected) = schema_declares_container(prop_schema) else {
-            continue;
-        };
-        let Some(slot) = map.get_mut(prop_name) else {
-            continue;
-        };
-        let Some(raw_str) = slot.as_str() else {
-            continue;
-        };
-        let trimmed = raw_str.trim();
-        match expected {
-            ExpectedJsonContainer::Array if trimmed.starts_with('[') && trimmed.ends_with(']') => {
-                if let Ok(parsed @ serde_json::Value::Array(_)) =
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    *slot = parsed;
-                    mutated = true;
-                }
-            }
-            ExpectedJsonContainer::Object if trimmed.starts_with('{') && trimmed.ends_with('}') => {
-                if let Ok(parsed @ serde_json::Value::Object(_)) =
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    *slot = parsed;
-                    mutated = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    mutated
+    liftgate_tool_virtualizer::coerce_stringified_container_fields(map, parameters_json)
 }
 
 fn single_required_string_param(parameters_json: &str) -> Option<String> {
@@ -3838,6 +3758,24 @@ async fn unwind_suspended_to_idle_entry<B: AcpBackend>(
     }
 }
 
+fn sync_and_build_warm_tools_delta<S: liftgate_types::session_key::TruncationSpillSink>(
+    mcp_handle: Option<&Arc<McpSessionHandle>>,
+    prev_tools: &[liftgate_types::canonical::CanonicalToolSpec],
+    next_tools: &[liftgate_types::canonical::CanonicalToolSpec],
+    tool_nonce: &str,
+    spill: &mut S,
+) -> Option<String> {
+    let use_virtualized_delta = mcp_handle.is_some_and(|handle| {
+        handle.sync_client_tools(next_tools);
+        handle.has_virtualized_dispatch()
+    });
+    if use_virtualized_delta {
+        build_mcp_virtualized_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
+    } else {
+        build_client_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "internal helper wires promoted MCP continuation step without extra heap indirection"
@@ -3860,7 +3798,8 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
     channel_cap: usize,
     mut spill_store: Option<SpillStore>,
 ) -> ActiveTurnStream {
-    let tools_delta = build_client_tools_delta_xml_with_spill(
+    let tools_delta = sync_and_build_warm_tools_delta(
+        step_lease.mcp_handle(),
         &promoted.declared_tools,
         &req.client_tools,
         step_lease.tool_nonce(),
@@ -4268,10 +4207,17 @@ fn compute_final_mcp_step_usage(
 }
 
 const MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS: u8 = 3;
+const MAX_CONSECUTIVE_PREFLIGHT_MCP_REJECTIONS: u8 = 4;
 
-fn translate_incoming_mcp_call(
-    incoming: IncomingMcpToolCall,
-    mcp_handle: &McpSessionHandle,
+struct ForwardedMcpCall {
+    client_name: String,
+    arguments: String,
+    is_custom: bool,
+    reply_tx: oneshot::Sender<McpToolCallReply>,
+}
+
+fn record_forwarded_mcp_call(
+    forwarded: ForwardedMcpCall,
     task_guard: &ActiveTaskGuard,
     state: &mut TurnStreamState,
 ) -> (
@@ -4280,33 +4226,13 @@ fn translate_incoming_mcp_call(
     TurnEvent,
     usize,
 ) {
-    let bridged = mcp_handle.catalog().lookup(&incoming.mcp_name);
-    let client_name = bridged.map_or_else(|| incoming.mcp_name.clone(), |b| b.client_name.clone());
-    let is_custom = bridged.is_some_and(|b| b.is_custom);
-
-    let arguments_str = if is_custom {
-        let unwrap_key = bridged.and_then(|b| b.unwrap_custom_key);
-        extract_custom_tool_input(&incoming.arguments, unwrap_key)
-    } else {
-        let mut args_val = incoming.arguments;
-        if args_val.is_null() {
-            args_val = serde_json::Value::Object(serde_json::Map::new());
-        }
-        if let serde_json::Value::Object(ref mut map) = args_val {
-            let schema_declares_tool_summary = bridged
-                .and_then(|b| b.parameters_json.as_deref())
-                .is_some_and(|s| s.contains("\"toolSummary\""));
-            if !schema_declares_tool_summary {
-                let _ = map.remove("toolSummary");
-            }
-            if let Some(params_json) = bridged.and_then(|b| b.parameters_json.as_deref()) {
-                let _ = coerce_stringified_container_fields(map, params_json);
-            }
-        }
-        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned())
-    };
-
-    let arg_chars = arguments_str.chars().count();
+    let ForwardedMcpCall {
+        client_name,
+        arguments,
+        is_custom,
+        reply_tx,
+    } = forwarded;
+    let arg_chars = arguments.chars().count();
     let nonce_suffix = generate_short_nonce();
     let call_id = format!("call_{nonce_suffix}");
 
@@ -4316,7 +4242,7 @@ fn translate_incoming_mcp_call(
     state.assistant_parts.push(CanonicalPart::ToolCall {
         call_id: call_id.clone(),
         name: client_name.clone(),
-        arguments: arguments_str.clone(),
+        arguments: arguments.clone(),
         is_custom,
     });
 
@@ -4328,10 +4254,10 @@ fn translate_incoming_mcp_call(
     let ev = TurnEvent::ClientToolCall {
         call_id,
         name: client_name,
-        arguments: arguments_str,
+        arguments,
         is_custom,
     };
-    (info, incoming.reply_tx, ev, arg_chars)
+    (info, reply_tx, ev, arg_chars)
 }
 
 #[expect(
@@ -4466,11 +4392,14 @@ async fn run_mcp_session_driver<B: AcpBackend>(
 
             let mut suppressed_banners: Vec<String> = Vec::new();
             let mut disabled_mcp_rejections: u8 = 0;
+            let mut preflight_mcp_rejections: u8 = 0;
             let mut pending_mcp_incoming: Vec<IncomingMcpToolCall> = Vec::new();
+            let mut ready_forwarded_calls: Vec<ForwardedMcpCall> = Vec::new();
             let mut prompt_outcome: Option<Result<PromptTurnResult, AcpError>> = None;
 
             'substep_loop: loop {
                 pending_mcp_incoming.clear();
+                ready_forwarded_calls.clear();
                 let mut upstream_abort: Option<(UpstreamBannerSignal, String)> = None;
                 let mut step_timed_out = false;
 
@@ -4848,39 +4777,66 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                 }
 
                 if !pending_mcp_incoming.is_empty() && prompt_outcome.is_none() {
-                    let mut allowed_incoming = Vec::with_capacity(pending_mcp_incoming.len());
-                    let mut exceeded_disabled_rejection_cap = false;
+                    mcp_handle.sync_client_tools(&cur_req.client_tools);
+                    let mut exceeded_rejection_reason: Option<&'static str> = None;
                     for incoming in pending_mcp_incoming.drain(..) {
-                        let resolved_client_name = mcp_handle
-                            .catalog()
-                            .lookup(&incoming.mcp_name)
-                            .map_or_else(|| incoming.mcp_name.clone(), |b| b.client_name.clone());
-                        let is_enabled = cur_req
-                            .client_tools
-                            .iter()
-                            .any(|t| t.name == resolved_client_name);
-                        if is_enabled {
-                            disabled_mcp_rejections = 0;
-                            allowed_incoming.push(incoming);
-                        } else {
-                            disabled_mcp_rejections = disabled_mcp_rejections.saturating_add(1);
-                            if disabled_mcp_rejections > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS {
-                                exceeded_disabled_rejection_cap = true;
-                            } else {
-                                let _ = incoming.reply_tx.send(McpToolCallReply {
-                                    content: vec![McpContentItem::Text {
-                                        text: format!(
-                                            "Tool `{resolved_client_name}` is disabled for this turn; do not call it."
-                                        ),
-                                    }],
-                                    is_error: true,
+                        match mcp_handle.resolve_incoming_call(incoming, &cur_req.client_tools) {
+                            ResolvedMcpIncoming::ImmediateLocalReply {
+                                reply_tx,
+                                reply,
+                                kind,
+                            } => match kind {
+                                LocalReplyKind::Search => {
+                                    disabled_mcp_rejections = 0;
+                                    preflight_mcp_rejections = 0;
+                                    let _ = reply_tx.send(reply);
+                                }
+                                LocalReplyKind::PreflightError => {
+                                    preflight_mcp_rejections =
+                                        preflight_mcp_rejections.saturating_add(1);
+                                    if preflight_mcp_rejections
+                                        > MAX_CONSECUTIVE_PREFLIGHT_MCP_REJECTIONS
+                                    {
+                                        exceeded_rejection_reason = Some(
+                                            "\"model repeatedly failed virtualized MCP tool preflight\"",
+                                        );
+                                    } else {
+                                        let _ = reply_tx.send(reply);
+                                    }
+                                }
+                                LocalReplyKind::DisabledTool => {
+                                    disabled_mcp_rejections =
+                                        disabled_mcp_rejections.saturating_add(1);
+                                    if disabled_mcp_rejections
+                                        > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS
+                                    {
+                                        exceeded_rejection_reason =
+                                            Some("\"model repeatedly invoked disabled MCP tool\"");
+                                    } else {
+                                        let _ = reply_tx.send(reply);
+                                    }
+                                }
+                            },
+                            ResolvedMcpIncoming::ForwardToClient {
+                                client_name,
+                                arguments,
+                                is_custom,
+                                reply_tx,
+                            } => {
+                                disabled_mcp_rejections = 0;
+                                preflight_mcp_rejections = 0;
+                                ready_forwarded_calls.push(ForwardedMcpCall {
+                                    client_name,
+                                    arguments,
+                                    is_custom,
+                                    reply_tx,
                                 });
                             }
                         }
                     }
 
-                    if exceeded_disabled_rejection_cap {
-                        drop(allowed_incoming);
+                    if let Some(abort_msg) = exceeded_rejection_reason {
+                        ready_forwarded_calls.clear();
                         state.tainted_session = true;
                         state.halted_post_tool_runaway = true;
                         backend.cancel_prompt_nonblocking(&session_id);
@@ -4894,10 +4850,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     "end_turn".to_owned()
                                 };
                                 if res.error.is_none() {
-                                    res.error = RawValue::from_string(
-                                        "\"model repeatedly invoked disabled MCP tool\"".to_owned(),
-                                    )
-                                    .ok();
+                                    res.error = RawValue::from_string(abort_msg.to_owned()).ok();
                                 }
                                 Some(Ok(res))
                             }
@@ -4908,38 +4861,30 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     "end_turn".to_owned()
                                 },
                                 usage: AcpUsage::default(),
-                                error: RawValue::from_string(
-                                    "\"model repeatedly invoked disabled MCP tool\"".to_owned(),
-                                )
-                                .ok(),
+                                error: RawValue::from_string(abort_msg.to_owned()).ok(),
                             })),
                         };
                         break 'substep_loop;
                     }
 
-                    if allowed_incoming.is_empty() {
+                    if ready_forwarded_calls.is_empty() {
                         continue 'substep_loop;
                     }
-                    pending_mcp_incoming = allowed_incoming;
                 }
                 break 'substep_loop;
             }
 
             // Case A: Native MCP tool suspension (`POST /mcp/{token} tools/call` parked in-flight).
-            if !pending_mcp_incoming.is_empty() && prompt_outcome.is_none() {
+            if !ready_forwarded_calls.is_empty() && prompt_outcome.is_none() {
                 state.flush_text_part();
-                let mut pending_infos = Vec::with_capacity(pending_mcp_incoming.len());
+                let mut pending_infos = Vec::with_capacity(ready_forwarded_calls.len());
                 let mut parked_replies: Vec<(String, oneshot::Sender<McpToolCallReply>)> =
-                    Vec::with_capacity(pending_mcp_incoming.len());
+                    Vec::with_capacity(ready_forwarded_calls.len());
                 let mut step_tool_arg_chars: usize = 0;
 
-                for incoming in pending_mcp_incoming {
-                    let (info, reply_tx, ev, arg_chars) = translate_incoming_mcp_call(
-                        incoming,
-                        &mcp_handle,
-                        &cur_task_guard,
-                        &mut state,
-                    );
+                for forwarded in ready_forwarded_calls {
+                    let (info, reply_tx, ev, arg_chars) =
+                        record_forwarded_mcp_call(forwarded, &cur_task_guard, &mut state);
                     step_tool_arg_chars = step_tool_arg_chars.saturating_add(arg_chars);
                     parked_replies.push((info.nonce_suffix.clone(), reply_tx));
                     pending_infos.push(info);

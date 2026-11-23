@@ -6886,6 +6886,11 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
             description: Some("Freeform patch.".to_owned()),
             kind: CanonicalToolKind::Custom { format_json: None },
         },
+        CanonicalToolSpec {
+            name: "sql_lark".to_owned(),
+            description: Some("Arbitrary custom Lark grammar.".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
     ];
     let catalog = liftgate_server::mcp_bridge::partition_tools_for_mcp(&tools, &mut NoopSpillSink);
     let handle = srv.register_session(catalog);
@@ -6917,7 +6922,8 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
     assert_eq!(disc_status, 200);
     assert_eq!(disc_json.unwrap()["error"]["code"], -32601);
 
-    // 3. `tools/list` exposes `exec` with `{code: string}` schema and omits freeform `apply_patch`
+    // 3. `tools/list` exposes `exec` (`{code: string}`) + `apply_patch` (`{patch: string}`)
+    //    natively and omits arbitrary unbridged custom grammars (`sql_lark`)
     let (list_status, list_json) = post_loopback_mcp_json(
         &url,
         &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
@@ -6928,10 +6934,15 @@ async fn mcp_handshake_discover_fallback_auth_and_session_drop_unregistration() 
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(wire_tools.len(), 1);
+    assert_eq!(wire_tools.len(), 2);
     assert_eq!(wire_tools[0]["name"], "exec");
     assert_eq!(
         wire_tools[0]["inputSchema"]["properties"]["code"]["type"],
+        "string"
+    );
+    assert_eq!(wire_tools[1]["name"], "apply_patch");
+    assert_eq!(
+        wire_tools[1]["inputSchema"]["properties"]["patch"]["type"],
         "string"
     );
 
@@ -8964,4 +8975,871 @@ async fn warm_mcp_turn_rejects_disabled_or_removed_tools_with_is_error_and_compl
         "expected empty-tools <client_tools_update> to forbid mcp_lg_* calls: {}",
         prompts[2].text_joined
     );
+}
+
+#[tokio::test]
+async fn openai_responses_130_tool_virtualized_hubs_zero_rtt_search_preflight_heal_and_dynamic_sync()
+ {
+    let final_sum = AcpUsage {
+        input_tokens: 18_500,
+        output_tokens: 920,
+        cached_read_tokens: 46_000,
+        cached_write_tokens: 0,
+        thought_tokens: 210,
+        total_tokens: 65_420,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            // Substep 1 (0-RTT inside Turn 1): search `github` namespace for `merge_pr_42`
+            McpMockStep::CallTool {
+                usage_used: 12_000,
+                thoughts: vec!["Searching GitHub hub for merge_pr_42 schema.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({
+                    "namespace": "github",
+                    "query": "merge_pr_42"
+                }),
+                expect_reply_substrings: vec![
+                    "mcp__codex_apps__github._merge_pr_42",
+                    "repository_full_name",
+                    "declare const tools:",
+                ],
+            },
+            // Substep 2 (0-RTT preflight self-heal inside Turn 1): pass wrong key `repo_full_name`
+            McpMockStep::CallTool {
+                usage_used: 12_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__github".to_owned(),
+                arguments: json!({
+                    "action": "merge_pr_42",
+                    "args": { "repo_full_name": "acking-you/liftgate", "pr_number": 42 }
+                }),
+                expect_reply_substrings: vec![
+                    "Missing required parameter(s)",
+                    "repository_full_name",
+                ],
+            },
+            // Substep 3 (Suspends Turn 1 -> emits `mcp__codex_apps__github._merge_pr_42` over SSE)
+            McpMockStep::CallTool {
+                usage_used: 12_900,
+                thoughts: vec!["Retrying with exact required parameter.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "ns__github".to_owned(),
+                arguments: json!({
+                    "action": "_merge_pr_42",
+                    "args": { "repository_full_name": "acking-you/liftgate", "pr_number": 42 },
+                    "toolSummary": "Merge PR #42"
+                }),
+                expect_reply_substrings: vec!["merged_sha=deadbeef"],
+            },
+            // Substep 4 (0-RTT inside Turn 2): search newly added dynamic `slack` tool
+            McpMockStep::CallTool {
+                usage_used: 14_100,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({ "query": "slack post_release" }),
+                expect_reply_substrings: vec!["mcp__slack__post_release", "call_client_tool"],
+            },
+            // Substep 5 (Suspends Turn 2 -> emits dynamically added `mcp__slack__post_release`)
+            McpMockStep::CallTool {
+                usage_used: 14_600,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "call_client_tool".to_owned(),
+                arguments: json!({
+                    "name": "mcp__slack__post_release",
+                    "arguments": { "channel": "#releases", "text": "Merged #42" }
+                }),
+                expect_reply_substrings: vec!["slack_ok=true"],
+            },
+            // Substep 6 (Suspends Turn 3 -> invokes direct Code Mode `exec` custom JS tool!)
+            McpMockStep::CallTool {
+                usage_used: 15_200,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "exec".to_owned(),
+                arguments: json!({
+                    "code": "const out = await tools.exec_command({ cmd: 'git status -sb' }); text(out.output);",
+                    "toolSummary": "Check git status"
+                }),
+                expect_reply_substrings: vec!["## feat/mcp-tool-virtualization"],
+            },
+            // Substep 7 (Completes Turn 4)
+            McpMockStep::FinalReply {
+                usage_used: 16_000,
+                thoughts: vec!["All tasks complete.".to_owned()],
+                chunks_template: vec![
+                    "PR #42 merged, Slack notified, and branch clean.".to_owned(),
+                ],
+                final_usage: final_sum,
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let ts_footer = "\n\nexec tool declaration:\n```ts\ndeclare const tools: { helper(args: { x: string }): Promise<unknown>; };\n```";
+    let mut tools_vec = vec![
+        json!({
+            "type": "custom",
+            "name": "exec",
+            "description": "Execute JavaScript in Code Mode. globalThis.tools exposes nested tools."
+        }),
+        json!({
+            "type": "function",
+            "name": "wait",
+            "description": format!("Wait on running exec cell.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "cell_id": { "type": "string" } },
+                "required": ["cell_id"]
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "exec_command",
+            "description": format!("Execute command in PTY.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        }),
+        json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Patch files with raw freeform grammar."
+        }),
+    ];
+    for i in 0..85 {
+        tools_vec.push(json!({
+            "type": "function",
+            "name": format!("mcp__codex_apps__github._merge_pr_{i:02}"),
+            "description": format!("Merge pull request variant #{i}.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repository_full_name": { "type": "string" },
+                    "pr_number": { "type": "integer" }
+                },
+                "required": ["repository_full_name", "pr_number"]
+            }
+        }));
+    }
+    for i in 0..40 {
+        tools_vec.push(json!({
+            "type": "function",
+            "name": format!("mcp__codex_tui.thread_op_{i:02}"),
+            "description": format!("Codex TUI thread operation #{i}.{ts_footer}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "thread_id": { "type": "string" } },
+                "required": ["thread_id"]
+            }
+        }));
+    }
+    assert_eq!(tools_vec.len(), 129);
+
+    // Turn 1: Cold request with 129 tools -> 0-RTT search + 0-RTT preflight self-heal -> suspends on `_merge_pr_42`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "instructions": "Merge PR #42 and announce release.",
+                        "tools": tools_vec,
+                        "input": "Please merge PR #42, post to Slack, and verify git status."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r1_events = parse_sse_events(&r1.into_body().collect().await.unwrap().to_bytes());
+    let r1_done = &r1_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_1 = r1_done["id"].as_str().unwrap().to_owned();
+    let r1_outputs = r1_done["output"].as_array().unwrap();
+    let r1_fcs: Vec<&Value> = r1_outputs
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .collect();
+    // Neither `search_client_tools` nor the failed preflight call may leak to the caller!
+    assert_eq!(r1_fcs.len(), 1);
+    assert_eq!(r1_fcs[0]["namespace"], "mcp__codex_apps__github");
+    assert_eq!(r1_fcs[0]["name"], "_merge_pr_42");
+    let fc1_args: Value = serde_json::from_str(r1_fcs[0]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        fc1_args,
+        json!({ "repository_full_name": "acking-you/liftgate", "pr_number": 42 })
+    );
+    let call_id_1 = r1_fcs[0]["call_id"].as_str().unwrap().to_owned();
+
+    // Cold turn outbound prompt must NOT carry any overflow `<client_tools_update>` spill!
+    {
+        let prompts = backend.recorded_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            !prompts[0].text_joined.contains("<client_tools_update>"),
+            "cold virtualized turn should not spill overflow XML tools: {}",
+            prompts[0].text_joined
+        );
+    }
+
+    // Turn 2: Resume `mcp-cont` AND dynamically add `mcp__slack__post_release` mid-session!
+    let mut tools_turn_2 = tools_vec.clone();
+    tools_turn_2.push(json!({
+        "type": "function",
+        "name": "mcp__slack__post_release",
+        "description": "Post release announcement to Slack channel.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "required": ["channel", "text"]
+        }
+    }));
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_1,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_1,
+                            "output": "merged_sha=deadbeef"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let r2_events = parse_sse_events(&r2.into_body().collect().await.unwrap().to_bytes());
+    let r2_done = &r2_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_2 = r2_done["id"].as_str().unwrap().to_owned();
+    let fc_2 = r2_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("expected dynamic slack function_call");
+    assert_eq!(fc_2["name"], "mcp__slack__post_release");
+    let call_id_2 = fc_2["call_id"].as_str().unwrap().to_owned();
+
+    // Turn 3: Resume `mcp-cont` -> receives direct Code Mode `exec` `custom_tool_call`!
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_2,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id_2,
+                            "output": "slack_ok=true"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let r3_events = parse_sse_events(&r3.into_body().collect().await.unwrap().to_bytes());
+    let r3_done = &r3_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let resp_id_3 = r3_done["id"].as_str().unwrap().to_owned();
+    let custom_3 = r3_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "custom_tool_call")
+        .expect("expected direct exec custom_tool_call");
+    assert_eq!(custom_3["name"], "exec");
+    assert_eq!(
+        custom_3["input"],
+        "const out = await tools.exec_command({ cmd: 'git status -sb' }); text(out.output);"
+    );
+    let call_id_3 = custom_3["call_id"].as_str().unwrap().to_owned();
+
+    // Turn 4: Resume `mcp-cont` with `custom_tool_call_output` -> Final answer!
+    let r4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": resp_id_3,
+                        "tools": tools_turn_2,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": call_id_3,
+                            "output": "## feat/mcp-tool-virtualization"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+    let r4_events = parse_sse_events(&r4.into_body().collect().await.unwrap().to_bytes());
+    let r4_done = &r4_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let r4_msg = r4_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("expected final assistant message item");
+    assert_eq!(
+        r4_msg["content"][0]["text"],
+        "PR #42 merged, Slack notified, and branch clean."
+    );
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 3);
+}
+
+#[tokio::test]
+async fn codex_native_mcp_apply_patch_preflight_heals_bad_syntax_and_coalesces_duplicate_files() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 9_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "apply_patch".to_owned(),
+                arguments: json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/router.rs\n@@\nunprefixed_context_line\n-old()\n+new()\n*** End Patch",
+                    "toolSummary": "Patch router.rs"
+                }),
+                expect_reply_substrings: vec![
+                    "Invalid `apply_patch` syntax at line 4",
+                    "src/router.rs",
+                ],
+            },
+            McpMockStep::CallTool {
+                usage_used: 9_600,
+                thoughts: vec![],
+                pre_text_templates: vec!["正在应用修复后的补丁。".to_owned()],
+                mcp_name: "apply_patch".to_owned(),
+                arguments: json!({
+                    "patch": "```patch\r\n*** Update File: src/router.rs\r\n@@\r\n-let a = 1;\r\n+let a = 2;\r\n\r\n let stay = true;\r\n*** Update File: src/router.rs\r\n@@ fn tail()\r\n-let b = 3;\r\n+let b = 4;\r\n```",
+                    "toolSummary": "Patch router.rs cleanly"
+                }),
+                expect_reply_substrings: vec!["Success. Updated the following files:"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 10_200,
+                thoughts: vec![],
+                chunks_template: vec!["`src/router.rs` 更新完成。".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 1_500,
+                    output_tokens: 180,
+                    cached_read_tokens: 8_500,
+                    cached_write_tokens: 0,
+                    thought_tokens: 20,
+                    total_tokens: 10_200,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let tools = json!([
+        {
+            "type": "custom",
+            "name": "exec",
+            "description": "Run JavaScript in Code Mode."
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Freeform V4A patch tool.",
+            "format": { "type": "grammar", "syntax": "lark", "definition": "start: /.+/" }
+        }
+    ]);
+
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "tools": tools,
+                        "input": [{ "role": "user", "content": "Update src/router.rs" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r1_events = parse_sse_events(&r1.into_body().collect().await.unwrap().to_bytes());
+    let r1_done = &r1_events
+        .iter()
+        .find(|(ev, _)| ev == "response.completed")
+        .unwrap()
+        .1["response"];
+    let r1_id = r1_done["id"].as_str().unwrap().to_owned();
+    let ctc_items: Vec<&Value> = r1_done["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "custom_tool_call")
+        .collect();
+    assert_eq!(
+        ctc_items.len(),
+        1,
+        "failed preflight call must never leak to client"
+    );
+    assert_eq!(ctc_items[0]["name"], "apply_patch");
+    assert_eq!(
+        ctc_items[0]["input"].as_str().unwrap(),
+        "*** Begin Patch\n*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n \n let stay = true;\n@@ fn tail()\n-let b = 3;\n+let b = 4;\n*** End Patch"
+    );
+    let ctc_call_id = ctc_items[0]["call_id"].as_str().unwrap().to_owned();
+
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "previous_response_id": r1_id,
+                        "tools": tools,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": ctc_call_id,
+                            "output": "Success. Updated the following files:\nM src/router.rs"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let r2_json: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let final_msg = r2_json["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(final_msg, "`src/router.rs` 更新完成。");
+}
+
+#[tokio::test]
+async fn anthropic_messages_claude_code_profile_virtualizes_pascal_families_plugins_and_backfills_standalones()
+ {
+    let final_usage = AcpUsage {
+        input_tokens: 14_200,
+        output_tokens: 610,
+        cached_read_tokens: 51_000,
+        cached_write_tokens: 0,
+        thought_tokens: 180,
+        total_tokens: 65_810,
+    };
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 11_000,
+                thoughts: vec!["Creating task and loading skill.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "ns__tasks".to_owned(),
+                arguments: json!({
+                    "action": "TaskCreate",
+                    "args": { "subject": "Audit Playwright E2E", "description": "Check login selector" },
+                    "toolSummary": "Create tracking task"
+                }),
+                expect_reply_substrings: vec!["task_id=task-1"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 12_100,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Skill".to_owned(),
+                arguments: json!({
+                    "skill": "chrome-devtools",
+                    "toolSummary": "Load browser skill"
+                }),
+                expect_reply_substrings: vec!["skill_loaded=true"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 12_800,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({
+                    "namespace": "playwright",
+                    "query": "browser_op_07"
+                }),
+                expect_reply_substrings: vec![
+                    "mcp__plugin_playwright_playwright__browser_op_07",
+                    "ns__playwright",
+                ],
+            },
+            McpMockStep::CallTool {
+                usage_used: 13_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "ns__playwright".to_owned(),
+                arguments: json!({
+                    "action": "browser_op_07",
+                    "args": { "selector": "#login-btn" }
+                }),
+                expect_reply_substrings: vec!["clicked=#login-btn"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 14_200,
+                thoughts: vec!["Playwright audit complete.".to_owned()],
+                chunks_template: vec!["Claude Code workflow verified.".to_owned()],
+                final_usage,
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+
+    let mut claude_tools = Vec::new();
+    for core in [
+        "REPL",
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "Grep",
+        "Glob",
+        "Agent",
+        "LSP",
+        "ToolSearch",
+    ] {
+        claude_tools.push(json!({
+            "name": core,
+            "description": format!("Claude Code core {core}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } }
+            }
+        }));
+    }
+    claude_tools.push(json!({
+        "name": "TaskCreate",
+        "description": "Create a structured task item.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string" },
+                "description": { "type": "string" }
+            },
+            "required": ["subject", "description"]
+        }
+    }));
+    for family in [
+        "TodoWrite",
+        "TaskUpdate",
+        "TaskList",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "TeamCreate",
+        "SendMessage",
+        "CronCreate",
+        "ScheduleWakeup",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+    ] {
+        claude_tools.push(json!({
+            "name": family,
+            "description": format!("Claude Code built-in {family}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }
+        }));
+    }
+    claude_tools.push(json!({
+        "name": "AskUserQuestion",
+        "description": "Ask user clarifying questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "question": { "type": "string" } },
+            "required": ["question"]
+        }
+    }));
+    claude_tools.push(json!({
+        "name": "Skill",
+        "description": "Load a Claude Code skill.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "skill": { "type": "string" } },
+            "required": ["skill"]
+        }
+    }));
+    for i in 0..25 {
+        claude_tools.push(json!({
+            "name": format!("mcp__plugin_playwright_playwright__browser_op_{i:02}"),
+            "description": format!("Playwright plugin op #{i}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "selector": { "type": "string" } },
+                "required": ["selector"]
+            }
+        }));
+    }
+    for i in 0..34 {
+        claude_tools.push(json!({
+            "name": format!("mcp__claude_ai_Linear__issue_op_{i:02}"),
+            "description": format!("Linear cloud connector op #{i}"),
+            "input_schema": {
+                "type": "object",
+                "properties": { "issue_id": { "type": "string" } },
+                "required": ["issue_id"]
+            }
+        }));
+    }
+    assert_eq!(claude_tools.len(), 85);
+
+    let mut messages =
+        vec![json!({ "role": "user", "content": "Audit the login button via Playwright." })];
+    let m1_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m1_resp.status(), StatusCode::OK);
+    let m1_json: Value =
+        serde_json::from_slice(&m1_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu1 = m1_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected TaskCreate tool_use");
+    assert_eq!(tu1["name"], "TaskCreate");
+    assert_eq!(tu1["input"]["subject"], "Audit Playwright E2E");
+    assert!(tu1["input"].get("toolSummary").is_none());
+    let tu1_id = tu1["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m1_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu1_id, "content": "task_id=task-1" }]
+    }));
+    let m2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m2_resp.status(), StatusCode::OK);
+    let m2_json: Value =
+        serde_json::from_slice(&m2_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu2 = m2_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected backfilled Skill tool_use");
+    assert_eq!(tu2["name"], "Skill");
+    assert_eq!(tu2["input"]["skill"], "chrome-devtools");
+    let tu2_id = tu2["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m2_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu2_id, "content": "skill_loaded=true" }]
+    }));
+    let m3_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m3_resp.status(), StatusCode::OK);
+    let m3_json: Value =
+        serde_json::from_slice(&m3_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let tu3 = m3_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("expected Playwright plugin tool_use");
+    assert_eq!(
+        tu3["name"],
+        "mcp__plugin_playwright_playwright__browser_op_07"
+    );
+    assert_eq!(tu3["input"]["selector"], "#login-btn");
+    let tu3_id = tu3["id"].as_str().unwrap().to_owned();
+
+    messages.push(json!({ "role": "assistant", "content": m3_json["content"] }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{ "type": "tool_result", "tool_use_id": tu3_id, "content": "clicked=#login-btn" }]
+    }));
+    let m4_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "stream": false,
+                        "tools": claude_tools,
+                        "messages": messages
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m4_resp.status(), StatusCode::OK);
+    let m4_json: Value =
+        serde_json::from_slice(&m4_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let final_text = m4_json["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "text")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(final_text, "Claude Code workflow verified.");
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(pool_snap.total_sessions_created, 1);
+    assert_eq!(pool_snap.mcp_continuations, 3);
 }

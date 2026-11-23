@@ -2,13 +2,14 @@
 resolver = "3"
 members = [
     "crates/liftgate-types",
+    "crates/liftgate-tool-virtualizer",
     "crates/liftgate-server",
     "crates/liftgate-core",
     "crates/liftgate",
 ]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
@@ -16,6 +17,7 @@ repository = "https://github.com/acking-you/liftgate"
 
 [workspace.dependencies]
 liftgate-types = { path = "crates/liftgate-types", default-features = false }
+liftgate-tool-virtualizer = { path = "crates/liftgate-tool-virtualizer", default-features = false }
 liftgate-server = { path = "crates/liftgate-server", default-features = false }
 liftgate-core = { path = "crates/liftgate-core", default-features = false }
 

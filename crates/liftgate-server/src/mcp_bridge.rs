@@ -2,12 +2,12 @@
 //! alongside coexisting `<agy_tool_call_{nonce}>` XML tools.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -20,14 +20,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use liftgate_types::{
-    acp::McpServerConfig,
-    canonical::{CanonicalToolKind, CanonicalToolSpec},
-    session_key::{
-        TruncationSpillSink, compact_mcp_tool_description, is_code_mode_custom_exec,
-        is_code_mode_orchestrator_tool,
-    },
+pub use liftgate_tool_virtualizer::{
+    CALL_CLIENT_TOOL_MCP_NAME, ClaudeCodeToolProfile, CodexToolProfile, DetectedHarness,
+    GenericToolProfile, HarnessToolProfile, LocalReplyKind, MAX_NATIVE_MCP_TOOLS, McpBridgedTool,
+    McpRoutingTable, McpSessionCatalog, McpWireTool, NAMESPACE_HUB_MCP_PREFIX, ProtocolHint,
+    SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement, VirtualizedCallDecision, VirtualizerBudget,
+    apply_patch_input_schema, detect_harness, extract_custom_tool_input,
+    normalize_apply_patch_text, partition_tools_for_harness, partition_tools_for_mcp,
+    partition_tools_for_mcp_with_hint, plan_virtualization, sanitize_mcp_tool_name,
+    strip_call_prefix, validate_apply_patch_preflight,
 };
+use liftgate_types::{acp::McpServerConfig, canonical::CanonicalToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use tokio::{
@@ -37,18 +40,12 @@ use tokio::{
 };
 use uuid::Uuid;
 
-/// Maximum client tools exposed natively on the `lg` loopback MCP server per session; any
-/// additional tools beyond this cap seamlessly fall back to `<client_tools>` XML coexistence.
-pub const MAX_NATIVE_MCP_TOOLS: usize = 64;
-
 /// Name of the loopback MCP server registered in `session/new.mcpServers` (`mcp_lg_<tool>`).
 pub const LOOPBACK_MCP_SERVER_NAME: &str = "lg";
 
 /// Prefix injected by `agy acp` onto tools exposed by [`LOOPBACK_MCP_SERVER_NAME`].
 pub const ACP_MCP_TOOL_PREFIX: &str = "mcp_lg_";
 
-const MAX_CODE_MODE_MCP_DESC_BYTES: usize = 64 * 1024;
-const MAX_STANDARD_MCP_DESC_BYTES: usize = 8 * 1024;
 const INITIAL_MCP_BODY_ALLOC_CAP: usize = 64 * 1024;
 const MCP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CANCEL_SOCKET_GRACE: Duration = Duration::from_millis(50);
@@ -90,47 +87,22 @@ impl fmt::Debug for IncomingMcpToolCall {
     }
 }
 
-/// Metadata mapping an MCP-exposed tool back to its exact caller-declared tool definition.
-#[derive(Clone, Debug)]
-pub struct McpBridgedTool {
-    pub mcp_name: String,
-    pub client_name: String,
-    pub is_custom: bool,
-    pub unwrap_custom_key: Option<&'static str>,
-    pub parameters_json: Option<String>,
-}
-
-/// Wire tool descriptor served in MCP `tools/list`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpWireTool {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub input_schema: Value,
-}
-
-/// Partitioned client tool catalog for a session created with the Hybrid Loopback MCP Bridge.
-#[derive(Clone, Debug, Default)]
-pub struct McpSessionCatalog {
-    pub wire_tools: Arc<[McpWireTool]>,
-    pub by_mcp_name: HashMap<String, McpBridgedTool>,
-    /// `(client_name, mcp_name)` pairs in declaration order for `<api_gateway_bridge_rules>`.
-    pub bridged_pairs: Vec<(String, String)>,
-    /// Freeform `Custom` tools (e.g. `apply_patch`) and `#65+` overflow tools routed via XML.
-    pub xml_only_tools: Vec<CanonicalToolSpec>,
-}
-
-impl McpSessionCatalog {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.wire_tools.is_empty()
-    }
-
-    #[must_use]
-    pub fn lookup(&self, mcp_name: &str) -> Option<&McpBridgedTool> {
-        self.by_mcp_name.get(mcp_name)
-    }
+/// Resolution outcome for an incoming `POST /mcp/{token}` `tools/call` invocation.
+#[derive(Debug)]
+pub enum ResolvedMcpIncoming {
+    /// Answered locally inside Liftgate (`search_client_tools`, schema preflight, or disabled tool).
+    ImmediateLocalReply {
+        reply_tx: oneshot::Sender<McpToolCallReply>,
+        reply: McpToolCallReply,
+        kind: LocalReplyKind,
+    },
+    /// Validated client tool call ready to suspend and emit over SSE/JSON to the caller.
+    ForwardToClient {
+        client_name: String,
+        arguments: String,
+        is_custom: bool,
+        reply_tx: oneshot::Sender<McpToolCallReply>,
+    },
 }
 
 struct RegisteredMcpSession {
@@ -141,14 +113,14 @@ struct RegisteredMcpSession {
 
 type SessionRegistryMap = Mutex<HashMap<u64, Arc<RegisteredMcpSession>>>;
 
-/// Per-session capability handle keeping a session's `/mcp/{token}` endpoint alive across turns.
+/// Per-session capability and channel handle owned by `SessionPool` and `turn_runner`.
 ///
-/// Dropping the final `Arc<McpSessionHandle>` synchronously unregisters the token from
-/// [`LoopbackMcpServer`] and closes the session's `tools/call` channel.
+/// Unregisters its endpoint from [`LoopbackMcpServer`] automatically on `Drop`.
 pub struct McpSessionHandle {
     slot_id: u64,
     server_config: McpServerConfig,
     catalog: McpSessionCatalog,
+    routing: RwLock<Arc<McpRoutingTable>>,
     call_rx: tokio::sync::Mutex<mpsc::Receiver<IncomingMcpToolCall>>,
     registry: Arc<SessionRegistryMap>,
 }
@@ -157,7 +129,9 @@ impl fmt::Debug for McpSessionHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpSessionHandle")
             .field("slot_id", &self.slot_id)
+            .field("profile", &self.catalog.profile_id)
             .field("bridged_tools", &self.catalog.bridged_pairs.len())
+            .field("virtualized_hubs", &self.catalog.virtualized_hubs.len())
             .finish_non_exhaustive()
     }
 }
@@ -174,8 +148,79 @@ impl McpSessionHandle {
     }
 
     #[must_use]
+    pub const fn has_virtualized_dispatch(&self) -> bool {
+        self.catalog.has_virtualized_dispatch
+    }
+
+    #[must_use]
     pub const fn call_rx(&self) -> &tokio::sync::Mutex<mpsc::Receiver<IncomingMcpToolCall>> {
         &self.call_rx
+    }
+
+    /// Synchronizes the session's live in-memory routing and search index with `client_tools`
+    /// when a warm or resumed turn updates the active tool catalog.
+    pub fn sync_client_tools(&self, client_tools: &[CanonicalToolSpec]) {
+        let rebuilt_opt = {
+            let guard = match self.routing.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.rebuild_if_changed(client_tools)
+        };
+        let Some(rebuilt_table) = rebuilt_opt else {
+            return;
+        };
+
+        let rebuilt = Arc::new(rebuilt_table);
+        match self.routing.write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = rebuilt;
+            }
+        }
+    }
+
+    /// Resolves an incoming loopback MCP `tools/call` against the live routing table, handling
+    /// `search_client_tools`, Hub unwrapping, and required-parameter preflight locally.
+    #[must_use]
+    pub fn resolve_incoming_call(
+        &self,
+        incoming: IncomingMcpToolCall,
+        active_tools: &[CanonicalToolSpec],
+    ) -> ResolvedMcpIncoming {
+        let table = {
+            let guard = match self.routing.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Arc::clone(&guard)
+        };
+        match table.resolve_call(&incoming.mcp_name, &incoming.arguments, active_tools) {
+            VirtualizedCallDecision::LocalReply {
+                text,
+                is_error,
+                kind,
+            } => ResolvedMcpIncoming::ImmediateLocalReply {
+                reply_tx: incoming.reply_tx,
+                reply: McpToolCallReply {
+                    content: vec![McpContentItem::Text { text }],
+                    is_error,
+                },
+                kind,
+            },
+            VirtualizedCallDecision::ForwardToClient {
+                client_name,
+                arguments,
+                is_custom,
+            } => ResolvedMcpIncoming::ForwardToClient {
+                client_name,
+                arguments,
+                is_custom,
+                reply_tx: incoming.reply_tx,
+            },
+        }
     }
 
     /// Estimates structural + heap bytes retained by this MCP handle while cached in `SessionPool`.
@@ -198,11 +243,19 @@ impl McpSessionHandle {
                 .saturating_add(b.client_name.len())
                 .saturating_add(b.parameters_json.as_deref().map_or(0, str::len))
         });
+        let routing_bytes = {
+            let guard = match self.routing.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.estimated_retained_bytes()
+        };
         std::mem::size_of::<Self>()
             .saturating_add(self.server_config.url.as_deref().map_or(0, str::len))
             .saturating_add(pairs_bytes)
             .saturating_add(wire_tools_bytes)
             .saturating_add(bridged_map_bytes)
+            .saturating_add(routing_bytes)
     }
 }
 
@@ -294,6 +347,8 @@ impl LoopbackMcpServer {
     #[must_use]
     pub fn register_session(&self, mut catalog: McpSessionCatalog) -> Arc<McpSessionHandle> {
         catalog.xml_only_tools = Vec::new();
+        let routing = RwLock::new(Arc::clone(&catalog.routing_table));
+        catalog.routing_table = Arc::new(McpRoutingTable::default());
         let slot_id = self.next_slot_id.fetch_add(1, Ordering::Relaxed);
         let raw_a = Uuid::new_v4().simple().to_string();
         let raw_b = Uuid::new_v4().simple().to_string();
@@ -331,6 +386,7 @@ impl LoopbackMcpServer {
             slot_id,
             server_config,
             catalog,
+            routing,
             call_rx: tokio::sync::Mutex::new(call_rx),
             registry: Arc::clone(&self.registry),
         })
@@ -649,390 +705,11 @@ async fn handle_mcp_post(
     }
 }
 
-/// Partitions caller-declared tools into native loopback MCP tools (up to [`MAX_NATIVE_MCP_TOOLS`],
-/// prioritizing CodeMode `exec` + `wait` + `REPL` and core harness tools) and coexisting XML tools.
-#[must_use]
-pub fn partition_tools_for_mcp<S: TruncationSpillSink>(
-    client_tools: &[CanonicalToolSpec],
-    spill: &mut S,
-) -> McpSessionCatalog {
-    struct EligibleCandidate {
-        orig_idx: usize,
-        tier: u8,
-        is_custom: bool,
-        unwrap_custom_key: Option<&'static str>,
-        input_schema: Value,
-        parameters_json: Option<String>,
-    }
-
-    let mut eligible: Vec<EligibleCandidate> = Vec::with_capacity(client_tools.len());
-    let mut ineligible_indices: HashSet<usize> = HashSet::new();
-
-    for (orig_idx, spec) in client_tools.iter().enumerate() {
-        if is_code_mode_custom_exec(spec) {
-            eligible.push(EligibleCandidate {
-                orig_idx,
-                tier: 0,
-                is_custom: true,
-                unwrap_custom_key: Some("code"),
-                input_schema: code_mode_exec_input_schema(),
-                parameters_json: None,
-            });
-            continue;
-        }
-
-        match &spec.kind {
-            CanonicalToolKind::Custom { .. } => {
-                ineligible_indices.insert(orig_idx);
-            }
-            CanonicalToolKind::Function { parameters_json } => {
-                if let Some(schema_val) = normalize_mcp_object_schema(parameters_json) {
-                    eligible.push(EligibleCandidate {
-                        orig_idx,
-                        tier: classify_mcp_priority_tier(spec),
-                        is_custom: false,
-                        unwrap_custom_key: None,
-                        input_schema: schema_val,
-                        parameters_json: (!parameters_json.trim().is_empty())
-                            .then(|| parameters_json.clone()),
-                    });
-                } else {
-                    ineligible_indices.insert(orig_idx);
-                }
-            }
-        }
-    }
-
-    if eligible.len() > MAX_NATIVE_MCP_TOOLS {
-        eligible.sort_by_key(|c| (c.tier, c.orig_idx));
-        for overflow in eligible.drain(MAX_NATIVE_MCP_TOOLS..) {
-            ineligible_indices.insert(overflow.orig_idx);
-        }
-        eligible.sort_by_key(|c| c.orig_idx);
-    }
-
-    let mut used_mcp_names: HashSet<String> = HashSet::with_capacity(eligible.len());
-    let mut wire_tools: Vec<McpWireTool> = Vec::with_capacity(eligible.len());
-    let mut by_mcp_name: HashMap<String, McpBridgedTool> = HashMap::with_capacity(eligible.len());
-    let mut bridged_pairs: Vec<(String, String)> = Vec::with_capacity(eligible.len());
-
-    for cand in eligible {
-        let Some(spec) = client_tools.get(cand.orig_idx) else {
-            continue;
-        };
-        let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
-        let max_desc = if cand.tier == 0 && is_code_mode_orchestrator_tool(spec) {
-            MAX_CODE_MODE_MCP_DESC_BYTES
-        } else {
-            MAX_STANDARD_MCP_DESC_BYTES
-        };
-        let description = compact_mcp_tool_description(spec, max_desc, spill);
-
-        wire_tools.push(McpWireTool {
-            name: mcp_name.clone(),
-            description,
-            input_schema: cand.input_schema,
-        });
-        bridged_pairs.push((spec.name.clone(), mcp_name.clone()));
-        by_mcp_name.insert(
-            mcp_name.clone(),
-            McpBridgedTool {
-                mcp_name,
-                client_name: spec.name.clone(),
-                is_custom: cand.is_custom,
-                unwrap_custom_key: cand.unwrap_custom_key,
-                parameters_json: cand.parameters_json,
-            },
-        );
-    }
-
-    let mut xml_only_tools = Vec::with_capacity(ineligible_indices.len());
-    for (idx, spec) in client_tools.iter().enumerate() {
-        if ineligible_indices.contains(&idx) {
-            xml_only_tools.push(spec.clone());
-        }
-    }
-
-    McpSessionCatalog {
-        wire_tools: Arc::from(wire_tools.into_boxed_slice()),
-        by_mcp_name,
-        bridged_pairs,
-        xml_only_tools,
-    }
-}
-
-fn code_mode_exec_input_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "code": {
-                "type": "string",
-                "description": "Raw JavaScript source code to execute in the Code Mode runtime (do not wrap in markdown code fences)."
-            }
-        },
-        "required": ["code"],
-        "additionalProperties": false
-    })
-}
-
-fn classify_mcp_priority_tier(spec: &CanonicalToolSpec) -> u8 {
-    if matches!(spec.name.as_str(), "exec" | "wait" | "REPL")
-        || is_code_mode_orchestrator_tool(spec)
-    {
-        return 0;
-    }
-    if matches!(
-        spec.name.as_str(),
-        "exec_command"
-            | "write_stdin"
-            | "Bash"
-            | "Read"
-            | "Edit"
-            | "Write"
-            | "MultiEdit"
-            | "Grep"
-            | "Glob"
-            | "LS"
-            | "NotebookEdit"
-            | "Agent"
-            | "Task"
-            | "TodoWrite"
-            | "WebSearch"
-            | "WebFetch"
-            | "__codex_local_shell"
-            | "__codex_tool_search"
-            | "ToolSearch"
-            | "tool_search"
-    ) {
-        return 1;
-    }
-    2
-}
-
-fn normalize_mcp_object_schema(parameters_json: &str) -> Option<Value> {
-    let trimmed = parameters_json.trim();
-    if trimmed.is_empty() {
-        return Some(json!({
-            "type": "object",
-            "properties": {}
-        }));
-    }
-    let Value::Object(mut map) = serde_json::from_str::<Value>(trimmed).ok()? else {
-        return None;
-    };
-    let _ = map.remove("$schema");
-
-    match map.get("type").and_then(Value::as_str) {
-        Some("object") => {
-            if !map.contains_key("properties") {
-                map.insert(
-                    "properties".to_owned(),
-                    Value::Object(serde_json::Map::new()),
-                );
-            }
-            Some(Value::Object(map))
-        }
-        Some(_) => None,
-        None => {
-            if map.contains_key("properties") || map.is_empty() {
-                map.insert("type".to_owned(), Value::String("object".to_owned()));
-                if !map.contains_key("properties") {
-                    map.insert(
-                        "properties".to_owned(),
-                        Value::Object(serde_json::Map::new()),
-                    );
-                }
-                Some(Value::Object(map))
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Sanitizes an arbitrary client tool identifier into a unique MCP tool name (`[a-zA-Z_][a-zA-Z0-9_-]{0,51}`).
-#[must_use]
-pub fn sanitize_mcp_tool_name(raw_name: &str, used: &mut HashSet<String>) -> String {
-    let base_raw = if let Some(after_dunder) = raw_name.strip_prefix("__") {
-        format!("lg_internal_{after_dunder}")
-    } else {
-        raw_name.to_owned()
-    };
-
-    let mut clean = String::with_capacity(base_raw.len().min(52));
-    for ch in base_raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            clean.push(ch);
-        } else if ch == '.' {
-            clean.push_str("__");
-        } else {
-            clean.push('_');
-        }
-    }
-    if clean.is_empty()
-        || clean
-            .chars()
-            .next()
-            .is_none_or(|c| !(c.is_ascii_alphabetic() || c == '_'))
-    {
-        clean.insert_str(0, "tool_");
-    }
-    if clean.len() > 52
-        && let Some(cut) = clean.get(..52)
-    {
-        clean = cut.to_owned();
-    }
-
-    if used.insert(clean.clone()) {
-        return clean;
-    }
-
-    let stem = if clean.len() > 46 {
-        clean.get(..46).unwrap_or(&clean).to_owned()
-    } else {
-        clean
-    };
-    let mut suffix = 2u32;
-    loop {
-        let candidate = format!("{stem}_{suffix}");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-        suffix = suffix.saturating_add(1);
-    }
-}
-
-/// Extracts a custom freeform string (such as CodeMode `exec` raw JavaScript) from MCP `arguments`.
-#[must_use]
-pub fn extract_custom_tool_input(arguments: &Value, preferred_key: Option<&str>) -> String {
-    if let Some(key) = preferred_key
-        && let Some(s) = arguments.get(key).and_then(Value::as_str)
-    {
-        return s.to_owned();
-    }
-    if let Some(s) = arguments.as_str() {
-        return s.to_owned();
-    }
-    if let Value::Object(map) = arguments {
-        for fallback in ["code", "input"] {
-            if let Some(s) = map.get(fallback).and_then(Value::as_str) {
-                return s.to_owned();
-            }
-        }
-        let mut non_summary_iter = map.iter().filter(|(k, _)| k.as_str() != "toolSummary");
-        if let Some((_, val)) = non_summary_iter.next()
-            && non_summary_iter.next().is_none()
-            && let Some(s) = val.as_str()
-        {
-            return s.to_owned();
-        }
-    }
-    if arguments.is_null() {
-        return String::new();
-    }
-    serde_json::to_string(arguments).unwrap_or_default()
-}
-
-/// Normalizes OpenAI (`call_<nonce>`) and Anthropic (`toolu_<nonce>`) tool call identifiers to
-/// their shared `<nonce>` suffix so suspended MCP continuations match seamlessly across protocols.
-#[must_use]
-pub fn strip_call_prefix(raw_id: &str) -> &str {
-    let trimmed = raw_id.trim();
-    trimmed
-        .strip_prefix("call_")
-        .or_else(|| trimmed.strip_prefix("toolu_"))
-        .unwrap_or(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
-    use liftgate_types::session_key::NoopSpillSink;
+    use liftgate_types::{canonical::CanonicalToolKind, session_key::NoopSpillSink};
 
     use super::*;
-
-    #[test]
-    fn sanitizes_names_bijectively_and_preserves_standard_identifiers() {
-        let mut used = HashSet::new();
-        assert_eq!(sanitize_mcp_tool_name("exec", &mut used), "exec");
-        assert_eq!(sanitize_mcp_tool_name("wait", &mut used), "wait");
-        assert_eq!(sanitize_mcp_tool_name("Bash", &mut used), "Bash");
-        assert_eq!(sanitize_mcp_tool_name("read-item", &mut used), "read-item");
-        assert_eq!(
-            sanitize_mcp_tool_name("multi_agent_v1.spawn_agent", &mut used),
-            "multi_agent_v1__spawn_agent"
-        );
-        assert_eq!(
-            sanitize_mcp_tool_name("multi_agent_v1__spawn_agent", &mut used),
-            "multi_agent_v1__spawn_agent_2"
-        );
-        assert_eq!(
-            sanitize_mcp_tool_name("__codex_local_shell", &mut used),
-            "lg_internal_codex_local_shell"
-        );
-    }
-
-    #[test]
-    fn partitions_code_mode_exec_custom_apply_patch_and_enforces_64_tool_priority_cap() {
-        let mut tools = vec![
-            CanonicalToolSpec {
-                name: "apply_patch".to_owned(),
-                description: Some("Freeform patch tool.".to_owned()),
-                kind: CanonicalToolKind::Custom { format_json: None },
-            },
-            CanonicalToolSpec {
-                name: "exec".to_owned(),
-                description: Some("declare const tools: { wait(): Promise<void>; };".to_owned()),
-                kind: CanonicalToolKind::Custom { format_json: None },
-            },
-        ];
-        for i in 0..70 {
-            tools.push(CanonicalToolSpec {
-                name: format!("extra_tool_{i:02}"),
-                description: Some("Extra function.".to_owned()),
-                kind: CanonicalToolKind::Function {
-                    parameters_json: r#"{"type":"object","properties":{"x":{"type":"number"}}}"#
-                        .to_owned(),
-                },
-            });
-        }
-        tools.push(CanonicalToolSpec {
-            name: "wait".to_owned(),
-            description: Some("Wait on CodeMode cell.".to_owned()),
-            kind: CanonicalToolKind::Function {
-                parameters_json: r#"{"type":"object","properties":{"cell_id":{"type":"string"}}}"#
-                    .to_owned(),
-            },
-        });
-
-        let cat = partition_tools_for_mcp(&tools, &mut NoopSpillSink);
-        assert_eq!(cat.wire_tools.len(), MAX_NATIVE_MCP_TOOLS);
-        assert!(cat.lookup("exec").is_some_and(|b| b.is_custom));
-        assert!(cat.lookup("wait").is_some_and(|b| !b.is_custom));
-        assert!(cat.lookup("apply_patch").is_none());
-        assert!(cat.xml_only_tools.iter().any(|t| t.name == "apply_patch"));
-        // 73 total tools (`apply_patch` + `exec` + 70 `extra_tool_*` + `wait`) - 64 MCP = 9 XML
-        assert_eq!(cat.xml_only_tools.len(), 9);
-
-        assert_eq!(strip_call_prefix("call_abc123"), "abc123");
-        assert_eq!(strip_call_prefix("toolu_abc123"), "abc123");
-        assert_eq!(strip_call_prefix("raw_99"), "raw_99");
-    }
-
-    #[test]
-    fn extract_custom_tool_input_ignores_tool_summary_and_null() {
-        assert_eq!(
-            extract_custom_tool_input(
-                &json!({"script": "console.log(42);", "toolSummary": "Execute JS"}),
-                None
-            ),
-            "console.log(42);"
-        );
-        assert_eq!(
-            extract_custom_tool_input(&json!({"toolSummary": "Execute JS"}), None),
-            r#"{"toolSummary":"Execute JS"}"#
-        );
-        assert_eq!(extract_custom_tool_input(&Value::Null, None), "");
-    }
 
     #[tokio::test]
     async fn register_session_clears_xml_overflow_and_accounts_schema_bytes() {
@@ -1049,7 +726,7 @@ mod tests {
         );
         let tools = vec![
             CanonicalToolSpec {
-                name: "apply_patch".to_owned(),
+                name: "custom_grammar_tool".to_owned(),
                 description: Some("Freeform patch tool.".to_owned()),
                 kind: CanonicalToolKind::Custom { format_json: None },
             },
