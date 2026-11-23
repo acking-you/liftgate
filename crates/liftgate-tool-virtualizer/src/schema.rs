@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-pub use liftgate_types::parser::{normalize_apply_patch_text, validate_apply_patch_preflight};
+pub use liftgate_types::parser::{
+    ApplyPatchPreflightError, normalize_apply_patch_text, validate_apply_patch_preflight,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

@@ -518,7 +518,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         .accumulated_messages
                         .len()
                         .saturating_add(req.messages.len());
-                    let tools_delta = build_client_tools_delta_xml_with_spill(
+                    let tools_delta = sync_and_build_warm_tools_delta(
+                        checkout.entry().mcp_handle.as_ref(),
                         &checkout.entry().declared_tools,
                         &req.client_tools,
                         &checkout.entry().tool_nonce,
@@ -631,26 +632,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     retired_lease.finish_ephemeral();
                 } else if let Some(delta_slice) = req.messages.get(delta_start..) {
                     let previous_session_context_tokens = checkout.entry().last_context_used;
-                    let use_virtualized_delta =
-                        checkout.entry().mcp_handle.as_ref().is_some_and(|handle| {
-                            handle.sync_client_tools(&req.client_tools);
-                            handle.has_virtualized_dispatch()
-                        });
-                    let tools_delta = if use_virtualized_delta {
-                        build_mcp_virtualized_tools_delta_xml_with_spill(
-                            &checkout.entry().declared_tools,
-                            &req.client_tools,
-                            &checkout.entry().tool_nonce,
-                            &mut spill_store,
-                        )
-                    } else {
-                        build_client_tools_delta_xml_with_spill(
-                            &checkout.entry().declared_tools,
-                            &req.client_tools,
-                            &checkout.entry().tool_nonce,
-                            &mut spill_store,
-                        )
-                    };
+                    let tools_delta = sync_and_build_warm_tools_delta(
+                        checkout.entry().mcp_handle.as_ref(),
+                        &checkout.entry().declared_tools,
+                        &req.client_tools,
+                        &checkout.entry().tool_nonce,
+                        &mut spill_store,
+                    );
                     let prompt_blocks = build_acp_prompt_plan_with_spill(
                         delta_slice,
                         &checkout.entry().tool_nonce,
@@ -716,26 +704,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 && let Some(delta_slice) = req.messages.get(delta_start..)
             {
                 let previous_session_context_tokens = checkout.entry().last_context_used;
-                let use_virtualized_delta =
-                    checkout.entry().mcp_handle.as_ref().is_some_and(|handle| {
-                        handle.sync_client_tools(&req.client_tools);
-                        handle.has_virtualized_dispatch()
-                    });
-                let tools_delta = if use_virtualized_delta {
-                    build_mcp_virtualized_tools_delta_xml_with_spill(
-                        &checkout.entry().declared_tools,
-                        &req.client_tools,
-                        &checkout.entry().tool_nonce,
-                        &mut spill_store,
-                    )
-                } else {
-                    build_client_tools_delta_xml_with_spill(
-                        &checkout.entry().declared_tools,
-                        &req.client_tools,
-                        &checkout.entry().tool_nonce,
-                        &mut spill_store,
-                    )
-                };
+                let tools_delta = sync_and_build_warm_tools_delta(
+                    checkout.entry().mcp_handle.as_ref(),
+                    &checkout.entry().declared_tools,
+                    &req.client_tools,
+                    &checkout.entry().tool_nonce,
+                    &mut spill_store,
+                );
                 let directive = build_compaction_directive_xml_with_spill(
                     req.system_instructions.as_deref(),
                     tools_delta.as_deref(),
@@ -3783,6 +3758,24 @@ async fn unwind_suspended_to_idle_entry<B: AcpBackend>(
     }
 }
 
+fn sync_and_build_warm_tools_delta<S: liftgate_types::session_key::TruncationSpillSink>(
+    mcp_handle: Option<&Arc<McpSessionHandle>>,
+    prev_tools: &[liftgate_types::canonical::CanonicalToolSpec],
+    next_tools: &[liftgate_types::canonical::CanonicalToolSpec],
+    tool_nonce: &str,
+    spill: &mut S,
+) -> Option<String> {
+    let use_virtualized_delta = mcp_handle.is_some_and(|handle| {
+        handle.sync_client_tools(next_tools);
+        handle.has_virtualized_dispatch()
+    });
+    if use_virtualized_delta {
+        build_mcp_virtualized_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
+    } else {
+        build_client_tools_delta_xml_with_spill(prev_tools, next_tools, tool_nonce, spill)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "internal helper wires promoted MCP continuation step without extra heap indirection"
@@ -3805,25 +3798,13 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
     channel_cap: usize,
     mut spill_store: Option<SpillStore>,
 ) -> ActiveTurnStream {
-    let use_virtualized_delta = step_lease.mcp_handle().is_some_and(|handle| {
-        handle.sync_client_tools(&req.client_tools);
-        handle.has_virtualized_dispatch()
-    });
-    let tools_delta = if use_virtualized_delta {
-        build_mcp_virtualized_tools_delta_xml_with_spill(
-            &promoted.declared_tools,
-            &req.client_tools,
-            step_lease.tool_nonce(),
-            &mut spill_store,
-        )
-    } else {
-        build_client_tools_delta_xml_with_spill(
-            &promoted.declared_tools,
-            &req.client_tools,
-            step_lease.tool_nonce(),
-            &mut spill_store,
-        )
-    };
+    let tools_delta = sync_and_build_warm_tools_delta(
+        step_lease.mcp_handle(),
+        &promoted.declared_tools,
+        &req.client_tools,
+        step_lease.tool_nonce(),
+        &mut spill_store,
+    );
     let full_messages = std::mem::take(&mut promoted.accumulated_messages);
     let base_state_hash = hash_conversation_state(
         req.system_instructions.as_deref(),

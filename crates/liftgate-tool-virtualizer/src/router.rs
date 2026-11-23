@@ -459,7 +459,7 @@ impl McpRoutingTable {
             &indexed.required_fields,
         ) {
             Ok(v) => v,
-            Err(msg) => return preflight_error_decision(msg),
+            Err(err) => return preflight_error_decision(err.into_message()),
         };
 
         finalize_indexed_tool_call(
@@ -530,7 +530,7 @@ impl McpRoutingTable {
             &indexed.required_fields,
         ) {
             Ok(v) => v,
-            Err(msg) => return preflight_error_decision(msg),
+            Err(err) => return preflight_error_decision(err.into_message()),
         };
 
         finalize_indexed_tool_call(
@@ -711,10 +711,10 @@ fn resolve_custom_tool_call(
     unwrap_custom_key: Option<&'static str>,
 ) -> VirtualizedCallDecision {
     let extracted = extract_custom_tool_input(raw_args, unwrap_custom_key);
-    if client_name == "apply_patch" {
+    if client_name.eq_ignore_ascii_case("apply_patch") {
         let normalized = normalize_apply_patch_text(&extracted);
-        if let Err(msg) = validate_apply_patch_preflight(&normalized) {
-            return preflight_error_decision(msg);
+        if let Err(err) = validate_apply_patch_preflight(&normalized) {
+            return preflight_error_decision(err.to_string());
         }
         return VirtualizedCallDecision::ForwardToClient {
             client_name: client_name.to_owned(),
@@ -752,11 +752,27 @@ fn format_direct_tool_arguments(raw_args: &Value, bridged: &McpBridgedTool) -> S
     serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned())
 }
 
+enum InnerArgsError {
+    NonObjectString { key: &'static str },
+    NonObjectValue { key: &'static str },
+}
+
+impl InnerArgsError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NonObjectString { key } => {
+                format!("`{key}` must be a JSON object, received non-object string.")
+            }
+            Self::NonObjectValue { key } => format!("`{key}` must be a JSON object."),
+        }
+    }
+}
+
 fn extract_virtualized_inner_args(
     outer: &Value,
     wrapper_keys: &[&str],
     target_required: &[String],
-) -> Result<Value, String> {
+) -> Result<Value, InnerArgsError> {
     let Value::Object(outer_map) = outer else {
         return Ok(Value::Object(serde_json::Map::new()));
     };
@@ -772,13 +788,11 @@ fn extract_virtualized_inner_args(
                     } else {
                         match serde_json::from_str::<Value>(trimmed) {
                             Ok(parsed @ Value::Object(_)) => Ok(parsed),
-                            _ => Err(format!(
-                                "`{key}` must be a JSON object, received non-object string."
-                            )),
+                            _ => Err(InnerArgsError::NonObjectString { key }),
                         }
                     }
                 }
-                _ => Err(format!("`{key}` must be a JSON object.")),
+                _ => Err(InnerArgsError::NonObjectValue { key }),
             };
         }
     }

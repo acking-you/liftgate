@@ -3,6 +3,7 @@ use std::mem;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use thiserror::Error;
 
 /// Parsed tool invocation extracted from an `<agy_tool_call_{nonce}>` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1483,27 +1484,78 @@ pub fn normalize_apply_patch_text(raw: &str) -> String {
     coalesce_and_repair_v4a_patch(&framed)
 }
 
+/// Structured 0-RTT structural preflight failure for V4A `apply_patch` payloads.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ApplyPatchPreflightError {
+    #[error(
+        "Empty `patch`: provide a non-empty V4A patch starting with '*** Begin Patch' and ending with '*** End Patch'."
+    )]
+    EmptyPatch,
+    #[error(
+        "Invalid `apply_patch` header: patch must start with '*** Begin Patch' followed by '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
+    )]
+    MissingBeginHeader,
+    #[error(
+        "Invalid `apply_patch` framing: patch must start with '*** Begin Patch\\n' and end with '*** End Patch'."
+    )]
+    InvalidFraming,
+    #[error(
+        "Invalid `apply_patch`: patch contains zero file operations; include at least one '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
+    )]
+    ZeroFileOperations,
+    #[error("Invalid `apply_patch`: '*** Add File: {path}' has no '+<line>' content lines.")]
+    EmptyAddFile { path: String },
+    #[error("Invalid `apply_patch`: '*** Update File: {path}' contains no '+/-' change lines.")]
+    EmptyUpdateFile { path: String },
+    #[error("Invalid `apply_patch` at line {line_no}: empty path in '{header}'.")]
+    EmptyFilePath {
+        line_no: usize,
+        header: &'static str,
+    },
+    #[error("Invalid `apply_patch` at line {line_no}: empty destination path in '*** Move to: '.")]
+    EmptyMoveDestination { line_no: usize },
+    #[error(
+        "Invalid `apply_patch` syntax at line {line_no} ({preview}): expected '*** Update File: <path>', '*** Add File: <path>', '*** Delete File: <path>', or '*** End Patch'."
+    )]
+    UnexpectedRootLine { line_no: usize, preview: String },
+    #[error(
+        "Invalid `apply_patch` syntax at line {line_no} in '*** Add File: {path}' ({preview}): every added file line must start with '+'."
+    )]
+    InvalidAddLine {
+        line_no: usize,
+        path: String,
+        preview: String,
+    },
+    #[error(
+        "Invalid `apply_patch` syntax at line {line_no} in '*** Update File: {path}' ({preview}): every hunk line must start with ' ' (context), '-' (remove), '+' (add), or '@@'."
+    )]
+    InvalidUpdateHunkLine {
+        line_no: usize,
+        path: String,
+        preview: String,
+    },
+    #[error(
+        "Invalid `apply_patch` syntax at line {line_no} in '*** Update File: {path}' ({preview}): '*** End of File' may only appear at the end of the file's hunks."
+    )]
+    TrailingLinesAfterEof {
+        line_no: usize,
+        path: String,
+        preview: String,
+    },
+}
+
 /// Validates a normalized V4A `apply_patch` payload before forwarding an MCP call to the client,
-/// returning an actionable 1-based line diagnostic so models self-heal in 0-RTT.
-pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
+/// returning a typed [`ApplyPatchPreflightError`] with 1-based line diagnostics so models self-heal in 0-RTT.
+pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), ApplyPatchPreflightError> {
     let trimmed = patch.trim();
     if trimmed.is_empty() {
-        return Err(
-            "Empty `patch`: provide a non-empty V4A patch starting with '*** Begin Patch' and ending with '*** End Patch'."
-                .to_owned(),
-        );
+        return Err(ApplyPatchPreflightError::EmptyPatch);
     }
     let Some(after_begin) = trimmed.strip_prefix("*** Begin Patch") else {
-        return Err(
-            "Invalid `apply_patch` header: patch must start with '*** Begin Patch' followed by '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
-                .to_owned(),
-        );
+        return Err(ApplyPatchPreflightError::MissingBeginHeader);
     };
     if !after_begin.starts_with('\n') || !trimmed.ends_with("*** End Patch") {
-        return Err(
-            "Invalid `apply_patch` framing: patch must start with '*** Begin Patch\\n' and end with '*** End Patch'."
-                .to_owned(),
-        );
+        return Err(ApplyPatchPreflightError::InvalidFraming);
     }
 
     enum Section<'a> {
@@ -1516,18 +1568,20 @@ pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
         Update {
             path: &'a str,
             has_move: bool,
-            count: usize,
+            hunk_lines: usize,
+            change_lines: usize,
+            saw_eof: bool,
         },
     }
 
-    let finalize_section = |sec: &Section<'_>| -> Result<(), String> {
+    let finalize_section = |sec: &Section<'_>| -> Result<(), ApplyPatchPreflightError> {
         match *sec {
             Section::Root | Section::Delete => Ok(()),
             Section::Add { path, count } => {
                 if count == 0 {
-                    Err(format!(
-                        "Invalid `apply_patch`: '*** Add File: {path}' has no '+<line>' content lines."
-                    ))
+                    Err(ApplyPatchPreflightError::EmptyAddFile {
+                        path: path.to_owned(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1535,12 +1589,13 @@ pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
             Section::Update {
                 path,
                 has_move,
-                count,
+                change_lines,
+                ..
             } => {
-                if !has_move && count == 0 {
-                    Err(format!(
-                        "Invalid `apply_patch`: '*** Update File: {path}' contains no '@@' hunk or '+/-' change lines."
-                    ))
+                if !has_move && change_lines == 0 {
+                    Err(ApplyPatchPreflightError::EmptyUpdateFile {
+                        path: path.to_owned(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1566,9 +1621,10 @@ pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
             finalize_section(&section)?;
             let path = p.trim();
             if path.is_empty() {
-                return Err(format!(
-                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Add File: '."
-                ));
+                return Err(ApplyPatchPreflightError::EmptyFilePath {
+                    line_no,
+                    header: "*** Add File: ",
+                });
             }
             op_count += 1;
             section = Section::Add { path, count: 0 };
@@ -1578,9 +1634,10 @@ pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
             finalize_section(&section)?;
             let path = p.trim();
             if path.is_empty() {
-                return Err(format!(
-                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Delete File: '."
-                ));
+                return Err(ApplyPatchPreflightError::EmptyFilePath {
+                    line_no,
+                    header: "*** Delete File: ",
+                });
             }
             op_count += 1;
             section = Section::Delete;
@@ -1590,74 +1647,94 @@ pub fn validate_apply_patch_preflight(patch: &str) -> Result<(), String> {
             finalize_section(&section)?;
             let path = p.trim();
             if path.is_empty() {
-                return Err(format!(
-                    "Invalid `apply_patch` at line {line_no}: empty path in '*** Update File: '."
-                ));
+                return Err(ApplyPatchPreflightError::EmptyFilePath {
+                    line_no,
+                    header: "*** Update File: ",
+                });
             }
             op_count += 1;
             section = Section::Update {
                 path,
                 has_move: false,
-                count: 0,
+                hunk_lines: 0,
+                change_lines: 0,
+                saw_eof: false,
             };
             continue;
         }
 
         match &mut section {
             Section::Root | Section::Delete => {
-                return Err(format!(
-                    "Invalid `apply_patch` syntax at line {line_no} ({}): expected '*** Update File: <path>', '*** Add File: <path>', '*** Delete File: <path>', or '*** End Patch'.",
-                    preview_patch_line(line)
-                ));
+                return Err(ApplyPatchPreflightError::UnexpectedRootLine {
+                    line_no,
+                    preview: preview_patch_line(line),
+                });
             }
             Section::Add { path, count } => {
                 if !line.starts_with('+') {
-                    return Err(format!(
-                        "Invalid `apply_patch` syntax at line {line_no} in '*** Add File: {path}' ({}): every added file line must start with '+'.",
-                        preview_patch_line(line)
-                    ));
+                    return Err(ApplyPatchPreflightError::InvalidAddLine {
+                        line_no,
+                        path: (*path).to_owned(),
+                        preview: preview_patch_line(line),
+                    });
                 }
                 *count += 1;
             }
             Section::Update {
                 path,
                 has_move,
-                count,
+                hunk_lines,
+                change_lines,
+                saw_eof,
             } => {
-                if *count == 0
+                if *saw_eof {
+                    return Err(ApplyPatchPreflightError::TrailingLinesAfterEof {
+                        line_no,
+                        path: (*path).to_owned(),
+                        preview: preview_patch_line(line),
+                    });
+                }
+                if *hunk_lines == 0
                     && !*has_move
                     && let Some(dst) = line.strip_prefix("*** Move to: ")
                 {
                     if dst.trim().is_empty() {
-                        return Err(format!(
-                            "Invalid `apply_patch` at line {line_no}: empty destination path in '*** Move to: '."
-                        ));
+                        return Err(ApplyPatchPreflightError::EmptyMoveDestination { line_no });
                     }
                     *has_move = true;
                     continue;
                 }
+                if line == "*** End of File" {
+                    if *hunk_lines == 0 {
+                        return Err(ApplyPatchPreflightError::EmptyUpdateFile {
+                            path: (*path).to_owned(),
+                        });
+                    }
+                    *saw_eof = true;
+                    continue;
+                }
                 let valid_hunk_line = line == "@@"
                     || line.starts_with("@@ ")
-                    || line == "*** End of File"
                     || line.starts_with('+')
                     || line.starts_with('-')
                     || line.starts_with(' ');
                 if !valid_hunk_line {
-                    return Err(format!(
-                        "Invalid `apply_patch` syntax at line {line_no} in '*** Update File: {path}' ({}): every hunk line must start with ' ' (context), '-' (remove), '+' (add), or '@@'.",
-                        preview_patch_line(line)
-                    ));
+                    return Err(ApplyPatchPreflightError::InvalidUpdateHunkLine {
+                        line_no,
+                        path: (*path).to_owned(),
+                        preview: preview_patch_line(line),
+                    });
                 }
-                *count += 1;
+                *hunk_lines += 1;
+                if line.starts_with('+') || line.starts_with('-') {
+                    *change_lines += 1;
+                }
             }
         }
     }
 
     if op_count == 0 {
-        return Err(
-            "Invalid `apply_patch`: patch contains zero file operations; include at least one '*** Update File: <path>', '*** Add File: <path>', or '*** Delete File: <path>'."
-                .to_owned(),
-        );
+        return Err(ApplyPatchPreflightError::ZeroFileOperations);
     }
     Ok(())
 }
@@ -1776,6 +1853,8 @@ fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
                 for ln in lines {
                     if ln.is_empty() {
                         ln.push(' ');
+                    } else if let Some(cleaned_hunk) = normalize_v4a_hunk_header(ln) {
+                        *ln = cleaned_hunk;
                     }
                 }
             }
@@ -1809,13 +1888,7 @@ fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
                             lines: existing,
                         } if *p == path => {
                             if !extra.is_empty() {
-                                let starts_with_hunk = extra
-                                    .first()
-                                    .is_some_and(|l| l == "@@" || l.starts_with("@@ "));
-                                if !existing.is_empty() && !starts_with_hunk {
-                                    existing.push("@@".to_owned());
-                                }
-                                existing.append(&mut extra);
+                                merge_v4a_update_lines(existing, &mut extra);
                             }
                             merged = true;
                             break;
@@ -1877,6 +1950,55 @@ fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
     out
 }
 
+fn normalize_v4a_hunk_header(line: &str) -> Option<String> {
+    let after_at = line.strip_prefix("@@ ")?;
+    if after_at.trim().is_empty() {
+        return Some("@@".to_owned());
+    }
+    let after_minus = after_at.strip_prefix('-')?;
+    let (old_range, rest) = after_minus.split_once(' ')?;
+    if old_range.is_empty() || !old_range.bytes().all(|b| b.is_ascii_digit() || b == b',') {
+        return None;
+    }
+    let after_plus = rest.strip_prefix('+')?;
+    let (new_range, after_ranges) = after_plus.split_once(' ')?;
+    if new_range.is_empty() || !new_range.bytes().all(|b| b.is_ascii_digit() || b == b',') {
+        return None;
+    }
+    let trailing = after_ranges.strip_prefix("@@")?.trim();
+    if trailing.is_empty() {
+        Some("@@".to_owned())
+    } else {
+        Some(format!("@@ {trailing}"))
+    }
+}
+
+fn merge_v4a_update_lines(existing: &mut Vec<String>, extra: &mut Vec<String>) {
+    let existing_ends_eof = existing.last().is_some_and(|l| l == "*** End of File");
+    let extra_ends_eof = extra.last().is_some_and(|l| l == "*** End of File");
+    if existing_ends_eof && !extra_ends_eof {
+        let existing_starts_hunk = existing
+            .first()
+            .is_some_and(|l| l == "@@" || l.starts_with("@@ "));
+        if !existing_starts_hunk {
+            extra.push("@@".to_owned());
+        }
+        extra.append(existing);
+        *existing = mem::take(extra);
+        return;
+    }
+    if existing_ends_eof && extra_ends_eof {
+        let _ = existing.pop();
+    }
+    let starts_with_hunk = extra
+        .first()
+        .is_some_and(|l| l == "@@" || l.starts_with("@@ "));
+    if !existing.is_empty() && !starts_with_hunk {
+        existing.push("@@".to_owned());
+    }
+    existing.append(extra);
+}
+
 fn try_convert_unified_diff_to_v4a(text: &str) -> Option<String> {
     if !(text.starts_with("diff --git ") || text.starts_with("--- ") || text.contains("\n--- "))
         || !text.contains("\n+++ ")
@@ -1897,9 +2019,14 @@ fn try_convert_unified_diff_to_v4a(text: &str) -> Option<String> {
     let mut current_mode: Option<&'static str> = None;
     let mut emitted_ops = 0usize;
 
-    for line in text.split('\n') {
-        if line.starts_with("diff --git ")
-            || line.starts_with("index ")
+    let mut iter = text.split('\n').peekable();
+    while let Some(line) = iter.next() {
+        if line.starts_with("diff --git ") {
+            current_mode = None;
+            pending_old = None;
+            continue;
+        }
+        if line.starts_with("index ")
             || line.starts_with("new file mode ")
             || line.starts_with("deleted file mode ")
             || line.starts_with("similarity index ")
@@ -1909,10 +2036,11 @@ fn try_convert_unified_diff_to_v4a(text: &str) -> Option<String> {
         {
             continue;
         }
-        if current_mode.is_none()
-            && let Some(old_raw) = line.strip_prefix("--- ")
+        if let Some(old_raw) = line.strip_prefix("--- ")
+            && iter.peek().is_some_and(|next| next.starts_with("+++ "))
         {
             pending_old = Some(strip_diff_path(old_raw, "a/"));
+            current_mode = None;
             continue;
         }
         if let Some(old_opt) = pending_old.take()
@@ -1948,11 +2076,6 @@ fn try_convert_unified_diff_to_v4a(text: &str) -> Option<String> {
                 }
                 (None, None) => return None,
             }
-            continue;
-        }
-        if let Some(old_raw) = line.strip_prefix("--- ") {
-            pending_old = Some(strip_diff_path(old_raw, "a/"));
-            current_mode = None;
             continue;
         }
         if let Some(after_at) = line.strip_prefix("@@ ") {
@@ -2643,25 +2766,38 @@ mod tests {
     #[test]
     fn normalize_and_validate_apply_patch_coalesces_duplicates_repairs_blank_lines_and_converts_unified_diff()
      {
-        let dup_and_blank = "*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n\n let keep = true;\n*** Update File: src/router.rs\n@@ fn second()\n-let b = 3;\n+let b = 4;";
+        let dup_and_blank = "*** Update File: src/router.rs\n@@ -40,2 +40,2 @@\n-let tail = 1;\n+let tail = 2;\n*** End of File\n*** Update File: src/router.rs\n@@ -10,4 +10,4 @@ fn earlier()\n-let a = 1;\n+let a = 2;\n\n let keep = true;";
         let repaired = normalize_apply_patch_text(dup_and_blank);
         assert_eq!(
             repaired,
-            "*** Begin Patch\n*** Update File: src/router.rs\n@@\n-let a = 1;\n+let a = 2;\n \n let keep = true;\n@@ fn second()\n-let b = 3;\n+let b = 4;\n*** End Patch"
+            "*** Begin Patch\n*** Update File: src/router.rs\n@@ fn earlier()\n-let a = 1;\n+let a = 2;\n \n let keep = true;\n@@\n-let tail = 1;\n+let tail = 2;\n*** End of File\n*** End Patch"
         );
         assert!(validate_apply_patch_preflight(&repaired).is_ok());
 
-        let unified = "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ pub fn run() {\n let x = 1;\n-let y = 2;\n+let y = 3;\n";
+        let unified = "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,4 +10,4 @@ pub fn run() {\n let x = 1;\n--- legacy comment\n-let y = 2;\n+let y = 3;\n";
         let v4a = normalize_apply_patch_text(unified);
         assert_eq!(
             v4a,
-            "*** Begin Patch\n*** Update File: src/lib.rs\n@@ pub fn run() {\n let x = 1;\n-let y = 2;\n+let y = 3;\n*** End Patch"
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@ pub fn run() {\n let x = 1;\n--- legacy comment\n-let y = 2;\n+let y = 3;\n*** End Patch"
         );
         assert!(validate_apply_patch_preflight(&v4a).is_ok());
 
         let bad_ctx = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\nlet missing_prefix = 1;\n-old\n+new\n*** End Patch";
         let err = validate_apply_patch_preflight(bad_ctx)
             .expect_err("missing context prefix must fail preflight");
-        assert!(err.contains("line 4"), "got err: {err}");
+        assert!(
+            matches!(
+                &err,
+                ApplyPatchPreflightError::InvalidUpdateHunkLine { line_no: 4, .. }
+            ),
+            "got err: {err:?}"
+        );
+        assert!(err.to_string().contains("line 4"), "got err: {err}");
+
+        let bad_eof_mid = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End of File\n@@\n-c\n+d\n*** End Patch";
+        assert!(matches!(
+            validate_apply_patch_preflight(bad_eof_mid),
+            Err(ApplyPatchPreflightError::TrailingLinesAfterEof { line_no: 7, .. })
+        ));
     }
 }

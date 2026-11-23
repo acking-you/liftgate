@@ -1,5 +1,6 @@
 [package]
 name = "liftgate-tool-virtualizer"
+description = "Zero-cost adaptive 3-tier MCP tool virtualization planner, 0-RTT search index, and harness profiles for Liftgate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

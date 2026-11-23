@@ -2110,7 +2110,10 @@ pub fn build_mcp_virtualized_tools_delta_xml_with_spill<S: TruncationSpillSink>(
         if prev_tools.iter().any(|pt| pt == nt) {
             continue;
         }
-        if matches!(nt.kind, CanonicalToolKind::Custom { .. }) && !is_code_mode_custom_exec(nt) {
+        if matches!(nt.kind, CanonicalToolKind::Custom { .. })
+            && !is_code_mode_custom_exec(nt)
+            && !nt.name.eq_ignore_ascii_case("apply_patch")
+        {
             added_xml_custom.push(nt);
         } else {
             added_mcp_names.push(nt.name.as_str());
