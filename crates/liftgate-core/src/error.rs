@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use liftgate_harness::HarnessError;
 use liftgate_server::{error::AcpError, platform::SessionCwdError};
 use liftgate_types::error::{ValidationError, format_error_chain};
 use thiserror::Error;
@@ -353,6 +354,12 @@ pub enum CliError {
     #[error("environment variable `{var}` must evaluate to a top-level JSON object (`{{ ... }}`)")]
     EnvConfigNotObject { var: &'static str },
 
+    #[error(
+        "unsupported or malformed YAML layout in `{}`: {detail}",
+        path.display()
+    )]
+    UnsupportedYamlLayout { path: PathBuf, detail: String },
+
     #[error("configuration file `{}` exceeds {limit} byte safety limit", path.display())]
     ConfigFileTooLarge { path: PathBuf, limit: u64 },
 
@@ -521,6 +528,26 @@ impl CliError {
     }
 }
 
+impl From<HarnessError> for CliError {
+    fn from(err: HarnessError) -> Self {
+        match err {
+            HarnessError::NoHomeDirectory => Self::NoHomeDirectory,
+            HarnessError::Io { path, source } => Self::StateIo { path, source },
+            HarnessError::Json { path, source } => Self::StateJson { path, source },
+            HarnessError::Utf8 { path, source } => Self::StateUtf8 { path, source },
+            HarnessError::ConfigRootNotObject { path } => Self::ConfigRootNotObject { path },
+            HarnessError::InvalidEnvConfigJson { var, source } => {
+                Self::InvalidEnvConfigJson { var, source }
+            }
+            HarnessError::EnvConfigNotObject { var } => Self::EnvConfigNotObject { var },
+            HarnessError::UnsupportedYamlLayout { path, detail } => {
+                Self::UnsupportedYamlLayout { path, detail }
+            }
+            HarnessError::HarnessNotFound { tool, hint } => Self::HarnessNotFound { tool, hint },
+        }
+    }
+}
+
 /// Returns an actionable recovery hint for `err` using `bin` as the CLI command name.
 #[must_use]
 pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
@@ -575,6 +602,10 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
                 "Fix `{var}` so it contains a valid JSON/JSONC object (`{{ ... }}`), or unset `{var}` before launching."
             ))
         }
+        CliError::UnsupportedYamlLayout { path, .. } => Some(format!(
+            "Convert `{}` to standard space-indented YAML mappings/lists before re-running `lg config omp`.",
+            path.display()
+        )),
         _ => None,
     }
 }

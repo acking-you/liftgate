@@ -1,0 +1,19 @@
+[package]
+name = "liftgate-harness"
+description = "Synchronous configuration schemas, YAML/TOML/JSON surgical editors, ledger, and binary resolvers for Claude Code, Codex, OpenCode, and Oh My Pi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+liftgate-types = { workspace = true }
+dunce = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
-    session_key::{TruncationSpillSink, compact_mcp_tool_description},
+    session_key::{McpOrchestratorContract, TruncationSpillSink, compact_mcp_tool_description},
 };
 use serde_json::{Value, json};
 
@@ -14,7 +14,7 @@ use crate::{
     SEARCH_CLIENT_TOOLS_MCP_NAME,
     profile::{
         DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
-        count_fallback_prefix_stems, detect_harness,
+        detect_harness,
     },
     profiles::{
         ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OmpToolProfile,
@@ -26,6 +26,29 @@ use crate::{
         gateway_web_fetch_input_schema, normalize_mcp_object_schema, sanitize_mcp_tool_name,
     },
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OwnedOrchestratorContract {
+    OmpPolyglotEval { mcp_name: String },
+}
+
+impl OwnedOrchestratorContract {
+    fn from_borrowed(contract: McpOrchestratorContract<'_>) -> Self {
+        match contract {
+            McpOrchestratorContract::OmpPolyglotEval { mcp_name } => Self::OmpPolyglotEval {
+                mcp_name: mcp_name.to_owned(),
+            },
+        }
+    }
+
+    fn as_borrowed(&self) -> McpOrchestratorContract<'_> {
+        match self {
+            Self::OmpPolyglotEval { mcp_name } => {
+                McpOrchestratorContract::OmpPolyglotEval { mcp_name }
+            }
+        }
+    }
+}
 
 /// Partitioned client tool catalog ready for `session/new` registration and `McpSessionHandle`.
 #[derive(Clone, Debug, Default)]
@@ -43,6 +66,7 @@ pub struct McpSessionCatalog {
     pub has_gateway_web_fetch: bool,
     /// Pure zero-IO routing and 0-RTT search table retained by `McpSessionHandle`.
     pub routing_table: Arc<McpRoutingTable>,
+    orchestrator: Option<OwnedOrchestratorContract>,
 }
 
 impl McpSessionCatalog {
@@ -54,6 +78,14 @@ impl McpSessionCatalog {
     #[must_use]
     pub fn lookup(&self, mcp_name: &str) -> Option<&McpBridgedTool> {
         self.by_mcp_name.get(mcp_name)
+    }
+
+    /// Active Code Mode orchestrator prompt contract for `<api_gateway_bridge_rules>`, if any.
+    #[must_use]
+    pub fn orchestrator_contract(&self) -> Option<McpOrchestratorContract<'_>> {
+        self.orchestrator
+            .as_ref()
+            .map(OwnedOrchestratorContract::as_borrowed)
     }
 }
 
@@ -193,11 +225,11 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         est_wire_bytes: usize,
     }
 
-    let stem_counts = count_fallback_prefix_stems(client_tools);
+    let prepass = profile.build_prepass(client_tools);
     let mut eligible: Vec<EligibleCandidate> = Vec::with_capacity(client_tools.len());
 
     for (orig_idx, spec) in client_tools.iter().enumerate() {
-        let placement = profile.classify_tool(spec, &stem_counts);
+        let placement = profile.classify_tool(spec, &prepass);
         let v4a_patch = profile.v4a_patch_contract(spec);
         let (schema_val, is_custom, unwrap_custom_key, parameters_json) = match &spec.kind {
             CanonicalToolKind::Custom { .. } => {
@@ -293,6 +325,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
     let mut bridged_pairs: Vec<(String, String)> = Vec::new();
     let mut virtualized_hubs: Vec<(String, String, usize)> = Vec::new();
     let mut hub_names_by_namespace: HashMap<String, String> = HashMap::new();
+    let mut orchestrator: Option<OwnedOrchestratorContract> = None;
     let call_tool_wire = build_call_client_tool_wire_tool();
     let search_tool_wire = build_search_client_tools_wire_tool(&budget);
     let web_fetch_wire = enable_gateway_web_fetch.then(build_gateway_web_fetch_wire_tool);
@@ -303,6 +336,11 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                 continue;
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
+            if orchestrator.is_none()
+                && let Some(contract) = profile.orchestrator_prompt_contract(spec, &mcp_name)
+            {
+                orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
+            }
             wire_tools.push(McpWireTool {
                 name: mcp_name.clone(),
                 description: c.description,
@@ -482,6 +520,11 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                 continue;
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
+            if orchestrator.is_none()
+                && let Some(contract) = profile.orchestrator_prompt_contract(spec, &mcp_name)
+            {
+                orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
+            }
             wire_tools.push(McpWireTool {
                 name: mcp_name.clone(),
                 description: c.description.clone(),
@@ -514,8 +557,9 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         wire_tools.push(search_tool_wire);
     }
 
-    let routing_table = Arc::new(McpRoutingTable::build_with_profile_and_options(
+    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_options(
         profile,
+        &prepass,
         client_tools,
         by_mcp_name.clone(),
         hub_names_by_namespace,
@@ -532,6 +576,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: enable_gateway_web_fetch,
         routing_table,
+        orchestrator,
     }
 }
 

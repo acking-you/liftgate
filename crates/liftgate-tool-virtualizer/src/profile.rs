@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::{
-        is_code_mode_custom_exec, is_omp_eval_orchestrator_tool, split_code_mode_ts_declaration,
+        McpOrchestratorContract, is_code_mode_custom_exec, is_omp_eval_orchestrator_tool,
+        split_code_mode_ts_declaration,
     },
 };
 
@@ -124,13 +125,30 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
     /// `agy acp` Eager tool & wire byte budget for this harness.
     const BUDGET: VirtualizerBudget = VirtualizerBudget::DEFAULT_AGY_ACP;
 
+    /// Profile-specific catalog prepass state built once per tool inventory.
+    type Prepass;
+
+    /// Computes profile-specific family/stem counts once across `tools`.
+    fn build_prepass(self, tools: &[CanonicalToolSpec]) -> Self::Prepass;
+
     /// Classifies an eligible caller tool into Tier 0 (`Orchestrator`), Tier 1 (`CoreDirect`),
     /// Tier 2 (`Namespaced`), or `Standalone` backfill candidate.
     fn classify_tool<'a>(
         self,
         spec: &'a CanonicalToolSpec,
-        fallback_stem_counts: &HashMap<String, usize>,
+        prepass: &Self::Prepass,
     ) -> ToolPlacement<'a>;
+
+    /// Returns the Code Mode orchestration prompt contract to inject into `<api_gateway_bridge_rules>`
+    /// when `spec` is mounted directly on `lg` under `mcp_name`.
+    #[inline]
+    fn orchestrator_prompt_contract<'a>(
+        self,
+        _spec: &CanonicalToolSpec,
+        _mcp_name: &'a str,
+    ) -> Option<McpOrchestratorContract<'a>> {
+        None
+    }
 
     /// Dehydrates embedded Code Mode TypeScript declarations out of non-orchestrator tool
     /// descriptions so wire `tools/list` schemas stay compact while 0-RTT search retains
@@ -234,11 +252,13 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
     let mut codex_score: u32 = 0;
     let mut claude_score: u32 = 0;
     let mut opencode_score: u32 = 0;
-    let mut omp_score: u32 = 0;
+    let mut has_omp_identity = false;
+    let mut omp_primary_score: u32 = 0;
+    let mut omp_secondary_score: u32 = 0;
 
     for spec in client_tools {
         let name = spec.name.as_str();
-        if (is_code_mode_custom_exec(spec) && !matches!(name, "execute" | "eval"))
+        if (is_code_mode_custom_exec(spec) && name != "execute")
             || matches!(
                 name,
                 "exec_command"
@@ -351,10 +371,9 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
                     | "new_context"
                     | "manage_skill"
                     | "memory_edit"
-                    | "security_scan"
-                    | "checkpoint"
-                    | "rewind"
             )
+            || name.starts_with("hindsight_")
+            || name.starts_with("mnemopi_")
             || spec.description.as_deref().is_some_and(|d| {
                 d.contains("help://")
                     || d.contains("omp://")
@@ -363,10 +382,14 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
                     || d.contains("Put line ranges in `path`")
             })
         {
-            omp_score = omp_score.saturating_add(5);
+            has_omp_identity = true;
+            omp_primary_score = omp_primary_score.saturating_add(5);
         } else if matches!(
             name,
-            "ask"
+            "checkpoint"
+                | "rewind"
+                | "security_scan"
+                | "ask"
                 | "web_search"
                 | "retain"
                 | "recall"
@@ -375,27 +398,26 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
                 | "find"
                 | "debug"
                 | "yield"
-        ) || name.starts_with("hindsight_")
-            || name.starts_with("mnemopi_")
-            || name.starts_with("irc_")
-            || (name.starts_with("mcp__")
-                && !name.starts_with("mcp__codex")
-                && !name.starts_with("mcp__node_repl")
-                && !name.starts_with("mcp__cua_repl")
-                && !name.starts_with("mcp__claude_ai_")
-                && !name.starts_with("mcp__plugin_")
-                && name.strip_prefix("mcp__").is_some_and(|rest| {
-                    split_mcp_server_and_action(rest).is_none() && rest.contains('_')
-                }))
+                | "bash"
+                | "read"
+                | "edit"
+                | "write"
+                | "glob"
+                | "grep"
+                | "lsp"
+                | "task"
+                | "todo"
+        ) || name.starts_with("irc_")
         {
-            omp_score = omp_score.saturating_add(3);
-        } else if matches!(
-            name,
-            "bash" | "read" | "edit" | "write" | "glob" | "grep" | "lsp" | "task" | "todo"
-        ) {
-            omp_score = omp_score.saturating_add(2);
+            omp_secondary_score = omp_secondary_score.saturating_add(2);
         }
     }
+
+    let omp_score = if has_omp_identity {
+        omp_primary_score.saturating_add(omp_secondary_score)
+    } else {
+        0
+    };
 
     if omp_score > codex_score && omp_score > claude_score && omp_score > opencode_score {
         return DetectedHarness::Omp;
@@ -487,7 +509,7 @@ pub fn split_mcp_server_and_action(trimmed: &str) -> Option<(&str, &str)> {
     Some((ns_raw, action_raw))
 }
 
-/// Counts fallback `<stem>_*` and single-underscore `mcp__<server>_*` prefixes across a catalog.
+/// Counts generic `<stem>_*` fallback prefixes across a catalog.
 #[must_use]
 pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -496,37 +518,7 @@ pub fn count_fallback_prefix_stems(tools: &[CanonicalToolSpec]) -> HashMap<Strin
         if matches!(name, "todowrite" | "todoread") {
             *counts.entry("todo_pair".to_owned()).or_insert(0) += 1;
         }
-        if matches!(
-            name,
-            "retain" | "recall" | "reflect" | "memory_edit" | "learn"
-        ) || name.starts_with("hindsight_")
-            || name.starts_with("mnemopi_")
-        {
-            *counts.entry("omp_memory".to_owned()).or_insert(0) += 1;
-        }
-        if matches!(
-            name,
-            "checkpoint" | "rewind" | "context_notes" | "new_context"
-        ) {
-            *counts.entry("omp_session_state".to_owned()).or_insert(0) += 1;
-        }
-        if let Some(after_mcp) = name.strip_prefix("mcp__") {
-            if split_mcp_server_and_action(after_mcp).is_none()
-                && let Some((srv, rest)) = after_mcp.split_once('_')
-                && srv.len() >= 2
-                && !rest.is_empty()
-            {
-                let key = format!("mcp1:{}", srv.to_ascii_lowercase());
-                *counts.entry(key).or_insert(0) += 1;
-                if let Some((seg2, rest2)) = rest.split_once('_')
-                    && seg2.len() >= 2
-                    && !rest2.is_empty()
-                    && let Some(two_seg) = after_mcp.get(..srv.len() + 1 + seg2.len())
-                {
-                    let key2 = format!("mcp2:{}", two_seg.to_ascii_lowercase());
-                    *counts.entry(key2).or_insert(0) += 1;
-                }
-            }
+        if name.starts_with("mcp__") {
             continue;
         }
         if name.contains('.') {

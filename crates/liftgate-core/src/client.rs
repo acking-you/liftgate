@@ -2,11 +2,10 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+pub use liftgate_harness::DiscoveredModel;
 use liftgate_server::routes::ADMIN_SHUTDOWN_HEADER;
-use liftgate_types::{
-    acp::AvailableModel, model::GEMINI_DEFAULT_WINDOW, telemetry::GatewayTelemetrySnapshot,
-};
-use serde::{Deserialize, Serialize};
+use liftgate_types::telemetry::GatewayTelemetrySnapshot;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
@@ -17,44 +16,6 @@ use crate::state::format_connect_url;
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SSE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DiscoveredModel {
-    pub id: String,
-    #[serde(default)]
-    pub display_name: String,
-    #[serde(default)]
-    pub context_window: u64,
-    #[serde(default)]
-    pub auto_compact_token_limit: u64,
-}
-
-impl DiscoveredModel {
-    /// Uses the live gateway's complete context policy, or a conservative fallback for old servers.
-    #[must_use]
-    pub fn context_limits(&self) -> (u64, u64) {
-        if self.auto_compact_token_limit >= 100_000
-            && self.auto_compact_token_limit <= self.context_window
-            && self.context_window <= GEMINI_DEFAULT_WINDOW
-        {
-            (self.context_window, self.auto_compact_token_limit)
-        } else {
-            liftgate_types::model::context_limits(&self.id)
-        }
-    }
-
-    #[must_use]
-    pub fn to_available_model(&self) -> AvailableModel {
-        AvailableModel {
-            model_id: self.id.clone(),
-            name: if self.display_name.is_empty() {
-                self.id.clone()
-            } else {
-                self.display_name.clone()
-            },
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct DiscoveredModelList {

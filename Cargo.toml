@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/liftgate-types",
     "crates/liftgate-tool-virtualizer",
+    "crates/liftgate-harness",
     "crates/liftgate-server",
     "crates/liftgate-core",
     "crates/liftgate",
@@ -18,6 +19,7 @@ repository = "https://github.com/acking-you/liftgate"
 [workspace.dependencies]
 liftgate-types = { path = "crates/liftgate-types", default-features = false }
 liftgate-tool-virtualizer = { path = "crates/liftgate-tool-virtualizer", default-features = false }
+liftgate-harness = { path = "crates/liftgate-harness", default-features = false }
 liftgate-server = { path = "crates/liftgate-server", default-features = false }
 liftgate-core = { path = "crates/liftgate-core", default-features = false }
 

@@ -24,9 +24,9 @@ use liftgate_types::{
 use crate::{
     budget::VirtualizerBudget,
     profile::{
-        HarnessToolProfile, ToolPlacement, V4aPatchContract, default_apply_patch_v4a_contract,
-        is_opencode_v4a_patch_spec, json_schema_declares_property, normalize_namespace_slug,
-        split_mcp_server_and_action,
+        HarnessToolProfile, ToolPlacement, V4aPatchContract, count_fallback_prefix_stems,
+        default_apply_patch_v4a_contract, is_opencode_v4a_patch_spec,
+        json_schema_declares_property, normalize_namespace_slug, split_mcp_server_and_action,
     },
 };
 
@@ -42,6 +42,11 @@ const _: () = assert!(
 impl HarnessToolProfile for OpenCodeToolProfile {
     const ID: &'static str = "opencode";
     const BUDGET: VirtualizerBudget = VirtualizerBudget::OPENCODE_AGY_ACP;
+    type Prepass = HashMap<String, usize>;
+
+    fn build_prepass(self, tools: &[CanonicalToolSpec]) -> Self::Prepass {
+        count_fallback_prefix_stems(tools)
+    }
 
     fn classify_tool<'a>(
         self,
