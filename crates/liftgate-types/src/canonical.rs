@@ -249,16 +249,29 @@ pub fn detect_auxiliary_task(
     //    (Checked before `client_tools` because Claude Code / Codex may attach session tools
     //    when forking the conversation history for background recaps.)
     if trimmed_user.starts_with("The user stepped away and is coming back. Recap in")
+        || (trimmed_user.starts_with("<recap>") && trimmed_user.contains("User stepped away"))
         || trimmed_user.contains("<prompt_suggestion>")
         || sys.contains("Suggest what the user might")
         || sys.contains(
             "Summarize what was done in this conversation. Write like a pull request description.",
         )
+        || sys.contains("Summarize conversation changes as a pull request description.")
+        || sys.starts_with("You design the live status widget of a coding agent's background job")
+        || sys.contains("Never restate the stated purpose or name the shell")
     {
         return Some(AuxiliaryTaskKind::AwayRecapOrSuggestion);
     }
 
-    // 3. Session title / topic / branch name generator (Claude Code, OpenAI Codex & OpenCode TUI)
+    // 2b. Forked session/agent naming requests (Oh My Pi `title-fork.md` & `tan-name.md`),
+    //     which branch off multi-turn conversations and may carry full session `client_tools`.
+    if (trimmed_user.starts_with("<title-request>")
+        && trimmed_user.contains("Session UI request, not from the user."))
+        || sys.contains("Name the background agent that carries out the request in the final")
+    {
+        return Some(AuxiliaryTaskKind::SessionTitleOrTopic);
+    }
+
+    // 3. Session title / topic / branch name generator (Claude Code, Codex, OpenCode & Oh My Pi)
     if conv_len <= 2
         && (trimmed_user.starts_with("Generate a concise, single-line task title")
             || sys.contains("Generate a concise, single-line task title")
@@ -266,6 +279,10 @@ pub fn detect_auxiliary_task(
             || sys.contains("Write the title in the predominant language of the session")
             || sys.contains("isNewTopic")
             || sys.contains("You name conversations so the user can find them later")
+            || sys.contains("You name coding-agent sessions.")
+            || sys.contains("You head coding-agent session titles with a small card.")
+            || sys.contains("Name the plan in the next user message:")
+            || sys.contains("NEVER echo header names or assignment structure.")
             || sys.contains("You are a title generator")
             || (trimmed_user.starts_with("<session>")
                 && trimmed_user.contains("</session>")
@@ -604,6 +621,59 @@ mod tests {
         assert_eq!(
             links[1].url,
             "https://www.timeanddate.com/weather/singapore"
+        );
+    }
+
+    #[test]
+    fn detects_omp_forked_titles_widgets_and_recaps() {
+        let dummy_tool = CanonicalToolSpec {
+            name: "eval".to_owned(),
+            description: Some("Persistent kernel".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: "{}".to_owned(),
+            },
+        };
+        let forked_msgs = vec![
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("Refactor router".to_owned())],
+            },
+            CanonicalMessage {
+                role: CanonicalRole::Assistant,
+                parts: vec![CanonicalPart::Text("Working on it.".to_owned())],
+            },
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text(
+                    "<title-request>\nSession UI request, not from the user. Output title JSON.\n</title-request>"
+                        .to_owned(),
+                )],
+            },
+        ];
+        assert_eq!(
+            detect_auxiliary_task(
+                Some("You name coding-agent sessions."),
+                &forked_msgs,
+                &[dummy_tool],
+                false,
+                false,
+            ),
+            Some(AuxiliaryTaskKind::SessionTitleOrTopic)
+        );
+
+        let widget_msgs = vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("cargo test --workspace".to_owned())],
+        }];
+        assert_eq!(
+            detect_auxiliary_task(
+                Some("You design the live status widget of a coding agent's background job."),
+                &widget_msgs,
+                &[],
+                false,
+                false,
+            ),
+            Some(AuxiliaryTaskKind::AwayRecapOrSuggestion)
         );
     }
 }

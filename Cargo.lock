@@ -783,6 +783,7 @@ dependencies = [
  "dunce",
  "flate2",
  "libc",
+ "liftgate-harness",
  "liftgate-server",
  "liftgate-types",
  "serde",
@@ -795,6 +796,18 @@ dependencies = [
  "uuid",
  "windows-sys",
  "zip",
+]
+
+[[package]]
+name = "liftgate-harness"
+version = "0.2.9"
+dependencies = [
+ "dunce",
+ "liftgate-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

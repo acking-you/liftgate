@@ -131,11 +131,12 @@ closing or crashing the gateway never leaves `agy` processes behind.
 | Path | Owns |
 | --- | --- |
 | `crates/liftgate-types` | protocol, wire and config types: no async runtime, HTTP or I/O |
-| `crates/liftgate-tool-virtualizer` | zero-cost, trait-driven (`HarnessToolProfile`) 3-tier MCP tool virtualizer, `CodexToolProfile`, `ClaudeCodeToolProfile` & `OpenCodeToolProfile` adapters, slack-slot backfill, 0-RTT search index, and preflight validator: no async runtime, HTTP or I/O |
+| `crates/liftgate-tool-virtualizer` | zero-cost, trait-driven (`HarnessToolProfile`) 3-tier MCP tool virtualizer, `CodexToolProfile`, `ClaudeCodeToolProfile`, `OpenCodeToolProfile` & `OmpToolProfile` adapters, slack-slot backfill, 0-RTT search index, and preflight validator: no async runtime, HTTP or I/O |
+| `crates/liftgate-harness` | synchronous per-harness client adapters (`claude`, `codex`, `opencode`, `omp`), structure-preserving YAML/TOML/JSON surgical editors, displaced-config ledger, CLI flag/session-alias normalizers, and cross-platform executable & Windows shim discovery: no async runtime, HTTP or server dependencies |
 | `crates/liftgate-server` | HTTP/SSE routes, ACP transport, `SessionPool`, process supervision, `web_fetch`, telemetry |
 | `crates/liftgate-core` | shared control-plane library: daemon lifecycle, embedded `web/dist` assets, HTTP/SSE client, `agy` & proxy manager, zero-side-effect CLI/GUI launchers, system terminal spawner, non-destructive `config` sync, and verified self-upgrade |
 | `crates/liftgate` | the `liftgate` / `lg` CLI and interactive `ratatui` TUI binaries |
 | `web/` | the dashboard (Bun, Vite, React 19, Tailwind CSS v4, shadcn/ui), embedded into release builds via `crates/liftgate-core/build.rs` |
 | `run-gateway.{sh,ps1,cmd}` | build and run the gateway |
 
-Dependencies point one way: `liftgate` → `liftgate-core` → `liftgate-server` → `liftgate-tool-virtualizer` → `liftgate-types`.
+Dependencies point one way: `liftgate` → `liftgate-core` → `{liftgate-harness, liftgate-server}` → `liftgate-tool-virtualizer` → `liftgate-types` (`liftgate-harness` depends directly on `liftgate-types` and compiles in parallel with `liftgate-server`).

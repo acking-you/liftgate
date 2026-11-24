@@ -803,6 +803,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     virtualized_hubs: &catalog.virtualized_hubs,
                     has_virtualized_dispatch: catalog.has_virtualized_dispatch,
                     has_gateway_web_fetch: catalog.has_gateway_web_fetch,
+                    orchestrator: catalog.orchestrator_contract(),
                 },
                 web_cfg,
                 &nonce,

@@ -11,6 +11,7 @@ repository.workspace = true
 default = []
 
 [dependencies]
+liftgate-harness = { workspace = true }
 liftgate-server = { workspace = true }
 liftgate-types = { workspace = true }
 clap = { workspace = true }

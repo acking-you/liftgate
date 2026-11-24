@@ -11,8 +11,8 @@ use liftgate_types::{
 use crate::{
     budget::VirtualizerBudget,
     profile::{
-        HarnessToolProfile, ToolPlacement, ascii_lowercase_cow, normalize_namespace_slug,
-        split_mcp_server_and_action,
+        HarnessToolProfile, ToolPlacement, ascii_lowercase_cow, count_fallback_prefix_stems,
+        normalize_namespace_slug, split_mcp_server_and_action,
     },
 };
 
@@ -39,6 +39,11 @@ const _: () = assert!(
 impl HarnessToolProfile for CodexToolProfile {
     const ID: &'static str = "codex";
     const BUDGET: VirtualizerBudget = VirtualizerBudget::CODEX_AGY_ACP;
+    type Prepass = HashMap<String, usize>;
+
+    fn build_prepass(self, tools: &[CanonicalToolSpec]) -> Self::Prepass {
+        count_fallback_prefix_stems(tools)
+    }
 
     fn classify_tool<'a>(
         self,

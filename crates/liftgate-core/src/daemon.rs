@@ -23,7 +23,9 @@ use crate::cli::{
 use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
 use crate::config_sync::resolve_fast_model;
 use crate::error::{CliError, DaemonStopError, GatewayTransportError};
-use crate::harness::{resolve_claude_command, resolve_codex_command, resolve_opencode_command};
+use crate::harness::{
+    resolve_claude_command, resolve_codex_command, resolve_omp_command, resolve_opencode_command,
+};
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
@@ -925,7 +927,7 @@ pub async fn inspect_doctor(
     let env_proxy = std::env::var("AGY_PROXY").ok();
     let effective_proxy = resolve_effective_agy_proxy(env_proxy.as_deref(), &settings)?;
     let auto_update_enabled = settings.agy_auto_update;
-    let mut checks: Vec<DoctorCheckItem> = Vec::with_capacity(11);
+    let mut checks: Vec<DoctorCheckItem> = Vec::with_capacity(12);
     let mut has_error = false;
     let mut has_warn = false;
     let mut agy_missing = false;
@@ -1062,6 +1064,20 @@ pub async fn inspect_doctor(
             status: "optional",
             tone: ReportTone::Muted,
             detail: "not detected in PATH (`npm i -g opencode-ai`)".to_owned(),
+        }),
+    }
+    match resolve_omp_command(None) {
+        Ok(cmd) => checks.push(DoctorCheckItem {
+            name: "Oh My Pi (omp)",
+            status: "found",
+            tone: ReportTone::Ok,
+            detail: cmd.program.display().to_string(),
+        }),
+        Err(_) => checks.push(DoctorCheckItem {
+            name: "Oh My Pi (omp)",
+            status: "optional",
+            tone: ReportTone::Muted,
+            detail: "not detected in PATH (`bun i -g @oh-my-pi/pi-coding-agent`)".to_owned(),
         }),
     }
     match crate::desktop::resolve_claude_desktop(None) {

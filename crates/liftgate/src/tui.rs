@@ -138,6 +138,7 @@ pub enum CockpitAction {
     LaunchCodex,
     LaunchClaude,
     LaunchOpenCode,
+    LaunchOmp,
     LaunchCodexApp,
     LaunchClaudeDesktop,
     OpenTop,
@@ -177,6 +178,12 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         label: "Launch OpenCode",
         desc: "Start OpenCode TUI in current dir (auto-starts gateway, 0 file side effects)",
         action: CockpitAction::LaunchOpenCode,
+    },
+    CockpitItem {
+        hotkey: 'y',
+        label: "Launch Oh My Pi (omp)",
+        desc: "Start Oh My Pi TUI in current dir (auto-starts gateway, 0 file side effects)",
+        action: CockpitAction::LaunchOmp,
     },
     CockpitItem {
         hotkey: 'w',
@@ -229,13 +236,13 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
     CockpitItem {
         hotkey: 'g',
         label: "Configure Client Files",
-        desc: "Non-destructively sync .claude, .codex & opencode.json project configuration",
+        desc: "Non-destructively sync .claude, .codex, opencode.json & .omp project configuration",
         action: CockpitAction::SyncConfig,
     },
     CockpitItem {
         hotkey: 'd',
         label: "Environment Doctor",
-        desc: "Check agy, claude, codex, opencode, network proxy & login readiness",
+        desc: "Check agy, claude, codex, opencode, omp, network proxy & login readiness",
         action: CockpitAction::Doctor,
     },
     CockpitItem {

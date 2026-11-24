@@ -111,12 +111,12 @@ lg agy mcp -- --help                    # forwards to `agy mcp ...` (any subcomm
   (rolling back automatically if the new binary fails ACP handshake), and
   resumes serving without dropping configuration.
 
-## Zero-side-effect launch (`lg cx` / `lg cc` / `lg oc` / `lg cxa` / `lg cd`)
+## Zero-side-effect launch (`lg cx` / `lg cc` / `lg oc` / `lg omp` / `lg cxa` / `lg cd`)
 
-Run Codex CLI, Claude Code, **OpenCode**, **Codex App**, or **Claude Desktop**
+Run Codex CLI, Claude Code, **OpenCode**, **Oh My Pi (`omp`)**, **Codex App**, or **Claude Desktop**
 across Windows, macOS, and Linux without polluting project files,
 `~/.claude/settings.json`, `~/.codex/config.toml`,
-`~/.config/opencode/opencode.json`, native desktop profiles, or your caller shell:
+`~/.config/opencode/opencode.json`, `~/.omp/agent/`, native desktop profiles, or your caller shell:
 
 ```bash
 cd /path/to/your/project
@@ -127,9 +127,13 @@ liftgate claude                             # interactive Claude Code (`CLAUDE_C
 liftgate opencode                           # interactive OpenCode TUI (alias: `lg oc`; `@opencode/codemode` active by default)
 liftgate opencode --full-code-mode          # enable OpenCode full Code Mode (`OPENCODE_FLAGS=full_codemode`)
 liftgate opencode --no-code-mode            # expose all OpenCode MCP & namespace tools directly (virtualized by Liftgate)
+liftgate omp                                # interactive Oh My Pi TUI (alias: `lg oh-my-pi`; polyglot `eval` + `tools.commands`)
+liftgate omp --full-code-mode               # mount MCP servers directly into `eval` globals (`mcp.evalNamespaces: true`)
+liftgate omp --no-code-mode                 # disable `eval` (`PI_PY=0 PI_JS=0`) and run direct tool calls
 liftgate codex exec "run cargo test"        # native flags & subcommands forward directly
 liftgate claude --model gemini-4-hydrogen-low -p "summarize recent commits"
 liftgate opencode run "run cargo test"      # non-interactive OpenCode prompt (`lg oc run -c "..."`)
+liftgate omp -p "run cargo test"            # non-interactive Oh My Pi print prompt
 
 # Native session browsing, resumption, forking, worktrees & background agents
 lg cx resume                                # interactive Codex session picker (`--all` across projects; alias: `lg cx -r`)
@@ -146,6 +150,10 @@ lg oc -c                                    # continue most recent OpenCode sess
 lg oc -s ses_42                             # continue or create a specific OpenCode session (alias: `lg oc resume ses_42`)
 lg oc models                                # list configured providers and live Antigravity models
 lg oc session list                          # list project sessions (`delete`, `export`, `import`, `web`, `serve`, `acp`)
+lg omp -c                                   # continue most recent Oh My Pi session (aliases: `lg omp continue`, `lg omp resume --last`)
+lg omp -r                                   # interactive Oh My Pi session picker (alias: `lg omp resume`; `lg omp resume <ID>`)
+lg omp --fork <ID>                          # fork an existing Oh My Pi session into a new branch
+lg omp models agy                           # list live Antigravity models (`commit`, `session`, `acp` also work)
 
 # Desktop GUI apps (Windows MSIX/Squirrel/standalone, macOS .app bundles, Linux .deb/Flatpak/AppImage)
 lg codex-app                                # alias: `lg cxa` or `lg cx --app` (isolated CODEX_HOME + --user-data-dir)
@@ -156,14 +164,19 @@ lg claude-desktop --restore                 # manually replay rollback journals 
 ```
 
 - If the background gateway is not running yet, `liftgate codex`,
-  `liftgate claude`, `liftgate opencode`, and the desktop launchers start it
-  automatically.
+  `liftgate claude`, `liftgate opencode`, `liftgate omp`, and the desktop
+  launchers start it automatically.
 - **OpenCode (`lg oc` / `lg opencode`)** injects an in-memory
   `OPENCODE_CONFIG_CONTENT` overlay (non-destructively preserving any caller
   `OPENCODE_CONFIG_CONTENT` keys) without touching `./opencode.json` or
   `~/.config/opencode/opencode.json`, and automatically passes `--standalone` on
   OpenCode v2 (`>= 2.0.0`) so a private server reads the session's gateway
   routing instead of attaching to an older background daemon.
+- **Oh My Pi (`lg omp` / `lg oh-my-pi`)** writes an ephemeral TypeScript
+  provider extension (`pi.registerProvider("agy", ...)`) and YAML overlay under
+  `~/.liftgate/ephemeral/` loaded via `PI_CONFIG_FILES` (inheriting any existing
+  user/project `extensions`), keeping `~/.omp/agent/{models.yml,config.yml}` and
+  `.omp/` 100% untouched and cleaning up both ephemeral files on exit.
 - Scoped environment variables and temporary settings/catalog files (under
   `~/.liftgate/ephemeral/`) apply **only** to the spawned child process and are
   deleted immediately when the CLI exits.
@@ -277,10 +290,11 @@ If you prefer running bare `claude`, `codex`, or `opencode` directly, let
 non-destructively merge the live model catalog and provider config for you:
 
 ```bash
-liftgate config                     # write .claude/settings.local.json + .codex/{config.toml,agy-models.json} + opencode.json
+liftgate config                     # write .claude/settings.local.json + .codex + opencode.json + .omp
 liftgate config claude --global     # merge into ~/.claude/settings.json
 liftgate config codex --global      # merge [model_providers.agy] + catalog into ~/.codex/
 liftgate config opencode --global   # merge provider.agy into ~/.config/opencode/opencode.json (alias: `oc`)
+liftgate config omp --global        # merge providers.agy + modelRoles into ~/.omp/agent/{models.yml,config.yml}
 liftgate config --print             # preview generated config without writing files
 liftgate config --uninstall         # remove only Liftgate-managed keys (--global for ~/)
 ```
@@ -478,6 +492,80 @@ For manual setup, add the `agy` provider to `~/.config/opencode/opencode.json`
   `agy acp`'s `524,288` internal ceiling), while OpenCode's `patch`
   (`{ "patchText": "..." }`) receives 0-RTT Lark V4A preflight self-healing and
   session titles / summaries route to ephemeral Flash sessions.
+
+## Oh My Pi (`omp`)
+
+Prefer `lg omp` (`liftgate omp`, alias `lg oh-my-pi`) for zero-side-effect
+automatic setup, or run `lg config omp --global` to sync
+`~/.omp/agent/models.yml` + `~/.omp/agent/config.yml` (honoring `OMP_PROFILE` /
+`PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and `$XDG_DATA_HOME/omp`).
+Running `lg config omp` inside a project writes `.omp/liftgate-agy-provider.ts`
+and merges `.omp/config.yml` without touching global `~/.omp/agent` files.
+
+For manual global setup, add `providers.agy` to `~/.omp/agent/models.yml` and
+point `modelRoles` in `~/.omp/agent/config.yml` at `agy/<model>`:
+
+```yaml
+# ~/.omp/agent/models.yml
+providers:
+  agy:
+    baseUrl: http://127.0.0.1:8787/v1
+    apiKey: local-agy
+    api: openai-responses
+    authHeader: true
+    compat:
+      supportsStore: false
+      statefulResponses: false
+      supportsDeveloperRole: true
+      supportsReasoningEffort: true
+      supportsReasoningSummary: true
+      supportsToolChoice: true
+      streamIdleTimeoutMs: 1800000
+    models:
+      - id: gemini-4-carbon-high
+        name: "Gemini 4 Carbon (High)"
+        api: openai-responses
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts: [low, medium, high]
+          defaultLevel: high
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 500000
+        maxTokens: 64000
+        preferWebsockets: false
+```
+
+```yaml
+# ~/.omp/agent/config.yml
+modelRoles:
+  default: agy/gemini-4-carbon-high
+  slow: agy/gemini-4-carbon-high
+  plan: agy/gemini-4-carbon-high
+  task: agy/gemini-4-carbon-high
+  vision: agy/gemini-4-carbon-high
+  smol: agy/gemini-4-hydrogen-low
+  commit: agy/gemini-4-hydrogen-low
+  tiny: agy/gemini-4-hydrogen-low
+  memory: agy/gemini-4-hydrogen-low
+  widget: agy/gemini-4-hydrogen-low
+```
+
+- **Polyglot Code Mode (`eval` + `wait` + `tools.commands`)**: Oh My Pi's
+  persistent Python (`py`) and Bun JavaScript (`js`) `eval` kernels stay at Tier
+  0 with full `<prelude>` / `<browser>` / `<computer>` / `<dsm>` documentation
+  preserved (`64 KiB` budget) and automatic `<api_gateway_bridge_rules>`
+  instructing models to call unprefixed `tool.<name>(args)` inside `eval` cells.
+  Pass `lg omp --full-code-mode` to activate `mcp.evalNamespaces: true` (binding
+  MCP servers directly as globals inside `eval`), or `lg omp --no-code-mode` to
+  disable `eval` (`PI_PY=0`, `PI_JS=0`) and run all tools directly.
+- **Hashline-safe `edit` & MCP virtualization**: Oh My Pi's default `hashline`
+  `edit` tool (`[path#TAG]` + `PUT N.=M:` envelopes inside `*** Begin Patch`,
+  both JSON `{ input }` and custom Lark grammar) passes through untouched without
+  false OpenAI V4A rejections, while `apply_patch` receives 0-RTT V4A healing and
+  large `mcp__<server>_<tool>`, `memory`, and `session_state` toolsets fold
+  cleanly into `mcp_lg_ns__*` hubs via `OmpToolProfile`.
 
 ## Other clients
 

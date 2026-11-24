@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
     budget::VirtualizerBudget,
-    profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract, count_fallback_prefix_stems},
+    profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract},
     schema::{
         McpBridgedTool, code_mode_exec_input_schema, coerce_stringified_container_fields,
         extract_custom_tool_input, extract_schema_metadata, normalize_apply_patch_text,
@@ -184,6 +184,29 @@ impl McpRoutingTable {
         has_virtualized_dispatch: bool,
         has_gateway_web_fetch: bool,
     ) -> Self {
+        let prepass = profile.build_prepass(client_tools);
+        Self::build_with_prepass_and_options(
+            profile,
+            &prepass,
+            client_tools,
+            direct_by_mcp,
+            hub_names_by_namespace,
+            has_virtualized_dispatch,
+            has_gateway_web_fetch,
+        )
+    }
+
+    /// Builds a routing table reusing an already-computed profile prepass.
+    #[must_use]
+    pub fn build_with_prepass_and_options<P: HarnessToolProfile>(
+        profile: P,
+        prepass: &P::Prepass,
+        client_tools: &[CanonicalToolSpec],
+        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        hub_names_by_namespace: HashMap<String, String>,
+        has_virtualized_dispatch: bool,
+        has_gateway_web_fetch: bool,
+    ) -> Self {
         assert_eq!(
             std::mem::size_of::<P>(),
             0,
@@ -195,7 +218,6 @@ impl McpRoutingTable {
             direct_by_client.insert(b.client_name.as_str(), b);
         }
 
-        let stem_counts = count_fallback_prefix_stems(client_tools);
         let mut hubs_by_mcp: HashMap<String, HubNamespaceTable> =
             HashMap::with_capacity(hub_names_by_namespace.len());
         for (ns, hub_mcp) in &hub_names_by_namespace {
@@ -211,7 +233,7 @@ impl McpRoutingTable {
 
         let mut all_indexed_tools = Vec::with_capacity(client_tools.len());
         for spec in client_tools {
-            let placement = profile.classify_tool(spec, &stem_counts);
+            let placement = profile.classify_tool(spec, prepass);
             let profile_v4a_patch = profile.v4a_patch_contract(spec);
             let is_orchestrator = matches!(placement, ToolPlacement::Orchestrator { .. });
             let custom_bridge = match &spec.kind {
