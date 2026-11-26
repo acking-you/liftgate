@@ -313,6 +313,17 @@ pub fn detect_auxiliary_task(
         return Some(AuxiliaryTaskKind::WebFetchExtractor);
     }
 
+    // 5. Oh My Pi (`omp`) one-shot startup skill routing-hint compressor, commit-message
+    //    generator, and background memory extractor / consolidator (`client_tools` empty above).
+    if conv_len <= 2
+        && (trimmed_user.starts_with("Compress into one routing hint of at most 12 words:")
+            || sys.starts_with("From provided diff, generate concise git commit message.")
+            || sys.starts_with("You are a precise long-term memory extractor.")
+            || sys.starts_with("Summarize memories in 1-3 concise sentences."))
+    {
+        return Some(AuxiliaryTaskKind::AwayRecapOrSuggestion);
+    }
+
     None
 }
 

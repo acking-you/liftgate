@@ -45,6 +45,11 @@ pub enum ToolPlacement<'a> {
         /// Sub-priority for slack-slot backfill (`0` highest ..= `255` lowest).
         backfill_rank: u8,
     },
+    /// Elided from top-level `tools/list` (`wire_tools`) when a Tier-0 Code Mode orchestrator is
+    /// active (such as Oh My Pi's `eval` `tool.<name>(args)` bridge), matching OpenAI Codex's
+    /// Code Mode tool elision while remaining indexed in `search_client_tools` and summarized
+    /// onto the orchestrator's wire description.
+    FoldedIntoOrchestrator,
 }
 
 /// V4A (`*** Begin Patch` ... `*** End Patch`) contract recognized for a client tool.
@@ -146,6 +151,7 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         self,
         _spec: &CanonicalToolSpec,
         _mcp_name: &'a str,
+        _has_folded_tools: bool,
     ) -> Option<McpOrchestratorContract<'a>> {
         None
     }
@@ -243,6 +249,24 @@ pub fn is_omp_input_edit_spec(spec: &CanonicalToolSpec) -> bool {
                 && !json_schema_declares_property(parameters_json, "oldString")
                 && !json_schema_declares_property(parameters_json, "old_string")
         }
+    }
+}
+
+#[must_use]
+fn is_omp_distinctive_bash_or_todo_spec(spec: &CanonicalToolSpec) -> bool {
+    let CanonicalToolKind::Function { parameters_json } = &spec.kind else {
+        return false;
+    };
+    match spec.name.as_str() {
+        "bash" => {
+            json_schema_declares_property(parameters_json, "pty")
+                && json_schema_declares_property(parameters_json, "ready")
+        }
+        "todo" => {
+            json_schema_declares_property(parameters_json, "op")
+                && json_schema_declares_property(parameters_json, "items")
+        }
+        _ => false,
     }
 }
 
@@ -363,6 +387,7 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
 
         if is_omp_eval_orchestrator_tool(spec)
             || is_omp_input_edit_spec(spec)
+            || is_omp_distinctive_bash_or_todo_spec(spec)
             || matches!(
                 name,
                 "ast_edit"

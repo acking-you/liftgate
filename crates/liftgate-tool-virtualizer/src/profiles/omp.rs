@@ -40,6 +40,7 @@ use crate::{
 /// between inventory counting and final tier placement.
 #[derive(Clone, Debug, Default)]
 pub struct OmpCatalogPrepass {
+    has_eval_orchestrator: bool,
     memory_builtins: usize,
     session_state_builtins: usize,
     mcp_first_seg: HashMap<String, usize>,
@@ -195,7 +196,11 @@ impl OmpCatalogPrepass {
     pub fn from_tools(tools: &[CanonicalToolSpec]) -> Self {
         let mut prepass = Self::default();
         for spec in tools {
-            if is_omp_eval_orchestrator_tool(spec) || is_code_mode_custom_exec(spec) {
+            if is_omp_eval_orchestrator_tool(spec) {
+                prepass.has_eval_orchestrator = true;
+                continue;
+            }
+            if is_code_mode_custom_exec(spec) {
                 continue;
             }
             match classify_omp_name_family(&spec.name) {
@@ -266,12 +271,12 @@ impl HarnessToolProfile for OmpToolProfile {
         prepass: &Self::Prepass,
     ) -> ToolPlacement<'a> {
         // Tier 0: `eval` polyglot Code Mode kernel + `wait` job barrier.
-        if is_omp_eval_orchestrator_tool(spec) || is_code_mode_custom_exec(spec) {
+        if is_code_mode_custom_exec(spec) {
             return ToolPlacement::Orchestrator {
                 custom_unwrap_key: Some("code"),
             };
         }
-        if is_code_mode_orchestrator_tool(spec) {
+        if is_omp_eval_orchestrator_tool(spec) || is_code_mode_orchestrator_tool(spec) {
             return ToolPlacement::Orchestrator {
                 custom_unwrap_key: None,
             };
@@ -281,7 +286,21 @@ impl HarnessToolProfile for OmpToolProfile {
             OmpNameFamily::WaitBarrier => ToolPlacement::Orchestrator {
                 custom_unwrap_key: None,
             },
-            OmpNameFamily::CoreDirect { rank } => ToolPlacement::CoreDirect { rank },
+            OmpNameFamily::CoreDirect { rank } => {
+                if prepass.has_eval_orchestrator
+                    && matches!(
+                        spec.name.as_str(),
+                        "bash" | "read" | "grep" | "glob" | "find" | "ast_grep" | "lsp"
+                    )
+                {
+                    // Code Mode elision (matching Codex `code_mode_only`): omit subordinate
+                    // read/shell/search/LSP tools from top-level `wire_tools` while keeping them
+                    // callable inside `eval` via `await tool.<name>(args)` / `sh(...)`.
+                    ToolPlacement::FoldedIntoOrchestrator
+                } else {
+                    ToolPlacement::CoreDirect { rank }
+                }
+            }
             OmpNameFamily::MemoryBuiltin { action } => {
                 if prepass.memory_builtins >= 2 {
                     ToolPlacement::Namespaced {
@@ -350,7 +369,13 @@ impl HarnessToolProfile for OmpToolProfile {
                 action: Cow::Borrowed(action),
             },
             OmpNameFamily::BuiltinStandalone { backfill_rank } => {
-                ToolPlacement::Standalone { backfill_rank }
+                if prepass.has_eval_orchestrator
+                    && !matches!(spec.name.as_str(), "ask" | "goal" | "think")
+                {
+                    ToolPlacement::FoldedIntoOrchestrator
+                } else {
+                    ToolPlacement::Standalone { backfill_rank }
+                }
             }
             OmpNameFamily::CustomUnderscore { stem, action } => {
                 if prepass
@@ -376,9 +401,13 @@ impl HarnessToolProfile for OmpToolProfile {
         self,
         spec: &CanonicalToolSpec,
         mcp_name: &'a str,
+        has_folded_tools: bool,
     ) -> Option<McpOrchestratorContract<'a>> {
         if is_omp_eval_orchestrator_tool(spec) {
-            Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name })
+            Some(McpOrchestratorContract::OmpPolyglotEval {
+                mcp_name,
+                elided_subordinate_tools: has_folded_tools,
+            })
         } else {
             None
         }

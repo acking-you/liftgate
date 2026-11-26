@@ -54,6 +54,7 @@ pub(crate) struct IndexedClientTool {
     pub(crate) namespace: Option<String>,
     pub(crate) short_action: Option<String>,
     pub(crate) invoke_via_mcp_name: String,
+    pub(crate) folded_into_orchestrator: bool,
     pub(crate) is_custom: bool,
     pub(crate) unwrap_custom_key: Option<&'static str>,
     pub(crate) v4a_patch: Option<V4aPatchContract>,
@@ -236,6 +237,8 @@ impl McpRoutingTable {
             let placement = profile.classify_tool(spec, prepass);
             let profile_v4a_patch = profile.v4a_patch_contract(spec);
             let is_orchestrator = matches!(placement, ToolPlacement::Orchestrator { .. });
+            let folded_into_orchestrator =
+                matches!(placement, ToolPlacement::FoldedIntoOrchestrator);
             let custom_bridge = match &spec.kind {
                 CanonicalToolKind::Custom { .. } => match &placement {
                     ToolPlacement::Orchestrator {
@@ -244,7 +247,8 @@ impl McpRoutingTable {
                     ToolPlacement::Orchestrator { .. }
                     | ToolPlacement::CoreDirect { .. }
                     | ToolPlacement::Namespaced { .. }
-                    | ToolPlacement::Standalone { .. } => {
+                    | ToolPlacement::Standalone { .. }
+                    | ToolPlacement::FoldedIntoOrchestrator => {
                         Some(profile.custom_tool_mcp_bridge(spec))
                     }
                 },
@@ -279,7 +283,8 @@ impl McpRoutingTable {
                         }
                         ToolPlacement::Orchestrator { .. }
                         | ToolPlacement::CoreDirect { .. }
-                        | ToolPlacement::Standalone { .. } => None,
+                        | ToolPlacement::Standalone { .. }
+                        | ToolPlacement::FoldedIntoOrchestrator => None,
                     };
                     (
                         opt_ns,
@@ -331,6 +336,7 @@ impl McpRoutingTable {
                 namespace,
                 short_action,
                 invoke_via_mcp_name: invoke_via_mcp_name.clone(),
+                folded_into_orchestrator,
                 is_custom,
                 unwrap_custom_key: unwrap_key,
                 v4a_patch,
@@ -724,7 +730,12 @@ impl McpRoutingTable {
                 );
                 break;
             }
-            let invoke_hint = if item.invoke_via_mcp_name == CALL_CLIENT_TOOL_MCP_NAME {
+            let invoke_hint = if item.folded_into_orchestrator {
+                format!(
+                    "`mcp_lg_eval` cell via `await tool.{}({{ ... }})`",
+                    item.client_name
+                )
+            } else if item.invoke_via_mcp_name == CALL_CLIENT_TOOL_MCP_NAME {
                 format!(
                     "`mcp_lg_{CALL_CLIENT_TOOL_MCP_NAME}` with `{{\"name\": \"{}\", \"arguments\": {{ ... }}}}`",
                     item.client_name

@@ -42,6 +42,7 @@ providers:
 ";
     let initial_config = "\
 # User 4-space config.yml
+inlineToolDescriptors: auto # user default
 modelRoles:
     default: ollama/qwen3
     advisor: openai/o3 # keep advisor
@@ -70,6 +71,8 @@ tools: {commands: false, customSandbox: strict} # inline flow map
     assert!(synced_cfg.contains("customSandbox: strict"));
     assert!(synced_cfg.contains("commands: true"));
     assert!(synced_cfg.contains("approvalMode: yolo"));
+    assert!(synced_cfg.contains("inlineToolDescriptors: \"off\" # user default"));
+    assert!(synced_cfg.contains("evalNamespaces: true"));
     assert_eq!(
         inspect_omp_default_model(&synced_cfg).as_deref(),
         Some("agy/gemini-4-carbon-high")
@@ -88,6 +91,8 @@ tools: {commands: false, customSandbox: strict} # inline flow map
     assert!(restored_cfg.contains("    advisor: openai/o3 # keep advisor\n"));
     assert!(restored_cfg.contains("commands: false"));
     assert!(restored_cfg.contains("customSandbox: strict"));
+    assert!(restored_cfg.contains("inlineToolDescriptors: auto # user default"));
+    assert!(!restored_cfg.contains("evalNamespaces:"));
 
     let _ = fs::remove_dir_all(&tmp);
 }

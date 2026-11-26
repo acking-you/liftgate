@@ -51,6 +51,12 @@ pub struct ScalarMappingUpsert {
     pub wrote_entries: BTreeMap<String, String>,
 }
 
+/// Result of upserting 1-level top-level scalar keys (`inlineToolDescriptors`, etc.).
+pub struct TopScalarUpsert {
+    pub previous_entries: BTreeMap<String, Option<String>>,
+    pub wrote_entries: BTreeMap<String, String>,
+}
+
 mod flow;
 mod render;
 mod validate;
@@ -617,6 +623,124 @@ pub fn revert_yaml_2level_scalars(
             sec_after.lines = rebuilt;
         }
     }
+    Ok(changed)
+}
+
+/// Upserts top-level scalar entries (`key: value`), preserving inline comments and existing
+/// section positions while recording displaced values (`Some(prev_rhs)` or `None` when absent).
+pub fn upsert_yaml_top_scalars(
+    doc: &mut YamlDocument,
+    desired: &[(&str, YamlScalar)],
+) -> Result<TopScalarUpsert, String> {
+    let mut previous_entries = BTreeMap::new();
+    let mut wrote_entries = BTreeMap::new();
+    for (k, v) in desired {
+        wrote_entries.insert((*k).to_owned(), v.render());
+    }
+
+    let mut seen = BTreeSet::new();
+    for sec in &mut doc.sections {
+        let Some(ref sk) = sec.key else {
+            continue;
+        };
+        let Some((_, new_val)) = desired.iter().find(|(dk, _)| dk == sk) else {
+            continue;
+        };
+        let has_nested_lines = sec
+            .lines
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .any(|l| !strip_yaml_inline_comment(l).trim().is_empty());
+        if has_nested_lines {
+            return Err(format!(
+                "top-level key `{sk}` is a nested mapping/sequence, expected a scalar"
+            ));
+        }
+        let first_line = sec.lines.first().map(String::as_str).unwrap_or("");
+        let (code_part, comment_opt) = split_yaml_inline_comment(first_line);
+        let prev_rhs = split_yaml_key_and_rhs(code_part.trim())
+            .map(|(_, rhs)| rhs.to_owned())
+            .filter(|s| !s.is_empty());
+        previous_entries.insert(sk.clone(), prev_rhs);
+        seen.insert(sk.clone());
+
+        let trailing: Vec<String> = sec.lines.get(1..).unwrap_or(&[]).to_vec();
+        let qk = yaml_quote_key_if_needed(sk);
+        let head = match comment_opt {
+            Some(comment) => format!("{qk}: {} {comment}\n", new_val.render()),
+            None => format!("{qk}: {}\n", new_val.render()),
+        };
+        let mut rebuilt = vec![head];
+        rebuilt.extend(trailing);
+        sec.lines = rebuilt;
+    }
+
+    for (k, v) in desired {
+        if !seen.contains(*k) {
+            previous_entries.insert((*k).to_owned(), None);
+            if let Some(last) = doc.sections.last_mut()
+                && last.lines.last().is_some_and(|l| !l.trim().is_empty())
+            {
+                last.lines.push("\n".to_owned());
+            }
+            let qk = yaml_quote_key_if_needed(k);
+            doc.sections.push(YamlTopSection {
+                key: Some((*k).to_owned()),
+                lines: vec![format!("{qk}: {}\n", v.render())],
+            });
+        }
+    }
+
+    Ok(TopScalarUpsert {
+        previous_entries,
+        wrote_entries,
+    })
+}
+
+/// Reverts top-level scalar entries previously written by [`upsert_yaml_top_scalars`],
+/// preserving inline comments and unrelated sections.
+pub fn revert_yaml_top_scalars(
+    doc: &mut YamlDocument,
+    previous: &BTreeMap<String, Option<String>>,
+    wrote: &BTreeMap<String, String>,
+) -> Result<bool, String> {
+    if wrote.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut keep_sections: Vec<YamlTopSection> = Vec::with_capacity(doc.sections.len());
+    for mut sec in doc.sections.drain(..) {
+        if let Some(ref sk) = sec.key
+            && let Some(wrote_val) = wrote.get(sk)
+        {
+            let first_line = sec.lines.first().map(String::as_str).unwrap_or("");
+            let (code_part, comment_opt) = split_yaml_inline_comment(first_line);
+            let current_rhs = split_yaml_key_and_rhs(code_part.trim()).map(|(_, rhs)| rhs);
+            let matches = current_rhs.is_some_and(|cur| {
+                cur == wrote_val.as_str()
+                    || unquote_yaml_scalar(cur) == unquote_yaml_scalar(wrote_val)
+            });
+            if matches {
+                changed = true;
+                if let Some(Some(prev_rhs)) = previous.get(sk) {
+                    let qk = yaml_quote_key_if_needed(sk);
+                    let head = match comment_opt {
+                        Some(comment) => format!("{qk}: {prev_rhs} {comment}\n"),
+                        None => format!("{qk}: {prev_rhs}\n"),
+                    };
+                    let trailing: Vec<String> = sec.lines.get(1..).unwrap_or(&[]).to_vec();
+                    let mut rebuilt = vec![head];
+                    rebuilt.extend(trailing);
+                    sec.lines = rebuilt;
+                    keep_sections.push(sec);
+                }
+                continue;
+            }
+        }
+        keep_sections.push(sec);
+    }
+    doc.sections = keep_sections;
     Ok(changed)
 }
 
