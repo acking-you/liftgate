@@ -16,11 +16,22 @@ pub enum McpOrchestratorContract<'a> {
     OmpPolyglotEval {
         /// Sanitized MCP tool name mounted on `lg` (e.g. `"eval"` -> `mcp_lg_eval`).
         mcp_name: &'a str,
+        /// Whether subordinate read/shell/search tools were elided from top-level `wire_tools`
+        /// and folded into `eval` (`tool.<name>(args)` / `sh(...)`), matching Codex Code Mode.
+        elided_subordinate_tools: bool,
     },
 }
 
 pub(super) const MAX_CODE_MODE_TOOL_DESC_BYTES: usize = 36_000;
 pub(super) const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
+
+const OMP_EVAL_FALLBACK_DESCRIPTION: &str = "\
+Execute Python (\"py\") or JavaScript/Bun (\"js\") in persistent Code Mode kernels; top-level state persists across turns.\n\
+<prelude>\n\
+- `sh(command, cwd?, timeout?)` (JS: `await sh(command, { cwd?, timeout? })`): run shell commands synchronously to completion.\n\
+- `await tool.<name>(args)`: invoke any session tool by its unprefixed client name (e.g. `await tool.read({\"path\": \"src/lib.rs:1-80\"})` for `[FILENAME#TAG]` hashline output, `await tool.grep(...)`, `await tool.glob(...)`, `await tool.todo(...)`).\n\
+- `read(path, offset?, limit?)` / `write(path, content)` (JS: `await read(...)` / `await write(...)`): raw file & URI helpers.\n\
+</prelude>";
 
 /// Returns `true` when `tool` is a Codex Code Mode custom JavaScript `exec` tool
 /// (`CanonicalToolKind::Custom` named `"exec"` or `"*.exec"`).
@@ -130,8 +141,15 @@ pub fn compact_mcp_tool_description<S: TruncationSpillSink>(
     max_bytes: usize,
     spill: &mut S,
 ) -> Option<String> {
-    let raw_desc = tool.description.as_deref()?.trim();
+    let raw_desc = tool
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
     if raw_desc.is_empty() {
+        if is_omp_eval_orchestrator_tool(tool) {
+            return Some(OMP_EVAL_FALLBACK_DESCRIPTION.to_owned());
+        }
         return None;
     }
     if is_code_mode_orchestrator_tool(tool) {

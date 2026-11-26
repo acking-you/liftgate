@@ -539,6 +539,7 @@ providers:
 
 ```yaml
 # ~/.omp/agent/config.yml
+inlineToolDescriptors: "off"
 modelRoles:
   default: agy/gemini-4-carbon-high
   slow: agy/gemini-4-carbon-high
@@ -555,8 +556,11 @@ modelRoles:
 - **Polyglot Code Mode (`eval` + `wait` + `tools.commands`)**: Oh My Pi's
   persistent Python (`py`) and Bun JavaScript (`js`) `eval` kernels stay at Tier
   0 with full `<prelude>` / `<browser>` / `<computer>` / `<dsm>` documentation
-  preserved (`64 KiB` budget) and automatic `<api_gateway_bridge_rules>`
-  instructing models to call unprefixed `tool.<name>(args)` inside `eval` cells.
+  preserved (`64 KiB` budget, backed by `inlineToolDescriptors: "off"` so Gemini
+  models keep wire tool descriptions), folding subordinate read/search/shell
+  tools (`read`, `bash`, `grep`, `glob`, `lsp`, etc.) into `mcp_lg_eval` via
+  dehydrated `<eval_session_tools>` signatures while keeping `edit`, `write`,
+  `task`, `ask`, and `wait` top-level.
   Pass `lg omp --full-code-mode` to activate `mcp.evalNamespaces: true` (binding
   MCP servers directly as globals inside `eval`), or `lg omp --no-code-mode` to
   disable `eval` (`PI_PY=0`, `PI_JS=0`) and run all tools directly.

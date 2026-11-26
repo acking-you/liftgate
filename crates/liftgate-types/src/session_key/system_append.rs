@@ -131,6 +131,12 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
 
     let mut header_rules = String::with_capacity(2048);
     header_rules.push_str("<api_gateway_bridge_rules>\n");
+    let batch_clause = match mcp_spec.orchestrator {
+        Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name, .. }) => format!(
+            "Batch multi-step or parallel reads, searches, and shell inspections inside a single `mcp_lg_{mcp_name}` Code Mode cell."
+        ),
+        None => "Batch independent read-only searches, reads, or checks as parallel `mcp_lg_*` calls in a single turn.".to_owned(),
+    };
     header_rules.push_str(
         "You are serving an external API harness via a structured protocol gateway.\n\
          - NEVER invoke internal host tools (`read_file`, `write_file`, `edit_file`, `run_command`, \
@@ -139,8 +145,11 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
          outside `mcp_lg_*`.\n\
          - Ignore internal ACP host folders (`liftgate-*`) and any host plugin rules/snapshots.\n\
          - Invoke the caller's native `mcp_lg_*` client tools directly as native tool calls (they \
-         execute in the caller's real workspace from `<developer_instructions>` and `<caller_system_instructions>`). \
-         Batch independent read-only searches, reads, or checks as parallel `mcp_lg_*` calls in a single turn.\n\
+         execute in the caller's real workspace from `<developer_instructions>` and `<caller_system_instructions>`). ",
+    );
+    header_rules.push_str(&batch_clause);
+    header_rules.push_str(
+        "\n\
          - NEVER emit transcript or role wrapper markers such as `<user>`, `</user>`, `<assistant>`, \
          `</assistant>`, `<client_tool_result>`, `</client_tool_result>`, or `[Client Tool Result`. \
          Generate ONLY the current single assistant turn.\n",
@@ -173,10 +182,19 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         ));
     }
     match mcp_spec.orchestrator {
-        Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name }) => {
+        Some(McpOrchestratorContract::OmpPolyglotEval {
+            mcp_name,
+            elided_subordinate_tools,
+        }) => {
             header_rules.push_str(&format!(
-                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` for persistent Python (`py`) / JavaScript (`js`) cells; inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code).\n"
+                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`); inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code)."
             ));
+            if elided_subordinate_tools {
+                header_rules.push_str(&format!(
+                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, read it via `await tool.read({{\"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` to obtain its `[FILENAME#TAG]` hashline anchors, then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for file mutations."
+                ));
+            }
+            header_rules.push('\n');
         }
         None => {}
     }

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.12] - 2026-11-27
+
+### Fixed
+- **Oh My Pi (`lg omp`) Code Mode (`eval`) tool elision & `inlineToolDescriptors: "off"`**:
+  - Folded subordinate built-in tools (`read`, `bash`, `grep`, `glob`, `find`, `lsp`, `todo`, `web_search`, etc.) into `mcp_lg_eval` (`ToolPlacement::FoldedIntoOrchestrator`) when `omp` Code Mode is active while keeping direct mutation and interactive tools (`edit`, `apply_patch`, `ast_edit`, `write`, `task`, `ask`, `wait`) mounted top-level, appending dehydrated `<eval_session_tools>` `tool.<name>(args)` signatures onto `mcp_lg_eval` (plus fallback Code Mode docs when wire descriptions are empty) and preserving 1:1 direct passthrough under `lg omp --no-code-mode`.
+  - Configured `inlineToolDescriptors: "off"` in `lg omp` session overlays and `lg config omp` (`~/.omp/agent/config.yml` and `.omp/config.yml`, with ledger-backed `--uninstall` restoration) so `omp` preserves tool and parameter descriptions on Gemini models instead of stripping them to empty strings under `inlineToolDescriptors: "auto"`, and aligned `<api_gateway_bridge_rules>` to steer workspace reads, searches, and shell commands into `mcp_lg_eval` (`await tool.read(...)` for `[FILENAME#TAG]` hashline anchors before `mcp_lg_edit`).
+  - Classified `omp` startup skill routing-hint compression, commit message generation, and background memory extraction prompts as auxiliary tasks so cold-start skill indexing runs on ephemeral fast-lane sessions without polluting primary `SessionPool` cache telemetry.
+
 ## [0.2.11] - 2026-11-26
 
 ### Changed

@@ -1148,7 +1148,10 @@ fn omp_eval_codemode_injects_unprefixed_bridge_rule_and_matches_compaction_promp
         virtualized_hubs: &hubs,
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: true,
-        orchestrator: Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name: "eval" }),
+        orchestrator: Some(McpOrchestratorContract::OmpPolyglotEval {
+            mcp_name: "eval",
+            elided_subordinate_tools: true,
+        }),
     };
     let mut spill = NoopSpillSink;
     let (append, _) = build_session_system_append_for_mcp_with_spill_sink(
@@ -1162,6 +1165,38 @@ fn omp_eval_codemode_injects_unprefixed_bridge_rule_and_matches_compaction_promp
     assert!(append.contains(
         "call `tool.<name>(args)` and MCP eval globals by their unprefixed client names"
     ));
+    assert!(append.contains("folded into `mcp_lg_eval`"));
+    assert!(!append.contains(
+        "Batch independent read-only searches, reads, or checks as parallel `mcp_lg_*` calls"
+    ));
+
+    let empty_desc_eval = CanonicalToolSpec {
+        name: "eval".to_owned(),
+        description: Some(String::new()),
+        kind: CanonicalToolKind::Function {
+            parameters_json: r#"{"type":"object","properties":{"language":{"type":"string"},"code":{"type":"string"}}}"#.to_owned(),
+        },
+    };
+    let fallback_desc = compact_mcp_tool_description(&empty_desc_eval, 8_000, &mut spill)
+        .expect("empty-description OMP eval must synthesize fallback Code Mode docs");
+    assert!(fallback_desc.contains("await tool.<name>(args)"));
+
+    let omp_skill_aux = crate::canonical::detect_auxiliary_task(
+        None,
+        &[CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text(
+                "Compress into one routing hint of at most 12 words: WHEN to use; WHEN NOT only if it prevents confusion.\n\nSkill: agents".to_owned(),
+            )],
+        }],
+        &[],
+        false,
+        false,
+    );
+    assert_eq!(
+        omp_skill_aux,
+        Some(crate::canonical::AuxiliaryTaskKind::AwayRecapOrSuggestion)
+    );
 }
 
 #[test]

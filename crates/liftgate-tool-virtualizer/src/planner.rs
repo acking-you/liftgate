@@ -29,23 +29,34 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedOrchestratorContract {
-    OmpPolyglotEval { mcp_name: String },
+    OmpPolyglotEval {
+        mcp_name: String,
+        elided_subordinate_tools: bool,
+    },
 }
 
 impl OwnedOrchestratorContract {
     fn from_borrowed(contract: McpOrchestratorContract<'_>) -> Self {
         match contract {
-            McpOrchestratorContract::OmpPolyglotEval { mcp_name } => Self::OmpPolyglotEval {
+            McpOrchestratorContract::OmpPolyglotEval {
+                mcp_name,
+                elided_subordinate_tools,
+            } => Self::OmpPolyglotEval {
                 mcp_name: mcp_name.to_owned(),
+                elided_subordinate_tools,
             },
         }
     }
 
     fn as_borrowed(&self) -> McpOrchestratorContract<'_> {
         match self {
-            Self::OmpPolyglotEval { mcp_name } => {
-                McpOrchestratorContract::OmpPolyglotEval { mcp_name }
-            }
+            Self::OmpPolyglotEval {
+                mcp_name,
+                elided_subordinate_tools,
+            } => McpOrchestratorContract::OmpPolyglotEval {
+                mcp_name,
+                elided_subordinate_tools: *elided_subordinate_tools,
+            },
         }
     }
 }
@@ -210,6 +221,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         CoreDirect { rank: u8 },
         Namespaced { namespace: String, action: String },
         Standalone { backfill_rank: u8 },
+        FoldedIntoOrchestrator,
     }
 
     struct EligibleCandidate {
@@ -240,7 +252,8 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     ToolPlacement::Orchestrator { .. }
                     | ToolPlacement::CoreDirect { .. }
                     | ToolPlacement::Namespaced { .. }
-                    | ToolPlacement::Standalone { .. } => profile.custom_tool_mcp_bridge(spec),
+                    | ToolPlacement::Standalone { .. }
+                    | ToolPlacement::FoldedIntoOrchestrator => profile.custom_tool_mcp_bridge(spec),
                 };
                 (schema_val, true, Some(unwrap_key), None)
             }
@@ -264,6 +277,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
             ToolPlacement::Standalone { backfill_rank } => {
                 (CandidateKind::Standalone { backfill_rank }, false)
             }
+            ToolPlacement::FoldedIntoOrchestrator => (CandidateKind::FoldedIntoOrchestrator, false),
         };
 
         let max_desc = if is_orchestrator {
@@ -301,15 +315,63 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         });
     }
 
+    let folded_indices: Vec<usize> = eligible
+        .iter()
+        .filter(|c| matches!(c.kind, CandidateKind::FoldedIntoOrchestrator))
+        .map(|c| c.orig_idx)
+        .collect();
+    let has_folded_tools = !folded_indices.is_empty();
+    if has_folded_tools {
+        let folded_block = build_folded_orchestrator_tools_block(client_tools, &folded_indices);
+        if !folded_block.is_empty()
+            && let Some(orch_cand) = eligible.iter_mut().find(|c| {
+                c.is_orchestrator
+                    && client_tools
+                        .get(c.orig_idx)
+                        .is_some_and(|spec| spec.name != "wait")
+            })
+        {
+            let merged = match orch_cand.description.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{folded_block}"),
+                _ => folded_block,
+            };
+            if merged.len() <= budget.max_orchestrator_desc_bytes {
+                orch_cand.description = Some(merged);
+            } else if let Some(spec) = client_tools.get(orch_cand.orig_idx) {
+                let synthetic = CanonicalToolSpec {
+                    name: spec.name.clone(),
+                    description: Some(merged),
+                    kind: spec.kind.clone(),
+                };
+                orch_cand.description = compact_mcp_tool_description(
+                    &synthetic,
+                    budget.max_orchestrator_desc_bytes,
+                    spill,
+                );
+            }
+            if let Some(spec) = client_tools.get(orch_cand.orig_idx) {
+                orch_cand.est_wire_bytes = estimate_wire_tool_bytes(
+                    &spec.name,
+                    orch_cand.description.as_deref(),
+                    &orch_cand.input_schema,
+                );
+            }
+        }
+    }
+
+    let wire_eligible_count = eligible
+        .iter()
+        .filter(|c| !matches!(c.kind, CandidateKind::FoldedIntoOrchestrator))
+        .count();
     let non_orch_wire_bytes: usize = eligible
         .iter()
-        .filter(|c| !c.is_orchestrator)
+        .filter(|c| !c.is_orchestrator && !matches!(c.kind, CandidateKind::FoldedIntoOrchestrator))
         .fold(0usize, |acc, c| acc.saturating_add(c.est_wire_bytes));
     let reserved_slots: usize = 2usize.saturating_add(usize::from(enable_gateway_web_fetch));
     let passthrough_max_tools = budget
         .direct_passthrough_max_tools
         .min(budget.max_eager_tools.saturating_sub(reserved_slots));
-    let should_virtualize = eligible.len() > passthrough_max_tools
+    let should_virtualize = wire_eligible_count > passthrough_max_tools
         || non_orch_wire_bytes > budget.direct_passthrough_max_non_orchestrator_bytes;
 
     let mut used_mcp_names: HashSet<String> =
@@ -332,12 +394,16 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
 
     if !should_virtualize {
         for c in eligible {
+            if matches!(c.kind, CandidateKind::FoldedIntoOrchestrator) {
+                continue;
+            }
             let Some(spec) = client_tools.get(c.orig_idx) else {
                 continue;
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
             if orchestrator.is_none()
-                && let Some(contract) = profile.orchestrator_prompt_contract(spec, &mcp_name)
+                && let Some(contract) =
+                    profile.orchestrator_prompt_contract(spec, &mcp_name, has_folded_tools)
             {
                 orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
             }
@@ -371,7 +437,9 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
             .filter_map(|(pos, c)| match c.kind {
                 CandidateKind::Orchestrator => Some((0u8, 0u8, pos)),
                 CandidateKind::CoreDirect { rank } => Some((1u8, rank, pos)),
-                CandidateKind::Namespaced { .. } | CandidateKind::Standalone { .. } => None,
+                CandidateKind::Namespaced { .. }
+                | CandidateKind::Standalone { .. }
+                | CandidateKind::FoldedIntoOrchestrator => None,
             })
             .collect();
         core_indices.sort_by_key(|&(tier, rank, pos)| {
@@ -422,6 +490,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                 CandidateKind::CoreDirect { rank } => {
                     standalone_positions.push((*rank, c.est_wire_bytes, pos));
                 }
+                CandidateKind::FoldedIntoOrchestrator => {}
             }
         }
 
@@ -521,7 +590,8 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
             if orchestrator.is_none()
-                && let Some(contract) = profile.orchestrator_prompt_contract(spec, &mcp_name)
+                && let Some(contract) =
+                    profile.orchestrator_prompt_contract(spec, &mcp_name, has_folded_tools)
             {
                 orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
             }
@@ -577,6 +647,111 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         has_gateway_web_fetch: enable_gateway_web_fetch,
         routing_table,
         orchestrator,
+    }
+}
+
+const MAX_FOLDED_TOOLS_SUMMARY_BYTES: usize = 6 * 1024;
+
+fn build_folded_orchestrator_tools_block(
+    client_tools: &[CanonicalToolSpec],
+    folded_indices: &[usize],
+) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str(
+        "<eval_session_tools>\n\
+         Folded session tools (omitted from top-level `mcp_lg_*`; invoke inside `eval` via `await tool.<name>(args)` in Python/JS, or inspect full schemas with `mcp_lg_search_client_tools`):\n",
+    );
+    let mut omitted_count: usize = 0;
+    for (pos, &orig_idx) in folded_indices.iter().enumerate() {
+        let Some(spec) = client_tools.get(orig_idx) else {
+            continue;
+        };
+        let sig = summarize_folded_tool_signature(spec);
+        let summary = summarize_folded_tool_hint(spec);
+        let line = if summary.is_empty() {
+            format!("- `tool.{}`({sig})\n", spec.name)
+        } else {
+            format!("- `tool.{}`({sig}): {summary}\n", spec.name)
+        };
+        if out.len().saturating_add(line.len()) > MAX_FOLDED_TOOLS_SUMMARY_BYTES {
+            omitted_count = folded_indices.len().saturating_sub(pos);
+            break;
+        }
+        out.push_str(&line);
+    }
+    if omitted_count > 0 {
+        out.push_str(&format!(
+            "- ... (+{omitted_count} additional folded session tools; query `mcp_lg_search_client_tools`)\n"
+        ));
+    }
+    out.push_str("</eval_session_tools>");
+    out
+}
+
+fn summarize_folded_tool_signature(spec: &CanonicalToolSpec) -> String {
+    let CanonicalToolKind::Function { parameters_json } = &spec.kind else {
+        return "raw_input".to_owned();
+    };
+    let Ok(val) = serde_json::from_str::<Value>(parameters_json) else {
+        return "{ ... }".to_owned();
+    };
+    let Some(props) = val.get("properties").and_then(Value::as_object) else {
+        return "{}".to_owned();
+    };
+    if props.is_empty() {
+        return "{}".to_owned();
+    }
+    let required: HashSet<&str> = val
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut req_names: Vec<&str> = Vec::new();
+    let mut opt_names: Vec<&str> = Vec::new();
+    for key in props.keys() {
+        if required.contains(key.as_str()) {
+            req_names.push(key.as_str());
+        } else {
+            opt_names.push(key.as_str());
+        }
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(req_names.len() + opt_names.len());
+    for r in req_names {
+        parts.push(r.to_owned());
+    }
+    for o in opt_names.iter().take(6) {
+        parts.push(format!("{o}?"));
+    }
+    if opt_names.len() > 6 {
+        parts.push("...".to_owned());
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+fn summarize_folded_tool_hint(spec: &CanonicalToolSpec) -> String {
+    match spec.name.as_str() {
+        "read" => {
+            return "Read file/dir/URI (`\"file.rs:1-80\"` returns `[FILENAME#TAG]` hashline anchors for `mcp_lg_edit`; also resolves `skill://`, `help://`, `local://`)".to_owned();
+        }
+        "bash" => {
+            return "Run shell command (with optional `pty`/`async`/`ready`) or mounted tool-commands (`ast_edit`, `debug`, `lsp --help`)".to_owned();
+        }
+        _ => {}
+    }
+    let Some(raw) = spec.description.as_deref() else {
+        return String::new();
+    };
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('<'))
+        .unwrap_or_default();
+    if first_line.chars().count() <= 110 {
+        first_line.to_owned()
+    } else {
+        let mut truncated: String = first_line.chars().take(107).collect();
+        truncated.push_str("...");
+        truncated
     }
 }
 

@@ -858,7 +858,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
 }
 
 #[test]
-fn omp_default_16_builtin_tools_pass_through_1_to_1_with_full_eval_prelude() {
+fn omp_default_16_builtin_tools_elide_subordinates_into_eval_with_full_prelude() {
     let mut spill = NoopSpillSink;
     let eval_prelude = format!(
         "Run persistent Python (`py`) or JavaScript (`js`) cells; top-level state persists.\n<prelude>\nawait tool.read({{ path: 'src/lib.rs' }});\n</prelude>\n<browser>\n{}</browser>",
@@ -927,21 +927,44 @@ fn omp_default_16_builtin_tools_pass_through_1_to_1_with_full_eval_prelude() {
         cat.virtualized_hubs.is_empty(),
         "16 default omp tools must bypass hub folding"
     );
+    let bridged_names: Vec<&str> = cat.bridged_pairs.iter().map(|(c, _)| c.as_str()).collect();
     assert_eq!(
-        cat.bridged_pairs.len(),
-        tools.len(),
-        "every default omp built-in tool must mount 1:1 as Direct Eager"
+        bridged_names,
+        vec!["eval", "wait", "edit", "write", "task", "ask", "ast_edit"],
+        "when OMP `eval` Code Mode is active, only orchestrators and direct mutation/interactive tools mount top-level"
     );
     let wire_eval = cat
         .wire_tools
         .iter()
         .find(|t| t.name == "eval")
         .expect("eval mounted 1:1");
-    assert_eq!(
-        wire_eval.description.as_deref(),
-        Some(eval_prelude.trim()),
+    let wire_eval_desc = wire_eval.description.as_deref().unwrap_or_default();
+    assert!(
+        wire_eval_desc.starts_with(eval_prelude.trim()),
         "64 KiB orchestrator budget must preserve <prelude> and <browser> docs intact"
     );
+    assert!(
+        wire_eval_desc.contains("<eval_session_tools>")
+            && wire_eval_desc.contains("`tool.read`")
+            && wire_eval_desc.contains("`tool.bash`")
+            && wire_eval_desc.contains("`tool.grep`"),
+        "wire eval description must append folded session tool signatures"
+    );
+    let search_out = cat.routing_table.resolve_call(
+        "search_client_tools",
+        &json!({ "names": ["grep"] }),
+        &tools,
+    );
+    match search_out {
+        VirtualizedCallDecision::LocalReply { text, is_error, .. } => {
+            assert!(!is_error);
+            assert!(
+                text.contains("`mcp_lg_eval` cell via `await tool.grep({ ... })`"),
+                "search_client_tools must guide folded tools into `mcp_lg_eval`, got:\n{text}"
+            );
+        }
+        other => panic!("expected LocalReply from search_client_tools, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1037,12 +1060,38 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
     assert!(cat.wire_tools.len() <= 24);
 
     let wire_names: Vec<&str> = cat.wire_tools.iter().map(|t| t.name.as_str()).collect();
-    for direct in ["eval", "wait", "bash", "read", "edit", "apply_patch"] {
+    for direct in [
+        "eval",
+        "wait",
+        "edit",
+        "apply_patch",
+        "write",
+        "task",
+        "ask",
+    ] {
         assert!(
             wire_names.contains(&direct),
             "expected `{direct}` to remain Tier 0/1 Direct Eager, got {wire_names:?}"
         );
     }
+    for elided in ["bash", "read", "grep", "glob", "lsp", "todo"] {
+        assert!(
+            !wire_names.contains(&elided),
+            "expected `{elided}` to be folded into `eval` when OMP Code Mode is active, got {wire_names:?}"
+        );
+    }
+    let eval_wire = cat
+        .wire_tools
+        .iter()
+        .find(|t| t.name == "eval")
+        .expect("eval wire tool");
+    let eval_desc = eval_wire.description.as_deref().unwrap_or_default();
+    assert!(
+        eval_desc.contains("<eval_session_tools>")
+            && eval_desc.contains("`tool.read`")
+            && eval_desc.contains("`tool.bash`"),
+        "eval wire description must summarize folded session tools:\n{eval_desc}"
+    );
     for hub in [
         "ns__memory",
         "ns__session_state",
@@ -1132,9 +1181,78 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
         Some(
             liftgate_types::session_key::McpOrchestratorContract::OmpPolyglotEval {
                 mcp_name: "eval",
+                elided_subordinate_tools: true,
             }
         )
     );
+
+    // 5. When `eval` is disabled (`lg omp --no-code-mode`), subordinate tools remain direct
+    //    1:1 Eager MCP tools and OMP detection still succeeds even with empty descriptions!
+    let no_code_mode_tools = vec![
+        fn_tool(
+            "bash",
+            "",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "pty": { "type": "boolean" },
+                    "ready": { "type": "object" }
+                },
+                "required": ["command"]
+            }),
+        ),
+        fn_tool(
+            "read",
+            "",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "grep",
+            "",
+            json!({ "type": "object", "properties": { "pattern": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "glob",
+            "",
+            json!({ "type": "object", "properties": { "pattern": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "lsp",
+            "",
+            json!({ "type": "object", "properties": { "action": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "todo",
+            "",
+            json!({
+                "type": "object",
+                "properties": { "op": { "type": "string" }, "items": { "type": "array" } }
+            }),
+        ),
+    ];
+    assert_eq!(
+        detect_harness(ProtocolHint::OpenAiResponses, &no_code_mode_tools),
+        DetectedHarness::Omp
+    );
+    let no_cm_cat = partition_tools_for_mcp_session(
+        ProtocolHint::OpenAiResponses,
+        &no_code_mode_tools,
+        false,
+        &mut spill,
+    );
+    let no_cm_names: Vec<&str> = no_cm_cat
+        .wire_tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    for direct in ["bash", "read", "grep", "glob", "lsp", "todo"] {
+        assert!(
+            no_cm_names.contains(&direct),
+            "expected `{direct}` to stay direct when `eval` is disabled, got {no_cm_names:?}"
+        );
+    }
+    assert_eq!(no_cm_cat.orchestrator_contract(), None);
 }
 
 #[test]

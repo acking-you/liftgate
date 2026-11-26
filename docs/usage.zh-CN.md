@@ -369,7 +369,7 @@ providers:
         preferWebsockets: false
 ```
 
-- **双栈 Code Mode（`eval` + `wait` + `tools.commands`）**：`OmpToolProfile` 将常驻 Python（`py`）与 Bun JavaScript（`js`）双内核 `eval` 及后台作业屏障 `wait` 固定在 Tier 0（`64 KiB` 描述预算完整保留 `<prelude>` / `<browser>` / `<computer>` / `<dsm>` 帮助），并注入桥接规则引导模型在 `eval` 代码与 `bash` 工具命令内使用无前缀原始名 `tool.<name>(args)`；加 `lg omp --full-code-mode` 开启 `mcp.evalNamespaces: true`，加 `lg omp --no-code-mode` 关闭 `eval` 切换为直连调用。
+- **双栈 Code Mode（`eval` + `wait` + `tools.commands`）**：自动写入 `inlineToolDescriptors: "off"` 以保留 Gemini 模型的工具描述，`OmpToolProfile` 将常驻 Python（`py`）与 Bun JavaScript（`js`）双内核 `eval` 及后台作业屏障 `wait` 固定在 Tier 0（`64 KiB` 描述预算完整保留 `<prelude>` / `<browser>` / `<computer>` / `<dsm>` 帮助并附带 `<eval_session_tools>` 签名），将从属检索/命令工具（`read`、`bash`、`grep`、`glob`、`lsp` 等）收敛进 `mcp_lg_eval` 并引导模型通过无前缀 `await tool.<name>(args)` 调用；加 `lg omp --full-code-mode` 开启 `mcp.evalNamespaces: true`，加 `lg omp --no-code-mode` 关闭 `eval` 切换为全量直连调用。
 - **`hashline` 安全编辑与单下划线 MCP 虚拟化**：完整保留 `omp` 默认 `edit` 工具的 `hashline`（`[path#TAG]` + `PUT N.=M:`，含 JSON `{ input }` 与自定义 Lark 语法两种形态）原样透传而不被误判为 V4A 补丁；`apply_patch` 享受 0-RTT V4A 自愈校验，大规模 `mcp__<server>_<tool>`、`memory` 与 `session_state` 工具自动折叠至 `mcp_lg_ns__*` 路由中心。
 
 ## 其它客户端

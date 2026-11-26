@@ -48,7 +48,11 @@ pub fn resolve_omp_command(explicit: Option<&Path>) -> Result<ResolvedCommand, H
         explicit_invalid_hint: "explicit `--omp-bin` path does not exist or is not executable",
         missing_install_hint: "install Oh My Pi (`bun install -g @oh-my-pi/pi-coding-agent` or `curl -fsSL https://omp.sh/install | sh`) or pass `--omp-bin <path>`",
         unix_bin_name: "omp",
-        unix_home_rel_paths: &[&[".omp", "bin", "omp"]],
+        unix_home_rel_paths: &[
+            &[".omp", "bin", "omp"],
+            &[".local", "bin", "omp"],
+            &[".bun", "bin", "omp"],
+        ],
         windows_exe_name: "omp.exe",
         windows_extra_exe_candidates: windows_omp_exe_candidates(),
         windows_npm_script_rel: None,

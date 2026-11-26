@@ -25,8 +25,9 @@ use crate::omp::{
 use crate::yaml_edit::{
     YamlScalar, YamlSubEntry, YamlTopSection, ensure_lf, parse_mapping_section,
     parse_yaml_document, parse_yaml_string_sequence_section, render_and_validate_yaml_document,
-    revert_yaml_2level_scalars, split_yaml_key_and_rhs, strip_yaml_inline_comment,
-    unquote_yaml_scalar, upsert_yaml_2level_scalars, yaml_quote_scalar,
+    revert_yaml_2level_scalars, revert_yaml_top_scalars, split_yaml_key_and_rhs,
+    strip_yaml_inline_comment, unquote_yaml_scalar, upsert_yaml_2level_scalars,
+    upsert_yaml_top_scalars, yaml_quote_scalar,
 };
 use crate::{HarnessSyncParams, OmpCodeModePolicy, strip_agy_provider_prefix};
 
@@ -406,6 +407,17 @@ fn merge_omp_config_yaml_with_record(
             }
         })?;
 
+    // Disable `omp`'s Gemini `inlineToolDescriptors: auto` pruning so `omp` preserves full tool
+    // & parameter descriptions on `/v1/responses` (including `eval` `<prelude>` docs) instead of
+    // stripping `description: ""` and bloating `<developer_instructions>` with `namespace functions`.
+    let desired_top = [("inlineToolDescriptors", YamlScalar::Str("off".to_owned()))];
+    let top_upsert = upsert_yaml_top_scalars(&mut doc, &desired_top).map_err(|detail| {
+        HarnessError::UnsupportedYamlLayout {
+            path: target_path.to_path_buf(),
+            detail,
+        }
+    })?;
+
     let approval_mode = if params.no_bypass {
         "always-ask"
     } else {
@@ -424,8 +436,7 @@ fn merge_omp_config_yaml_with_record(
         })?;
 
     let (eval_enabled, eval_ns) = match code_mode {
-        OmpCodeModePolicy::Standard => (true, None),
-        OmpCodeModePolicy::FullEvalNamespaces => (true, Some(true)),
+        OmpCodeModePolicy::Standard | OmpCodeModePolicy::FullEvalNamespaces => (true, Some(true)),
         OmpCodeModePolicy::Disabled => (false, Some(false)),
     };
     let desired_eval = [
@@ -542,6 +553,8 @@ fn merge_omp_config_yaml_with_record(
         wrote_mcp_entries,
         previous_mcp_header_rhs,
         mcp_was_absent,
+        previous_top_entries: top_upsert.previous_entries,
+        wrote_top_entries: top_upsert.wrote_entries,
     })
 }
 
@@ -611,6 +624,12 @@ fn revert_omp_config_yaml_with_record(
         path: target_path.to_path_buf(),
         detail,
     })?;
+
+    changed |= revert_yaml_top_scalars(&mut doc, &rec.previous_top_entries, &rec.wrote_top_entries)
+        .map_err(|detail| HarnessError::UnsupportedYamlLayout {
+            path: target_path.to_path_buf(),
+            detail,
+        })?;
 
     if let Some(ref added_ext) = rec.added_extension_entry
         && let Some(idx) = doc

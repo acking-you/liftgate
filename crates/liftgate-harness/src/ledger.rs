@@ -73,6 +73,10 @@ pub struct OmpManagedRecord {
     pub previous_mcp_header_rhs: Option<String>,
     #[serde(default)]
     pub mcp_was_absent: bool,
+    #[serde(default)]
+    pub previous_top_entries: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub wrote_top_entries: BTreeMap<String, String>,
 }
 
 /// Per-file installation record for OpenCode (`lg config opencode`).
