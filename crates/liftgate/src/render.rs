@@ -242,7 +242,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
     ui::kv(
         "Vision Offload",
         if report.vision_offload_enabled {
-            "enabled (>=150k ephemeral sub-session)"
+            "enabled (>=300k ephemeral sub-session)"
         } else {
             "disabled"
         },

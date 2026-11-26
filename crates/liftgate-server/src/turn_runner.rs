@@ -9,7 +9,7 @@ use liftgate_types::{
     acp::{AcpPromptBlock, AcpUsage, PromptTurnResult, SessionUpdatePayload},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
-        NormalizedTurnRequest,
+        NormalizedTurnRequest, ReasoningEffort,
     },
     config::{AcpModeId, GatewayLimits, ModelId},
     error::format_error_chain,
@@ -159,7 +159,7 @@ pub struct GatewayRuntimeConfig {
     pub acp_mode: AcpModeId,
     pub api_key: Option<Arc<str>>,
     pub limits: GatewayLimits,
-    /// Live runtime toggle for `>=150k`-token ephemeral vision sub-session offload (`true` by default).
+    /// Live runtime toggle for `>=300k`-token ephemeral vision sub-session offload (`false` by default).
     pub vision_offload: Arc<AtomicBool>,
     /// Live runtime toggle for Hybrid Loopback MCP Tool Bridge (`true` by default).
     pub mcp_tool_bridge: Arc<AtomicBool>,
@@ -1030,11 +1030,11 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     })
 }
 
-/// Context occupancy threshold (`150,000` tokens) at and above which sending raw multimodal
-/// `Image` blocks into a warm ACP session invalidates upstream prompt caches and triggers a
-/// 3–7x TTFT cliff (`40–97s/turn`). Warm sessions at or above this threshold inspect incoming
-/// images in a zero-history ephemeral ACP sub-session and forward a structured text-only report.
-pub const LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS: u64 = 150_000;
+/// Context occupancy threshold (`300,000` tokens) at and above which warm ACP sessions—when
+/// `vision_offload` is explicitly enabled—inspect incoming `Image` blocks inside a zero-history
+/// ephemeral ACP sub-session on the lowest reasoning effort tier of the active model family and
+/// forward a structured text-only report.
+pub const LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS: u64 = 300_000;
 
 const VISION_SUBSESSION_SYSTEM_APPEND: &str = "<vision_subagent_rules>\n\
 You are an isolated visual inspection sub-session assisting an active coding session.\n\
@@ -1135,11 +1135,28 @@ async fn offload_images_via_ephemeral_session<B: AcpBackend>(
         armed: true,
     };
 
+    let subsession_model = if created.models.available_models.is_empty() {
+        let fallback_catalog = backend.available_models();
+        resolve_model_id(
+            Some(active_model.as_str()),
+            Some(ReasoningEffort::Low),
+            &fallback_catalog,
+            active_model,
+        )
+    } else {
+        resolve_model_id(
+            Some(active_model.as_str()),
+            Some(ReasoningEffort::Low),
+            &created.models.available_models,
+            active_model,
+        )
+    };
+
     let setup_ok = tokio::select! {
         biased;
         () = cancel.cancelled() => return VisionOffloadOutcome::Cancelled,
         res = async {
-            timeout_at(deadline, backend.set_session_model(&created.session_id, active_model)).await.ok()?.ok()?;
+            timeout_at(deadline, backend.set_session_model(&created.session_id, &subsession_model)).await.ok()?.ok()?;
             timeout_at(deadline, backend.set_session_mode(&created.session_id, acp_mode)).await.ok()?.ok()
         } => res.is_some(),
     };
@@ -1242,13 +1259,17 @@ async fn offload_images_via_ephemeral_session<B: AcpBackend>(
         detail,
     )) = fatal_sig
     {
-        return VisionOffloadOutcome::RateLimited(signal_to_acp_error(sig, active_model, detail));
+        return VisionOffloadOutcome::RateLimited(signal_to_acp_error(
+            sig,
+            &subsession_model,
+            detail,
+        ));
     }
 
     let turn_res = match prompt_done {
         Some(Ok(r)) => r,
         Some(Err(err)) => {
-            let upgraded = upgrade_acp_error(err, active_model);
+            let upgraded = upgrade_acp_error(err, &subsession_model);
             if matches!(
                 upgraded,
                 AcpError::UpstreamRateLimited { .. } | AcpError::UpstreamQuotaExhausted { .. }
@@ -1295,7 +1316,7 @@ async fn offload_images_via_ephemeral_session<B: AcpBackend>(
                     merged.push('\n');
                 }
                 merged.push_str(&format!(
-                    "[Attached Image #{img_idx} ({mime_type}) — inspected in isolated sub-session below to preserve >150k session prompt cache]\n"
+                    "[Attached Image #{img_idx} ({mime_type}) — inspected in isolated sub-session below for >=300k session]\n"
                 ));
             }
         }
@@ -1317,8 +1338,9 @@ async fn offload_images_via_ephemeral_session<B: AcpBackend>(
 
     tracing::info!(
         images = image_count,
+        subsession_model = %subsession_model,
         report_bytes = bounded_report.len(),
-        "offloaded multimodal image inspection to ephemeral zero-history ACP session to preserve >=150k warm prompt cache"
+        "offloaded multimodal image inspection to ephemeral zero-history ACP session (>=300k opt-in)"
     );
 
     VisionOffloadOutcome::Replaced {

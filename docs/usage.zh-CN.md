@@ -48,7 +48,7 @@ lg completions powershell       # 生成 Shell 自动补全脚本（bash、zsh�
 liftgate serve                  # 前台运行网关
 ```
 
-在 `lg tui` 中按 `3` 进入 Models，选中模型后按 `t` 保存为标题生成模型（默认 `gemini-4-hydrogen-low`）；按 `b` 或 `v` 可分别实时热切换「混合原生 MCP 工具挂起桥接」与「`>=150k` 视觉子会话卸载」。
+在 `lg tui` 中按 `3` 进入 Models，选中模型后按 `t` 保存为标题生成模型（默认 `gemini-4-hydrogen-low`）；按 `b` 或 `v` 可分别实时热切换「混合原生 MCP 工具挂起桥接」与「`>=300k` 视觉子会话卸载」。
 
 ## Antigravity CLI 管理（`lg agy`）与代理配置（`lg proxy`）
 
@@ -378,7 +378,7 @@ OpenAI Responses 客户端指向 `http://127.0.0.1:8787/v1`，Anthropic Messages
 
 ## 监控面板
 
-Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含工具调用与 Token 明细）、会话池（可手动释放空闲或 MCP 挂起会话，并在线热切换 MCP 原生工具桥接与 `>=150k` 视觉卸载）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
+Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含工具调用与 Token 明细）、会话池（可手动释放空闲或 MCP 挂起会话，并在线热切换 MCP 原生工具桥接与 `>=300k` 视觉卸载）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
 
 ## 参数与环境变量
 
@@ -391,7 +391,7 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--agy-proxy`（`<端口\|URL>` 或 `off`） | `AGY_PROXY` | 无（直连；或读取 `~/.liftgate/settings.json` 中的 `agy_proxy`） |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `agy_auto_update`） |
 | `--mcp-tool-bridge` / `--no-mcp-tool-bridge` | `AGY_MCP_TOOL_BRIDGE` | `true`（或读取 `~/.liftgate/settings.json` 中的 `mcp_tool_bridge`，亦可通过 `POST /api/telemetry/mcp-tool-bridge`、Web 面板与 `lg top` 按 `b` 实时切换） |
-| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true`（或读取 `~/.liftgate/settings.json` 中的 `vision_offload`，亦可在 Web 面板与 `lg top` 按 `v` 实时切换） |
+| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `false`（或读取 `~/.liftgate/settings.json` 中的 `vision_offload`，可选 `>=300k` 视觉子会话卸载，亦可在 Web 面板与 `lg top` 按 `v` 实时切换） |
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000`（`0..=50000`；原子持久化至 `~/.liftgate/cache-telemetry.json`，可在 Web 面板实时调整） |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50`（`0..=100%`；低于该命中率阈值的请求自动持久化归档） |
 | `--low-cache-capture-payload` / `--no-low-cache-capture-payload` | `AGY_LOW_CACHE_CAPTURE_PAYLOAD` | `true`（低命中时在 `~/.liftgate/low-cache-payloads/` 落盘完整请求内容与消息明细，可在 Web 面板实时开关） |

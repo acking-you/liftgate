@@ -702,7 +702,7 @@ const fn default_true() -> bool {
 pub struct GatewayTelemetrySnapshot {
     pub generated_at_unix_ms: u64,
     pub gateway_version: Cow<'static, str>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub vision_offload_enabled: bool,
     #[serde(default = "default_true")]
     pub mcp_tool_bridge_enabled: bool,

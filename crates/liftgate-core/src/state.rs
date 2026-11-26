@@ -250,8 +250,8 @@ pub struct LiftgateSettings {
     /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
-    /// Offload incoming `Image` blocks on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
-    #[serde(default = "default_true")]
+    /// Offload incoming `Image` blocks on `>=300k`-token warm sessions to an ephemeral sub-session (`false` by default).
+    #[serde(default)]
     pub vision_offload: bool,
     /// Expose client tools over a loopback HTTP MCP bridge for native `session/prompt` tool suspension (`true` by default).
     #[serde(default = "default_true")]
@@ -278,7 +278,7 @@ impl Default for LiftgateSettings {
         Self {
             agy_proxy: None,
             agy_auto_update: true,
-            vision_offload: true,
+            vision_offload: false,
             mcp_tool_bridge: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
@@ -319,7 +319,7 @@ pub const fn resolve_effective_agy_auto_update(
     }
 }
 
-/// Resolves the effective `>=150k`-token ephemeral vision sub-session offload toggle (`true` by default).
+/// Resolves the effective `>=300k`-token ephemeral vision sub-session offload toggle (`false` by default).
 #[must_use]
 pub const fn resolve_effective_vision_offload(
     cli_override: Option<bool>,
@@ -430,7 +430,7 @@ pub struct DaemonState {
     pub agy_proxy: Option<String>,
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub vision_offload: bool,
     #[serde(default = "default_true")]
     pub mcp_tool_bridge: bool,
@@ -747,7 +747,14 @@ mod tests {
         let defaults = paths.read_settings().unwrap();
         assert!(defaults.agy_proxy.is_none());
         assert!(defaults.agy_auto_update);
-        assert!(defaults.vision_offload);
+        assert!(!defaults.vision_offload);
+        assert!(!resolve_effective_vision_offload(None, false, &defaults));
+        assert!(resolve_effective_vision_offload(
+            Some(true),
+            false,
+            &defaults
+        ));
+        assert!(!resolve_effective_vision_offload(None, true, &defaults));
         assert!(defaults.mcp_tool_bridge);
         assert!(resolve_effective_mcp_tool_bridge(None, false, &defaults));
         assert!(!resolve_effective_mcp_tool_bridge(None, true, &defaults));
@@ -760,7 +767,7 @@ mod tests {
         let mut updated = defaults;
         updated.agy_proxy = Some(ProxyUrl::try_new("7890").unwrap());
         updated.agy_auto_update = false;
-        updated.vision_offload = false;
+        updated.vision_offload = true;
         updated.mcp_tool_bridge = false;
         paths.write_settings(&updated).unwrap();
         let reloaded = paths.read_settings().unwrap();
@@ -769,7 +776,7 @@ mod tests {
             Some("http://127.0.0.1:7890")
         );
         assert!(!reloaded.agy_auto_update);
-        assert!(!reloaded.vision_offload);
+        assert!(reloaded.vision_offload);
         assert!(!reloaded.mcp_tool_bridge);
         assert!(!resolve_effective_mcp_tool_bridge(None, false, &reloaded));
         assert!(resolve_effective_mcp_tool_bridge(

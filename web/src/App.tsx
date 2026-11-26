@@ -2159,7 +2159,7 @@ claude`,
                   <h1 className="sf-title">ACP 会话池与跨平台进程监管</h1>
                   <p className="sf-desc">
                     监管 <code>agy acp --process-per-session</code> 主控与独立工作子进程树，支持原生本地回环
-                    MCP 工具挂起续接、热会话前缀匹配、45 分钟冷空闲自动回收及 &ge;150k 长上下文视觉旁路卸载热开关。
+                    MCP 工具挂起续接、热会话前缀匹配、45 分钟冷空闲自动回收及 &ge;300k 长上下文视觉旁路卸载热开关。
                   </p>
                 </div>
                 {acp && (
@@ -2212,13 +2212,13 @@ claude`,
                     <div className="inline-flex items-center gap-1.5">
                       <span
                         className={`sf-pill ${
-                          (snapshot?.vision_offload_enabled ?? true)
+                          (snapshot?.vision_offload_enabled ?? false)
                             ? "sf-pill--ok"
                             : ""
                         }`}
                       >
-                        &ge;150k 视觉子会话卸载:{" "}
-                        {(snapshot?.vision_offload_enabled ?? true)
+                        &ge;300k 视觉子会话卸载:{" "}
+                        {(snapshot?.vision_offload_enabled ?? false)
                           ? "已开启"
                           : "已关闭"}
                       </span>
@@ -2227,11 +2227,11 @@ claude`,
                         type="button"
                         className="sf-btn sf-btn--sm"
                         onClick={() => {
-                          const current = snapshot?.vision_offload_enabled ?? true;
+                          const current = snapshot?.vision_offload_enabled ?? false;
                           void toggleVisionOffload(!current);
                         }}
                       >
-                        {(snapshot?.vision_offload_enabled ?? true)
+                        {(snapshot?.vision_offload_enabled ?? false)
                           ? "关闭子会话卸载"
                           : "开启子会话卸载"}
                       </button>

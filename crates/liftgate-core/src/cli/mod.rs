@@ -269,11 +269,11 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
 
-    /// Offload incoming images on `>=150k`-token warm sessions to an ephemeral sub-session (`true` by default).
+    /// Offload incoming images on `>=300k`-token warm sessions to an ephemeral sub-session (`false` by default).
     #[arg(long, env = "AGY_VISION_OFFLOAD")]
     pub vision_offload: Option<bool>,
 
-    /// Disable `>=150k`-token ephemeral vision sub-session offload for this server run.
+    /// Disable `>=300k`-token ephemeral vision sub-session offload for this server run.
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
 
@@ -475,11 +475,11 @@ pub struct RestartArgs {
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
 
-    /// Override `>=150k`-token ephemeral vision sub-session offload (`true` or `false`).
+    /// Override `>=300k`-token ephemeral vision sub-session offload (`true` or `false`).
     #[arg(long)]
     pub vision_offload: Option<bool>,
 
-    /// Disable `>=150k`-token ephemeral vision sub-session offload.
+    /// Disable `>=300k`-token ephemeral vision sub-session offload.
     #[arg(long, conflicts_with = "vision_offload")]
     pub no_vision_offload: bool,
 

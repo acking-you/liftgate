@@ -63,7 +63,7 @@ lg completions zsh              # generate shell completions (bash, zsh, fish, p
 liftgate serve                  # run in the foreground
 ```
 
-In `lg tui`, press `3` to open Models, select a model, and press `t` to save it for future titles (default `gemini-4-hydrogen-low`), or press `b` / `v` to live-toggle the Hybrid MCP Tool Bridge and `>=150k` vision offload.
+In `lg tui`, press `3` to open Models, select a model, and press `t` to save it for future titles (default `gemini-4-hydrogen-low`), or press `b` / `v` to live-toggle the Hybrid MCP Tool Bridge and `>=300k` vision offload.
 
 ## Antigravity CLI (`lg agy`) & Proxy Management (`lg proxy`)
 
@@ -578,7 +578,7 @@ Liftgate serves the observability dashboard directly at `http://127.0.0.1:8787/`
 (embedded inside release binaries at compile time, or opened via `liftgate ui`):
 in-flight and recent turns with their tool calls and token counts, the session
 pool (idle or MCP-suspended sessions can be closed by hand, and the Hybrid MCP
-Tool Bridge and `>=150k` vision offload can be toggled live), the model catalog
+Tool Bridge and `>=300k` vision offload can be toggled live), the model catalog
 and the last lines of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
 (or enter it in the dashboard's connection settings). Serve an extra dedicated
 UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir>`.
@@ -594,7 +594,7 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--agy-proxy` (`<port\|url>` or `off`) | `AGY_PROXY` | none (direct; or `agy_proxy` in `~/.liftgate/settings.json`) |
 | `--agy-auto-update` / `--no-agy-auto-update` | `AGY_AUTO_UPDATE` | `true` (or `agy_auto_update` in `~/.liftgate/settings.json`) |
 | `--mcp-tool-bridge` / `--no-mcp-tool-bridge` | `AGY_MCP_TOOL_BRIDGE` | `true` (or `mcp_tool_bridge` in `~/.liftgate/settings.json`; also live-toggleable via `POST /api/telemetry/mcp-tool-bridge`, Web UI & `b` in `lg top`) |
-| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `true` (or `vision_offload` in `~/.liftgate/settings.json`; also live-toggleable in Web UI & `lg top`) |
+| `--vision-offload` / `--no-vision-offload` | `AGY_VISION_OFFLOAD` | `false` (or `vision_offload` in `~/.liftgate/settings.json`; optional `>=300k` sub-session offload, also live-toggleable in Web UI & `lg top`) |
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000` (`0..=50000`; persisted in `~/.liftgate/cache-telemetry.json`, live-configurable in Web UI) |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50` (`0..=100%`; turns below threshold are persisted as low-cache-hit records) |
 | `--low-cache-capture-payload` / `--no-low-cache-capture-payload` | `AGY_LOW_CACHE_CAPTURE_PAYLOAD` | `true` (persists full low-cache request payloads under `~/.liftgate/low-cache-payloads/`, live-toggleable in Web UI) |

@@ -39,10 +39,9 @@ escape sequences and carriage-return progress-bar overwrites on the wire while
 persisting raw unmodified bytes on spill, and schema-aware argument coercion
 unwraps JSON-stringified `array` / `object` tool fields and `null` envelopes.
 Multimodal images inside both user turns and tool outputs (`view_image`, `Read`)
-become native ACP image blocks on fresh or `<150k`-token sessions, and
-automatically offload to a zero-history ephemeral ACP sub-session on warm
-`>=150k`-token coding sessions so upstream prompt caches are never invalidated
-by mid-session screenshots.
+become native ACP image blocks by default (`vision_offload = false`), and can
+optionally offload to a zero-history `-low`-effort ephemeral ACP sub-session on
+warm `>=300k`-token coding sessions when `vision_offload` is enabled.
 
 ### Inference-only sessions
 

@@ -881,7 +881,7 @@ fn test_state(
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: api_key.map(Arc::<str>::from),
             limits,
-            vision_offload: Arc::new(AtomicBool::new(true)),
+            vision_offload: Arc::new(AtomicBool::new(false)),
             mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
             mcp_server: None,
         },
@@ -3372,7 +3372,7 @@ async fn serves_embedded_ui_assets_and_enforces_admin_shutdown_token() {
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: None,
             limits,
-            vision_offload: Arc::new(AtomicBool::new(true)),
+            vision_offload: Arc::new(AtomicBool::new(false)),
             mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
             mcp_server: None,
         },
@@ -5411,7 +5411,7 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: Some(Arc::from("secret-gate-key")),
             limits,
-            vision_offload: Arc::new(AtomicBool::new(true)),
+            vision_offload: Arc::new(AtomicBool::new(false)),
             mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
             mcp_server: None,
         },
@@ -5709,14 +5709,20 @@ async fn pre_body_auth_payload_caps_and_aggregate_memory_budgets_hold() {
 }
 
 #[tokio::test]
-async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserving_prefix_hash() {
+async fn warm_session_above_300k_offloads_images_when_enabled_using_low_effort_and_preserving_prefix_hash()
+ {
     let backend = Arc::new(MockAcpBackend::new(vec![
-        // Turn 1 on `sess_1`: reaches 165,000 tokens (> 150,000 threshold)
+        // Turn 1 on `sess_1` (`gemini-4-hydrogen-xhigh`): reaches 315,000 tokens (>= 300,000 threshold)
         MockScript::ImmediateWithUsage {
-            usage_updates: vec![(165_000, 1_048_576)],
+            usage_updates: vec![(315_000, 1_048_576)],
             chunks_template: vec!["Ready to inspect screenshot.".to_owned()],
         },
-        // Turn 2 ephemeral vision sub-session (`sess_2`): receives the raw image block
+        // Turn 2 with default `vision_offload == false`: warm `sess_1` receives raw image block directly
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(316_500, 1_048_576)],
+            chunks_template: vec!["Inspected screenshot directly on primary session.".to_owned()],
+        },
+        // Turn 3 (after toggling vision offload ON) ephemeral vision sub-session (`sess_2`): receives raw image on `-low`
         MockScript::Immediate {
             thoughts: vec![],
             chunks_template: vec![
@@ -5724,26 +5730,21 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
                     .to_owned(),
             ],
         },
-        // Turn 2 primary warm session (`sess_1`): receives text-only `<ephemeral_vision_inspection>`
+        // Turn 3 primary warm session (`sess_1`): receives text-only `<ephemeral_vision_inspection>`
         MockScript::ImmediateWithUsage {
-            usage_updates: vec![(166_200, 1_048_576)],
+            usage_updates: vec![(317_700, 1_048_576)],
             chunks_template: vec!["Fix `#retry-btn` handler for E-402.".to_owned()],
         },
-        // Turn 3 continuation on warm `sess_1`: verifies prefix hash remained 100% intact!
+        // Turn 4 continuation on warm `sess_1`: verifies prefix hash remained 100% intact!
         MockScript::ImmediateWithUsage {
-            usage_updates: vec![(166_800, 1_048_576)],
+            usage_updates: vec![(318_300, 1_048_576)],
             chunks_template: vec!["Applied E-402 fix.".to_owned()],
-        },
-        // Turn 4 with vision offload toggled OFF: warm `sess_1` receives raw image block directly
-        MockScript::ImmediateWithUsage {
-            usage_updates: vec![(168_400, 1_048_576)],
-            chunks_template: vec!["Inspected screenshot directly on primary session.".to_owned()],
         },
     ]));
     let state = test_state(Arc::clone(&backend), 30, Some("secret-gate-key"));
     let app = build_router(state.clone());
 
-    // Default snapshot must advertise `vision_offload_enabled == true`.
+    // Default snapshot must advertise `vision_offload_enabled == false`.
     let snap_resp = app
         .clone()
         .oneshot(
@@ -5759,11 +5760,11 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
     assert_eq!(snap_resp.status(), StatusCode::OK);
     let snap_json: Value =
         serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(snap_json["vision_offload_enabled"], true);
+    assert_eq!(snap_json["vision_offload_enabled"], false);
 
     let msg_u1 = json!({ "role": "user", "content": "Help debug payment UI." });
     let t1_req = json!({
-        "model": "claude-opus-4-6",
+        "model": "gemini-4-hydrogen-xhigh",
         "max_tokens": 1024,
         "messages": [msg_u1]
     });
@@ -5782,7 +5783,7 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
         .unwrap();
     assert_eq!(t1_resp.status(), StatusCode::OK);
 
-    // Turn 2: caller resends history + new user turn containing a base64 PNG screenshot
+    // Turn 2 (vision offload disabled by default): raw image block goes directly to warm `sess_1` even at 315k
     let msg_a1 = json!({
         "role": "assistant",
         "content": [{ "type": "text", "text": "Ready to inspect screenshot." }]
@@ -5790,7 +5791,7 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
     let msg_u2 = json!({
         "role": "user",
         "content": [
-            { "type": "text", "text": "Here is the failing checkout modal screenshot:" },
+            { "type": "text", "text": "Verify initial modal screenshot:" },
             {
                 "type": "image",
                 "source": {
@@ -5802,7 +5803,7 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
         ]
     });
     let t2_req = json!({
-        "model": "claude-opus-4-6",
+        "model": "gemini-4-hydrogen-xhigh",
         "max_tokens": 1024,
         "messages": [msg_u1, msg_a1, msg_u2]
     });
@@ -5820,48 +5821,56 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
         .await
         .unwrap();
     assert_eq!(t2_resp.status(), StatusCode::OK);
-    let t2_body: Value =
-        serde_json::from_slice(&t2_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(
-        t2_body["content"][0]["text"],
-        "Fix `#retry-btn` handler for E-402."
-    );
-
     {
         let prompts = backend.recorded_prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 3);
-        assert_eq!(prompts[0].session_id, "sess_1");
-        // Ephemeral vision sub-session (`sess_2`) received the raw PNG image
-        assert_eq!(prompts[1].session_id, "sess_2");
+        assert_eq!(
+            prompts.len(),
+            2,
+            "by default vision offload is disabled so no ephemeral sub-session may be spawned"
+        );
+        assert_eq!(prompts[1].session_id, "sess_1");
         assert_eq!(prompts[1].image_blocks.len(), 1);
-        assert_eq!(prompts[1].image_blocks[0].0, "image/png");
-        // Warm 165k session (`sess_1`) received ZERO raw images and got the text report instead
-        assert_eq!(prompts[2].session_id, "sess_1");
-        assert!(
-            prompts[2].image_blocks.is_empty(),
-            "warm >=150k session must receive zero raw image blocks"
-        );
-        assert!(
-            prompts[2]
-                .text_joined
-                .contains("<ephemeral_vision_inspection images=\"1\">")
-        );
-        assert!(prompts[2].text_joined.contains("error code E-402"));
     }
 
-    // Verify telemetry recorded `vision_offloaded_images == 1` and `ttft_ms`
-    let (_metrics, _cache, _active, recent) = state.telemetry.snapshot_tasks();
-    assert_eq!(recent[0].vision_offloaded_images, 1);
-    assert!(recent[0].ttft_ms.is_some());
+    // Bodyless POST toggles vision offload ON (`true`)
+    let toggle_on = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/telemetry/vision-offload")
+                .header("authorization", "Bearer secret-gate-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_on.status(), StatusCode::OK);
+    let toggle_on_json: Value =
+        serde_json::from_slice(&toggle_on.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(toggle_on_json["vision_offload_enabled"], true);
 
-    // Turn 3: verify prefix hash on `sess_1` still matches seamlessly on subsequent coding turns!
+    // Turn 3 (vision offload enabled at >=300k): offloads image to `-low` ephemeral sub-session `sess_2`
     let msg_a2 = json!({
         "role": "assistant",
-        "content": [{ "type": "text", "text": "Fix `#retry-btn` handler for E-402." }]
+        "content": [{ "type": "text", "text": "Inspected screenshot directly on primary session." }]
     });
-    let msg_u3 = json!({ "role": "user", "content": "Apply the fix now." });
+    let msg_u3 = json!({
+        "role": "user",
+        "content": [
+            { "type": "text", "text": "Here is the failing checkout modal screenshot:" },
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                }
+            }
+        ]
+    });
     let t3_req = json!({
-        "model": "claude-opus-4-6",
+        "model": "gemini-4-hydrogen-xhigh",
         "max_tokens": 1024,
         "messages": [msg_u1, msg_a1, msg_u2, msg_a2, msg_u3]
     });
@@ -5879,55 +5888,54 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
         .await
         .unwrap();
     assert_eq!(t3_resp.status(), StatusCode::OK);
+    let t3_body: Value =
+        serde_json::from_slice(&t3_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        t3_body["content"][0]["text"],
+        "Fix `#retry-btn` handler for E-402."
+    );
+
     {
         let prompts = backend.recorded_prompts.lock().unwrap();
         assert_eq!(prompts.len(), 4);
+        // Ephemeral vision sub-session (`sess_2`) received the raw PNG image
+        assert_eq!(prompts[2].session_id, "sess_2");
+        assert_eq!(prompts[2].image_blocks.len(), 1);
+        assert_eq!(prompts[2].image_blocks[0].0, "image/png");
+        // Warm >=300k session (`sess_1`) received ZERO raw images and got the text report instead
+        assert_eq!(prompts[3].session_id, "sess_1");
+        assert!(
+            prompts[3].image_blocks.is_empty(),
+            "warm >=300k session with vision offload enabled must receive zero raw image blocks"
+        );
+        assert!(
+            prompts[3]
+                .text_joined
+                .contains("<ephemeral_vision_inspection images=\"1\">")
+        );
+        assert!(prompts[3].text_joined.contains("error code E-402"));
+
+        let models = backend.recorded_models.lock().unwrap();
         assert_eq!(
-            prompts[3].session_id, "sess_1",
-            "subsequent turn after vision offload must still hit warm session prefix hash"
+            models.as_slice(),
+            &["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-low"],
+            "ephemeral vision sub-session must downgrade reasoning effort to `-low` within the same model family"
         );
     }
 
-    // Live toggle vision offload OFF via `/api/telemetry/vision-offload?enabled=false`
-    let toggle_off = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/telemetry/vision-offload?enabled=false")
-                .header("authorization", "Bearer secret-gate-key")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(toggle_off.status(), StatusCode::OK);
-    let toggle_off_json: Value =
-        serde_json::from_slice(&toggle_off.into_body().collect().await.unwrap().to_bytes())
-            .unwrap();
-    assert_eq!(toggle_off_json["vision_offload_enabled"], false);
+    // Verify telemetry recorded `vision_offloaded_images == 1` and `ttft_ms`
+    let (_metrics, _cache, _active, recent) = state.telemetry.snapshot_tasks();
+    assert_eq!(recent[0].vision_offloaded_images, 1);
+    assert!(recent[0].ttft_ms.is_some());
 
-    // Turn 4 with vision offload disabled: raw image block goes directly to warm `sess_1`
+    // Turn 4: verify prefix hash on `sess_1` still matches seamlessly on subsequent coding turns!
     let msg_a3 = json!({
         "role": "assistant",
-        "content": [{ "type": "text", "text": "Applied E-402 fix." }]
+        "content": [{ "type": "text", "text": "Fix `#retry-btn` handler for E-402." }]
     });
-    let msg_u4 = json!({
-        "role": "user",
-        "content": [
-            { "type": "text", "text": "Verify updated modal screenshot:" },
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-                }
-            }
-        ]
-    });
+    let msg_u4 = json!({ "role": "user", "content": "Apply the fix now." });
     let t4_req = json!({
-        "model": "claude-opus-4-6",
+        "model": "gemini-4-hydrogen-xhigh",
         "max_tokens": 1024,
         "messages": [msg_u1, msg_a1, msg_u2, msg_a2, msg_u3, msg_a3, msg_u4]
     });
@@ -5947,31 +5955,30 @@ async fn warm_session_above_150k_offloads_images_to_ephemeral_subsession_preserv
     assert_eq!(t4_resp.status(), StatusCode::OK);
     {
         let prompts = backend.recorded_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 5);
         assert_eq!(
-            prompts.len(),
-            5,
-            "when vision offload is disabled, no ephemeral sub-session may be spawned"
+            prompts[4].session_id, "sess_1",
+            "subsequent turn after vision offload must still hit warm session prefix hash"
         );
-        assert_eq!(prompts[4].session_id, "sess_1");
-        assert_eq!(prompts[4].image_blocks.len(), 1);
     }
 
-    // Bodyless POST toggles vision offload back ON (`true`)
-    let toggle_on = app
+    // Live toggle vision offload OFF via `/api/telemetry/vision-offload?enabled=false`
+    let toggle_off = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/telemetry/vision-offload")
+                .uri("/api/telemetry/vision-offload?enabled=false")
                 .header("authorization", "Bearer secret-gate-key")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(toggle_on.status(), StatusCode::OK);
-    let toggle_on_json: Value =
-        serde_json::from_slice(&toggle_on.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(toggle_on_json["vision_offload_enabled"], true);
+    assert_eq!(toggle_off.status(), StatusCode::OK);
+    let toggle_off_json: Value =
+        serde_json::from_slice(&toggle_off.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(toggle_off_json["vision_offload_enabled"], false);
 }
 
 #[tokio::test]
@@ -6828,7 +6835,7 @@ async fn test_state_with_mcp(
             acp_mode: AcpModeId::try_new("auto").unwrap(),
             api_key: None,
             limits,
-            vision_offload: Arc::new(AtomicBool::new(true)),
+            vision_offload: Arc::new(AtomicBool::new(false)),
             mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
             mcp_server: Some(mcp_srv),
         },

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.11] - 2026-11-26
+
+### Changed
+- **Native multimodal image passthrough by default & `300k`-token opt-in vision offload**:
+  - Disabled ephemeral vision sub-session offload by default (`vision_offload = false`) so incoming `Image` blocks in user turns and loopback MCP tool results (`view_image`, `Read`, `read`) pass natively to `agy acp` while preserving `97.7%–99.6%` upstream prompt cache hit rates without two-stage sub-session latency or lossy text re-encoding.
+  - Raised `LONG_CONTEXT_VISION_OFFLOAD_THRESHOLD_TOKENS` from `150,000` to `300,000` tokens when explicitly opted in (`--vision-offload true`, `AGY_VISION_OFFLOAD=true`, `vision_offload` in `~/.liftgate/settings.json`, `POST /api/telemetry/vision-offload`, Web UI, or `v` in `lg top`), and routed opt-in vision sub-sessions to the lowest available reasoning effort tier of the active model family (`ReasoningEffort::Low`) to eliminate extended thinking overhead during visual inspection.
+
 ## [0.2.10] - 2026-11-25
 
 ### Added

@@ -1237,7 +1237,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                                 let _ = worker_paths.write_daemon(&d);
                             }
                             Ok(format!(
-                                "Vision offload (>=150k ephemeral sub-session): {}",
+                                "Vision offload (>=300k ephemeral sub-session): {}",
                                 if enabled { "ON" } else { "OFF" }
                             ))
                         }
@@ -1612,7 +1612,7 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .data
             .telemetry
             .as_ref()
-            .is_none_or(|t| t.vision_offload_enabled);
+            .is_some_and(|t| t.vision_offload_enabled);
         let mcp_on = app
             .data
             .telemetry
@@ -2661,7 +2661,7 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Toggle >=150k ephemeral vision sub-session offload"),
+            Span::raw("Toggle >=300k ephemeral vision sub-session offload"),
         ]),
         Line::from(vec![
             Span::styled(
