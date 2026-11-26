@@ -300,6 +300,9 @@ claude
   "$schema": "https://opencode.ai/config.json",
   "model": "agy/gemini-4-carbon-high",
   "small_model": "agy/gemini-4-hydrogen-low",
+  "experimental": {
+    "full_codemode": true
+  },
   "provider": {
     "agy": {
       "npm": "@ai-sdk/anthropic",
@@ -328,7 +331,7 @@ claude
 }
 ```
 
-- **Code Mode（`@opencode/codemode`）**：OpenCode v2 默认已对外部 MCP 与二级命名空间工具开启基于 `psychoscript` 的 `execute` Code Mode；加 `lg oc --full-code-mode` 可将内置文件/终端工具与 `Bun.file` / `Bun.write` 一并纳入 `execute`，加 `lg oc --no-code-mode` 则将全部 MCP 与命名空间工具切换为直连调用（由 Liftgate 零开销 `OpenCodeToolProfile` 自动折叠至 `<= 24` 个 Eager 槽位）。
+- **Code Mode（`@opencode/codemode`）**：`lg oc` 与 `lg config opencode` 默认开启 OpenCode v2 全量 Code Mode（`experimental.full_codemode: true` / `OPENCODE_FLAGS=full_codemode`，OpenCode v1.x 则自动注入 `OPENCODE_EXPERIMENTAL_CODE_MODE=true`），将内置文件读写/编辑/终端命令、`Bun.file` / `Bun.write` / `Bun.Glob` 及外部 MCP 与命名空间工具统一纳入 `execute` 编排；加 `lg oc --mcp-code-mode` 可将内置文件/终端工具保留为直连调用（仅对 MCP 与命名空间工具使用 `execute`），加 `lg oc --no-code-mode` 则将全部工具切换为直连调用（由 Liftgate 零开销 `OpenCodeToolProfile` 自动折叠至 `<= 24` 个 Eager 槽位）。
 - **上下文校准与补丁预检自愈**：`limit.context = 500000` 配合 OpenCode 默认 `15%` 余量恰好在 `425,000` token 稳妥触发自动压缩（避开上游 `524,288` 内部压缩线）；OpenCode 的 `patch`（`{ "patchText": "..." }`）享受网关侧 0-RTT Lark V4A 语法预检自愈与同文件自动合并，会话标题与摘要自动分流至轻量临时会话。
 
 ## Oh My Pi（`omp`）

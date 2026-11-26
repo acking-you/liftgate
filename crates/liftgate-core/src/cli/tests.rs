@@ -394,6 +394,16 @@ fn native_session_commands_mixed_flags_and_conflicting_options_route_cleanly() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
+    let oc_mcp_cm = parse_strs(&["lg", "oc", "run", "inspect mcp", "--mcp-code-mode"]);
+    match oc_mcp_cm.command {
+        Some(Commands::Opencode(oc)) => {
+            assert!(oc.mcp_code_mode);
+            assert!(!oc.full_code_mode);
+            assert!(!oc.no_code_mode);
+            assert_eq!(oc.passthrough_args, vec!["run", "inspect mcp"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
     let oc_resume_id = parse_strs(&["lg", "oc", "resume", "ses_42"]);
     assert!(matches!(
         oc_resume_id.command,

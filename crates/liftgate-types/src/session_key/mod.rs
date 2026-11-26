@@ -14,7 +14,9 @@ use crate::config::ModelId;
 
 pub use codemode::{
     McpOrchestratorContract, compact_mcp_tool_description, is_code_mode_custom_exec,
-    is_code_mode_orchestrator_tool, is_omp_eval_orchestrator_tool, split_code_mode_ts_declaration,
+    is_code_mode_orchestrator_tool, is_omp_eval_orchestrator_tool,
+    is_opencode_execute_orchestrator_tool, is_opencode_full_code_mode_exec,
+    split_code_mode_ts_declaration,
 };
 pub use prompt_plan::{
     MAX_ACP_PROMPT_TEXT_BYTES, build_acp_prompt_blocks, build_acp_prompt_blocks_with_spill,

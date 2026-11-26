@@ -1243,3 +1243,98 @@ fn generic_eval_tool_does_not_receive_omp_polyglot_codemode_instructions() {
     assert!(!append.contains("Polyglot Code Mode"));
     assert!(!append.contains("tool.<name>(args)"));
 }
+
+#[test]
+fn opencode_execute_contract_preserves_v1_catalog_and_classifies_summary_auxiliary() {
+    let v1_catalog_desc = format!(
+        "Run a confined orchestration script with access to connected MCP tools.\n\n## Rules\n- Only Code Mode tools listed here or returned by `tools.$codemode.search` and internal runtime tools are available.\n\n## Available tools\n{}",
+        "- github.list_prs({ repo: string }): Promise<unknown>\n".repeat(60)
+    );
+    assert!(v1_catalog_desc.len() > 2_500);
+    let v1_exec = CanonicalToolSpec {
+        name: "execute".to_owned(),
+        description: Some(v1_catalog_desc.clone()),
+        kind: CanonicalToolKind::Function {
+            parameters_json:
+                r#"{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}"#
+                    .to_owned(),
+        },
+    };
+    assert!(is_opencode_execute_orchestrator_tool(&v1_exec));
+    assert!(!is_opencode_full_code_mode_exec(&v1_exec));
+    assert!(is_code_mode_orchestrator_tool(&v1_exec));
+
+    let mut spill = NoopSpillSink;
+    let full_kept = compact_mcp_tool_description(&v1_exec, 36_000, &mut spill).expect("kept");
+    assert!(!full_kept.contains("omitted"));
+    assert_eq!(full_kept.matches("github.list_prs").count(), 60);
+
+    // Unrelated SQL `execute(query)` tool is NOT treated as an OpenCode Code Mode orchestrator.
+    let sql_exec = CanonicalToolSpec {
+        name: "execute".to_owned(),
+        description: Some("Execute parameterized SQL statement.".to_owned()),
+        kind: CanonicalToolKind::Function {
+            parameters_json:
+                r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
+                    .to_owned(),
+        },
+    };
+    assert!(!is_opencode_execute_orchestrator_tool(&sql_exec));
+    assert!(!is_code_mode_orchestrator_tool(&sql_exec));
+
+    // Full Code Mode prompt rules steer workspace operations into `mcp_lg_execute`.
+    let bridged = vec![
+        ("execute".to_owned(), "execute".to_owned()),
+        ("subagent".to_owned(), "subagent".to_owned()),
+        ("question".to_owned(), "question".to_owned()),
+    ];
+    let mcp_spec = McpBridgePromptSpec {
+        bridged_tools: &bridged,
+        virtualized_hubs: &[],
+        has_virtualized_dispatch: true,
+        has_gateway_web_fetch: false,
+        orchestrator: Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name: "execute",
+            full_code_mode: true,
+        }),
+    };
+    let (append, _) = build_session_system_append_for_mcp_with_spill_sink(
+        Some("You are an AI agent running in OpenCode."),
+        mcp_spec,
+        WebToolBridgeConfig::default(),
+        "nonce_oc_exec",
+        &mut spill,
+    );
+    assert!(append.contains("OpenCode Code Mode (`mcp_lg_execute`)"));
+    assert!(append.contains("Bun.file"));
+    assert!(append.contains("do NOT call `mcp_lg_call_client_tool`"));
+
+    // OpenCode hidden `summary` agent (`conv_len > 2`, empty `client_tools`) routes to auxiliary.
+    let multi_turn_msgs = vec![
+        CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Fix calc.rs".to_owned())],
+        },
+        CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Fixed mul().".to_owned())],
+        },
+        CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Also run tests".to_owned())],
+        },
+    ];
+    let summary_aux = crate::canonical::detect_auxiliary_task(
+        Some(
+            "Summarize what was done in this conversation. Write like a pull request description.\n\nRules:\n- 2-3 sentences max",
+        ),
+        &multi_turn_msgs,
+        &[],
+        false,
+        false,
+    );
+    assert_eq!(
+        summary_aux,
+        Some(crate::canonical::AuxiliaryTaskKind::AwayRecapOrSuggestion)
+    );
+}

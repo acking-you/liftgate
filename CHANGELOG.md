@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.13] - 2026-11-27
+
+### Fixed
+- **OpenCode (`lg oc` & `lg config opencode`) full Code Mode (`execute`) enabled by default**:
+  - Enabled `experimental.full_codemode: true` by default in `merged_opencode_config_into` (`lg config opencode` and `lg oc`, with reversible ledger restoration on `lg config opencode --uninstall`) and automatically injected `OPENCODE_FLAGS=full_codemode` on OpenCode v2 (`OPENCODE_EXPERIMENTAL_CODE_MODE=true` on OpenCode v1.x) unless `--no-code-mode`, `--mcp-code-mode`, or an explicit caller `-full_codemode` / `experimental.full_codemode: false` opt-out is set, fixing OpenCode v2 release builds leaving `read`, `shell`, `edit`, `write`, `glob`, and `grep` outside `execute` by default.
+  - Added `McpOrchestratorContract::OpenCodeExecute` on `OpenCodeToolProfile` (`liftgate-types` & `liftgate-tool-virtualizer`) so `<api_gateway_bridge_rules>` steers multi-step file reads, searches, edits, and shell commands into `mcp_lg_execute` (`{"code": "<plain JavaScript>", ...}` calling unprefixed `tools.<path>({ ... })`, `Bun.file`/`Bun.write`/`Bun.Glob`, and `search(...)` rather than `mcp_lg_call_client_tool` / `mcp_lg_search_client_tools`), while preserving full `36 KiB` inline MCP catalog descriptions on OpenCode v1 `execute` tools.
+  - Classified OpenCode's hidden `summary` agent (`PROMPT_SUMMARY`) and multi-turn conversation title regeneration prompts as auxiliary tasks so background summaries and re-titling run on ephemeral fast-lane sessions without evicting warm primary coding sessions.
+
 ## [0.2.12] - 2026-11-27
 
 ### Fixed

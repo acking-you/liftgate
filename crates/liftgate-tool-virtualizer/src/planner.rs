@@ -29,6 +29,10 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedOrchestratorContract {
+    OpenCodeExecute {
+        mcp_name: String,
+        full_code_mode: bool,
+    },
     OmpPolyglotEval {
         mcp_name: String,
         elided_subordinate_tools: bool,
@@ -38,6 +42,13 @@ enum OwnedOrchestratorContract {
 impl OwnedOrchestratorContract {
     fn from_borrowed(contract: McpOrchestratorContract<'_>) -> Self {
         match contract {
+            McpOrchestratorContract::OpenCodeExecute {
+                mcp_name,
+                full_code_mode,
+            } => Self::OpenCodeExecute {
+                mcp_name: mcp_name.to_owned(),
+                full_code_mode,
+            },
             McpOrchestratorContract::OmpPolyglotEval {
                 mcp_name,
                 elided_subordinate_tools,
@@ -50,6 +61,13 @@ impl OwnedOrchestratorContract {
 
     fn as_borrowed(&self) -> McpOrchestratorContract<'_> {
         match self {
+            Self::OpenCodeExecute {
+                mcp_name,
+                full_code_mode,
+            } => McpOrchestratorContract::OpenCodeExecute {
+                mcp_name,
+                full_code_mode: *full_code_mode,
+            },
             Self::OmpPolyglotEval {
                 mcp_name,
                 elided_subordinate_tools,

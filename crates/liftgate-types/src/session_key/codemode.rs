@@ -11,6 +11,14 @@ use super::strip_tag_blocks;
 /// forwarded into `_meta.antigravity.systemPrompt.append` without name-based guessing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpOrchestratorContract<'a> {
+    /// OpenCode (`@opencode/codemode` / `@opencode-ai/codemode`) `execute` JavaScript runtime.
+    OpenCodeExecute {
+        /// Sanitized MCP tool name mounted on `lg` (e.g. `"execute"` -> `mcp_lg_execute`).
+        mcp_name: &'a str,
+        /// Whether OpenCode v2 `full_codemode` (`tools.read`, `tools.shell`, `tools.edit`,
+        /// `tools.write`, `Bun.file`, `Bun.write`, `Bun.Glob`) is active inside `execute`.
+        full_code_mode: bool,
+    },
     /// Oh My Pi (`omp`) persistent polyglot `eval` (`py` / `js` kernels calling `tool.<name>(args)`
     /// and `mcp.evalNamespaces` globals by unprefixed client names).
     OmpPolyglotEval {
@@ -39,6 +47,87 @@ Execute Python (\"py\") or JavaScript/Bun (\"js\") in persistent Code Mode kerne
 pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
     matches!(tool.kind, CanonicalToolKind::Custom { .. })
         && (matches!(tool.name.as_str(), "exec" | "execute") || tool.name.ends_with(".exec"))
+}
+
+/// Returns `true` when `tool` is OpenCode's `@opencode/codemode` (`v2`) or `@opencode-ai/codemode`
+/// (`v1`) `execute` JavaScript orchestrator.
+///
+/// Requires explicit OpenCode `execute` evidence in the description, freeform `Custom` contract,
+/// or `{ code, timeout?, background? }` input schema so unrelated database/RPC `execute` tools are
+/// never misidentified as Code Mode orchestrators.
+#[must_use]
+pub fn is_opencode_execute_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
+    if tool.name != "execute" {
+        return false;
+    }
+    if matches!(tool.kind, CanonicalToolKind::Custom { .. }) {
+        return true;
+    }
+    let has_oc_desc = tool.description.as_deref().is_some_and(|desc| {
+        desc.contains("Code Mode runtime")
+            || desc.contains("Code Mode catalog")
+            || desc.contains("Only Code Mode tools listed here")
+            || desc.contains("confined orchestration script")
+            || desc.contains("tools.$codemode.search")
+            || desc.contains("Bun.file")
+    });
+    if has_oc_desc {
+        return true;
+    }
+    match &tool.kind {
+        CanonicalToolKind::Custom { .. } => true,
+        CanonicalToolKind::Function { parameters_json } => {
+            parameters_json.contains("\"code\"")
+                && serde_json::from_str::<serde_json::Value>(parameters_json)
+                    .ok()
+                    .and_then(|val| {
+                        val.get("properties")
+                            .and_then(serde_json::Value::as_object)
+                            .map(|props| {
+                                props.contains_key("code")
+                                    && props.keys().all(|k| {
+                                        matches!(k.as_str(), "code" | "timeout" | "background")
+                                    })
+                            })
+                    })
+                    .unwrap_or(false)
+        }
+    }
+}
+
+/// Returns `true` when `tool` is OpenCode v2's `execute` tool running under `full_codemode`
+/// (`FullInput` with `timeout` + `background` and `Bun.file` / built-in file & shell tools).
+#[must_use]
+pub fn is_opencode_full_code_mode_exec(tool: &CanonicalToolSpec) -> bool {
+    if !is_opencode_execute_orchestrator_tool(tool) {
+        return false;
+    }
+    if tool
+        .description
+        .as_deref()
+        .is_some_and(|desc| desc.contains("Bun.file") || desc.contains("work with files and data"))
+    {
+        return true;
+    }
+    match &tool.kind {
+        CanonicalToolKind::Custom { format_json } => format_json
+            .as_deref()
+            .is_some_and(|fmt| fmt.contains("timeout") && fmt.contains("background")),
+        CanonicalToolKind::Function { parameters_json } => {
+            parameters_json.contains("\"timeout\"")
+                && parameters_json.contains("\"background\"")
+                && serde_json::from_str::<serde_json::Value>(parameters_json)
+                    .ok()
+                    .and_then(|val| {
+                        val.get("properties")
+                            .and_then(serde_json::Value::as_object)
+                            .map(|props| {
+                                props.contains_key("timeout") && props.contains_key("background")
+                            })
+                    })
+                    .unwrap_or(false)
+        }
+    }
 }
 
 /// Returns `true` when `tool` is Oh My Pi (`omp`)'s persistent polyglot `eval` Code Mode
@@ -110,13 +199,9 @@ pub fn is_code_mode_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
     if tool.name == "REPL" {
         return true;
     }
-    if is_code_mode_custom_exec(tool) || is_omp_eval_orchestrator_tool(tool) {
-        return true;
-    }
-    if tool.name == "execute"
-        && tool.description.as_deref().is_some_and(|desc| {
-            desc.contains("Code Mode runtime") || desc.contains("Code Mode catalog")
-        })
+    if is_code_mode_custom_exec(tool)
+        || is_opencode_execute_orchestrator_tool(tool)
+        || is_omp_eval_orchestrator_tool(tool)
     {
         return true;
     }

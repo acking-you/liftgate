@@ -453,6 +453,9 @@ For manual setup, add the `agy` provider to `~/.config/opencode/opencode.json`
   "$schema": "https://opencode.ai/config.json",
   "model": "agy/gemini-4-carbon-high",
   "small_model": "agy/gemini-4-hydrogen-low",
+  "experimental": {
+    "full_codemode": true
+  },
   "provider": {
     "agy": {
       "npm": "@ai-sdk/anthropic",
@@ -481,11 +484,14 @@ For manual setup, add the `agy` provider to `~/.config/opencode/opencode.json`
 }
 ```
 
-- **Code Mode (`@opencode/codemode`)**: OpenCode v2 enables Code Mode (`execute`
-  over `psychoscript`) out of the box for MCP and namespace tools; pass
-  `lg oc --full-code-mode` to route built-in file/shell tools and `Bun.file` /
-  `Bun.write` into `execute` as well, or `lg oc --no-code-mode` to expose all
-  MCP and namespace tools directly (virtualized within `<= 24` Eager slots by
+- **Code Mode (`@opencode/codemode`)**: `lg oc` and `lg config opencode` enable
+  OpenCode v2 full Code Mode (`experimental.full_codemode: true` /
+  `OPENCODE_FLAGS=full_codemode`, and `OPENCODE_EXPERIMENTAL_CODE_MODE=true` on
+  OpenCode v1.x) by default so built-in file/shell/edit tools, `Bun.file` /
+  `Bun.write` / `Bun.Glob`, and MCP/namespace tools compose inside `execute`;
+  pass `lg oc --mcp-code-mode` to keep built-in file/shell tools direct while
+  retaining `execute` for MCP/namespace tools, or `lg oc --no-code-mode` to
+  expose all tools directly (virtualized within `<= 24` Eager slots by
   Liftgate's `OpenCodeToolProfile`).
 - **Calibrated compaction & fast lanes**: `limit.context = 500000` aligns
   OpenCode's default `15%` buffer directly with `425,000` tokens (safely below

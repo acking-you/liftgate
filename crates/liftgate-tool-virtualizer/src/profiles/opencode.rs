@@ -18,7 +18,10 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
-    session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
+    session_key::{
+        McpOrchestratorContract, is_code_mode_custom_exec, is_code_mode_orchestrator_tool,
+        is_opencode_execute_orchestrator_tool, is_opencode_full_code_mode_exec,
+    },
 };
 
 use crate::{
@@ -201,6 +204,20 @@ impl HarnessToolProfile for OpenCodeToolProfile {
         }
 
         ToolPlacement::Standalone { backfill_rank: 16 }
+    }
+
+    fn orchestrator_prompt_contract<'a>(
+        self,
+        spec: &CanonicalToolSpec,
+        mcp_name: &'a str,
+        _has_folded_tools: bool,
+    ) -> Option<McpOrchestratorContract<'a>> {
+        is_opencode_execute_orchestrator_tool(spec).then(|| {
+            McpOrchestratorContract::OpenCodeExecute {
+                mcp_name,
+                full_code_mode: is_opencode_full_code_mode_exec(spec),
+            }
+        })
     }
 
     fn search_aliases(self, _spec: &CanonicalToolSpec, namespace: Option<&str>) -> &'static str {

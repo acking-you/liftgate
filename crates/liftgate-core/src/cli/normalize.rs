@@ -294,6 +294,7 @@ fn harness_bool_flags(kind: HarnessSubcommand, is_desktop_mode: bool) -> &'stati
             "--no-bypass",
             "--full-code-mode",
             "--code-mode-only",
+            "--mcp-code-mode",
             "--no-code-mode",
         ],
         HarnessSubcommand::Omp => &[

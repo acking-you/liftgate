@@ -267,6 +267,10 @@ pub fn detect_auxiliary_task(
     if (trimmed_user.starts_with("<title-request>")
         && trimmed_user.contains("Session UI request, not from the user."))
         || sys.contains("Name the background agent that carries out the request in the final")
+        || (client_tools.is_empty()
+            && !enable_native_web_search
+            && !enable_native_web_fetch
+            && sys.contains("You name conversations so the user can find them later"))
     {
         return Some(AuxiliaryTaskKind::SessionTitleOrTopic);
     }
@@ -293,6 +297,16 @@ pub fn detect_auxiliary_task(
 
     if !client_tools.is_empty() || enable_native_web_fetch {
         return None;
+    }
+
+    // OpenCode built-in hidden `summary` agent (`PROMPT_SUMMARY`), which summarizes multi-turn
+    // sessions (`conv_len > 2`) with `client_tools` denied (`*`: `deny`).
+    if !enable_native_web_search
+        && sys.starts_with(
+            "Summarize what was done in this conversation. Write like a pull request description.",
+        )
+    {
+        return Some(AuxiliaryTaskKind::AwayRecapOrSuggestion);
     }
 
     if enable_native_web_search {

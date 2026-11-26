@@ -116,6 +116,12 @@ pub struct OpenCodeManagedRecord {
     pub previous_permission_execute: Option<Value>,
     #[serde(default)]
     pub wrote_permission_execute: Option<Value>,
+    #[serde(default)]
+    pub experimental_was_absent: bool,
+    #[serde(default)]
+    pub previous_experimental_full_codemode: Option<Value>,
+    #[serde(default)]
+    pub wrote_experimental_full_codemode: Option<Value>,
 }
 
 fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
