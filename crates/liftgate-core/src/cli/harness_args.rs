@@ -11,6 +11,10 @@ pub struct ClaudeArgs {
     #[arg(long)]
     pub listen: Option<SocketAddr>,
 
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
+
     /// Optional gateway API key.
     #[arg(long)]
     pub api_key: Option<String>,
@@ -61,6 +65,7 @@ impl ClaudeArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             fast_model: None,
@@ -85,6 +90,10 @@ pub struct ClaudeDesktopArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -120,6 +129,7 @@ impl ClaudeDesktopArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             restart_app: false,
@@ -138,6 +148,10 @@ pub struct CodexArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -197,6 +211,7 @@ impl CodexArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             no_bypass: false,
@@ -223,6 +238,10 @@ pub struct CodexAppArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -278,6 +297,7 @@ impl CodexAppArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             no_bypass: false,
@@ -318,6 +338,10 @@ pub struct OpencodeArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -365,6 +389,7 @@ impl OpencodeArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             fast_model: None,
@@ -385,6 +410,10 @@ pub struct OmpArgs {
     /// Target gateway socket address (auto-starts background gateway if offline).
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`; never spawns a local daemon).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -428,6 +457,7 @@ impl OmpArgs {
     pub fn default_interactive() -> Self {
         Self {
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             fast_model: None,
@@ -459,6 +489,10 @@ pub struct ConfigArgs {
     /// Target gateway socket address.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional gateway API key.
     #[arg(long)]
@@ -501,6 +535,7 @@ impl ConfigArgs {
             global: false,
             dir: None,
             listen: None,
+            remote: None,
             api_key: None,
             model: None,
             fast_model: None,

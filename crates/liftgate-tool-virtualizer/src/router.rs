@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     parser::ApplyPatchPreflightError,
-    session_key::is_code_mode_custom_exec,
+    session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
 };
 use serde_json::Value;
 
 use crate::{
-    CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
+    CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, READ_CONTEXT_SPILL_MCP_NAME,
+    SEARCH_CLIENT_TOOLS_MCP_NAME,
     budget::VirtualizerBudget,
     profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract},
     schema::{
@@ -27,6 +28,7 @@ pub enum LocalReplyKind {
     Search,
     PreflightError,
     DisabledTool,
+    SpillRead,
 }
 
 /// Pure transport-independent resolution of an incoming `tools/call` against [`McpRoutingTable`].
@@ -46,6 +48,13 @@ pub enum VirtualizedCallDecision {
     },
     /// Execute server-managed URL fetch inside the gateway and reply in-flight.
     GatewayWebFetch { url: String },
+    /// Read a bounded line slice or search matches from a gateway-local context spill file in 0-RTT.
+    ReadContextSpill {
+        path: String,
+        start_line: usize,
+        max_lines: usize,
+        query: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +71,9 @@ pub(crate) struct IndexedClientTool {
     pub(crate) ts_declaration: Option<String>,
     pub(crate) parameters_json: Option<String>,
     pub(crate) required_fields: Vec<String>,
+    pub(crate) non_nullable_required_fields: Vec<String>,
     pub(crate) declares_tool_summary: bool,
+    pub(crate) requires_string_intent_i: bool,
     pub(crate) has_root_combinator: bool,
     pub(crate) searchable_lower: String,
 }
@@ -100,6 +111,7 @@ type RebuildRoutingFn = fn(
     HashMap<String, String>,
     bool,
     bool,
+    bool,
 ) -> McpRoutingTable;
 
 /// Live routing and 0-RTT search snapshot for an ACP session's active client tools.
@@ -118,6 +130,7 @@ pub struct McpRoutingTable {
     all_indexed_tools: Vec<IndexedClientTool>,
     has_virtualized_dispatch: bool,
     has_gateway_web_fetch: bool,
+    has_context_spill_reader: bool,
     rebuild_fn: RebuildRoutingFn,
 }
 
@@ -133,6 +146,7 @@ impl Default for McpRoutingTable {
             all_indexed_tools: Vec::new(),
             has_virtualized_dispatch: false,
             has_gateway_web_fetch: false,
+            has_context_spill_reader: false,
             rebuild_fn: build_routing_table_for_profile::<crate::profiles::GenericToolProfile>,
         }
     }
@@ -144,14 +158,16 @@ pub(crate) fn build_routing_table_for_profile<P: HarnessToolProfile>(
     hub_names_by_namespace: HashMap<String, String>,
     has_virtualized_dispatch: bool,
     has_gateway_web_fetch: bool,
+    has_context_spill_reader: bool,
 ) -> McpRoutingTable {
-    McpRoutingTable::build_with_profile_and_options(
+    McpRoutingTable::build_with_profile_and_session_options(
         P::default(),
         client_tools,
         direct_by_mcp,
         hub_names_by_namespace,
         has_virtualized_dispatch,
         has_gateway_web_fetch,
+        has_context_spill_reader,
     )
 }
 
@@ -185,8 +201,30 @@ impl McpRoutingTable {
         has_virtualized_dispatch: bool,
         has_gateway_web_fetch: bool,
     ) -> Self {
+        Self::build_with_profile_and_session_options(
+            profile,
+            client_tools,
+            direct_by_mcp,
+            hub_names_by_namespace,
+            has_virtualized_dispatch,
+            has_gateway_web_fetch,
+            false,
+        )
+    }
+
+    /// Builds a live routing and search index with gateway `gateway_web_fetch` and `read_context_spill` flags.
+    #[must_use]
+    pub fn build_with_profile_and_session_options<P: HarnessToolProfile>(
+        profile: P,
+        client_tools: &[CanonicalToolSpec],
+        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        hub_names_by_namespace: HashMap<String, String>,
+        has_virtualized_dispatch: bool,
+        has_gateway_web_fetch: bool,
+        has_context_spill_reader: bool,
+    ) -> Self {
         let prepass = profile.build_prepass(client_tools);
-        Self::build_with_prepass_and_options(
+        Self::build_with_prepass_and_session_options(
             profile,
             &prepass,
             client_tools,
@@ -194,6 +232,7 @@ impl McpRoutingTable {
             hub_names_by_namespace,
             has_virtualized_dispatch,
             has_gateway_web_fetch,
+            has_context_spill_reader,
         )
     }
 
@@ -207,6 +246,34 @@ impl McpRoutingTable {
         hub_names_by_namespace: HashMap<String, String>,
         has_virtualized_dispatch: bool,
         has_gateway_web_fetch: bool,
+    ) -> Self {
+        Self::build_with_prepass_and_session_options(
+            profile,
+            prepass,
+            client_tools,
+            direct_by_mcp,
+            hub_names_by_namespace,
+            has_virtualized_dispatch,
+            has_gateway_web_fetch,
+            false,
+        )
+    }
+
+    /// Builds a routing table reusing an already-computed profile prepass and full session options.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal zero-cost monomorphized builder passes prepass and boolean capabilities directly"
+    )]
+    pub fn build_with_prepass_and_session_options<P: HarnessToolProfile>(
+        profile: P,
+        prepass: &P::Prepass,
+        client_tools: &[CanonicalToolSpec],
+        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        hub_names_by_namespace: HashMap<String, String>,
+        has_virtualized_dispatch: bool,
+        has_gateway_web_fetch: bool,
+        has_context_spill_reader: bool,
     ) -> Self {
         assert_eq!(
             std::mem::size_of::<P>(),
@@ -272,8 +339,7 @@ impl McpRoutingTable {
 
             let raw_desc = spec.description.as_deref().unwrap_or("");
             let (prose, ts_decl) = profile.dehydrate_description(raw_desc, is_orchestrator);
-            let (required_fields, declares_tool_summary, has_root_combinator, prop_names_joined) =
-                extract_schema_metadata(params_json.as_deref());
+            let schema_meta = extract_schema_metadata(params_json.as_deref());
 
             let (namespace, short_action, invoke_via_mcp_name, is_custom, unwrap_key, v4a_patch) =
                 if let Some(direct) = direct_by_client.get(spec.name.as_str()) {
@@ -326,7 +392,7 @@ impl McpRoutingTable {
                 spec.name.to_ascii_lowercase(),
                 namespace.as_deref().unwrap_or(""),
                 short_action.as_deref().unwrap_or("").to_ascii_lowercase(),
-                prop_names_joined.to_ascii_lowercase(),
+                schema_meta.prop_names_joined.to_ascii_lowercase(),
                 prose.to_ascii_lowercase(),
                 aliases
             );
@@ -343,9 +409,11 @@ impl McpRoutingTable {
                 prose_description: prose.to_owned(),
                 ts_declaration: ts_decl.map(str::to_owned),
                 parameters_json: params_json,
-                required_fields,
-                declares_tool_summary,
-                has_root_combinator,
+                required_fields: schema_meta.required_fields,
+                non_nullable_required_fields: schema_meta.non_nullable_required_fields,
+                declares_tool_summary: schema_meta.declares_tool_summary,
+                requires_string_intent_i: schema_meta.requires_string_intent_i,
+                has_root_combinator: schema_meta.has_root_combinator,
                 searchable_lower,
             };
 
@@ -365,6 +433,7 @@ impl McpRoutingTable {
             all_indexed_tools,
             has_virtualized_dispatch,
             has_gateway_web_fetch,
+            has_context_spill_reader,
             rebuild_fn: build_routing_table_for_profile::<P>,
         }
     }
@@ -394,6 +463,7 @@ impl McpRoutingTable {
             self.hub_names_by_namespace.clone(),
             self.has_virtualized_dispatch,
             self.has_gateway_web_fetch,
+            self.has_context_spill_reader,
         ))
     }
 
@@ -429,6 +499,43 @@ impl McpRoutingTable {
             };
         }
 
+        if self.has_context_spill_reader && mcp_name == READ_CONTEXT_SPILL_MCP_NAME {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if path.is_empty() {
+                return preflight_error_decision(
+                    "Missing non-empty `path` string for `mcp_lg_read_context_spill`.".to_owned(),
+                );
+            }
+            let start_line = arguments
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(1)
+                .max(1);
+            let max_lines = arguments
+                .get("max_lines")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(120)
+                .clamp(1, 200);
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            return VirtualizedCallDecision::ReadContextSpill {
+                path: path.to_owned(),
+                start_line,
+                max_lines,
+                query,
+            };
+        }
+
         if self.has_virtualized_dispatch && mcp_name == SEARCH_CLIENT_TOOLS_MCP_NAME {
             let text = self.execute_search(arguments, active_tools);
             return VirtualizedCallDecision::LocalReply {
@@ -450,9 +557,13 @@ impl McpRoutingTable {
                     bridged.v4a_patch,
                 );
             }
-            let serialized = match format_direct_tool_arguments(arguments, bridged) {
+            let serialized = match format_direct_tool_arguments(
+                arguments,
+                bridged,
+                self.budget.max_single_schema_in_search_bytes,
+            ) {
                 Ok(s) => s,
-                Err(preflight_err) => return preflight_error_decision(preflight_err.to_string()),
+                Err(preflight_msg) => return preflight_error_decision(preflight_msg),
             };
             return VirtualizedCallDecision::ForwardToClient {
                 client_name: bridged.client_name.clone(),
@@ -478,7 +589,8 @@ impl McpRoutingTable {
             return finalize_indexed_tool_call(
                 indexed,
                 arguments,
-                false,
+                None,
+                true,
                 self.budget.max_single_schema_in_search_bytes,
             );
         }
@@ -537,6 +649,7 @@ impl McpRoutingTable {
             return disabled_tool_decision(&indexed.client_name);
         }
 
+        let outer_summary = arguments.get("toolSummary").and_then(Value::as_str);
         let inner_args = match extract_virtualized_inner_args(
             arguments,
             &["action", "toolSummary"],
@@ -549,6 +662,7 @@ impl McpRoutingTable {
         finalize_indexed_tool_call(
             indexed,
             &inner_args,
+            outer_summary,
             true,
             self.budget.max_single_schema_in_search_bytes,
         )
@@ -608,6 +722,7 @@ impl McpRoutingTable {
             return disabled_tool_decision(&indexed.client_name);
         }
 
+        let outer_summary = arguments.get("toolSummary").and_then(Value::as_str);
         let inner_args = match extract_virtualized_inner_args(
             arguments,
             &["name", "tool", "action", "toolSummary"],
@@ -620,6 +735,7 @@ impl McpRoutingTable {
         finalize_indexed_tool_call(
             indexed,
             &inner_args,
+            outer_summary,
             true,
             self.budget.max_single_schema_in_search_bytes,
         )
@@ -685,7 +801,9 @@ impl McpRoutingTable {
 
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let total_matches = scored.len();
-        let has_code_mode_exec = active_tools.iter().any(is_code_mode_custom_exec);
+        let has_code_mode_exec = active_tools
+            .iter()
+            .any(|t| is_code_mode_custom_exec(t) || is_code_mode_orchestrator_tool(t));
 
         if scored.is_empty() {
             let mut ns_counts: HashMap<&str, usize> = HashMap::new();
@@ -834,10 +952,70 @@ fn heal_and_validate_json_patch_field(
     Ok(())
 }
 
+fn backfill_intent_i_from_summary(
+    map: &mut serde_json::Map<String, Value>,
+    requires_string_intent_i: bool,
+    outer_summary_fallback: Option<&str>,
+) {
+    if !requires_string_intent_i {
+        return;
+    }
+    let missing_i = map
+        .get("i")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty());
+    if !missing_i {
+        return;
+    }
+    let candidate = map
+        .get("toolSummary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            outer_summary_fallback
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(summary) = candidate {
+        map.insert("i".to_owned(), Value::String(summary.to_owned()));
+    }
+}
+
+fn check_missing_non_nullable_required(
+    map: &serde_json::Map<String, Value>,
+    non_nullable_required_fields: &[String],
+    client_name: &str,
+    parameters_json: Option<&str>,
+    max_schema_bytes: usize,
+) -> Result<(), String> {
+    if non_nullable_required_fields.is_empty() {
+        return Ok(());
+    }
+    let missing: Vec<&str> = non_nullable_required_fields
+        .iter()
+        .filter(|req_key| map.get(req_key.as_str()).is_none_or(Value::is_null))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let provided: Vec<&str> = map.keys().map(String::as_str).collect();
+    let schema_snippet = parameters_json
+        .map(|s| truncate_utf8_prefix(s, max_schema_bytes))
+        .unwrap_or(Cow::Borrowed("{}"));
+    Err(format!(
+        "Missing required parameter(s) [{}] for `{client_name}` (provided keys: [{}]).\nExact inputSchema:\n{schema_snippet}\nRetry the call with all required parameters.",
+        missing.join(", "),
+        provided.join(", ")
+    ))
+}
+
 fn format_direct_tool_arguments(
     raw_args: &Value,
     bridged: &McpBridgedTool,
-) -> Result<String, ApplyPatchPreflightError> {
+    max_schema_bytes: usize,
+) -> Result<String, String> {
     if bridged.is_custom {
         return Ok(extract_custom_tool_input(
             raw_args,
@@ -849,17 +1027,24 @@ fn format_direct_tool_arguments(
         args_val = Value::Object(serde_json::Map::new());
     }
     if let Value::Object(ref mut map) = args_val {
-        let declares_summary = bridged
-            .parameters_json
-            .as_deref()
-            .is_some_and(|s| s.contains("\"toolSummary\""));
-        if !declares_summary {
+        backfill_intent_i_from_summary(map, bridged.requires_string_intent_i, None);
+        if !bridged.declares_tool_summary {
             let _ = map.remove("toolSummary");
         }
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
-        heal_and_validate_json_patch_field(bridged.v4a_patch, map)?;
+        heal_and_validate_json_patch_field(bridged.v4a_patch, map)
+            .map_err(|err| err.to_string())?;
+        if !bridged.has_root_combinator {
+            check_missing_non_nullable_required(
+                map,
+                &bridged.non_nullable_required_fields,
+                &bridged.client_name,
+                bridged.parameters_json.as_deref(),
+                max_schema_bytes,
+            )?;
+        }
     }
     Ok(serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned()))
 }
@@ -923,6 +1108,7 @@ fn extract_virtualized_inner_args(
 fn finalize_indexed_tool_call(
     indexed: &IndexedClientTool,
     inner_args: &Value,
+    outer_summary_fallback: Option<&str>,
     enforce_required_preflight: bool,
     max_schema_bytes: usize,
 ) -> VirtualizedCallDecision {
@@ -939,6 +1125,11 @@ fn finalize_indexed_tool_call(
         Value::Object(m) => m.clone(),
         _ => serde_json::Map::new(),
     };
+    backfill_intent_i_from_summary(
+        &mut map,
+        indexed.requires_string_intent_i,
+        outer_summary_fallback,
+    );
     if !indexed.declares_tool_summary {
         let _ = map.remove("toolSummary");
     }
@@ -951,28 +1142,15 @@ fn finalize_indexed_tool_call(
 
     if enforce_required_preflight
         && !indexed.has_root_combinator
-        && !indexed.required_fields.is_empty()
+        && let Err(msg) = check_missing_non_nullable_required(
+            &map,
+            &indexed.non_nullable_required_fields,
+            &indexed.client_name,
+            indexed.parameters_json.as_deref(),
+            max_schema_bytes,
+        )
     {
-        let missing: Vec<&str> = indexed
-            .required_fields
-            .iter()
-            .filter(|req_key| map.get(req_key.as_str()).is_none_or(Value::is_null))
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            let provided: Vec<&str> = map.keys().map(String::as_str).collect();
-            let schema_snippet = indexed
-                .parameters_json
-                .as_deref()
-                .map(|s| truncate_utf8_prefix(s, max_schema_bytes))
-                .unwrap_or(Cow::Borrowed("{}"));
-            return preflight_error_decision(format!(
-                "Missing required parameter(s) [{}] for `{}` (provided keys: [{}]).\nExact inputSchema:\n{schema_snippet}\nRetry the call with all required parameters.",
-                missing.join(", "),
-                indexed.client_name,
-                provided.join(", ")
-            ));
-        }
+        return preflight_error_decision(msg);
     }
 
     let arguments = serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".to_owned());

@@ -401,6 +401,14 @@ pub enum CliError {
         source: GatewayTransportError,
     },
 
+    #[error(
+        "`{operation}` manages a local daemon and cannot run while targeting remote gateway `{endpoint}`"
+    )]
+    UnsupportedInRemoteMode {
+        operation: &'static str,
+        endpoint: String,
+    },
+
     #[error("gateway request `{url}` failed with HTTP {status}: {body}")]
     GatewayHttpStatus {
         url: String,
@@ -564,8 +572,22 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::AgyNetwork { .. } | CliError::AgyProxyProbeFailed { .. } => Some(format!(
             "If your network requires a proxy to reach Google Cloud Storage, configure `{bin} proxy <port_or_url>` first and re-run `{bin} agy install`."
         )),
-        CliError::GatewayUnreachable { .. } => Some(format!(
-            "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
+        CliError::GatewayUnreachable { url, .. } => {
+            let is_loopback = url.contains("://127.0.0.1")
+                || url.contains("://[::1]")
+                || url.contains("://localhost");
+            if is_loopback {
+                Some(format!(
+                    "Start the background gateway with `{bin} up` (or `{bin} start`), or check `{bin} status`."
+                ))
+            } else {
+                Some(format!(
+                    "Verify the remote Liftgate server is running (`liftgate serve --listen 0.0.0.0:8787`) and reachable, pass `--no-verify` when pre-configuring offline, or switch back to local mode with `{bin} remote local`."
+                ))
+            }
+        }
+        CliError::UnsupportedInRemoteMode { .. } => Some(format!(
+            "Switch back to local daemon mode with `{bin} remote local` (or pass `--listen 127.0.0.1:8787`), or run daemon lifecycle commands directly on the remote host."
         )),
         CliError::PortOccupiedUnmanaged { .. } => Some(format!(
             "Run `{bin} status` to inspect the active listener, or bind another port with `--listen 127.0.0.1:8788`."

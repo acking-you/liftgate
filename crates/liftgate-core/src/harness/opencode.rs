@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use liftgate_harness::merge_endpoint_no_proxy;
 use liftgate_harness::opencode::{
     OpenCodeInvocationKind, classify_opencode_invocation, has_negated_opencode_flag,
     merge_opencode_flag, parse_opencode_major_version, strip_opencode_flag,
 };
-use liftgate_server::platform::merge_loopback_no_proxy;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
@@ -18,7 +18,7 @@ use crate::config_sync::{
     HarnessSyncParams, merged_opencode_config_into, parse_opencode_env_config_content,
     resolve_fast_model, strip_agy_provider_prefix,
 };
-use crate::daemon::ensure_gateway_ready;
+use crate::daemon::ensure_gateway_ready_for_target;
 use crate::error::CliError;
 use crate::state::StatePaths;
 use crate::terminal::TerminalLaunchSpec;
@@ -87,9 +87,10 @@ pub(super) async fn build_opencode_invocation(
         .filter(|s| !s.is_empty());
 
     let (target, v2_runtime) = tokio::join!(
-        ensure_gateway_ready(
+        ensure_gateway_ready_for_target(
             state_paths,
             args.listen,
+            args.remote.as_deref(),
             args.api_key.clone(),
             requested_model,
             true,
@@ -143,11 +144,12 @@ pub(super) async fn build_opencode_invocation(
             source,
         })?;
 
-    let no_proxy = merge_loopback_no_proxy(
+    let no_proxy = merge_endpoint_no_proxy(
         std::env::var("NO_PROXY")
             .ok()
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
+        Some(target.client.base_url()),
     );
     let mut env_set = vec![
         ("OPENCODE_CONFIG_CONTENT".to_owned(), config_content),

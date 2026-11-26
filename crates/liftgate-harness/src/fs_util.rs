@@ -140,6 +140,63 @@ pub fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
     entries.join(",")
 }
 
+/// Extracts the host component (unbracketed IPv4/hostname or IPv6 literal) from a URL or `host:port`.
+#[must_use]
+pub fn extract_url_host(url_or_host: &str) -> Option<&str> {
+    let trimmed = url_or_host.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    if let Some(after_bracket) = host_port.strip_prefix('[') {
+        return after_bracket
+            .split_once(']')
+            .map(|(h, _)| h)
+            .filter(|h| !h.is_empty());
+    }
+    if let Some((h, _port)) = host_port.rsplit_once(':')
+        && !h.contains(':')
+    {
+        return (!h.is_empty()).then_some(h);
+    }
+    (!host_port.is_empty()).then_some(host_port)
+}
+
+/// Ensures `127.0.0.1`, `localhost`, `::1`, and an optional target gateway endpoint host
+/// bypass local `HTTP_PROXY` / `HTTPS_PROXY` interceptors via `NO_PROXY`.
+#[must_use]
+pub fn merge_endpoint_no_proxy(
+    existing: Option<&str>,
+    endpoint_url_or_host: Option<&str>,
+) -> String {
+    let mut merged = merge_loopback_no_proxy(existing);
+    let Some(raw) = endpoint_url_or_host else {
+        return merged;
+    };
+    let Some(host) = extract_url_host(raw) else {
+        return merged;
+    };
+    let mut entries: Vec<String> = merged
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if !entries.iter().any(|e| e.eq_ignore_ascii_case(host)) {
+        entries.push(host.to_owned());
+    }
+    if host.contains(':') {
+        let bracketed = format!("[{host}]");
+        if !entries.iter().any(|e| e.eq_ignore_ascii_case(&bracketed)) {
+            entries.push(bracketed);
+        }
+    }
+    merged = entries.join(",");
+    merged
+}
+
 struct UnlinkOnDrop<'a> {
     path: &'a Path,
     armed: bool,
@@ -392,4 +449,37 @@ pub fn strip_jsonc_to_json(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_endpoint_host_into_no_proxy_across_ipv4_ipv6_and_dns() {
+        assert_eq!(
+            extract_url_host("http://192.168.1.50:8787/v1"),
+            Some("192.168.1.50")
+        );
+        assert_eq!(extract_url_host("http://[fd00::1]:8787"), Some("fd00::1"));
+        assert_eq!(
+            extract_url_host("devbox.tailnet.ts.net:8787"),
+            Some("devbox.tailnet.ts.net")
+        );
+
+        let merged_v4 =
+            merge_endpoint_no_proxy(Some("corp.internal"), Some("http://192.168.1.50:8787"));
+        assert_eq!(
+            merged_v4,
+            "corp.internal,127.0.0.1,localhost,::1,192.168.1.50"
+        );
+
+        let merged_v6 = merge_endpoint_no_proxy(None, Some("http://[fd00::1]:8787"));
+        assert_eq!(merged_v6, "127.0.0.1,localhost,::1,fd00::1,[fd00::1]");
+
+        // Loopback deduplication
+        let merged_local =
+            merge_endpoint_no_proxy(Some("127.0.0.1,localhost"), Some("http://127.0.0.1:8787"));
+        assert_eq!(merged_local, "127.0.0.1,localhost,::1");
+    }
 }

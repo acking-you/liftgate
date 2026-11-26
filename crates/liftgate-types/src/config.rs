@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ProxyUrlError, ValidationError};
+use crate::error::{GatewayEndpointError, ProxyUrlError, ValidationError};
 
 pub const DEFAULT_MAX_LINE_BYTES: usize = 48 * 1024 * 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -16,6 +17,7 @@ pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 pub const DEFAULT_MAX_LOW_CACHE_RECORDS: usize = 1_000;
 pub const MAX_ALLOWED_LOW_CACHE_RECORDS: usize = 50_000;
 pub const DEFAULT_LOW_CACHE_THRESHOLD_BPS: u16 = 5_000;
+pub const DEFAULT_GATEWAY_PORT: u16 = 8787;
 
 const _: () = assert!(
     DEFAULT_MAX_LINE_BYTES > DEFAULT_MAX_BODY_BYTES,
@@ -576,6 +578,318 @@ impl From<CacheHitThresholdBps> for u16 {
     }
 }
 
+/// Returns `true` when `raw` is a keyword switching target mode back to the local managed daemon.
+#[must_use]
+pub fn is_endpoint_local_keyword(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "local" | "off" | "none" | "clear" | "reset" | "default"
+    )
+}
+
+/// Extensible gateway connection mode stored in client settings (`~/.liftgate/settings.json`).
+///
+/// Unknown variants written by newer Liftgate releases deserialize cleanly to [`Self::Unknown`]
+/// so older binaries remain forward-compatible without failing settings deserialization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTargetMode {
+    /// Managed or external local loopback gateway (`127.0.0.1:8787` by default).
+    #[default]
+    Local,
+    /// Local CLI/harnesses connect directly to a remote `liftgate` HTTP endpoint (`<ip:port>`).
+    Remote,
+    /// Forward-compatible catch-all for connection modes introduced in newer versions.
+    #[serde(other)]
+    Unknown,
+}
+
+impl GatewayTargetMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local | Self::Unknown => "local",
+            Self::Remote => "remote",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+}
+
+/// Validated HTTP gateway endpoint (`http://<host>:<port>`) used to connect local harnesses
+/// and observability commands to a local or remote `liftgate` instance.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GatewayEndpoint {
+    base_url: Arc<str>,
+    host: Arc<str>,
+    host_header: Arc<str>,
+    port: NonZeroU16,
+}
+
+impl GatewayEndpoint {
+    /// Parses and normalizes a gateway endpoint specification.
+    ///
+    /// Accepted forms:
+    /// - `<ip>:<port>` / `<host>:<port>` (`"192.168.1.50:8787"`, `"[fd00::1]:8787"`, `"devbox.lan:9000"`)
+    /// - Bare `<ip>` / `<host>` (`"192.168.1.50"`, `"[fd00::1]"`, `"devbox.lan"`) -> defaults port to `8787`
+    /// - Port shorthand (`"9000"`) -> `"http://127.0.0.1:9000"`
+    /// - Explicit HTTP URL (`"http://192.168.1.50:8787"`, `"http://192.168.1.50:8787/v1"`)
+    pub fn try_new(raw: impl AsRef<str>) -> Result<Self, ValidationError> {
+        let raw_ref = raw.as_ref();
+        let trimmed = raw_ref.trim();
+        if trimmed.is_empty() {
+            return Err(ValidationError::InvalidGatewayEndpoint {
+                value: raw_ref.to_owned(),
+                source: GatewayEndpointError::Empty,
+            });
+        }
+        if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ValidationError::InvalidGatewayEndpoint {
+                value: trimmed.to_owned(),
+                source: GatewayEndpointError::WhitespaceOrControl,
+            });
+        }
+
+        if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            let port = trimmed
+                .parse::<u16>()
+                .ok()
+                .and_then(NonZeroU16::new)
+                .ok_or_else(|| ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::InvalidPort,
+                })?;
+            return Ok(Self::from_validated_parts("127.0.0.1", false, port));
+        }
+
+        let authority = if let Some((scheme_raw, rest_raw)) = trimmed.split_once("://") {
+            if !scheme_raw.eq_ignore_ascii_case("http") {
+                return Err(ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::UnsupportedScheme,
+                });
+            }
+            strip_optional_v1_path(rest_raw, trimmed)?
+        } else {
+            strip_optional_v1_path(trimmed, trimmed)?
+        };
+
+        if authority.contains('@') {
+            return Err(ValidationError::InvalidGatewayEndpoint {
+                value: trimmed.to_owned(),
+                source: GatewayEndpointError::ContainsCredentials,
+            });
+        }
+        if authority.is_empty() {
+            return Err(ValidationError::InvalidGatewayEndpoint {
+                value: trimmed.to_owned(),
+                source: GatewayEndpointError::EmptyHost,
+            });
+        }
+
+        let (raw_host, is_ipv6, port_opt) = if let Some(after_bracket) = authority.strip_prefix('[')
+        {
+            let Some((ipv6_host, tail)) = after_bracket.split_once(']') else {
+                return Err(ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::UnclosedIpv6Bracket,
+                });
+            };
+            if ipv6_host.is_empty() {
+                return Err(ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::EmptyIpv6Host,
+                });
+            }
+            let port_str = if tail.is_empty() {
+                None
+            } else if let Some(p) = tail.strip_prefix(':') {
+                Some(p)
+            } else {
+                return Err(ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::UnexpectedAfterIpv6Bracket,
+                });
+            };
+            (ipv6_host, true, port_str)
+        } else if let Some((h, p)) = authority.rsplit_once(':') {
+            if h.contains(':') {
+                return Err(ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::UnbracketedIpv6Host,
+                });
+            }
+            (h, false, Some(p))
+        } else {
+            (authority, false, None)
+        };
+
+        if raw_host.is_empty() {
+            return Err(ValidationError::InvalidGatewayEndpoint {
+                value: trimmed.to_owned(),
+                source: GatewayEndpointError::EmptyHost,
+            });
+        }
+
+        let port = match port_opt {
+            Some(p_str) => p_str
+                .parse::<u16>()
+                .ok()
+                .and_then(NonZeroU16::new)
+                .ok_or_else(|| ValidationError::InvalidGatewayEndpoint {
+                    value: trimmed.to_owned(),
+                    source: GatewayEndpointError::InvalidPort,
+                })?,
+            None => NonZeroU16::new(DEFAULT_GATEWAY_PORT)
+                .expect("DEFAULT_GATEWAY_PORT is a non-zero compile-time constant"),
+        };
+
+        let (norm_host, norm_ipv6) = normalize_connectable_host(raw_host, is_ipv6);
+        Ok(Self::from_validated_parts(&norm_host, norm_ipv6, port))
+    }
+
+    /// Builds a [`GatewayEndpoint`] from a local or remote [`SocketAddr`], mapping unspecified
+    /// bind addresses (`0.0.0.0` / `::`) to loopback (`127.0.0.1` / `::1`).
+    #[must_use]
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        let port = NonZeroU16::new(addr.port()).unwrap_or_else(|| {
+            NonZeroU16::new(DEFAULT_GATEWAY_PORT)
+                .expect("DEFAULT_GATEWAY_PORT is a non-zero compile-time constant")
+        });
+        match addr {
+            SocketAddr::V4(v4) => {
+                let ip = if v4.ip().is_unspecified() {
+                    Ipv4Addr::LOCALHOST
+                } else {
+                    *v4.ip()
+                };
+                Self::from_validated_parts(&ip.to_string(), false, port)
+            }
+            SocketAddr::V6(v6) => {
+                let ip = if v6.ip().is_unspecified() {
+                    Ipv6Addr::LOCALHOST
+                } else {
+                    *v6.ip()
+                };
+                Self::from_validated_parts(&ip.to_string(), true, port)
+            }
+        }
+    }
+
+    fn from_validated_parts(host: &str, is_ipv6: bool, port: NonZeroU16) -> Self {
+        let p = port.get();
+        let host_header = if is_ipv6 {
+            format!("[{host}]:{p}")
+        } else {
+            format!("{host}:{p}")
+        };
+        let base_url = format!("http://{host_header}");
+        Self {
+            base_url: Arc::from(base_url),
+            host: Arc::from(host),
+            host_header: Arc::from(host_header),
+            port,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Unbracketed hostname or IP literal suitable for `TcpStream::connect((host, port))` and `NO_PROXY`.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Authority string (`host:port` or `[ipv6]:port`) sent in HTTP/1.1 `Host` headers.
+    #[must_use]
+    pub fn host_header(&self) -> &str {
+        &self.host_header
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port.get()
+    }
+
+    /// Returns `Some(SocketAddr)` when `host` is a literal IPv4 or IPv6 address.
+    #[must_use]
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        let ip: IpAddr = self.host.parse().ok()?;
+        Some(SocketAddr::new(ip, self.port.get()))
+    }
+}
+
+fn strip_optional_v1_path<'a>(rest: &'a str, original: &str) -> Result<&'a str, ValidationError> {
+    let without_trailing = rest.strip_suffix('/').unwrap_or(rest);
+    if let Some((authority, path)) = without_trailing.split_once('/') {
+        if path.eq_ignore_ascii_case("v1") {
+            Ok(authority)
+        } else {
+            Err(ValidationError::InvalidGatewayEndpoint {
+                value: original.to_owned(),
+                source: GatewayEndpointError::ContainsPath,
+            })
+        }
+    } else {
+        Ok(without_trailing)
+    }
+}
+
+fn normalize_connectable_host(raw_host: &str, is_ipv6: bool) -> (String, bool) {
+    if is_ipv6 {
+        if let Ok(v6) = raw_host.parse::<Ipv6Addr>() {
+            let norm = if v6.is_unspecified() {
+                Ipv6Addr::LOCALHOST
+            } else {
+                v6
+            };
+            return (norm.to_string(), true);
+        }
+        return (raw_host.to_owned(), true);
+    }
+    if let Ok(v4) = raw_host.parse::<Ipv4Addr>() {
+        let norm = if v4.is_unspecified() {
+            Ipv4Addr::LOCALHOST
+        } else {
+            v4
+        };
+        return (norm.to_string(), false);
+    }
+    (raw_host.to_owned(), false)
+}
+
+impl fmt::Display for GatewayEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.base_url)
+    }
+}
+
+impl TryFrom<String> for GatewayEndpoint {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<GatewayEndpoint> for String {
+    fn from(value: GatewayEndpoint) -> Self {
+        value.base_url.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +969,53 @@ mod tests {
         };
         assert_eq!(usage.total_prompt_tokens(), 2_000);
         assert_eq!(usage.cache_hit_bps(), Some(7_500));
+    }
+
+    #[test]
+    fn gateway_endpoint_and_target_mode_parse_ipv4_ipv6_dns_and_forward_unknown_modes() {
+        let ep_v4 = GatewayEndpoint::try_new("192.168.1.50:8787").unwrap();
+        assert_eq!(ep_v4.base_url(), "http://192.168.1.50:8787");
+        assert_eq!(ep_v4.host(), "192.168.1.50");
+        assert_eq!(ep_v4.host_header(), "192.168.1.50:8787");
+        assert_eq!(ep_v4.port(), 8787);
+        assert_eq!(ep_v4.socket_addr(), "192.168.1.50:8787".parse().ok());
+
+        let ep_default_port = GatewayEndpoint::try_new("http://192.168.1.50/v1/").unwrap();
+        assert_eq!(ep_default_port.base_url(), "http://192.168.1.50:8787");
+
+        let ep_port_only = GatewayEndpoint::try_new("9000").unwrap();
+        assert_eq!(ep_port_only.base_url(), "http://127.0.0.1:9000");
+
+        let ep_dns = GatewayEndpoint::try_new("devbox.tailnet.ts.net:8899").unwrap();
+        assert_eq!(ep_dns.base_url(), "http://devbox.tailnet.ts.net:8899");
+        assert_eq!(ep_dns.host(), "devbox.tailnet.ts.net");
+        assert_eq!(ep_dns.socket_addr(), None);
+
+        let ep_v6 = GatewayEndpoint::try_new("http://[fd00::42]:8787/v1").unwrap();
+        assert_eq!(ep_v6.base_url(), "http://[fd00::42]:8787");
+        assert_eq!(ep_v6.host(), "fd00::42");
+        assert_eq!(ep_v6.host_header(), "[fd00::42]:8787");
+        assert_eq!(ep_v6.socket_addr(), "[fd00::42]:8787".parse().ok());
+
+        let wildcard_v4 = GatewayEndpoint::from_socket_addr("0.0.0.0:8787".parse().unwrap());
+        assert_eq!(wildcard_v4.base_url(), "http://127.0.0.1:8787");
+        let wildcard_v6 = GatewayEndpoint::from_socket_addr("[::]:8787".parse().unwrap());
+        assert_eq!(wildcard_v6.base_url(), "http://[::1]:8787");
+
+        assert!(GatewayEndpoint::try_new("").is_err());
+        assert!(GatewayEndpoint::try_new("0").is_err());
+        assert!(GatewayEndpoint::try_new("https://192.168.1.50:8787").is_err());
+        assert!(GatewayEndpoint::try_new("http://user:pass@192.168.1.50:8787").is_err());
+        assert!(GatewayEndpoint::try_new("http://192.168.1.50:8787/custom/path").is_err());
+        assert!(GatewayEndpoint::try_new("fd00::42:8787").is_err());
+
+        assert!(is_endpoint_local_keyword("local"));
+        assert!(is_endpoint_local_keyword("OFF"));
+        assert!(!is_endpoint_local_keyword("192.168.1.50"));
+
+        let unknown_mode: GatewayTargetMode = serde_json::from_str("\"future_cluster\"").unwrap();
+        assert_eq!(unknown_mode, GatewayTargetMode::Unknown);
+        assert!(!unknown_mode.is_remote());
+        assert_eq!(unknown_mode.as_str(), "local");
     }
 }

@@ -8,12 +8,12 @@ use liftgate_harness::claude::{
     ClaudeInvocationKind, build_claude_gateway_env_pairs, classify_claude_invocation,
     default_claude_effort_level,
 };
-use liftgate_server::platform::merge_loopback_no_proxy;
+use liftgate_harness::merge_endpoint_no_proxy;
 use serde_json::Value;
 
 use crate::cli::{ClaudeArgs, ClaudeDesktopArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::config_sync::{HarnessSyncParams, build_claude_settings_map, resolve_fast_model};
-use crate::daemon::ensure_gateway_ready;
+use crate::daemon::ensure_gateway_ready_for_target;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths};
 use crate::terminal::TerminalLaunchSpec;
@@ -26,6 +26,7 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
             state_paths,
             ClaudeDesktopArgs {
                 listen: args.listen,
+                remote: args.remote,
                 api_key: args.api_key,
                 model: args.model,
                 restart_app: args.restart_app,
@@ -69,14 +70,12 @@ pub(super) async fn build_claude_invocation(
     let resolved_cmd = resolve_claude_command(args.claude_bin.as_deref())?;
     let invocation = classify_claude_invocation(&args.passthrough_args);
 
-    let no_proxy = merge_loopback_no_proxy(
-        std::env::var("NO_PROXY")
-            .ok()
-            .or_else(|| std::env::var("no_proxy").ok())
-            .as_deref(),
-    );
+    let existing_no_proxy = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok());
 
     if invocation == ClaudeInvocationKind::DirectPassthrough {
+        let no_proxy = merge_endpoint_no_proxy(existing_no_proxy.as_deref(), None);
         let mut full_args: Vec<OsString> = resolved_cmd
             .prefix_args
             .iter()
@@ -109,14 +108,18 @@ pub(super) async fn build_claude_invocation(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         requested_model,
         true,
     )
     .await?;
+
+    let no_proxy =
+        merge_endpoint_no_proxy(existing_no_proxy.as_deref(), Some(target.client.base_url()));
 
     let primary_model = requested_model.unwrap_or(&target.default_model).to_owned();
     let auth_token = normalize_optional_api_key(target.api_key.as_deref())

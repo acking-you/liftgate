@@ -162,6 +162,10 @@ pub enum Commands {
     #[command(visible_alias = "px")]
     Proxy(ProxyArgs),
 
+    /// View, set (`lg remote 192.168.1.50:8787`), or clear (`lg remote local`) a remote Liftgate gateway target.
+    #[command(visible_alias = "endpoint")]
+    Remote(RemoteArgs),
+
     /// Check GitHub Releases and automatically upgrade `lg` and `liftgate` with SHA-256 verification.
     #[command(visible_aliases = ["update", "self-update", "upg"])]
     Upgrade(UpgradeArgs),
@@ -204,6 +208,10 @@ pub struct TopArgs {
     /// Target gateway socket address override.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint override (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional API key when inspecting an authenticated gateway.
     #[arg(long)]
@@ -518,6 +526,10 @@ pub struct StatusArgs {
     #[arg(long)]
     pub listen: Option<SocketAddr>,
 
+    /// Target remote `liftgate` endpoint override (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
+
     /// Optional API key when inspecting an externally started authenticated gateway.
     #[arg(long)]
     pub api_key: Option<String>,
@@ -541,6 +553,14 @@ pub struct LogsArgs {
     #[arg(long)]
     pub acp: bool,
 
+    /// Target remote `liftgate` endpoint override when fetching `--acp` stderr diagnostics.
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Optional API key when fetching `--acp` stderr diagnostics.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
     /// Truncate the managed gateway log file.
     #[arg(long)]
     pub clear: bool,
@@ -550,11 +570,15 @@ pub struct LogsArgs {
     pub path: bool,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct UiArgs {
     /// Target gateway socket address override.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint override (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional API key passed via `#api_key=...` URL fragment (automatically stripped by UI).
     #[arg(long)]
@@ -569,11 +593,15 @@ pub struct UiArgs {
     pub no_start: bool,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct ModelsArgs {
     /// Target gateway socket address override.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+
+    /// Target remote `liftgate` endpoint override (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
 
     /// Optional API key for `/v1/models`.
     #[arg(long)]
@@ -592,7 +620,7 @@ pub struct ModelsArgs {
     pub no_start: bool,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct DoctorArgs {
     /// Optional explicit path to `agy` executable.
     #[arg(long, env = "AGY_BIN")]
@@ -602,9 +630,40 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub listen: Option<SocketAddr>,
 
+    /// Target remote `liftgate` endpoint override (`host:port` or `http://host:port`).
+    #[arg(long, conflicts_with = "listen")]
+    pub remote: Option<String>,
+
     /// Optional API key for querying live gateway status.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct RemoteArgs {
+    /// Remote `liftgate` endpoint (`192.168.1.50:8787`, `http://devbox.lan:8787`, `[fd00::1]:8787`),
+    /// `status` (inspect current target), or `local` / `off` / `clear` (switch back to local daemon).
+    pub target: Option<String>,
+
+    /// Switch back to local managed daemon mode (`target_mode = "local"`).
+    #[arg(long, visible_aliases = ["local", "clear", "unset", "disable"])]
+    pub off: bool,
+
+    /// Optional bearer API key saved alongside the remote endpoint (`--clear-key` to remove).
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Clear any saved `remote_api_key` in `~/.liftgate/settings.json`.
+    #[arg(long, conflicts_with = "api_key")]
+    pub clear_key: bool,
+
+    /// Save the remote endpoint without probing `/healthz` first.
+    #[arg(long)]
+    pub no_verify: bool,
 
     /// Emit structured JSON output.
     #[arg(long)]

@@ -194,6 +194,7 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
         HarnessSubcommand::Claude => &[
             "--state-dir",
             "--listen",
+            "--remote",
             "--api-key",
             "-m",
             "--model",
@@ -204,6 +205,7 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
         HarnessSubcommand::ClaudeDesktop => &[
             "--state-dir",
             "--listen",
+            "--remote",
             "--api-key",
             "-m",
             "--model",
@@ -212,6 +214,7 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
         HarnessSubcommand::Codex | HarnessSubcommand::CodexApp => &[
             "--state-dir",
             "--listen",
+            "--remote",
             "--api-key",
             "-m",
             "--model",
@@ -221,6 +224,7 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
         HarnessSubcommand::Opencode => &[
             "--state-dir",
             "--listen",
+            "--remote",
             "--api-key",
             "-m",
             "--model",
@@ -230,6 +234,7 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
         HarnessSubcommand::Omp => &[
             "--state-dir",
             "--listen",
+            "--remote",
             "--api-key",
             "-m",
             "--model",

@@ -156,7 +156,8 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
                 assert!(text.contains("line 4"), "got: {text}");
             }
             VirtualizedCallDecision::ForwardToClient { .. }
-            | VirtualizedCallDecision::GatewayWebFetch { .. } => {
+            | VirtualizedCallDecision::GatewayWebFetch { .. }
+            | VirtualizedCallDecision::ReadContextSpill { .. } => {
                 panic!("malformed apply_patch must be caught in 0-RTT preflight")
             }
         }
@@ -177,8 +178,9 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             VirtualizedCallDecision::LocalReply { text, .. } => {
                 panic!("expected coalesced ForwardToClient, got LocalReply: {text}")
             }
-            VirtualizedCallDecision::GatewayWebFetch { .. } => {
-                panic!("unexpected GatewayWebFetch")
+            VirtualizedCallDecision::GatewayWebFetch { .. }
+            | VirtualizedCallDecision::ReadContextSpill { .. } => {
+                panic!("unexpected GatewayWebFetch or ReadContextSpill")
             }
         }
     let exec_cmd_wire = cat
@@ -221,7 +223,8 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             assert!(text.contains("declare const tools:"));
         }
         VirtualizedCallDecision::ForwardToClient { .. }
-        | VirtualizedCallDecision::GatewayWebFetch { .. } => {
+        | VirtualizedCallDecision::GatewayWebFetch { .. }
+        | VirtualizedCallDecision::ReadContextSpill { .. } => {
             panic!("search_client_tools must resolve locally in 0-RTT")
         }
     }
@@ -365,7 +368,8 @@ fn claude_code_profile_groups_pascal_families_dedupes_plugins_and_backfills_stan
             assert_eq!(arguments, r#"{"id":"t-1"}"#);
         }
         VirtualizedCallDecision::LocalReply { .. }
-        | VirtualizedCallDecision::GatewayWebFetch { .. } => {
+        | VirtualizedCallDecision::GatewayWebFetch { .. }
+        | VirtualizedCallDecision::ReadContextSpill { .. } => {
             panic!("valid TaskCreate hub call must forward to client")
         }
     }
@@ -387,7 +391,8 @@ fn claude_code_profile_groups_pascal_families_dedupes_plugins_and_backfills_stan
             assert_eq!(arguments, r##"{"selector":"#submit"}"##);
         }
         VirtualizedCallDecision::LocalReply { .. }
-        | VirtualizedCallDecision::GatewayWebFetch { .. } => {
+        | VirtualizedCallDecision::GatewayWebFetch { .. }
+        | VirtualizedCallDecision::ReadContextSpill { .. } => {
             panic!("valid playwright plugin hub call must forward to client")
         }
     }
@@ -460,7 +465,8 @@ fn custom_zst_harness_profile_monomorphizes_and_preserves_profile_across_warm_re
             assert_eq!(client_name, "lsp_op_99");
         }
         VirtualizedCallDecision::LocalReply { .. }
-        | VirtualizedCallDecision::GatewayWebFetch { .. } => {
+        | VirtualizedCallDecision::GatewayWebFetch { .. }
+        | VirtualizedCallDecision::ReadContextSpill { .. } => {
             panic!("dynamically synced tool must route through custom profile's `ns__lsp` hub")
         }
     }
@@ -1396,5 +1402,193 @@ fn opencode_profile_emits_full_and_partial_execute_orchestrator_contracts() {
             mcp_name: "execute",
             full_code_mode: false,
         })
+    );
+}
+
+#[test]
+fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader() {
+    let mut spill = NoopSpillSink;
+    let tools = vec![
+        fn_tool(
+            "eval",
+            "Persistent kernels (`py` / `js`); call `await tool.read(...)`.\n<prelude>helpers</prelude>",
+            json!({
+                "type": "object",
+                "properties": {
+                    "i": { "type": "string" },
+                    "language": { "type": "string", "enum": ["py", "js"] },
+                    "code": { "type": "string" }
+                },
+                "required": ["i", "language", "code"]
+            }),
+        ),
+        fn_tool(
+            "edit",
+            "Hashline edit (`[FILENAME#TAG]`).\nexec tool declaration:\n```ts\ndeclare function edit(args: { i: string; path: string; edits: EditOp[] }): Promise<string>;\n```",
+            json!({
+                "type": "object",
+                "properties": {
+                    "i": { "type": "string" },
+                    "path": { "type": "string" },
+                    "edits": { "type": "array", "items": { "type": "object" } },
+                    "rename": { "type": ["string", "null"] }
+                },
+                "required": ["i", "path", "edits", "rename"]
+            }),
+        ),
+        fn_tool(
+            "todo",
+            "Manage structured task list",
+            json!({
+                "type": "object",
+                "properties": {
+                    "i": { "type": "string" },
+                    "op": { "type": "string", "enum": ["write", "update", "list"] },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string" },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                            },
+                            "required": ["content"]
+                        }
+                    }
+                },
+                "required": ["i", "op"]
+            }),
+        ),
+        fn_tool(
+            "read",
+            "Read file with hashline tags",
+            json!({
+                "type": "object",
+                "properties": {
+                    "i": { "type": "string" },
+                    "path": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["i", "path"]
+            }),
+        ),
+    ];
+
+    let cat = partition_tools_for_mcp_session_with_options(
+        ProtocolHint::OpenAiResponses,
+        &tools,
+        McpSessionOptions {
+            enable_gateway_web_fetch: true,
+            enable_context_spill_reader: true,
+        },
+        &mut spill,
+    );
+    assert_eq!(cat.profile_id, "omp");
+    assert!(cat.has_context_spill_reader);
+    assert!(
+        cat.wire_tools
+            .iter()
+            .any(|w| w.name == READ_CONTEXT_SPILL_MCP_NAME)
+    );
+
+    // 1. `<eval_session_tools>` includes compact TypeScript types & union enums for folded `todo` and `read`
+    let eval_desc = cat
+        .wire_tools
+        .iter()
+        .find(|w| w.name == "eval")
+        .and_then(|w| w.description.as_deref())
+        .unwrap_or_default();
+    assert!(
+        eval_desc.contains("`tool.todo`({ i: string, op: \"write\" | \"update\" | \"list\"")
+            && eval_desc.contains("items?: { content: string, status?: \"pending\" | \"in_progress\" | \"completed\" }[]"),
+        "folded todo signature must render TypeScript types and enums:\n{eval_desc}"
+    );
+    assert!(
+        eval_desc.contains("`tool.read`({ i: string, path: string, limit?: number })"),
+        "folded read signature must render TypeScript types:\n{eval_desc}"
+    );
+
+    // 2. Direct bridged `edit` auto-backfills `"i"` from `"toolSummary"`, strips `"toolSummary"`,
+    //    and permits omitted/null OpenAI-strict nullable `rename: ["string", "null"]`!
+    match cat.routing_table.resolve_call(
+        "edit",
+        &json!({
+            "path": "src/main.rs",
+            "edits": [{ "op": "put", "loc": "1.=1", "content": "fn main() {}" }],
+            "toolSummary": "Update main.rs entry point"
+        }),
+        &tools,
+    ) {
+        VirtualizedCallDecision::ForwardToClient {
+            client_name,
+            arguments,
+            is_custom,
+        } => {
+            assert_eq!(client_name, "edit");
+            assert!(!is_custom);
+            let parsed: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(parsed["i"], "Update main.rs entry point");
+            assert!(parsed.get("toolSummary").is_none());
+            assert_eq!(parsed["path"], "src/main.rs");
+        }
+        other => panic!("expected ForwardToClient with backfilled `i`, got {other:?}"),
+    }
+
+    // 3. Direct bridged `edit` missing non-nullable required `edits` fails in 0-RTT with schema!
+    match cat.routing_table.resolve_call(
+        "edit",
+        &json!({
+            "path": "src/main.rs",
+            "toolSummary": "Incomplete edit call"
+        }),
+        &tools,
+    ) {
+        VirtualizedCallDecision::LocalReply {
+            text,
+            is_error: true,
+            kind: LocalReplyKind::PreflightError,
+        } => {
+            assert!(text.contains("Missing required parameter(s) [edits] for `edit`"));
+        }
+        other => panic!("expected 0-RTT PreflightError for missing `edits`, got {other:?}"),
+    }
+
+    // 4. `search_client_tools` surfaces `codeModeTs:` in OMP `eval` sessions
+    match cat.routing_table.resolve_call(
+        SEARCH_CLIENT_TOOLS_MCP_NAME,
+        &json!({ "names": ["edit"] }),
+        &tools,
+    ) {
+        VirtualizedCallDecision::LocalReply {
+            text,
+            is_error: false,
+            kind: LocalReplyKind::Search,
+        } => {
+            assert!(
+                text.contains("codeModeTs:") && text.contains("declare function edit"),
+                "OMP search_client_tools must include codeModeTs when eval is active:\n{text}"
+            );
+        }
+        other => panic!("expected Search reply, got {other:?}"),
+    }
+
+    // 5. `read_context_spill` resolves to 0-RTT `VirtualizedCallDecision::ReadContextSpill`
+    assert_eq!(
+        cat.routing_table.resolve_call(
+            READ_CONTEXT_SPILL_MCP_NAME,
+            &json!({
+                "path": "/Users/dev/.liftgate/spills/tool_result_exec-abcd1234.txt",
+                "start_line": 120,
+                "max_lines": 80,
+                "query": "planner"
+            }),
+            &tools,
+        ),
+        VirtualizedCallDecision::ReadContextSpill {
+            path: "/Users/dev/.liftgate/spills/tool_result_exec-abcd1234.txt".to_owned(),
+            start_line: 120,
+            max_lines: 80,
+            query: Some("planner".to_owned()),
+        }
     );
 }

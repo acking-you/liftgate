@@ -15,9 +15,10 @@ pub mod schema;
 
 pub use budget::VirtualizerBudget;
 pub use planner::{
-    McpSessionCatalog, partition_tools_for_harness, partition_tools_for_mcp,
-    partition_tools_for_mcp_session, partition_tools_for_mcp_with_hint, plan_virtualization,
-    plan_virtualization_with_options,
+    McpSessionCatalog, McpSessionOptions, partition_tools_for_harness, partition_tools_for_mcp,
+    partition_tools_for_mcp_session, partition_tools_for_mcp_session_with_options,
+    partition_tools_for_mcp_with_hint, plan_virtualization, plan_virtualization_with_options,
+    plan_virtualization_with_session_options,
 };
 pub use profile::{
     DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
@@ -33,8 +34,8 @@ pub use schema::{
     McpBridgedTool, McpWireTool, apply_patch_input_schema, code_mode_exec_input_schema,
     coerce_stringified_container_fields, estimate_wire_tool_bytes, extract_custom_tool_input,
     freeform_custom_input_schema, gateway_web_fetch_input_schema, normalize_apply_patch_text,
-    normalize_mcp_object_schema, sanitize_mcp_tool_name, strip_call_prefix,
-    validate_apply_patch_preflight,
+    normalize_mcp_object_schema, read_context_spill_input_schema, sanitize_mcp_tool_name,
+    strip_call_prefix, validate_apply_patch_preflight,
 };
 
 /// Default hard ceiling on MCP tools exposed per session on `lg`.
@@ -48,6 +49,9 @@ pub const CALL_CLIENT_TOOL_MCP_NAME: &str = "call_client_tool";
 
 /// Server-managed URL fetch MCP tool mounted on `lg` (`mcp_lg_gateway_web_fetch`).
 pub const GATEWAY_WEB_FETCH_MCP_NAME: &str = "gateway_web_fetch";
+
+/// Gateway-local 0-RTT context spill reader MCP tool mounted on `lg` (`mcp_lg_read_context_spill`).
+pub const READ_CONTEXT_SPILL_MCP_NAME: &str = "read_context_spill";
 
 /// Prefix for namespace action hub MCP tools (`mcp_lg_ns__<namespace>`).
 pub const NAMESPACE_HUB_MCP_PREFIX: &str = "ns__";

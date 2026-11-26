@@ -586,7 +586,7 @@ pub(super) fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
         let omitted_lines = last_omitted.saturating_sub(first_omitted) + 1;
         if let Some(path) = &spilled_path {
             format!(
-                "\n... [Gateway truncated {kind_label}: {total_bytes} bytes ({total_lines} lines) total; omitted middle {omitted_bytes} bytes ({omitted_lines} lines, lines {first_omitted}..={last_omitted}) to fit single-turn limit. Full lossless content saved locally at `{path}` — beginning and end are preserved intact; inspect `{path}` (e.g. lines {first_omitted}..={last_omitted}) if the omitted middle section is needed.] ...\n"
+                "\n... [Gateway truncated {kind_label}: {total_bytes} bytes ({total_lines} lines) total; omitted middle {omitted_bytes} bytes ({omitted_lines} lines, lines {first_omitted}..={last_omitted}) to fit single-turn limit. Full lossless content saved locally at `{path}` — beginning and end are preserved intact; inspect `{path}` (e.g. lines {first_omitted}..={last_omitted}, or in 0-RTT via `mcp_lg_read_context_spill`) if the omitted middle section is needed.] ...\n"
             )
         } else {
             format!(
@@ -595,7 +595,7 @@ pub(super) fn truncate_head_tail_lines_from_source<S: TruncationSpillSink>(
         }
     } else if let Some(path) = &spilled_path {
         format!(
-            "\n... [Gateway truncated {kind_label}: {total_bytes} bytes total; omitted middle {omitted_bytes} bytes to fit single-turn limit. Full lossless content saved locally at `{path}` — beginning and end are preserved intact; inspect `{path}` if the omitted middle section is needed.] ...\n"
+            "\n... [Gateway truncated {kind_label}: {total_bytes} bytes total; omitted middle {omitted_bytes} bytes to fit single-turn limit. Full lossless content saved locally at `{path}` — beginning and end are preserved intact; inspect `{path}` (or query via `mcp_lg_read_context_spill`) if the omitted middle section is needed.] ...\n"
         )
     } else {
         format!(

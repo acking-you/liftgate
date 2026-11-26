@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use clap::CommandFactory as _;
 use liftgate_server::platform::{canonicalize_clean, split_expanded_path_var};
-use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl};
+use liftgate_types::config::{
+    AcpModeId, GatewayEndpoint, GatewayLimits, GatewayTargetMode, ModelId, ProxyUrl,
+    is_endpoint_local_keyword,
+};
 use liftgate_types::telemetry::GatewayTelemetrySnapshot;
 use serde::Serialize;
 use uuid::Uuid;
@@ -17,7 +20,7 @@ use crate::agy_manager::{
     AgyAuthStatus, probe_agy_auth, probe_agy_version, quick_local_agy_summary,
 };
 use crate::cli::{
-    AliasArgs, Cli, DoctorArgs, ModelsArgs, RestartArgs, ServeArgs, StatusArgs, UiArgs,
+    AliasArgs, Cli, DoctorArgs, ModelsArgs, RemoteArgs, RestartArgs, ServeArgs, StatusArgs, UiArgs,
     normalize_optional_api_key,
 };
 use crate::client::{DiscoveredModel, GatewayClient, percent_encode_query_component};
@@ -28,11 +31,11 @@ use crate::harness::{
 };
 use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
-    DaemonState, StatePaths, now_unix_ms, resolve_effective_agy_auto_update,
-    resolve_effective_agy_bin, resolve_effective_agy_proxy,
+    DaemonState, EffectiveTargetMode, StatePaths, format_connect_url, now_unix_ms,
+    resolve_effective_agy_auto_update, resolve_effective_agy_bin, resolve_effective_agy_proxy,
     resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
     resolve_effective_max_low_cache_records, resolve_effective_mcp_tool_bridge,
-    resolve_effective_vision_offload, write_file_atomic,
+    resolve_effective_target_mode, resolve_effective_vision_offload, write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -43,6 +46,7 @@ pub struct ActiveGatewayTarget {
     pub dashboard_url: String,
     pub default_model: String,
     pub api_key: Option<String>,
+    pub is_remote: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -538,113 +542,186 @@ pub async fn ensure_gateway_ready(
     preferred_model: Option<&str>,
     auto_start: bool,
 ) -> Result<ActiveGatewayTarget, CliError> {
-    let daemon = state_paths.read_daemon()?;
-    if let Some(addr) = explicit_listen {
-        let key = resolve_client_api_key(explicit_api_key.as_deref(), daemon.as_ref(), addr);
-        let client = GatewayClient::new(addr, key.clone());
-        if client.check_health(Duration::from_millis(800)).await {
-            let matching_daemon = daemon
-                .as_ref()
-                .filter(|d| d.listen == addr && is_pid_alive(d.pid));
-            let dash_url = matching_daemon.map_or_else(
-                || format!("{}/", client.base_url()),
-                |d| format!("{}/", d.dashboard_base_url()),
-            );
-            let model_fallback = matching_daemon
-                .map(|d| d.default_model.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("gemini-4-carbon-high");
-            return Ok(ActiveGatewayTarget {
-                dashboard_url: dash_url,
-                default_model: preferred_model.unwrap_or(model_fallback).to_owned(),
-                api_key: key,
-                client,
-            });
-        }
-        let conflicting_managed_daemon = daemon
-            .as_ref()
-            .is_some_and(|d| d.listen != addr && is_pid_alive(d.pid));
-        if !auto_start || conflicting_managed_daemon {
-            return Err(CliError::GatewayUnreachable {
-                url: format!("{}/healthz", client.base_url()),
-                source: GatewayTransportError::NotRunning,
-            });
-        }
-        let mut serve = ServeArgs {
-            listen: addr,
-            api_key: key,
-            ..ServeArgs::default()
-        };
-        if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
-            serve.default_model = m.to_owned();
-        }
-        let daemon = start_daemon(state_paths, serve, false).await?.daemon;
-        let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
-        return Ok(ActiveGatewayTarget {
-            dashboard_url: format!("{}/", daemon.dashboard_base_url()),
-            default_model: daemon.default_model,
-            api_key: daemon.api_key,
-            client,
-        });
-    }
+    ensure_gateway_ready_for_target(
+        state_paths,
+        explicit_listen,
+        None,
+        explicit_api_key,
+        preferred_model,
+        auto_start,
+    )
+    .await
+}
 
-    if let Some(daemon) = daemon {
-        let key = resolve_client_api_key(explicit_api_key.as_deref(), Some(&daemon), daemon.listen);
-        let client = GatewayClient::new(daemon.listen, key.clone());
-        if is_pid_alive(daemon.pid) && client.check_health(Duration::from_millis(800)).await {
-            return Ok(ActiveGatewayTarget {
-                dashboard_url: format!("{}/", daemon.dashboard_base_url()),
-                default_model: if daemon.default_model.is_empty() {
-                    "gemini-4-carbon-high".to_owned()
+pub async fn ensure_gateway_ready_for_target(
+    state_paths: &StatePaths,
+    explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
+    explicit_api_key: Option<String>,
+    preferred_model: Option<&str>,
+    auto_start: bool,
+) -> Result<ActiveGatewayTarget, CliError> {
+    let settings = state_paths.read_settings()?;
+    match resolve_effective_target_mode(
+        explicit_listen,
+        explicit_remote,
+        explicit_api_key.as_deref(),
+        &settings,
+    )? {
+        EffectiveTargetMode::Remote { endpoint, api_key } => {
+            let client = GatewayClient::from_endpoint(endpoint, api_key.clone());
+            if !client.check_health(Duration::from_secs(3)).await {
+                return Err(CliError::GatewayUnreachable {
+                    url: format!("{}/healthz", client.base_url()),
+                    source: GatewayTransportError::NotRunning,
+                });
+            }
+            let default_model =
+                if let Some(pref) = preferred_model.map(str::trim).filter(|s| !s.is_empty()) {
+                    pref.to_owned()
+                } else if let Ok(snap) = client.fetch_telemetry().await
+                    && !snap.acp_process.default_model.trim().is_empty()
+                {
+                    snap.acp_process.default_model
+                } else if let Ok(models) = client.fetch_models().await
+                    && let Some(first) = models.first()
+                {
+                    first.id.clone()
                 } else {
-                    daemon.default_model
-                },
-                api_key: key,
+                    "gemini-4-carbon-high".to_owned()
+                };
+            let dashboard_url = format!("{}/", client.base_url());
+            Ok(ActiveGatewayTarget {
                 client,
-            });
+                dashboard_url,
+                default_model,
+                api_key,
+                is_remote: true,
+            })
+        }
+        EffectiveTargetMode::Local {
+            explicit_listen: resolved_explicit_listen,
+        } => {
+            let daemon = state_paths.read_daemon()?;
+            if let Some(addr) = resolved_explicit_listen {
+                let key =
+                    resolve_client_api_key(explicit_api_key.as_deref(), daemon.as_ref(), addr);
+                let client = GatewayClient::new(addr, key.clone());
+                if client.check_health(Duration::from_millis(800)).await {
+                    let matching_daemon = daemon
+                        .as_ref()
+                        .filter(|d| d.listen == addr && is_pid_alive(d.pid));
+                    let dash_url = matching_daemon.map_or_else(
+                        || format!("{}/", client.base_url()),
+                        |d| format!("{}/", d.dashboard_base_url()),
+                    );
+                    let model_fallback = matching_daemon
+                        .map(|d| d.default_model.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("gemini-4-carbon-high");
+                    return Ok(ActiveGatewayTarget {
+                        dashboard_url: dash_url,
+                        default_model: preferred_model.unwrap_or(model_fallback).to_owned(),
+                        api_key: key,
+                        client,
+                        is_remote: false,
+                    });
+                }
+                let conflicting_managed_daemon = daemon
+                    .as_ref()
+                    .is_some_and(|d| d.listen != addr && is_pid_alive(d.pid));
+                if !auto_start || conflicting_managed_daemon {
+                    return Err(CliError::GatewayUnreachable {
+                        url: format!("{}/healthz", client.base_url()),
+                        source: GatewayTransportError::NotRunning,
+                    });
+                }
+                let mut serve = ServeArgs {
+                    listen: addr,
+                    api_key: key,
+                    ..ServeArgs::default()
+                };
+                if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
+                    serve.default_model = m.to_owned();
+                }
+                let daemon = start_daemon(state_paths, serve, false).await?.daemon;
+                let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
+                return Ok(ActiveGatewayTarget {
+                    dashboard_url: format!("{}/", daemon.dashboard_base_url()),
+                    default_model: daemon.default_model,
+                    api_key: daemon.api_key,
+                    client,
+                    is_remote: false,
+                });
+            }
+
+            if let Some(daemon) = daemon {
+                let key = resolve_client_api_key(
+                    explicit_api_key.as_deref(),
+                    Some(&daemon),
+                    daemon.listen,
+                );
+                let client = GatewayClient::new(daemon.listen, key.clone());
+                if is_pid_alive(daemon.pid) && client.check_health(Duration::from_millis(800)).await
+                {
+                    return Ok(ActiveGatewayTarget {
+                        dashboard_url: format!("{}/", daemon.dashboard_base_url()),
+                        default_model: if daemon.default_model.is_empty() {
+                            "gemini-4-carbon-high".to_owned()
+                        } else {
+                            daemon.default_model
+                        },
+                        api_key: key,
+                        client,
+                        is_remote: false,
+                    });
+                }
+            }
+
+            let default_serve = ServeArgs::default();
+            let fallback_key = normalize_optional_api_key(explicit_api_key.as_deref())
+                .or_else(|| default_serve.api_key.clone());
+            let fallback_client = GatewayClient::new(default_serve.listen, fallback_key.clone());
+            if fallback_client
+                .check_health(Duration::from_millis(500))
+                .await
+            {
+                return Ok(ActiveGatewayTarget {
+                    dashboard_url: format!("{}/", fallback_client.base_url()),
+                    default_model: preferred_model
+                        .unwrap_or(&default_serve.default_model)
+                        .to_owned(),
+                    api_key: fallback_key,
+                    client: fallback_client,
+                    is_remote: false,
+                });
+            }
+
+            if !auto_start {
+                return Err(CliError::GatewayUnreachable {
+                    url: format!("{}/healthz", fallback_client.base_url()),
+                    source: GatewayTransportError::NotRunning,
+                });
+            }
+
+            let mut serve = default_serve;
+            if let Some(key) = explicit_api_key {
+                serve.api_key = Some(key);
+            }
+            if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
+                serve.default_model = m.to_owned();
+            }
+            let daemon = start_daemon(state_paths, serve, false).await?.daemon;
+            let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
+            Ok(ActiveGatewayTarget {
+                dashboard_url: format!("{}/", daemon.dashboard_base_url()),
+                default_model: daemon.default_model,
+                api_key: daemon.api_key,
+                client,
+                is_remote: false,
+            })
         }
     }
-
-    let default_serve = ServeArgs::default();
-    let fallback_key = normalize_optional_api_key(explicit_api_key.as_deref())
-        .or_else(|| default_serve.api_key.clone());
-    let fallback_client = GatewayClient::new(default_serve.listen, fallback_key.clone());
-    if fallback_client
-        .check_health(Duration::from_millis(500))
-        .await
-    {
-        return Ok(ActiveGatewayTarget {
-            dashboard_url: format!("{}/", fallback_client.base_url()),
-            default_model: preferred_model
-                .unwrap_or(&default_serve.default_model)
-                .to_owned(),
-            api_key: fallback_key,
-            client: fallback_client,
-        });
-    }
-
-    if !auto_start {
-        return Err(CliError::GatewayUnreachable {
-            url: format!("{}/healthz", fallback_client.base_url()),
-            source: GatewayTransportError::NotRunning,
-        });
-    }
-
-    let mut serve = default_serve;
-    if let Some(key) = explicit_api_key {
-        serve.api_key = Some(key);
-    }
-    if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
-        serve.default_model = m.to_owned();
-    }
-    let daemon = start_daemon(state_paths, serve, false).await?.daemon;
-    let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
-    Ok(ActiveGatewayTarget {
-        dashboard_url: format!("{}/", daemon.dashboard_base_url()),
-        default_model: daemon.default_model,
-        api_key: daemon.api_key,
-        client,
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -652,6 +729,7 @@ pub async fn ensure_gateway_ready(
 pub enum GatewayStatusMode {
     Managed,
     External,
+    Remote,
     Offline,
 }
 
@@ -661,6 +739,7 @@ impl GatewayStatusMode {
         match self {
             Self::Managed => "running (managed)",
             Self::External => "running (external)",
+            Self::Remote => "running (remote)",
             Self::Offline => "stopped",
         }
     }
@@ -670,6 +749,7 @@ impl GatewayStatusMode {
         match self {
             Self::Managed => "ONLINE · MANAGED",
             Self::External => "ONLINE · EXTERNAL",
+            Self::Remote => "ONLINE · REMOTE",
             Self::Offline => "OFFLINE",
         }
     }
@@ -679,9 +759,10 @@ impl GatewayStatusMode {
 pub struct GatewayStatusReport {
     pub mode: GatewayStatusMode,
     pub healthy: bool,
+    pub is_remote: bool,
     pub managed_daemon: Option<DaemonState>,
     pub pid: Option<u32>,
-    pub listen: SocketAddr,
+    pub listen: Option<SocketAddr>,
     pub gateway_url: String,
     pub dashboard_url: String,
     pub authenticated_dashboard_url: String,
@@ -702,102 +783,176 @@ pub async fn inspect_gateway_status(
     state_paths: &StatePaths,
     args: &StatusArgs,
 ) -> Result<GatewayStatusReport, CliError> {
-    let daemon = state_paths.read_daemon()?;
-    let listen = args
-        .listen
-        .or_else(|| daemon.as_ref().map(|d| d.listen))
-        .unwrap_or_else(|| ServeArgs::default().listen);
-    let api_key = resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), listen);
-
-    let client = GatewayClient::new(listen, api_key.clone());
-    let healthy = client.check_health(Duration::from_millis(800)).await;
-    let managed_alive = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
-    let telemetry = if healthy {
-        client.fetch_telemetry().await.ok()
-    } else {
-        None
-    };
-    let models = if healthy {
-        client.fetch_models().await.ok()
-    } else {
-        None
-    };
-
-    let mode = if healthy && managed_alive {
-        GatewayStatusMode::Managed
-    } else if healthy {
-        GatewayStatusMode::External
-    } else {
-        GatewayStatusMode::Offline
-    };
-
-    let dashboard_url = daemon.as_ref().map_or_else(
-        || format!("{}/", client.base_url()),
-        |d| format!("{}/", d.dashboard_base_url()),
-    );
-    let authenticated_dashboard_url = build_authenticated_dashboard_url(
-        dashboard_url.trim_end_matches('/'),
-        client.base_url(),
-        api_key.as_deref(),
-    );
-    let local_agy = quick_local_agy_summary(state_paths, None).await;
-    let effective_version = telemetry
-        .as_ref()
-        .and_then(|t| t.acp_process.agent_version.clone())
-        .or_else(|| local_agy.version.clone());
-    let effective_proxy_display = telemetry
-        .as_ref()
-        .and_then(|t| t.acp_process.agy_proxy.clone())
-        .or_else(|| {
-            local_agy
-                .proxy
+    let settings = state_paths.read_settings()?;
+    match resolve_effective_target_mode(
+        args.listen,
+        args.remote.as_deref(),
+        args.api_key.as_deref(),
+        &settings,
+    )? {
+        EffectiveTargetMode::Remote { endpoint, api_key } => {
+            let listen = endpoint.socket_addr();
+            let client = GatewayClient::from_endpoint(endpoint, api_key.clone());
+            let healthy = client.check_health(Duration::from_secs(2)).await;
+            let telemetry = if healthy {
+                client.fetch_telemetry().await.ok()
+            } else {
+                None
+            };
+            let models = if healthy {
+                client.fetch_models().await.ok()
+            } else {
+                None
+            };
+            let mode = if healthy {
+                GatewayStatusMode::Remote
+            } else {
+                GatewayStatusMode::Offline
+            };
+            let dashboard_url = format!("{}/", client.base_url());
+            let authenticated_dashboard_url = build_authenticated_dashboard_url(
+                dashboard_url.trim_end_matches('/'),
+                client.base_url(),
+                api_key.as_deref(),
+            );
+            let pid = telemetry.as_ref().and_then(|t| t.acp_process.pid);
+            let agy_version = telemetry
                 .as_ref()
-                .map(|p| p.redacted_display().into_owned())
-        });
-    let effective_auto_update = telemetry
-        .as_ref()
-        .map_or(local_agy.auto_update_enabled, |t| {
-            t.acp_process.auto_update_enabled
-        });
-    let settings = state_paths.read_settings().unwrap_or_default();
-    let effective_vision_offload = telemetry.as_ref().map_or(
-        daemon
-            .as_ref()
-            .filter(|_| managed_alive)
-            .map_or(settings.vision_offload, |d| d.vision_offload),
-        |t| t.vision_offload_enabled,
-    );
-    let effective_mcp_tool_bridge = telemetry.as_ref().map_or(
-        daemon
-            .as_ref()
-            .filter(|_| managed_alive)
-            .map_or(settings.mcp_tool_bridge, |d| d.mcp_tool_bridge),
-        |t| t.mcp_tool_bridge_enabled,
-    );
+                .and_then(|t| t.acp_process.agent_version.clone());
+            let agy_proxy_display = telemetry
+                .as_ref()
+                .and_then(|t| t.acp_process.agy_proxy.clone());
+            let agy_auto_update_enabled = telemetry
+                .as_ref()
+                .is_some_and(|t| t.acp_process.auto_update_enabled);
+            let vision_offload_enabled =
+                telemetry.as_ref().is_some_and(|t| t.vision_offload_enabled);
+            let mcp_tool_bridge_enabled =
+                telemetry.as_ref().is_none_or(|t| t.mcp_tool_bridge_enabled);
 
-    let active_daemon = daemon.filter(|_| managed_alive);
-    let pid = active_daemon.as_ref().map(|d| d.pid);
-    Ok(GatewayStatusReport {
-        mode,
-        healthy,
-        managed_daemon: active_daemon,
-        pid,
-        listen,
-        gateway_url: client.base_url().to_owned(),
-        dashboard_url,
-        authenticated_dashboard_url,
-        auth_enabled: api_key.is_some(),
-        state_dir: state_paths.root().to_path_buf(),
-        log_file: state_paths.log_file(),
-        models,
-        agy_binary_path: local_agy.binary_path,
-        agy_version: effective_version,
-        agy_proxy_display: effective_proxy_display,
-        agy_auto_update_enabled: effective_auto_update,
-        vision_offload_enabled: effective_vision_offload,
-        mcp_tool_bridge_enabled: effective_mcp_tool_bridge,
-        telemetry,
-    })
+            Ok(GatewayStatusReport {
+                mode,
+                healthy,
+                is_remote: true,
+                managed_daemon: None,
+                pid,
+                listen,
+                gateway_url: client.base_url().to_owned(),
+                dashboard_url,
+                authenticated_dashboard_url,
+                auth_enabled: api_key.is_some(),
+                state_dir: state_paths.root().to_path_buf(),
+                log_file: state_paths.log_file(),
+                models,
+                agy_binary_path: None,
+                agy_version,
+                agy_proxy_display,
+                agy_auto_update_enabled,
+                vision_offload_enabled,
+                mcp_tool_bridge_enabled,
+                telemetry,
+            })
+        }
+        EffectiveTargetMode::Local { explicit_listen } => {
+            let daemon = state_paths.read_daemon()?;
+            let listen = explicit_listen
+                .or_else(|| daemon.as_ref().map(|d| d.listen))
+                .unwrap_or_else(|| ServeArgs::default().listen);
+            let api_key = resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), listen);
+
+            let client = GatewayClient::new(listen, api_key.clone());
+            let healthy = client.check_health(Duration::from_millis(800)).await;
+            let managed_alive = daemon
+                .as_ref()
+                .is_some_and(|d| d.listen == listen && is_pid_alive(d.pid));
+            let telemetry = if healthy {
+                client.fetch_telemetry().await.ok()
+            } else {
+                None
+            };
+            let models = if healthy {
+                client.fetch_models().await.ok()
+            } else {
+                None
+            };
+
+            let mode = if healthy && managed_alive {
+                GatewayStatusMode::Managed
+            } else if healthy {
+                GatewayStatusMode::External
+            } else {
+                GatewayStatusMode::Offline
+            };
+
+            let dashboard_url = daemon.as_ref().filter(|d| d.listen == listen).map_or_else(
+                || format!("{}/", client.base_url()),
+                |d| format!("{}/", d.dashboard_base_url()),
+            );
+            let authenticated_dashboard_url = build_authenticated_dashboard_url(
+                dashboard_url.trim_end_matches('/'),
+                client.base_url(),
+                api_key.as_deref(),
+            );
+            let local_agy = quick_local_agy_summary(state_paths, None).await;
+            let effective_version = telemetry
+                .as_ref()
+                .and_then(|t| t.acp_process.agent_version.clone())
+                .or_else(|| local_agy.version.clone());
+            let effective_proxy_display = telemetry
+                .as_ref()
+                .and_then(|t| t.acp_process.agy_proxy.clone())
+                .or_else(|| {
+                    local_agy
+                        .proxy
+                        .as_ref()
+                        .map(|p| p.redacted_display().into_owned())
+                });
+            let effective_auto_update = telemetry
+                .as_ref()
+                .map_or(local_agy.auto_update_enabled, |t| {
+                    t.acp_process.auto_update_enabled
+                });
+            let effective_vision_offload = telemetry.as_ref().map_or(
+                daemon
+                    .as_ref()
+                    .filter(|_| managed_alive)
+                    .map_or(settings.vision_offload, |d| d.vision_offload),
+                |t| t.vision_offload_enabled,
+            );
+            let effective_mcp_tool_bridge = telemetry.as_ref().map_or(
+                daemon
+                    .as_ref()
+                    .filter(|_| managed_alive)
+                    .map_or(settings.mcp_tool_bridge, |d| d.mcp_tool_bridge),
+                |t| t.mcp_tool_bridge_enabled,
+            );
+
+            let active_daemon = daemon.filter(|_| managed_alive);
+            let pid = active_daemon.as_ref().map(|d| d.pid);
+            Ok(GatewayStatusReport {
+                mode,
+                healthy,
+                is_remote: false,
+                managed_daemon: active_daemon,
+                pid,
+                listen: Some(listen),
+                gateway_url: client.base_url().to_owned(),
+                dashboard_url,
+                authenticated_dashboard_url,
+                auth_enabled: api_key.is_some(),
+                state_dir: state_paths.root().to_path_buf(),
+                log_file: state_paths.log_file(),
+                models,
+                agy_binary_path: local_agy.binary_path,
+                agy_version: effective_version,
+                agy_proxy_display: effective_proxy_display,
+                agy_auto_update_enabled: effective_auto_update,
+                vision_offload_enabled: effective_vision_offload,
+                mcp_tool_bridge_enabled: effective_mcp_tool_bridge,
+                telemetry,
+            })
+        }
+    }
 }
 
 pub fn clear_gateway_log(state_paths: &StatePaths) -> Result<PathBuf, CliError> {
@@ -823,6 +978,179 @@ pub fn read_log_tail(path: &Path, max_lines: usize) -> Result<String, CliError> 
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct RemoteProbeSummary {
+    pub healthy: bool,
+    pub latency_ms: u64,
+    pub default_model: Option<String>,
+    pub live_model_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteOutcome {
+    pub updated: bool,
+    pub target_mode: GatewayTargetMode,
+    pub configured_endpoint: Option<String>,
+    pub has_saved_api_key: bool,
+    pub env_override: Option<String>,
+    pub effective_endpoint: String,
+    pub effective_is_remote: bool,
+    pub settings_file: PathBuf,
+    pub probe: Option<RemoteProbeSummary>,
+}
+
+async fn probe_remote_endpoint(
+    endpoint: &GatewayEndpoint,
+    api_key: Option<String>,
+    strict: bool,
+) -> Result<RemoteProbeSummary, CliError> {
+    let client = GatewayClient::from_endpoint(endpoint.clone(), api_key);
+    let started = std::time::Instant::now();
+    let healthy = client.check_health(Duration::from_secs(3)).await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if !healthy {
+        if strict {
+            return Err(CliError::GatewayUnreachable {
+                url: format!("{}/healthz", client.base_url()),
+                source: GatewayTransportError::NotRunning,
+            });
+        }
+        return Ok(RemoteProbeSummary {
+            healthy: false,
+            latency_ms,
+            default_model: None,
+            live_model_count: None,
+        });
+    }
+
+    let models = match client.fetch_models().await {
+        Ok(list) => Some(list),
+        Err(err) if strict => return Err(err),
+        Err(_) => None,
+    };
+    let default_model = client
+        .fetch_telemetry()
+        .await
+        .ok()
+        .map(|s| s.acp_process.default_model)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            models
+                .as_ref()
+                .and_then(|m| m.first())
+                .map(|m| m.id.clone())
+        });
+
+    Ok(RemoteProbeSummary {
+        healthy: true,
+        latency_ms,
+        default_model,
+        live_model_count: models.as_ref().map(Vec::len),
+    })
+}
+
+/// Inspects, configures (`lg remote <host:port>`), or clears (`lg remote local`) persistent remote
+/// gateway routing in `~/.liftgate/settings.json`.
+pub async fn execute_remote(
+    state_paths: &StatePaths,
+    args: &RemoteArgs,
+) -> Result<RemoteOutcome, CliError> {
+    let mut settings = state_paths.read_settings()?;
+    let raw_target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let is_status_only = matches!(raw_target, Some(t) if t.eq_ignore_ascii_case("status") || t.eq_ignore_ascii_case("st") || t.eq_ignore_ascii_case("show"));
+    let wants_local = args.off || raw_target.is_some_and(is_endpoint_local_keyword);
+
+    let mut updated = false;
+    let mut probe: Option<RemoteProbeSummary> = None;
+
+    if wants_local {
+        settings.target_mode = GatewayTargetMode::Local;
+        settings.remote_endpoint = None;
+        if args.clear_key {
+            settings.remote_api_key = None;
+        }
+        state_paths.write_settings(&settings)?;
+        updated = true;
+    } else if !is_status_only && let Some(raw_ep) = raw_target {
+        let endpoint = GatewayEndpoint::try_new(raw_ep)?;
+        let next_key = if args.clear_key {
+            None
+        } else if args.api_key.is_some() {
+            normalize_optional_api_key(args.api_key.as_deref())
+        } else if settings.remote_endpoint.as_ref() == Some(&endpoint) {
+            normalize_optional_api_key(settings.remote_api_key.as_deref())
+        } else {
+            None
+        };
+        if !args.no_verify {
+            probe = Some(probe_remote_endpoint(&endpoint, next_key.clone(), true).await?);
+        }
+        settings.target_mode = GatewayTargetMode::Remote;
+        settings.remote_endpoint = Some(endpoint);
+        settings.remote_api_key = next_key;
+        state_paths.write_settings(&settings)?;
+        updated = true;
+    } else if !is_status_only && (args.api_key.is_some() || args.clear_key) {
+        let next_key = if args.clear_key {
+            None
+        } else {
+            normalize_optional_api_key(args.api_key.as_deref())
+        };
+        if let Some(ref endpoint) = settings.remote_endpoint
+            && !args.no_verify
+        {
+            probe = Some(probe_remote_endpoint(endpoint, next_key.clone(), true).await?);
+        }
+        settings.remote_api_key = next_key;
+        state_paths.write_settings(&settings)?;
+        updated = true;
+    }
+
+    let env_override = std::env::var("AGY_REMOTE")
+        .ok()
+        .or_else(|| std::env::var("LIFTGATE_REMOTE").ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+
+    let effective = resolve_effective_target_mode(None, None, None, &settings)?;
+    let (effective_endpoint, effective_is_remote) = match &effective {
+        EffectiveTargetMode::Remote { endpoint, api_key } => {
+            if probe.is_none() && !args.no_verify {
+                probe = probe_remote_endpoint(endpoint, api_key.clone(), false)
+                    .await
+                    .ok();
+            }
+            (endpoint.base_url().to_owned(), true)
+        }
+        EffectiveTargetMode::Local { .. } => {
+            let daemon = state_paths.read_daemon().ok().flatten();
+            let listen = daemon
+                .as_ref()
+                .map_or_else(|| ServeArgs::default().listen, |d| d.listen);
+            (format_connect_url(listen), false)
+        }
+    };
+
+    Ok(RemoteOutcome {
+        updated,
+        target_mode: settings.target_mode,
+        configured_endpoint: settings
+            .remote_endpoint
+            .as_ref()
+            .map(|e| e.base_url().to_owned()),
+        has_saved_api_key: normalize_optional_api_key(settings.remote_api_key.as_deref()).is_some(),
+        env_override,
+        effective_endpoint,
+        effective_is_remote,
+        settings_file: state_paths.settings_file(),
+        probe,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ResolvedUiTarget {
     pub authenticated_url: String,
     pub display_url: String,
@@ -832,9 +1160,10 @@ pub async fn resolve_ui_target(
     state_paths: &StatePaths,
     args: &UiArgs,
 ) -> Result<ResolvedUiTarget, CliError> {
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         None,
         !args.no_start,
@@ -855,6 +1184,7 @@ pub async fn resolve_ui_target(
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelsReport {
     pub gateway_url: String,
+    pub is_remote: bool,
     pub default_model: String,
     pub fast_model: String,
     pub title_model: String,
@@ -877,9 +1207,10 @@ pub async fn inspect_models(
     state_paths: &StatePaths,
     args: &ModelsArgs,
 ) -> Result<ModelsReport, CliError> {
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         None,
         !args.no_start,
@@ -894,6 +1225,7 @@ pub async fn inspect_models(
             .to_owned();
     Ok(ModelsReport {
         gateway_url: target.client.base_url().to_owned(),
+        is_remote: target.is_remote,
         default_model: target.default_model,
         fast_model,
         title_model,
@@ -924,10 +1256,17 @@ pub async fn inspect_doctor(
     bin_hint: &str,
 ) -> Result<DoctorReport, CliError> {
     let settings = state_paths.read_settings()?;
+    let effective_target = resolve_effective_target_mode(
+        args.listen,
+        args.remote.as_deref(),
+        args.api_key.as_deref(),
+        &settings,
+    )?;
+    let is_remote_target = matches!(effective_target, EffectiveTargetMode::Remote { .. });
     let env_proxy = std::env::var("AGY_PROXY").ok();
     let effective_proxy = resolve_effective_agy_proxy(env_proxy.as_deref(), &settings)?;
     let auto_update_enabled = settings.agy_auto_update;
-    let mut checks: Vec<DoctorCheckItem> = Vec::with_capacity(12);
+    let mut checks: Vec<DoctorCheckItem> = Vec::with_capacity(13);
     let mut has_error = false;
     let mut has_warn = false;
     let mut agy_missing = false;
@@ -939,6 +1278,24 @@ pub async fn inspect_doctor(
         tone: ReportTone::Ok,
         detail: state_paths.root().display().to_string(),
     });
+
+    match &effective_target {
+        EffectiveTargetMode::Remote { endpoint, .. } => checks.push(DoctorCheckItem {
+            name: "Target Mode",
+            status: "remote",
+            tone: ReportTone::Info,
+            detail: format!(
+                "{}/ (`{bin_hint} remote local` to switch back to local daemon)",
+                endpoint.base_url()
+            ),
+        }),
+        EffectiveTargetMode::Local { .. } => checks.push(DoctorCheckItem {
+            name: "Target Mode",
+            status: "local",
+            tone: ReportTone::Ok,
+            detail: format!("local managed daemon (`{bin_hint} remote <host:port>` for remote)"),
+        }),
+    }
 
     let resolved_agy = resolve_effective_agy_bin(args.agy_bin.clone(), &settings);
     match &resolved_agy {
@@ -953,6 +1310,14 @@ pub async fn inspect_doctor(
                 status: "found",
                 tone: ReportTone::Ok,
                 detail,
+            });
+        }
+        None if is_remote_target => {
+            checks.push(DoctorCheckItem {
+                name: "Antigravity CLI",
+                status: "remote host",
+                tone: ReportTone::Muted,
+                detail: "not required locally while targeting a remote Liftgate server".to_owned(),
             });
         }
         None => {
@@ -1109,18 +1474,32 @@ pub async fn inspect_doctor(
         }),
     }
 
-    let daemon = state_paths.read_daemon()?;
-    let listen = args
-        .listen
-        .or_else(|| daemon.as_ref().map(|d| d.listen))
-        .unwrap_or_else(|| ServeArgs::default().listen);
-    let api_key = resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), listen);
-    let client = GatewayClient::new(listen, api_key);
+    let (client, probe_timeout) = match effective_target {
+        EffectiveTargetMode::Remote { endpoint, api_key } => (
+            GatewayClient::from_endpoint(endpoint, api_key),
+            Duration::from_secs(3),
+        ),
+        EffectiveTargetMode::Local { explicit_listen } => {
+            let daemon = state_paths.read_daemon()?;
+            let listen = explicit_listen
+                .or_else(|| daemon.as_ref().map(|d| d.listen))
+                .unwrap_or_else(|| ServeArgs::default().listen);
+            let api_key = resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), listen);
+            (
+                GatewayClient::new(listen, api_key),
+                Duration::from_millis(800),
+            )
+        }
+    };
 
-    if client.check_health(Duration::from_millis(800)).await {
+    if client.check_health(probe_timeout).await {
         checks.push(DoctorCheckItem {
             name: "Gateway Service",
-            status: "online",
+            status: if is_remote_target {
+                "online (remote)"
+            } else {
+                "online"
+            },
             tone: ReportTone::Ok,
             detail: format!("{}/", client.base_url()),
         });
@@ -1135,12 +1514,16 @@ pub async fn inspect_doctor(
             }
             Ok(_) => {
                 has_warn = true;
-                login_needed = true;
+                login_needed = !is_remote_target;
                 checks.push(DoctorCheckItem {
                     name: "ACP Auth/Models",
                     status: "login needed",
                     tone: ReportTone::Warn,
-                    detail: format!("only fallback model returned; run `{bin_hint} agy login`"),
+                    detail: if is_remote_target {
+                        "remote gateway returned fallback model only; sign in with `lg agy login` on the remote host".to_owned()
+                    } else {
+                        format!("only fallback model returned; run `{bin_hint} agy login`")
+                    },
                 });
             }
             Err(err) => {
@@ -1153,6 +1536,17 @@ pub async fn inspect_doctor(
                 });
             }
         }
+    } else if is_remote_target {
+        has_error = true;
+        checks.push(DoctorCheckItem {
+            name: "Gateway Service",
+            status: "unreachable",
+            tone: ReportTone::Err,
+            detail: format!(
+                "remote gateway {}/ did not respond to `/healthz` (`{bin_hint} remote local` to reset)",
+                client.base_url()
+            ),
+        });
     } else {
         has_warn = true;
         checks.push(DoctorCheckItem {
@@ -2109,6 +2503,194 @@ mod tests {
             !mismatch_outcome.config_matches,
             "toggling --no-mcp-tool-bridge must be detected by config_matches"
         );
+
+        server_task.abort();
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn remote_endpoint_mode_connects_without_spawning_local_daemon_and_resets_cleanly() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let temp = std::env::temp_dir().join(format!("liftgate-remote-mode-{}", Uuid::new_v4()));
+        let state_paths = StatePaths::resolve(Some(temp.clone())).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let is_health = req.starts_with("GET /healthz ");
+                let authed = req
+                    .lines()
+                    .any(|l| l.eq_ignore_ascii_case("authorization: bearer remote-secret"));
+                let (status_line, body) = if is_health {
+                    ("200 OK", r#"{"status":"ok"}"#.to_owned())
+                } else if !authed {
+                    ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned())
+                } else if req.starts_with("GET /v1/models ") {
+                    (
+                        "200 OK",
+                        r#"{"object":"list","data":[{"id":"gemini-4-carbon-high","display_name":"Gemini 4 Carbon"},{"id":"gemini-3.8-flash-low","display_name":"Gemini 3.8 Flash"}]}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        serde_json::to_string(&GatewayTelemetrySnapshot {
+                            generated_at_unix_ms: 1,
+                            gateway_version: std::borrow::Cow::Borrowed("0.2.13"),
+                            vision_offload_enabled: false,
+                            mcp_tool_bridge_enabled: true,
+                            acp_process: liftgate_types::telemetry::AcpProcessTelemetry {
+                                connected: true,
+                                pid: Some(4242),
+                                binary_path: "/usr/local/bin/agy".to_owned(),
+                                session_cwd: "/srv/workspace".to_owned(),
+                                os: std::borrow::Cow::Borrowed("linux"),
+                                arch: std::borrow::Cow::Borrowed("x86_64"),
+                                supervision_strategy: std::borrow::Cow::Borrowed("prctl"),
+                                protocol_version: 1,
+                                agent_name: Some("antigravity".to_owned()),
+                                agent_version: Some("2.2.2".to_owned()),
+                                started_at_unix_ms: 1,
+                                uptime_secs: 60,
+                                default_model: "gemini-4-carbon-high".to_owned(),
+                                acp_mode: "agent".to_owned(),
+                                rpc_requests_sent: 10,
+                                rpc_responses_received: 10,
+                                rpc_notifications_received: 20,
+                                rpc_pending_in_flight: 0,
+                                active_prompt_streams: 0,
+                                recent_stderr: Vec::new(),
+                                agy_proxy: None,
+                                auto_update_enabled: true,
+                                latest_known_version: None,
+                                last_update_check_unix_ms: None,
+                                last_auto_update_unix_ms: None,
+                                last_auto_updated_from: None,
+                                auto_update_note: None,
+                            },
+                            session_pool: liftgate_types::telemetry::SessionPoolTelemetry {
+                                active_leased_sessions: 0,
+                                suspended_mcp_sessions: 0,
+                                idle_cached_sessions: 1,
+                                max_idle_sessions: 16,
+                                stored_responses: 2,
+                                max_stored_responses: 64,
+                                total_sessions_created: 1,
+                                total_sessions_reused: 4,
+                                mcp_continuations: 2,
+                                total_sessions_closed_or_evicted: 0,
+                                sessions: Vec::new(),
+                            },
+                            metrics: liftgate_types::telemetry::GatewayMetricsSummary::default(),
+                            cache_telemetry:
+                                liftgate_types::telemetry::CacheTelemetrySummary::default(),
+                            active_tasks: Vec::new(),
+                            recent_tasks: Vec::new(),
+                            available_models: Vec::new(),
+                        })
+                        .unwrap(),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        // 1. Missing API key on protected remote endpoint fails verification before mutating settings
+        let unauthed_res = execute_remote(
+            &state_paths,
+            &RemoteArgs {
+                target: Some(addr.to_string()),
+                ..RemoteArgs::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            unauthed_res,
+            Err(CliError::GatewayHttpStatus { status: 401, .. })
+        ));
+        assert_eq!(
+            state_paths.read_settings().unwrap().target_mode,
+            GatewayTargetMode::Local
+        );
+
+        // 2. Setting remote endpoint with valid `--api-key` verifies and persists cleanly
+        let set_out = execute_remote(
+            &state_paths,
+            &RemoteArgs {
+                target: Some(addr.to_string()),
+                api_key: Some("remote-secret".to_owned()),
+                ..RemoteArgs::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_out.updated);
+        assert!(set_out.effective_is_remote);
+        assert!(set_out.has_saved_api_key);
+        assert_eq!(
+            set_out.probe.as_ref().and_then(|p| p.live_model_count),
+            Some(2)
+        );
+        assert!(!state_paths.daemon_file().exists());
+
+        // 3. `ensure_gateway_ready_for_target`, `inspect_gateway_status`, and `inspect_doctor`
+        //    all route to the remote endpoint without needing a local `agy` binary or daemon!
+        let ready = ensure_gateway_ready_for_target(&state_paths, None, None, None, None, true)
+            .await
+            .unwrap();
+        assert!(ready.is_remote);
+        assert_eq!(ready.default_model, "gemini-4-carbon-high");
+        assert!(!state_paths.daemon_file().exists());
+
+        let status = inspect_gateway_status(&state_paths, &StatusArgs::default())
+            .await
+            .unwrap();
+        assert_eq!(status.mode, GatewayStatusMode::Remote);
+        assert!(status.healthy);
+        assert!(status.is_remote);
+
+        let doctor = inspect_doctor(
+            &state_paths,
+            &DoctorArgs {
+                agy_bin: Some(temp.join("nonexistent-agy")),
+                ..DoctorArgs::default()
+            },
+            "lg",
+        )
+        .await
+        .unwrap();
+        assert!(
+            doctor.ok,
+            "doctor must pass in remote mode even without a local agy binary: {:?}",
+            doctor.checks
+        );
+
+        // 4. `lg remote local` switches back to local mode cleanly
+        let reset_out = execute_remote(
+            &state_paths,
+            &RemoteArgs {
+                target: Some("local".to_owned()),
+                clear_key: true,
+                ..RemoteArgs::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reset_out.updated);
+        assert!(!reset_out.effective_is_remote);
+        assert!(!reset_out.has_saved_api_key);
 
         server_task.abort();
         let _ = fs::remove_dir_all(&temp);

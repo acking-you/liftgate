@@ -23,13 +23,15 @@ use axum::{
 pub use liftgate_tool_virtualizer::{
     CALL_CLIENT_TOOL_MCP_NAME, ClaudeCodeToolProfile, CodexToolProfile, DetectedHarness,
     GATEWAY_WEB_FETCH_MCP_NAME, GenericToolProfile, HarnessToolProfile, LocalReplyKind,
-    MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog, McpWireTool,
-    NAMESPACE_HUB_MCP_PREFIX, OmpToolProfile, OpenCodeToolProfile, ProtocolHint,
-    SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement, VirtualizedCallDecision, VirtualizerBudget,
-    apply_patch_input_schema, detect_harness, extract_custom_tool_input,
-    freeform_custom_input_schema, gateway_web_fetch_input_schema, normalize_apply_patch_text,
-    partition_tools_for_harness, partition_tools_for_mcp, partition_tools_for_mcp_session,
+    MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog, McpSessionOptions,
+    McpWireTool, NAMESPACE_HUB_MCP_PREFIX, OmpToolProfile, OpenCodeToolProfile, ProtocolHint,
+    READ_CONTEXT_SPILL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement,
+    VirtualizedCallDecision, VirtualizerBudget, apply_patch_input_schema, detect_harness,
+    extract_custom_tool_input, freeform_custom_input_schema, gateway_web_fetch_input_schema,
+    normalize_apply_patch_text, partition_tools_for_harness, partition_tools_for_mcp,
+    partition_tools_for_mcp_session, partition_tools_for_mcp_session_with_options,
     partition_tools_for_mcp_with_hint, plan_virtualization, plan_virtualization_with_options,
+    plan_virtualization_with_session_options, read_context_spill_input_schema,
     sanitize_mcp_tool_name, strip_call_prefix, validate_apply_patch_preflight,
 };
 use liftgate_types::{acp::McpServerConfig, canonical::CanonicalToolSpec};
@@ -108,6 +110,14 @@ pub enum ResolvedMcpIncoming {
     /// Server-managed `gateway_web_fetch` executed inside the gateway in-flight.
     GatewayWebFetch {
         url: String,
+        reply_tx: oneshot::Sender<McpToolCallReply>,
+    },
+    /// Gateway-local 0-RTT context spill slice/search read (`mcp_lg_read_context_spill`).
+    ReadContextSpill {
+        path: String,
+        start_line: usize,
+        max_lines: usize,
+        query: Option<String>,
         reply_tx: oneshot::Sender<McpToolCallReply>,
     },
 }
@@ -233,6 +243,18 @@ impl McpSessionHandle {
                     reply_tx: incoming.reply_tx,
                 }
             }
+            VirtualizedCallDecision::ReadContextSpill {
+                path,
+                start_line,
+                max_lines,
+                query,
+            } => ResolvedMcpIncoming::ReadContextSpill {
+                path,
+                start_line,
+                max_lines,
+                query,
+                reply_tx: incoming.reply_tx,
+            },
         }
     }
 

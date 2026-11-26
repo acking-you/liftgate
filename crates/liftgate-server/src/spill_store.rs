@@ -184,6 +184,142 @@ impl SpillStore {
 
         Ok(format_portable_path(&final_path))
     }
+
+    /// Reads a bounded line window or case-insensitive `query` filter from a persisted spill file.
+    ///
+    /// Strictly extracts and validates only the basename (`<slug>-<hash>.txt` or `.json`) inside
+    /// `self.dir` so callers can pass either a full notice path or bare filename with zero
+    /// path-traversal risk.
+    pub fn read_slice(
+        &self,
+        raw_ref: &str,
+        start_line: usize,
+        max_lines: usize,
+        query: Option<&str>,
+    ) -> Result<String, SpillReadError> {
+        const MAX_SPILL_SOURCE_READ_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_SPILL_SLICE_OUTPUT_BYTES: usize = 9_000;
+        const MAX_SPILL_SLICE_LINES: usize = 200;
+
+        let file_name = extract_safe_spill_basename(raw_ref)?;
+        let target_path = canonicalize_clean(&self.dir).join(file_name);
+        let file = fs::File::open(&target_path).map_err(|source| SpillReadError::Open {
+            file_name: file_name.to_owned(),
+            source,
+        })?;
+        let mut buf = String::new();
+        use std::io::Read as _;
+        file.take(MAX_SPILL_SOURCE_READ_BYTES)
+            .read_to_string(&mut buf)
+            .map_err(|source| SpillReadError::Read {
+                file_name: file_name.to_owned(),
+                source,
+            })?;
+
+        let start_ln = start_line.max(1);
+        let limit = max_lines.clamp(1, MAX_SPILL_SLICE_LINES);
+        let clean_query = query.map(str::trim).filter(|q| !q.is_empty());
+        let total_lines = buf.lines().count();
+
+        let mut body = String::with_capacity(2048);
+        let mut emitted = 0usize;
+        let mut first_ln = 0usize;
+        let mut last_ln = 0usize;
+        let mut total_matches = 0usize;
+
+        if let Some(needle) = clean_query {
+            let needle_lower = needle.to_ascii_lowercase();
+            for (idx, line) in buf.lines().enumerate() {
+                let line_no = idx + 1;
+                if line_no < start_ln {
+                    continue;
+                }
+                if line.to_ascii_lowercase().contains(&needle_lower) {
+                    total_matches = total_matches.saturating_add(1);
+                    if emitted < limit && body.len() < MAX_SPILL_SLICE_OUTPUT_BYTES {
+                        if first_ln == 0 {
+                            first_ln = line_no;
+                        }
+                        last_ln = line_no;
+                        let row = format!("L{line_no}: {line}\n");
+                        if body.len().saturating_add(row.len()) <= MAX_SPILL_SLICE_OUTPUT_BYTES {
+                            body.push_str(&row);
+                            emitted = emitted.saturating_add(1);
+                        } else if body.is_empty() {
+                            push_bounded_overlong_row(
+                                &mut body,
+                                &row,
+                                MAX_SPILL_SLICE_OUTPUT_BYTES,
+                            );
+                            emitted = emitted.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            if emitted == 0 {
+                return Ok(format!(
+                    "[Context spill `{file_name}` ({total_lines} lines) · 0 matches for `{needle}` from line {start_ln}]"
+                ));
+            }
+            return Ok(format!(
+                "[Context spill `{file_name}` ({total_lines} lines) · showing {emitted} of {total_matches} matches for `{needle}` (L{first_ln}..=L{last_ln})]\n{body}"
+            ));
+        }
+
+        let mut capped_by_bytes = false;
+        for (idx, line) in buf.lines().enumerate() {
+            let line_no = idx + 1;
+            if line_no < start_ln {
+                continue;
+            }
+            if emitted >= limit {
+                break;
+            }
+            let row = format!("L{line_no}: {line}\n");
+            if !body.is_empty()
+                && body.len().saturating_add(row.len()) > MAX_SPILL_SLICE_OUTPUT_BYTES
+            {
+                capped_by_bytes = true;
+                break;
+            }
+            if first_ln == 0 {
+                first_ln = line_no;
+            }
+            last_ln = line_no;
+            if row.len() > MAX_SPILL_SLICE_OUTPUT_BYTES {
+                push_bounded_overlong_row(&mut body, &row, MAX_SPILL_SLICE_OUTPUT_BYTES);
+                emitted = emitted.saturating_add(1);
+                capped_by_bytes = true;
+                break;
+            }
+            body.push_str(&row);
+            emitted = emitted.saturating_add(1);
+        }
+
+        if emitted == 0 {
+            return Ok(format!(
+                "[Context spill `{file_name}` ({total_lines} lines) · requested start_line={start_ln} is past EOF]"
+            ));
+        }
+        if capped_by_bytes && last_ln < total_lines {
+            let next_ln = last_ln.saturating_add(1);
+            body.push_str(&format!(
+                "[... slice capped at line {last_ln} to stay within lossless MCP window; call mcp_lg_read_context_spill with start_line={next_ln} to continue ...]\n"
+            ));
+        }
+        Ok(format!(
+            "[Context spill `{file_name}` · lines {first_ln}..={last_ln} of {total_lines}]\n{body}"
+        ))
+    }
+}
+
+fn push_bounded_overlong_row(body: &mut String, row: &str, max_bytes: usize) {
+    let mut end = max_bytes.min(row.len());
+    while end > 0 && !row.is_char_boundary(end) {
+        end -= 1;
+    }
+    body.push_str(row.get(..end).unwrap_or_default());
+    body.push_str(" ...[single overlong line capped]\n");
 }
 
 impl TruncationSpillSink for SpillStore {
@@ -201,6 +337,53 @@ impl TruncationSpillSink for SpillStore {
             }
         }
     }
+}
+
+/// Structured failure when reading a gateway-local spill slice via `mcp_lg_read_context_spill`.
+#[derive(Debug, Error)]
+pub enum SpillReadError {
+    #[error(
+        "invalid spill file reference `{raw}` (expected a `.txt` or `.json` spill filename or path)"
+    )]
+    InvalidReference { raw: String },
+
+    #[error("spill file `{file_name}` was not found (it may have rotated or expired)")]
+    Open {
+        file_name: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed reading spill file `{file_name}`")]
+    Read {
+        file_name: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+fn extract_safe_spill_basename(raw_ref: &str) -> Result<&str, SpillReadError> {
+    let trimmed = raw_ref.trim().trim_matches('`').trim_matches('"');
+    let without_scheme = trimmed.strip_prefix("spill://").unwrap_or(trimmed);
+    let last_seg = without_scheme
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let valid = !last_seg.is_empty()
+        && last_seg.len() <= 160
+        && !last_seg.starts_with('.')
+        && !last_seg.contains("..")
+        && (last_seg.ends_with(".txt") || last_seg.ends_with(".json"))
+        && last_seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(SpillReadError::InvalidReference {
+            raw: raw_ref.to_owned(),
+        });
+    }
+    Ok(last_seg)
 }
 
 fn ensure_spill_dir(dir: &Path) -> Result<(), SpillStoreError> {
@@ -323,6 +506,59 @@ mod tests {
             remaining.len()
         );
         assert_eq!(fs::read_to_string(&newest).unwrap(), "c".repeat(4_000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_slice_supports_txt_and_json_spills_queries_byte_caps_and_rejects_traversal() {
+        let dir = std::env::temp_dir().join(format!("liftgate-spill-slice-{}", Uuid::new_v4()));
+        let store = SpillStore::new(&dir);
+
+        let lines_content = (1..=300)
+            .map(|i| format!("row_{i:03}: exact source line content for verification"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let txt_path = store
+            .try_spill("tool_result:exec_command", &lines_content)
+            .unwrap();
+        let slice = store.read_slice(&txt_path, 140, 5, None).unwrap();
+        assert!(slice.contains("lines 140..=144 of 300"));
+        assert!(slice.contains("L140: row_140:"));
+        assert!(slice.contains("L144: row_144:"));
+        assert!(!slice.contains("L145:"));
+
+        let filtered = store.read_slice(&txt_path, 1, 20, Some("row_255")).unwrap();
+        assert!(filtered.contains("showing 1 of 1 matches for `row_255`"));
+        assert!(filtered.contains("L255: row_255:"));
+
+        // `.json` spill files (including minified >10KB single-line JSON) must be accepted and bounded < 10KB!
+        let minified_json = format!(r#"{{"items":["{}"]}}"#, "x".repeat(18_000));
+        let json_path = store
+            .try_spill("client tools catalog", &minified_json)
+            .unwrap();
+        assert!(json_path.ends_with(".json"));
+        let json_slice = store.read_slice(&json_path, 1, 50, None).unwrap();
+        assert!(
+            json_slice.len() < 10_000,
+            "single overlong JSON line must stay strictly below agy acp 10KB truncation cliff"
+        );
+        assert!(json_slice.contains("[single overlong line capped]"));
+
+        // Multi-line byte cap emits exact next `start_line` continuation hint
+        let wide_lines = (1..=150)
+            .map(|i| format!("L_{i:03}_{}", "a".repeat(120)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wide_path = store.try_spill("tool output", &wide_lines).unwrap();
+        let capped = store.read_slice(&wide_path, 1, 200, None).unwrap();
+        assert!(capped.len() < 10_000);
+        assert!(capped.contains("call mcp_lg_read_context_spill with start_line="));
+
+        // Path traversal / non-spill extensions are rejected
+        assert!(store.read_slice("../etc/passwd", 1, 10, None).is_err());
+        assert!(store.read_slice(".hidden.txt", 1, 10, None).is_err());
+        assert!(store.read_slice("payload.exe", 1, 10, None).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

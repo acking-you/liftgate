@@ -179,6 +179,10 @@ async fn dispatch(
             render::run_proxy(&state_paths, args).await?;
             Ok(0)
         }
+        Some(Commands::Remote(args)) => {
+            render::run_remote(&state_paths, args).await?;
+            Ok(0)
+        }
         Some(Commands::Alias(args)) => {
             render::run_alias(args)?;
             Ok(0)
@@ -239,6 +243,7 @@ async fn dispatch_cockpit_action(
                 state_paths,
                 TopArgs {
                     listen: None,
+                    remote: None,
                     api_key: None,
                     interval_ms: 1_000,
                     auto_start: false,
@@ -252,6 +257,7 @@ async fn dispatch_cockpit_action(
                 state_paths,
                 ModelsArgs {
                     listen: None,
+                    remote: None,
                     api_key: None,
                     pick: true,
                     json: false,
@@ -266,6 +272,7 @@ async fn dispatch_cockpit_action(
                 state_paths,
                 UiArgs {
                     listen: None,
+                    remote: None,
                     api_key: None,
                     print: false,
                     no_start: false,
@@ -333,6 +340,7 @@ async fn dispatch_cockpit_action(
                 DoctorArgs {
                     agy_bin: None,
                     listen: None,
+                    remote: None,
                     api_key: None,
                     json: false,
                 },

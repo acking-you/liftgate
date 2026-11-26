@@ -1066,6 +1066,7 @@ fn mcp_system_append_and_tools_delta_are_xml_free_and_nonce_deterministic() {
         virtualized_hubs: &hubs,
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: true,
+        has_context_spill_reader: false,
         orchestrator: None,
     };
     let (append_a, spill_a) = build_session_system_append_for_mcp_with_spill_sink(
@@ -1148,6 +1149,7 @@ fn omp_eval_codemode_injects_unprefixed_bridge_rule_and_matches_compaction_promp
         virtualized_hubs: &hubs,
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: true,
+        has_context_spill_reader: false,
         orchestrator: Some(McpOrchestratorContract::OmpPolyglotEval {
             mcp_name: "eval",
             elided_subordinate_tools: true,
@@ -1230,6 +1232,7 @@ fn generic_eval_tool_does_not_receive_omp_polyglot_codemode_instructions() {
         virtualized_hubs: &[],
         has_virtualized_dispatch: false,
         has_gateway_web_fetch: false,
+        has_context_spill_reader: false,
         orchestrator: None,
     };
     let mut spill = NoopSpillSink;
@@ -1293,6 +1296,7 @@ fn opencode_execute_contract_preserves_v1_catalog_and_classifies_summary_auxilia
         virtualized_hubs: &[],
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: false,
+        has_context_spill_reader: false,
         orchestrator: Some(McpOrchestratorContract::OpenCodeExecute {
             mcp_name: "execute",
             full_code_mode: true,
@@ -1337,4 +1341,95 @@ fn opencode_execute_contract_preserves_v1_catalog_and_classifies_summary_auxilia
         summary_aux,
         Some(crate::canonical::AuxiliaryTaskKind::AwayRecapOrSuggestion)
     );
+}
+
+#[test]
+fn active_prompt_waterfill_never_truncates_assistant_output_or_real_tool_call_arguments() {
+    use crate::acp::AcpPromptBlock;
+
+    let large_patch = format!(
+        "*** Begin Patch\n*** Update File: src/engine.rs\n@@\n{}\n*** End Patch",
+        (0..900)
+            .map(|i| format!(
+                "-    let old_val_{i} = {i};\n+    let new_val_{i} = {};",
+                i + 1
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        large_patch.len() > 35_000,
+        "patch payload must exceed old 2KB/waterfill truncation thresholds"
+    );
+    let assistant_prose = "Applying verified single-file patch to `src/engine.rs`.".repeat(40);
+    let huge_tool_output = (1..=3_500)
+        .map(|ln| {
+            format!("line {ln:04}: compiler output diagnostic context padding.................")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(huge_tool_output.len() > 200_000);
+
+    let messages = [
+        CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("Refactor src/engine.rs".to_owned())],
+        },
+        CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![
+                CanonicalPart::Text(assistant_prose.clone()),
+                CanonicalPart::ToolCall {
+                    call_id: "call_patch_1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: large_patch.clone(),
+                    is_custom: true,
+                },
+            ],
+        },
+        CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::ToolResult {
+                call_id: "call_patch_1".to_owned(),
+                output: huge_tool_output,
+                is_error: false,
+            }],
+        },
+    ];
+
+    let mut spill = MemorySpillSink::default();
+    // Delta from index 1 simulates an active slice carrying both the large ToolCall and 200KB ToolResult.
+    let blocks = build_acp_prompt_plan_with_spill(
+        messages.get(1..).expect("active slice"),
+        "nonce_notrunc",
+        false,
+        None,
+        &mut spill,
+    )
+    .expect("prompt plan");
+    let joined: String = blocks
+        .iter()
+        .filter_map(|b| match b {
+            AcpPromptBlock::Text { text } => Some(text.as_str()),
+            AcpPromptBlock::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let escaped_patch = serde_json::to_string(&large_patch).expect("json-escaped custom patch");
+    assert!(
+        joined.contains(&escaped_patch),
+        "real ToolCall arguments must never be truncated in active prompt planning"
+    );
+    assert!(
+        joined.contains(&assistant_prose),
+        "assistant output text must never be truncated in active prompt planning"
+    );
+    assert!(!joined.contains("_truncated_arguments_preview"));
+    assert!(!joined.contains("Gateway truncated tool call arguments"));
+    assert!(
+        joined.contains("mcp_lg_read_context_spill"),
+        "oversized ToolResult should spill cleanly with 0-RTT mcp_lg_read_context_spill notice"
+    );
+    assert!(!spill.files().is_empty());
 }

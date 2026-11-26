@@ -98,6 +98,8 @@ pub struct McpBridgePromptSpec<'a> {
     pub has_virtualized_dispatch: bool,
     /// Whether server-managed `mcp_lg_gateway_web_fetch` is mounted on `lg`.
     pub has_gateway_web_fetch: bool,
+    /// Whether gateway-local 0-RTT `mcp_lg_read_context_spill` is mounted on `lg`.
+    pub has_context_spill_reader: bool,
     /// Active Code Mode orchestrator contract supplied by the selected harness tool profile.
     pub orchestrator: Option<McpOrchestratorContract<'a>>,
 }
@@ -190,7 +192,7 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         .find(|(client_name, _)| client_name.eq_ignore_ascii_case("apply_patch"))
     {
         header_rules.push_str(&format!(
-            "- File edits: invoke native `mcp_lg_{mcp_ap}` directly with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` (prefer native `mcp_lg_{mcp_ap}` over embedding multi-line patches inside `exec` JavaScript template literals; keep `@@` hunks surgical with 1-3 exact context lines and merge multiple edits to the same file under one `*** Update File:` header).\n"
+            "- File edits: invoke native `mcp_lg_{mcp_ap}` directly with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` (prefer native `mcp_lg_{mcp_ap}` over embedding multi-line patches inside `exec` JavaScript template literals; scope each `mcp_lg_{mcp_ap}` call to a single target file — issuing parallel per-file `mcp_lg_{mcp_ap}` calls when editing multiple files so one context mismatch never rolls back other files; always read exact target line ranges verbatim first and use `mcp_lg_read_context_spill` if a prior read was truncated; keep `@@` hunks surgical with 1-3 exact context lines and merge multiple edits to the same file under one `*** Update File:` header).\n"
         ));
     }
     match mcp_spec.orchestrator {
@@ -213,11 +215,11 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
             elided_subordinate_tools,
         }) => {
             header_rules.push_str(&format!(
-                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`); inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code)."
+                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`); inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code), and ensure newlines inside JSON string literals are properly escaped."
             ));
             if elided_subordinate_tools {
                 header_rules.push_str(&format!(
-                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, read it via `await tool.read({{\"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` to obtain its `[FILENAME#TAG]` hashline anchors, then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for file mutations."
+                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, ALWAYS read the exact target line range via `await tool.read({{\"i\": \"Read target lines\", \"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` (never prelude `read(...)`/`Bun.file`, which do not register `[FILENAME#TAG]` line-hash snapshots and cause `unseen_lines` rejections), then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for file mutations."
                 ));
             }
             header_rules.push('\n');
@@ -295,6 +297,14 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
                  invoke native `mcp_lg_gateway_web_fetch` (`{\"url\": \"https://...\"}`) directly.\n",
             );
         }
+    }
+
+    if mcp_spec.has_context_spill_reader {
+        header_rules.push_str(
+            "- Context spills: when a prompt, tool output, or web fetch notes a truncated spill file saved in `spills`, \
+             inspect line ranges or search matches in 0-RTT via native `mcp_lg_read_context_spill` (`{\"path\": \"<spill_path_or_filename>\", \"start_line\": 1, \"max_lines\": 120}`) \
+             rather than client file/shell tools (which execute on the caller's host, not the gateway host).\n",
+        );
     }
 
     let mut bounded = header_rules;

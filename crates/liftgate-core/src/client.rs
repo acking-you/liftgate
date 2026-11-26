@@ -1,17 +1,16 @@
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 pub use liftgate_harness::DiscoveredModel;
 use liftgate_server::routes::ADMIN_SHUTDOWN_HEADER;
-use liftgate_types::telemetry::GatewayTelemetrySnapshot;
+use liftgate_types::{config::GatewayEndpoint, telemetry::GatewayTelemetrySnapshot};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
 use crate::error::{CliError, GatewayTransportError};
-use crate::state::format_connect_url;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SSE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -29,46 +28,38 @@ struct CloseSessionResponse {
     closed: bool,
 }
 
-/// Proxy-immune HTTP/1.1 client speaking directly over loopback TCP to a local `liftgate` instance.
+/// Proxy-immune HTTP/1.1 client speaking directly over TCP to a local or remote `liftgate` instance.
 #[derive(Clone, Debug)]
 pub struct GatewayClient {
-    connect_addr: SocketAddr,
-    base_url: String,
-    host_header: String,
+    endpoint: GatewayEndpoint,
     api_key: Option<String>,
 }
 
 impl GatewayClient {
     #[must_use]
     pub fn new(listen: SocketAddr, api_key: Option<String>) -> Self {
-        let connect_addr = match listen {
-            SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v4.port())
-            }
-            SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), v6.port())
-            }
-            other => other,
-        };
-        let base_url = format_connect_url(connect_addr);
-        let host_header = match connect_addr {
-            SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
-            SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
-        };
+        Self::from_endpoint(GatewayEndpoint::from_socket_addr(listen), api_key)
+    }
+
+    #[must_use]
+    pub fn from_endpoint(endpoint: GatewayEndpoint, api_key: Option<String>) -> Self {
         let clean_key = api_key
             .map(|k| k.trim().to_owned())
             .filter(|k| !k.is_empty());
         Self {
-            connect_addr,
-            base_url,
-            host_header,
+            endpoint,
             api_key: clean_key,
         }
     }
 
     #[must_use]
+    pub const fn endpoint(&self) -> &GatewayEndpoint {
+        &self.endpoint
+    }
+
+    #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.endpoint.base_url()
     }
 
     pub async fn check_health(&self, timeout_dur: Duration) -> bool {
@@ -80,7 +71,7 @@ impl GatewayClient {
 
     pub async fn fetch_models(&self) -> Result<Vec<DiscoveredModel>, CliError> {
         let path = "/v1/models";
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_get(path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -107,7 +98,7 @@ impl GatewayClient {
             }
             None => format!("/v1/codex-models?default_model={encoded}"),
         };
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_get(&path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -123,7 +114,7 @@ impl GatewayClient {
 
     pub async fn fetch_telemetry(&self) -> Result<GatewayTelemetrySnapshot, CliError> {
         let path = "/api/telemetry/snapshot";
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_get(path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -138,7 +129,7 @@ impl GatewayClient {
     pub async fn close_idle_session(&self, session_id: &str) -> Result<bool, CliError> {
         let encoded = percent_encode_query_component(session_id);
         let path = format!("/api/telemetry/sessions/{encoded}/close");
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_request("POST", &path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -163,7 +154,7 @@ impl GatewayClient {
             Some(false) => "/api/telemetry/vision-offload?enabled=false",
             None => "/api/telemetry/vision-offload",
         };
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_request("POST", path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -188,7 +179,7 @@ impl GatewayClient {
             Some(false) => "/api/telemetry/mcp-tool-bridge?enabled=false",
             None => "/api/telemetry/mcp-tool-bridge",
         };
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_request("POST", path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
@@ -204,7 +195,7 @@ impl GatewayClient {
 
     pub async fn request_shutdown(&self, shutdown_token: &str) -> Result<(), CliError> {
         let path = "/api/admin/shutdown";
-        let url = format!("{}{path}", self.base_url);
+        let url = format!("{}{path}", self.base_url());
         let headers = [(ADMIN_SHUTDOWN_HEADER, shutdown_token)];
         let (status, body) = self
             .raw_request("POST", path, &headers, Duration::from_secs(3))
@@ -219,7 +210,7 @@ impl GatewayClient {
         Ok(())
     }
 
-    /// Subscribes to `/api/telemetry/events` over loopback SSE, streaming parsed
+    /// Subscribes to `/api/telemetry/events` over TCP SSE, streaming parsed
     /// latest [`GatewayTelemetrySnapshot`] frames into `tx` (coalescing bursts in O(1) memory)
     /// until `cancel` triggers, all receivers drop, or the connection closes.
     pub async fn subscribe_telemetry_events(
@@ -228,12 +219,12 @@ impl GatewayClient {
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), CliError> {
         let path = "/api/telemetry/events";
-        let full_url = format!("{}{path}", self.base_url);
+        let full_url = format!("{}{path}", self.base_url());
         let mut req_buf = String::with_capacity(256);
         let _ = write!(
             req_buf,
             "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n",
-            self.host_header
+            self.endpoint.host_header()
         );
         if let Some(key) = &self.api_key {
             let clean_key: String = key.chars().filter(|&c| c != '\r' && c != '\n').collect();
@@ -242,8 +233,9 @@ impl GatewayClient {
         req_buf.push_str("\r\n");
 
         let connect_deadline = Instant::now() + Duration::from_secs(5);
+        let connect_target = (self.endpoint.host(), self.endpoint.port());
         let mut stream =
-            match timeout_at(connect_deadline, TcpStream::connect(self.connect_addr)).await {
+            match timeout_at(connect_deadline, TcpStream::connect(connect_target)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(source)) => {
                     return Err(CliError::GatewayUnreachable {
@@ -341,14 +333,14 @@ impl GatewayClient {
         extra_headers: &[(&str, &str)],
         timeout_dur: Duration,
     ) -> Result<(u16, Vec<u8>), CliError> {
-        let full_url = format!("{}{path_and_query}", self.base_url);
+        let full_url = format!("{}{path_and_query}", self.base_url());
         let deadline = Instant::now() + timeout_dur;
 
         let mut req_buf = String::with_capacity(256);
         let _ = write!(
             req_buf,
             "{method} {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n",
-            self.host_header
+            self.endpoint.host_header()
         );
         if method == "POST" {
             req_buf.push_str("Content-Length: 0\r\n");
@@ -359,8 +351,9 @@ impl GatewayClient {
         }
         req_buf.push_str("\r\n");
 
+        let connect_target = (self.endpoint.host(), self.endpoint.port());
         let io_fut = async {
-            let mut stream = TcpStream::connect(self.connect_addr).await?;
+            let mut stream = TcpStream::connect(connect_target).await?;
             stream.write_all(req_buf.as_bytes()).await?;
             let mut raw = Vec::with_capacity(4096);
             stream

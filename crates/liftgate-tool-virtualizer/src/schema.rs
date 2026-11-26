@@ -30,6 +30,10 @@ pub struct McpBridgedTool {
     pub unwrap_custom_key: Option<&'static str>,
     pub v4a_patch: Option<V4aPatchContract>,
     pub parameters_json: Option<String>,
+    pub non_nullable_required_fields: Vec<String>,
+    pub declares_tool_summary: bool,
+    pub requires_string_intent_i: bool,
+    pub has_root_combinator: bool,
 }
 
 /// Measures serialized JSON wire size of `(name, description, schema)` without allocating a `String`.
@@ -112,6 +116,33 @@ pub fn gateway_web_fetch_input_schema() -> Value {
     })
 }
 
+/// Input JSON Schema for the gateway-local 0-RTT `read_context_spill` MCP tool.
+#[must_use]
+pub fn read_context_spill_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Spill file path or `<slug>-<hash>.txt` / `<slug>-<hash>.json` filename referenced in a truncation notice."
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "1-based starting line number (default 1)."
+            },
+            "max_lines": {
+                "type": "integer",
+                "description": "Maximum lines to return (1..200, default 120)."
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional case-insensitive substring filter returning matching lines with line numbers."
+            }
+        },
+        "required": ["path"]
+    })
+}
+
 /// Normalizes a caller tool's JSON Schema string into a valid root `{"type": "object", ...}` MCP schema.
 ///
 /// Always returns a valid object schema so 100% of `Function` tools are bridged natively over MCP
@@ -162,17 +193,53 @@ pub fn normalize_mcp_object_schema(parameters_json: &str) -> Value {
     }
 }
 
-/// Extracts `(required_fields, declares_tool_summary, has_root_combinator, property_names_joined)`
-/// from a raw JSON Schema string for preflight validation and lexical indexing.
+/// Pre-extracted structural metadata from a tool's JSON Schema for 0-RTT preflight and search indexing.
+#[derive(Clone, Debug, Default)]
+pub struct ExtractedSchemaMeta {
+    pub required_fields: Vec<String>,
+    pub non_nullable_required_fields: Vec<String>,
+    pub declares_tool_summary: bool,
+    pub requires_string_intent_i: bool,
+    pub has_root_combinator: bool,
+    pub prop_names_joined: String,
+}
+
+fn schema_property_allows_null(prop_schema: &Value) -> bool {
+    if let Some(ty) = prop_schema.get("type") {
+        match ty {
+            Value::String(s) if s == "null" => return true,
+            Value::Array(arr) if arr.iter().any(|v| v.as_str() == Some("null")) => return true,
+            _ => {}
+        }
+    }
+    for union_key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = prop_schema.get(union_key)
+            && branches.iter().any(schema_property_allows_null)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn schema_property_is_string(prop_schema: &Value) -> bool {
+    match prop_schema.get("type") {
+        Some(Value::String(s)) => s == "string",
+        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("string")),
+        _ => false,
+    }
+}
+
+/// Extracts [`ExtractedSchemaMeta`] from a raw JSON Schema string for preflight validation and lexical indexing.
 #[must_use]
-pub fn extract_schema_metadata(parameters_json: Option<&str>) -> (Vec<String>, bool, bool, String) {
+pub fn extract_schema_metadata(parameters_json: Option<&str>) -> ExtractedSchemaMeta {
     let Some(raw) = parameters_json else {
-        return (Vec::new(), false, false, String::new());
+        return ExtractedSchemaMeta::default();
     };
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
-        return (Vec::new(), false, false, String::new());
+        return ExtractedSchemaMeta::default();
     };
-    let required = map
+    let required_fields = map
         .get("required")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -182,24 +249,43 @@ pub fn extract_schema_metadata(parameters_json: Option<&str>) -> (Vec<String>, b
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let has_combinator =
+    let has_root_combinator =
         map.contains_key("oneOf") || map.contains_key("anyOf") || map.contains_key("allOf");
-    let mut declares_summary = false;
+    let props_opt = map.get("properties").and_then(Value::as_object);
+    let non_nullable_required_fields = required_fields
+        .iter()
+        .filter(|req_key| {
+            props_opt
+                .and_then(|props| props.get(req_key.as_str()))
+                .is_none_or(|prop_schema| !schema_property_allows_null(prop_schema))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let requires_string_intent_i = required_fields.iter().any(|r| r == "i")
+        && props_opt
+            .and_then(|props| props.get("i"))
+            .is_some_and(|prop_i| {
+                schema_property_is_string(prop_i) && !schema_property_allows_null(prop_i)
+            });
+
+    let mut declares_tool_summary = false;
     let mut prop_names = Vec::new();
-    if let Some(Value::Object(props)) = map.get("properties") {
+    if let Some(props) = props_opt {
         for k in props.keys() {
             if k == "toolSummary" {
-                declares_summary = true;
+                declares_tool_summary = true;
             }
             prop_names.push(k.as_str());
         }
     }
-    (
-        required,
-        declares_summary,
-        has_combinator,
-        prop_names.join(" "),
-    )
+    ExtractedSchemaMeta {
+        required_fields,
+        non_nullable_required_fields,
+        declares_tool_summary,
+        requires_string_intent_i,
+        has_root_combinator,
+        prop_names_joined: prop_names.join(" "),
+    }
 }
 
 /// Sanitizes an arbitrary client tool identifier into a unique MCP tool name (`[a-zA-Z_][a-zA-Z0-9_-]{0,51}`).

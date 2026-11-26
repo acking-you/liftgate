@@ -8,7 +8,8 @@ use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_
 use liftgate_types::config::{
     CacheHitThresholdBps, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_IDLE_SESSIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES,
-    DEFAULT_TURN_TIMEOUT_SECS, LowCacheRecordLimit, ProxyUrl, is_proxy_disable_keyword,
+    DEFAULT_TURN_TIMEOUT_SECS, GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl,
+    is_endpoint_local_keyword, is_proxy_disable_keyword,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -268,6 +269,15 @@ pub struct LiftgateSettings {
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
+    /// Default gateway target mode (`local` managed daemon by default, or `remote` endpoint).
+    #[serde(default)]
+    pub target_mode: GatewayTargetMode,
+    /// Saved remote `liftgate` endpoint (`http://host:port`) used when `target_mode == Remote`.
+    #[serde(default)]
+    pub remote_endpoint: Option<GatewayEndpoint>,
+    /// Optional bearer API key paired with `remote_endpoint`.
+    #[serde(default)]
+    pub remote_api_key: Option<String>,
     /// Forward-compatible unknown keys preserved across versions.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -284,9 +294,89 @@ impl Default for LiftgateSettings {
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
             agy_bin: None,
+            target_mode: GatewayTargetMode::Local,
+            remote_endpoint: None,
+            remote_api_key: None,
             extra: serde_json::Map::new(),
         }
     }
+}
+
+/// Effective gateway routing target after combining CLI flags, environment variables, and `settings.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectiveTargetMode {
+    Local {
+        explicit_listen: Option<SocketAddr>,
+    },
+    Remote {
+        endpoint: GatewayEndpoint,
+        api_key: Option<String>,
+    },
+}
+
+/// Resolves whether a command targets a local gateway (`--listen` / `daemon.json`) or a remote
+/// `liftgate` endpoint (`--remote` / `AGY_REMOTE` / `LIFTGATE_REMOTE` / `settings.json`).
+pub fn resolve_effective_target_mode(
+    explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
+    explicit_api_key: Option<&str>,
+    settings: &LiftgateSettings,
+) -> Result<EffectiveTargetMode, CliError> {
+    if let Some(addr) = explicit_listen {
+        return Ok(EffectiveTargetMode::Local {
+            explicit_listen: Some(addr),
+        });
+    }
+
+    let env_remote = std::env::var("AGY_REMOTE")
+        .ok()
+        .or_else(|| std::env::var("LIFTGATE_REMOTE").ok());
+    let raw_override = explicit_remote
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            env_remote
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+
+    let clean_cli_key = crate::cli::normalize_optional_api_key(explicit_api_key);
+    let clean_saved_remote_key =
+        crate::cli::normalize_optional_api_key(settings.remote_api_key.as_deref());
+    let env_key = crate::cli::normalize_optional_api_key(
+        std::env::var("AGY_GATEWAY_API_KEY").ok().as_deref(),
+    );
+
+    if let Some(raw) = raw_override {
+        if is_endpoint_local_keyword(raw) {
+            return Ok(EffectiveTargetMode::Local {
+                explicit_listen: None,
+            });
+        }
+        let endpoint = GatewayEndpoint::try_new(raw)?;
+        let matching_saved_key = settings
+            .remote_endpoint
+            .as_ref()
+            .filter(|saved| *saved == &endpoint)
+            .and_then(|_| clean_saved_remote_key.clone());
+        let api_key = clean_cli_key.or(matching_saved_key).or(env_key);
+        return Ok(EffectiveTargetMode::Remote { endpoint, api_key });
+    }
+
+    if settings.target_mode == GatewayTargetMode::Remote
+        && let Some(ref endpoint) = settings.remote_endpoint
+    {
+        let api_key = clean_cli_key.or(clean_saved_remote_key).or(env_key);
+        return Ok(EffectiveTargetMode::Remote {
+            endpoint: endpoint.clone(),
+            api_key,
+        });
+    }
+
+    Ok(EffectiveTargetMode::Local {
+        explicit_listen: None,
+    })
 }
 
 /// Resolves the effective outbound `agy` proxy (`CLI/env override` -> `settings.json` -> `None`).
