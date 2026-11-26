@@ -10,11 +10,15 @@ use liftgate_harness::codex::{
     toml_inline_string,
 };
 use liftgate_harness::omp::merge_omp_config_files_env;
-use liftgate_harness::opencode::{merge_opencode_flag, parse_opencode_major_version};
+use liftgate_harness::opencode::{
+    has_negated_opencode_flag, merge_opencode_flag, parse_opencode_major_version,
+};
 
 use super::*;
 use super::{
-    codex::build_codex_invocation, omp::build_omp_invocation, opencode::build_opencode_invocation,
+    codex::build_codex_invocation,
+    omp::build_omp_invocation,
+    opencode::{apply_opencode_runtime_env_flags, build_opencode_invocation},
 };
 use crate::cli::{CodexArgs, OmpArgs, OpencodeArgs};
 use crate::state::StatePaths;
@@ -345,6 +349,69 @@ fn parses_opencode_major_versions_and_merges_flags() {
     assert_eq!(
         merge_opencode_flag(Some("sqlite_fts,-full_codemode"), "full_codemode"),
         "sqlite_fts,full_codemode"
+    );
+    assert!(has_negated_opencode_flag(
+        Some("sqlite_fts, -full_codemode"),
+        "full_codemode"
+    ));
+    assert!(!has_negated_opencode_flag(
+        Some("sqlite_fts,full_codemode"),
+        "full_codemode"
+    ));
+
+    // OpenCode v2 default enables `OPENCODE_FLAGS=full_codemode` automatically
+    let mut v2_default_env = Vec::new();
+    apply_opencode_runtime_env_flags(
+        &mut v2_default_env,
+        &OpencodeArgs::default_interactive(),
+        true,
+        Some("sqlite_fts"),
+        false,
+        false,
+    );
+    assert_eq!(
+        v2_default_env,
+        vec![(
+            "OPENCODE_FLAGS".to_owned(),
+            "sqlite_fts,full_codemode".to_owned()
+        )]
+    );
+
+    // `--mcp-code-mode` strips `full_codemode` (`-full_codemode`) while keeping `execute` enabled
+    let mut v2_mcp_env = Vec::new();
+    let mcp_args = OpencodeArgs {
+        mcp_code_mode: true,
+        ..OpencodeArgs::default_interactive()
+    };
+    apply_opencode_runtime_env_flags(
+        &mut v2_mcp_env,
+        &mcp_args,
+        true,
+        Some("full_codemode"),
+        false,
+        false,
+    );
+    assert_eq!(
+        v2_mcp_env,
+        vec![("OPENCODE_FLAGS".to_owned(), "-full_codemode".to_owned())]
+    );
+
+    // OpenCode v1 default enables `OPENCODE_EXPERIMENTAL_CODE_MODE=true` unless already set
+    let mut v1_default_env = Vec::new();
+    apply_opencode_runtime_env_flags(
+        &mut v1_default_env,
+        &OpencodeArgs::default_interactive(),
+        false,
+        None,
+        false,
+        false,
+    );
+    assert_eq!(
+        v1_default_env,
+        vec![(
+            "OPENCODE_EXPERIMENTAL_CODE_MODE".to_owned(),
+            "true".to_owned()
+        )]
     );
 }
 

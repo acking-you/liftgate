@@ -54,6 +54,17 @@ pub fn parse_opencode_major_version(text: &str) -> Option<u32> {
     None
 }
 
+/// Returns `true` when `existing` `OPENCODE_FLAGS` explicitly contains `-{flag}`.
+#[must_use]
+pub fn has_negated_opencode_flag(existing: Option<&str>, flag: &str) -> bool {
+    let neg = format!("-{flag}");
+    existing
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .any(|s| s == neg)
+}
+
 /// Enables `flag` in `OPENCODE_FLAGS`, stripping any negated `-{flag}` entry.
 #[must_use]
 pub fn merge_opencode_flag(existing: Option<&str>, flag: &str) -> String {

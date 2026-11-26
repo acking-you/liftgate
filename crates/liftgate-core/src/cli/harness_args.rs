@@ -335,16 +335,20 @@ pub struct OpencodeArgs {
     #[arg(long)]
     pub no_bypass: bool,
 
-    /// Enable OpenCode's experimental full Code Mode (`OPENCODE_FLAGS=full_codemode`) for all built-in tools.
+    /// Force OpenCode full Code Mode (`full_codemode`: built-in file/shell tools + `Bun.file`/`Bun.write` inside `execute`; enabled by default on OpenCode v2).
     #[arg(
         long,
         visible_alias = "code-mode-only",
-        conflicts_with = "no_code_mode"
+        conflicts_with_all = ["mcp_code_mode", "no_code_mode"]
     )]
     pub full_code_mode: bool,
 
+    /// Use OpenCode v2's partial MCP/namespace-only Code Mode (`OPENCODE_FLAGS=-full_codemode`) while keeping built-in file and shell tools direct.
+    #[arg(long, conflicts_with_all = ["full_code_mode", "no_code_mode"])]
+    pub mcp_code_mode: bool,
+
     /// Disable OpenCode Code Mode (`execute: deny`) so all MCP and namespace tools run as direct tool calls.
-    #[arg(long, conflicts_with = "full_code_mode")]
+    #[arg(long, conflicts_with_all = ["full_code_mode", "mcp_code_mode"])]
     pub no_code_mode: bool,
 
     /// Explicit path to `opencode` executable.
@@ -366,6 +370,7 @@ impl OpencodeArgs {
             fast_model: None,
             no_bypass: false,
             full_code_mode: false,
+            mcp_code_mode: false,
             no_code_mode: false,
             opencode_bin: std::env::var_os("OPENCODE_BIN")
                 .filter(|s| !s.is_empty())

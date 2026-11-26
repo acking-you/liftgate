@@ -1305,3 +1305,96 @@ fn codex_with_single_underscore_mcp_integrations_stays_codex_and_generic_eval_ha
         "generic `eval(expression)` must not emit an OMP polyglot eval prompt contract"
     );
 }
+
+#[test]
+fn opencode_profile_emits_full_and_partial_execute_orchestrator_contracts() {
+    use liftgate_types::session_key::McpOrchestratorContract;
+
+    let mut spill = NoopSpillSink;
+
+    // 1. OpenCode v2 `full_codemode` (`question`, `skill`, `subagent`, `execute` with `timeout` & `background`)
+    let full_tools = vec![
+        fn_tool(
+            "question",
+            "Ask user questions",
+            json!({ "type": "object", "properties": { "questions": { "type": "array" } } }),
+        ),
+        fn_tool(
+            "skill",
+            "Load skill",
+            json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "subagent",
+            "Spawn child subagent",
+            json!({ "type": "object", "properties": { "prompt": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "execute",
+            "Run JavaScript in a confined Code Mode runtime to work with files and data (`Bun.file`, `Bun.write`, `Bun.Glob`).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "timeout": { "type": "integer" },
+                    "background": { "type": "boolean" }
+                },
+                "required": ["code"]
+            }),
+        ),
+    ];
+    assert_eq!(
+        detect_harness(ProtocolHint::AnthropicMessages, &full_tools),
+        DetectedHarness::OpenCode
+    );
+    let full_cat = partition_tools_for_mcp_session(
+        ProtocolHint::AnthropicMessages,
+        &full_tools,
+        true,
+        &mut spill,
+    );
+    assert_eq!(full_cat.profile_id, "opencode");
+    assert_eq!(
+        full_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name: "execute",
+            full_code_mode: true,
+        })
+    );
+
+    // 2. Partial / MCP-only Code Mode (`execute` with `{ code }` alongside direct `shell` & `read`)
+    let partial_tools = vec![
+        fn_tool(
+            "shell",
+            "Run shell command",
+            json!({ "type": "object", "properties": { "command": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "read",
+            "Read file",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        ),
+        fn_tool(
+            "execute",
+            "Run JavaScript in a confined Code Mode runtime to script tool calls.",
+            json!({
+                "type": "object",
+                "properties": { "code": { "type": "string" } },
+                "required": ["code"]
+            }),
+        ),
+    ];
+    let partial_cat = partition_tools_for_mcp_session(
+        ProtocolHint::AnthropicMessages,
+        &partial_tools,
+        true,
+        &mut spill,
+    );
+    assert_eq!(
+        partial_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name: "execute",
+            full_code_mode: false,
+        })
+    );
+}

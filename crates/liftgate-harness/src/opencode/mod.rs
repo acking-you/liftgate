@@ -113,6 +113,7 @@ pub fn merged_opencode_config_into(
     }
 
     apply_opencode_permission_policy(existing, params.no_bypass, params.no_code_mode);
+    apply_opencode_code_mode_policy(existing, params.no_code_mode);
 
     if v2_runtime {
         let compaction_entry = existing
@@ -197,6 +198,36 @@ fn apply_opencode_permission_policy(
         *slot = Value::Object(ordered);
     } else {
         existing.insert("permission".to_owned(), Value::Object(ordered));
+    }
+}
+
+/// Configures `experimental.full_codemode` in OpenCode's JSON config.
+///
+/// OpenCode v2 release builds default `full_codemode` to `false` unless explicitly enabled via
+/// `experimental.full_codemode: true` or `OPENCODE_FLAGS=full_codemode`, leaving `read`, `shell`,
+/// `edit`, `write`, `glob`, and `grep` outside `execute`. Setting `experimental.full_codemode`
+/// to `true` by default (unless `no_code_mode` is set or the caller explicitly configured
+/// `"full_codemode": false` for partial MCP-only Code Mode) activates full Code Mode across both
+/// `lg oc` and `lg config opencode` while remaining ignored safely by OpenCode v1.x.
+fn apply_opencode_code_mode_policy(existing: &mut Map<String, Value>, no_code_mode: bool) {
+    if !no_code_mode
+        && existing
+            .get("experimental")
+            .and_then(Value::as_object)
+            .and_then(|exp| exp.get("full_codemode"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        return;
+    }
+    let exp_entry = existing
+        .entry("experimental".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !exp_entry.is_object() {
+        *exp_entry = Value::Object(Map::new());
+    }
+    if let Value::Object(exp_map) = exp_entry {
+        exp_map.insert("full_codemode".to_owned(), Value::Bool(!no_code_mode));
     }
 }
 
@@ -320,6 +351,17 @@ fn capture_opencode_managed_record(
     let wrote_permission_execute = params
         .no_code_mode
         .then(|| Value::String("deny".to_owned()));
+    let experimental_was_absent = !baseline.contains_key("experimental");
+    let previous_experimental_full_codemode = baseline
+        .get("experimental")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("full_codemode"))
+        .cloned();
+    let wrote_experimental_full_codemode = merged
+        .get("experimental")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("full_codemode"))
+        .cloned();
 
     OpenCodeManagedRecord {
         existed_before_sync,
@@ -337,6 +379,9 @@ fn capture_opencode_managed_record(
         wrote_permission_wildcard,
         previous_permission_execute,
         wrote_permission_execute,
+        experimental_was_absent,
+        previous_experimental_full_codemode,
+        wrote_experimental_full_codemode,
     }
 }
 
@@ -418,6 +463,25 @@ fn revert_opencode_managed_record(
             map.insert("permission".to_owned(), Value::String(shorthand));
         } else if remove_permission_key {
             let _ = remove_key_preserving_order(map, "permission");
+        }
+    }
+
+    if let Some(ref wrote_fc) = rec.wrote_experimental_full_codemode {
+        let mut remove_experimental_key = false;
+        if let Some(Value::Object(exp_map)) = map.get_mut("experimental") {
+            if exp_map.get("full_codemode") == Some(wrote_fc) {
+                if let Some(ref prev_fc) = rec.previous_experimental_full_codemode {
+                    exp_map.insert("full_codemode".to_owned(), prev_fc.clone());
+                } else {
+                    let _ = remove_key_preserving_order(exp_map, "full_codemode");
+                }
+            }
+            if exp_map.is_empty() && rec.experimental_was_absent {
+                remove_experimental_key = true;
+            }
+        }
+        if remove_experimental_key {
+            let _ = remove_key_preserving_order(map, "experimental");
         }
     }
 

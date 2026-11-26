@@ -132,6 +132,18 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
     let mut header_rules = String::with_capacity(2048);
     header_rules.push_str("<api_gateway_bridge_rules>\n");
     let batch_clause = match mcp_spec.orchestrator {
+        Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name,
+            full_code_mode: true,
+        }) => format!(
+            "Compose multi-step or parallel file reads, searches, edits, and shell commands inside a single `mcp_lg_{mcp_name}` Code Mode script (`Promise.all` / `Promise.allSettled`)."
+        ),
+        Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name,
+            full_code_mode: false,
+        }) => format!(
+            "Compose multi-step or parallel `# Code Mode` catalog calls inside `mcp_lg_{mcp_name}`, and batch independent direct `mcp_lg_*` calls in a single turn."
+        ),
         Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name, .. }) => format!(
             "Batch multi-step or parallel reads, searches, and shell inspections inside a single `mcp_lg_{mcp_name}` Code Mode cell."
         ),
@@ -182,6 +194,20 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         ));
     }
     match mcp_spec.orchestrator {
+        Some(McpOrchestratorContract::OpenCodeExecute {
+            mcp_name,
+            full_code_mode,
+        }) => {
+            header_rules.push_str(&format!(
+                "- OpenCode Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with JSON arguments `{{\"code\": \"<plain JavaScript>\", ...}}` (pass raw JavaScript inside the `code` string property with no markdown code fences or nested JSON wrapper). Inside `execute` scripts, call `# Code Mode` catalog tools via `await tools.<path>({{ ... }})` using their exact unprefixed catalog paths (never `mcp_lg_*`) and discover unlisted Code Mode catalog entries with the global `search(...)` helper inside `execute` (do NOT call `mcp_lg_call_client_tool` or `mcp_lg_search_client_tools` for `# Code Mode` tools, which run exclusively inside `mcp_lg_{mcp_name}`)."
+            ));
+            if full_code_mode {
+                header_rules.push_str(&format!(
+                    " Built-in workspace tools (`tools.read`, `tools.shell`, `tools.edit`, `tools.write`, etc.) plus `Bun.file` / `Bun.write` / `Bun.Glob` and `fetch` run inside `mcp_lg_{mcp_name}`; use `mcp_lg_{mcp_name}` as your primary workspace inspection, search, edit, and shell tool, and invoke top-level `mcp_lg_subagent` / `mcp_lg_question` / `mcp_lg_skill` directly when needed."
+                ));
+            }
+            header_rules.push('\n');
+        }
         Some(McpOrchestratorContract::OmpPolyglotEval {
             mcp_name,
             elided_subordinate_tools,

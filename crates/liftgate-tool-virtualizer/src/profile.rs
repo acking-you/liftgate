@@ -7,7 +7,7 @@ use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::{
         McpOrchestratorContract, is_code_mode_custom_exec, is_omp_eval_orchestrator_tool,
-        split_code_mode_ts_declaration,
+        is_opencode_execute_orchestrator_tool, split_code_mode_ts_declaration,
     },
 };
 
@@ -368,6 +368,7 @@ pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) ->
                 | "shell"
                 | "skill"
         ) || is_opencode_v4a_patch_spec(spec)
+            || is_opencode_execute_orchestrator_tool(spec)
             || name.starts_with("opencode_")
             || name.starts_with("opencode.")
             || name.starts_with("automation_")

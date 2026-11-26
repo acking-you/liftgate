@@ -6,11 +6,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use liftgate_harness::opencode::{
-    OpenCodeInvocationKind, classify_opencode_invocation, merge_opencode_flag,
-    parse_opencode_major_version, strip_opencode_flag,
+    OpenCodeInvocationKind, classify_opencode_invocation, has_negated_opencode_flag,
+    merge_opencode_flag, parse_opencode_major_version, strip_opencode_flag,
 };
 use liftgate_server::platform::merge_loopback_no_proxy;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::process::Command;
 
 use crate::cli::{OpencodeArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
@@ -122,7 +122,21 @@ pub(super) async fn build_opencode_invocation(
 
     let raw_env_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
     let mut cfg_map = parse_opencode_env_config_content(raw_env_config.as_deref())?;
+    let existing_flags = std::env::var("OPENCODE_FLAGS").ok();
+    let env_negates_full_cm = has_negated_opencode_flag(existing_flags.as_deref(), "full_codemode");
+    let cfg_negates_full_cm = cfg_map
+        .get("experimental")
+        .and_then(Value::as_object)
+        .and_then(|exp| exp.get("full_codemode"))
+        .and_then(Value::as_bool)
+        == Some(false);
+
     merged_opencode_config_into(&mut cfg_map, &sync_params, v2_runtime);
+    if args.full_code_mode {
+        set_experimental_full_codemode(&mut cfg_map, true);
+    } else if args.mcp_code_mode || (!args.no_code_mode && env_negates_full_cm) {
+        set_experimental_full_codemode(&mut cfg_map, false);
+    }
     let config_content =
         serde_json::to_string(&Value::Object(cfg_map)).map_err(|source| CliError::StateJson {
             path: PathBuf::from("OPENCODE_CONFIG_CONTENT"),
@@ -140,21 +154,14 @@ pub(super) async fn build_opencode_invocation(
         ("NO_PROXY".to_owned(), no_proxy.clone()),
         ("no_proxy".to_owned(), no_proxy),
     ];
-    if args.full_code_mode {
-        let flags = merge_opencode_flag(
-            std::env::var("OPENCODE_FLAGS").ok().as_deref(),
-            "full_codemode",
-        );
-        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
-    } else if args.no_code_mode
-        && let Ok(existing_flags) = std::env::var("OPENCODE_FLAGS")
-        && existing_flags
-            .split(',')
-            .any(|item| item.trim() == "full_codemode")
-    {
-        let flags = strip_opencode_flag(Some(existing_flags.as_str()), "full_codemode");
-        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
-    }
+    apply_opencode_runtime_env_flags(
+        &mut env_set,
+        args,
+        v2_runtime,
+        existing_flags.as_deref(),
+        env_negates_full_cm || cfg_negates_full_cm,
+        std::env::var_os("OPENCODE_EXPERIMENTAL_CODE_MODE").is_some(),
+    );
 
     let has_server_flag = args
         .passthrough_args
@@ -180,6 +187,52 @@ pub(super) async fn build_opencode_invocation(
         cleanup_files: Vec::new(),
         hold_open_on_exit: hold_open,
     })
+}
+
+fn set_experimental_full_codemode(cfg_map: &mut Map<String, Value>, enabled: bool) {
+    let exp_entry = cfg_map
+        .entry("experimental".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !exp_entry.is_object() {
+        *exp_entry = Value::Object(Map::new());
+    }
+    if let Value::Object(exp_map) = exp_entry {
+        exp_map.insert("full_codemode".to_owned(), Value::Bool(enabled));
+    }
+}
+
+pub(super) fn apply_opencode_runtime_env_flags(
+    env_set: &mut Vec<(String, String)>,
+    args: &OpencodeArgs,
+    v2_runtime: bool,
+    existing_opencode_flags: Option<&str>,
+    caller_opted_out_full_cm: bool,
+    has_v1_code_mode_env: bool,
+) {
+    if args.no_code_mode || args.mcp_code_mode {
+        if v2_runtime || existing_opencode_flags.is_some() {
+            let flags = strip_opencode_flag(existing_opencode_flags, "full_codemode");
+            env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
+        }
+        if !v2_runtime && args.no_code_mode {
+            env_set.push((
+                "OPENCODE_EXPERIMENTAL_CODE_MODE".to_owned(),
+                "false".to_owned(),
+            ));
+        }
+        return;
+    }
+
+    if args.full_code_mode || (v2_runtime && !caller_opted_out_full_cm) {
+        let flags = merge_opencode_flag(existing_opencode_flags, "full_codemode");
+        env_set.push(("OPENCODE_FLAGS".to_owned(), flags));
+    }
+    if !v2_runtime && !has_v1_code_mode_env {
+        env_set.push((
+            "OPENCODE_EXPERIMENTAL_CODE_MODE".to_owned(),
+            "true".to_owned(),
+        ));
+    }
 }
 
 async fn detect_opencode_v2(resolved: &ResolvedCommand) -> bool {

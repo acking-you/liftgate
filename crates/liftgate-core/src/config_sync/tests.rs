@@ -520,6 +520,10 @@ fn opencode_config_merge_and_uninstall_preserve_unrelated_user_fields() {
         .collect();
     assert_eq!(perm_keys, vec!["*", "doom_loop", "execute"]);
     assert_eq!(existing["compaction"]["background"].as_bool(), Some(false));
+    assert_eq!(
+        existing["experimental"]["full_codemode"].as_bool(),
+        Some(false)
+    );
 
     // Conservative strip without ledger removes Liftgate's `agy` provider & models while
     // keeping `theme`, `mcp`, `openrouter`, and leaving `permission` untouched without a ledger
@@ -561,6 +565,29 @@ fn opencode_no_bypass_preserves_user_execute_deny_object_wildcard_and_rule_order
     let keys: Vec<&str> = perm_obj.keys().map(String::as_str).collect();
     assert_eq!(keys, vec!["bash*", "bash", "execute"]);
     assert_eq!(perm_obj["execute"].as_str(), Some("deny"));
+    assert_eq!(
+        reparsed["experimental"]["full_codemode"].as_bool(),
+        Some(true)
+    );
+
+    // Explicit caller `"experimental": { "full_codemode": false }` opt-out is preserved when
+    // `no_code_mode == false`.
+    let mut explicit_partial: Map<String, Value> = serde_json::from_value(json!({
+        "experimental": {
+            "full_codemode": false,
+            "subagent_depth": 2
+        }
+    }))
+    .expect("json object");
+    merged_opencode_config_into(&mut explicit_partial, &base_params, true);
+    assert_eq!(
+        explicit_partial["experimental"]["full_codemode"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explicit_partial["experimental"]["subagent_depth"].as_u64(),
+        Some(2)
+    );
 
     // 2. `--no-bypass --no-code-mode` preserves object-form `permission["*"]` AND rule order,
     // appending `"execute": "deny"` at the end for last-match-wins evaluation.
@@ -675,6 +702,7 @@ fn opencode_uninstall_leaves_unmanaged_files_unchanged_and_reverts_only_managed_
     );
     assert!(after.get("small_model").is_none());
     assert!(after.get("provider").is_none());
+    assert!(after.get("experimental").is_none());
     // User's original `execute: "deny"` and `bash*` -> `bash` order preserved, Liftgate's `*` removed!
     let after_perms = after["permission"].as_object().expect("permission object");
     let after_perm_keys: Vec<&str> = after_perms.keys().map(String::as_str).collect();

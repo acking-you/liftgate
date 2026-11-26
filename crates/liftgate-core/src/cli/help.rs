@@ -58,7 +58,8 @@ Native OpenCode Commands & Session Examples:
   lg oc                           Start an interactive OpenCode TUI session in current directory
   lg oc -c / lg oc continue       Continue most recent session (alias: `lg oc resume`)
   lg oc -s <ID> / lg oc resume <ID> Continue or create a specific session by ID
-  lg oc --full-code-mode          Enable full Code Mode (`OPENCODE_FLAGS=full_codemode`)
+  lg oc --mcp-code-mode           Keep file/shell tools direct (`execute` for MCP/namespaces only)
+  lg oc --no-code-mode            Disable `execute` (`execute: deny`) so all tools run directly
   lg oc run \"run cargo test\"      Run a non-interactive prompt (`lg oc run -c \"...\"`)
   lg oc models                    List configured providers and live Antigravity models
   lg oc session list              List recent project sessions (`delete`, `export`, `import`)
