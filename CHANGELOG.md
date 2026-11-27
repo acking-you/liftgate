@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Per-call tool I/O telemetry (#21)**:
+  - Every tool call the gateway sees is recorded in a bounded in-memory ring buffer (`2,000` calls, `128 KiB` per stored field, `64 MiB` total, oldest evicted first): suspended MCP round-trips and XML calls, `mcp_lg_ns__*` hub and `mcp_lg_call_client_tool` dispatcher unwrapping (wire vs. forwarded arguments), gateway-local 0-RTT `search_client_tools` / `read_context_spill` replies, preflight and disabled-tool rejections, and `gateway_web_fetch`.
+  - Each record carries harness profile, orchestration mode, session, turn and step, route, status, duration, input/output bytes with token estimates, CodeMode orchestrator flag and script language, V4A auto-repair, terminal-control sanitization, spill, and image blocks with probed PNG / GIF / JPEG / WebP dimensions. Results are matched by call id whether they come back through the parked MCP reply or in the next request; CodeMode results that report `Script failed` count as script exceptions even when the harness leaves `is_error` unset.
+  - New `GET /api/telemetry/tool-calls[?since=<revision>]` (incremental polling) and `GET /api/telemetry/tool-calls/{call_id}`; the snapshot gains `tool_call_telemetry`.
+- **Session tool catalog (#21)**: `GET /api/telemetry/sessions/{id}/tool-catalog` explains how a pooled MCP session's client tools were virtualized — the tier of every tool (orchestrator, direct, folded into the orchestrator, hub action, slack backfill, search-index only), client vs. wire description and schema, wire tools with folded actions, the `<api_gateway_bridge_rules>` and orchestrator contract sent at `session/new`, and the context composition of the latest turn.
+- **Opt-in full-context capture (#21)**: `--capture-full-context` (`AGY_CAPTURE_FULL_CONTEXT`, `capture_full_context` in `settings.json`, live toggle in the dashboard; off by default) writes each turn's message history (resident prefix vs. delta), reasoning, `session/prompt` blocks and output to `~/.liftgate/context-captures/`, bounded by `--max-context-captures` (`200`) and `--max-context-capture-mib` (`512`). New `GET /api/telemetry/context-captures[/{task_id}]`, `POST /api/telemetry/context-capture` and `POST /api/telemetry/context-captures/clear`; the snapshot gains `context_capture`.
+
+### Changed
+- **Redesigned web dashboard (`web/`)**:
+  - Rewrote the single-file dashboard into a hash-routed console (`#/overview`, `#/tools`, `#/catalog`, `#/context`, `#/cache`, `#/sessions`, `#/models`, `#/diagnostics`) with light / dark themes that follow the system until toggled, a collapsible sidebar that becomes a drawer on phones, and tables that drop secondary columns on small screens.
+  - `#/tools` shows a per-harness scoreboard, an I/O skyline (one column per call, output above and input below on one scale), a keyboard-navigable (`J` / `K`) call stream grouped by turn, and an inspector that draws each call's route and renders its payload by kind: highlighted CodeMode scripts with jump-to nested `tools.*` calls, V4A / unified patches as diffs with a file index, and harness result envelopes (`Script completed`, exit codes) as status pills over a terminal view.
+  - `#/catalog` and `#/context` visualize the session tool catalog and full-context captures; gateways without these endpoints get an explanatory placeholder.
+  - `vite dev` accepts `?demo` to run every view against a synthetic backend (excluded from production builds). Removed unused shadcn-era dependencies.
+
 ## [0.2.15] - 2026-11-27
 
 ### Added
