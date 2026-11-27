@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
 use liftgate_types::config::{
-    CacheHitThresholdBps, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES,
-    DEFAULT_MAX_IDLE_SESSIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES,
-    DEFAULT_TURN_TIMEOUT_SECS, GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl,
-    is_endpoint_local_keyword, is_proxy_disable_keyword,
+    CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit,
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
+    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS,
+    GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl, is_endpoint_local_keyword,
+    is_proxy_disable_keyword,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -113,6 +114,11 @@ impl StatePaths {
     }
 
     #[must_use]
+    pub fn context_capture_dir(&self) -> PathBuf {
+        self.root.join("context-captures")
+    }
+
+    #[must_use]
     pub fn launchers_dir(&self) -> PathBuf {
         self.root.join("launchers")
     }
@@ -139,6 +145,12 @@ impl StatePaths {
 
     pub fn ensure_spill_dir(&self) -> Result<PathBuf, CliError> {
         let dir = self.spill_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_context_capture_dir(&self) -> Result<PathBuf, CliError> {
+        let dir = self.context_capture_dir();
         ensure_private_dir(&dir)?;
         Ok(canonicalize_clean(&dir))
     }
@@ -266,6 +278,15 @@ pub struct LiftgateSettings {
     /// Persist full request payload details & message breakdown for low-cache turns (`true` by default).
     #[serde(default = "default_true")]
     pub capture_low_cache_request_details: bool,
+    /// Capture the complete context of every turn to `context-captures/` (`false` by default).
+    #[serde(default)]
+    pub capture_full_context: bool,
+    /// Maximum retained full-context captures (`200` by default).
+    #[serde(default)]
+    pub max_context_captures: ContextCaptureRecordLimit,
+    /// Disk quota in MiB for full-context captures (`512` by default).
+    #[serde(default)]
+    pub max_context_capture_mib: ContextCaptureDiskMib,
     /// Custom `agy` binary path recorded when `lg agy install --dir <path>` installs outside `PATH`.
     #[serde(default)]
     pub agy_bin: Option<PathBuf>,
@@ -293,6 +314,9 @@ impl Default for LiftgateSettings {
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
+            capture_full_context: false,
+            max_context_captures: ContextCaptureRecordLimit::default(),
+            max_context_capture_mib: ContextCaptureDiskMib::default(),
             agy_bin: None,
             target_mode: GatewayTargetMode::Local,
             remote_endpoint: None,
@@ -488,6 +512,44 @@ pub const fn resolve_effective_low_cache_capture_payload(
     }
 }
 
+/// Resolves whether every turn's complete context is captured (`CLI/env` -> `settings.json` -> `false`).
+#[must_use]
+pub const fn resolve_effective_capture_full_context(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.capture_full_context
+    }
+}
+
+/// Resolves the retained full-context capture count (`CLI/env` -> `settings.json` -> `200`).
+pub fn resolve_effective_max_context_captures(
+    cli_override: Option<usize>,
+    settings: &LiftgateSettings,
+) -> Result<ContextCaptureRecordLimit, CliError> {
+    match cli_override {
+        Some(raw) => Ok(ContextCaptureRecordLimit::try_new(raw)?),
+        None => Ok(settings.max_context_captures),
+    }
+}
+
+/// Resolves the full-context capture disk quota in MiB (`CLI/env` -> `settings.json` -> `512`).
+pub fn resolve_effective_max_context_capture_mib(
+    cli_override: Option<usize>,
+    settings: &LiftgateSettings,
+) -> Result<ContextCaptureDiskMib, CliError> {
+    match cli_override {
+        Some(raw) => Ok(ContextCaptureDiskMib::try_new(raw)?),
+        None => Ok(settings.max_context_capture_mib),
+    }
+}
+
 /// Resolves the `agy` executable path, consulting saved `settings.agy_bin` when not yet on `PATH`.
 #[must_use]
 pub fn resolve_effective_agy_bin(
@@ -539,6 +601,12 @@ pub struct DaemonState {
     pub low_cache_threshold_bps: CacheHitThresholdBps,
     #[serde(default = "default_true")]
     pub capture_low_cache_request_details: bool,
+    #[serde(default)]
+    pub capture_full_context: bool,
+    #[serde(default)]
+    pub max_context_captures: ContextCaptureRecordLimit,
+    #[serde(default)]
+    pub max_context_capture_mib: ContextCaptureDiskMib,
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
@@ -821,6 +889,9 @@ mod tests {
             max_low_cache_records: LowCacheRecordLimit::default(),
             low_cache_threshold_bps: CacheHitThresholdBps::default(),
             capture_low_cache_request_details: true,
+            capture_full_context: true,
+            max_context_captures: ContextCaptureRecordLimit::default(),
+            max_context_capture_mib: ContextCaptureDiskMib::default(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -839,6 +910,8 @@ mod tests {
         assert!(loaded.vision_offload);
         assert!(loaded.mcp_tool_bridge);
         assert!(loaded.agy_proxy.is_none());
+        assert!(loaded.capture_full_context);
+        assert_eq!(loaded.max_context_capture_mib.get(), 512);
 
         paths.remove_daemon().unwrap();
         assert!(paths.read_daemon().unwrap().is_none());
@@ -862,12 +935,41 @@ mod tests {
             false,
             &defaults
         ));
+        assert!(!defaults.capture_full_context);
+        assert!(!resolve_effective_capture_full_context(
+            None, false, &defaults
+        ));
+        assert!(resolve_effective_capture_full_context(
+            Some(true),
+            false,
+            &defaults
+        ));
+        assert!(!resolve_effective_capture_full_context(
+            Some(true),
+            true,
+            &defaults
+        ));
+        assert_eq!(
+            resolve_effective_max_context_captures(None, &defaults)
+                .unwrap()
+                .get(),
+            200
+        );
+        assert!(resolve_effective_max_context_captures(Some(0), &defaults).is_err());
+        assert_eq!(
+            resolve_effective_max_context_capture_mib(Some(1024), &defaults)
+                .unwrap()
+                .bytes(),
+            1024 * 1024 * 1024
+        );
+        assert!(resolve_effective_max_context_capture_mib(Some(8), &defaults).is_err());
 
         let mut updated = defaults;
         updated.agy_proxy = Some(ProxyUrl::try_new("7890").unwrap());
         updated.agy_auto_update = false;
         updated.vision_offload = true;
         updated.mcp_tool_bridge = false;
+        updated.capture_full_context = true;
         paths.write_settings(&updated).unwrap();
         let reloaded = paths.read_settings().unwrap();
         assert_eq!(
@@ -877,6 +979,9 @@ mod tests {
         assert!(!reloaded.agy_auto_update);
         assert!(reloaded.vision_offload);
         assert!(!reloaded.mcp_tool_bridge);
+        assert!(resolve_effective_capture_full_context(
+            None, false, &reloaded
+        ));
         assert!(!resolve_effective_mcp_tool_bridge(None, false, &reloaded));
         assert!(resolve_effective_mcp_tool_bridge(
             Some(true),

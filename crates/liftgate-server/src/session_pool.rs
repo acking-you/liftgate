@@ -226,6 +226,7 @@ struct ActiveLeaseMeta {
     last_active_unix_ms: u64,
     last_response_id: Option<String>,
     mcp_summary: Option<SessionMcpSummary>,
+    mcp_handle: Option<Arc<McpSessionHandle>>,
 }
 
 struct StoredResponseEntry {
@@ -1042,6 +1043,55 @@ impl SessionPool {
         }
     }
 
+    fn update_lease_mcp(
+        &self,
+        sid: &SessionId,
+        summary: Option<SessionMcpSummary>,
+        handle: Option<Arc<McpSessionHandle>>,
+    ) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(meta) = guard.active_leases.get_mut(sid.as_str()) {
+            meta.mcp_summary = summary;
+            meta.mcp_handle = handle;
+        }
+    }
+
+    /// MCP handle and model of a running, suspended, or idle session, for the tool catalog view.
+    #[must_use]
+    pub fn mcp_handle_for(&self, session_id: &str) -> Option<(Arc<McpSessionHandle>, String)> {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(meta) = guard.active_leases.get(session_id)
+            && let Some(handle) = meta.mcp_handle.as_ref()
+        {
+            return Some((Arc::clone(handle), meta.model_id.as_str().to_owned()));
+        }
+        if let Some(entry) = guard
+            .suspended_sessions
+            .iter()
+            .find(|e| e.session_id.as_str() == session_id)
+        {
+            return Some((
+                Arc::clone(&entry.mcp_handle),
+                entry.model_id.as_str().to_owned(),
+            ));
+        }
+        guard
+            .idle_sessions
+            .iter()
+            .find(|e| e.session_id.as_str() == session_id)
+            .and_then(|e| {
+                e.mcp_handle
+                    .as_ref()
+                    .map(|h| (Arc::clone(h), e.model_id.as_str().to_owned()))
+            })
+    }
+
     fn set_lease_in_flight_hashes(&self, sid: &SessionId, hashes: Vec<ConversationHash>) {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -1401,6 +1451,7 @@ impl<B: AcpBackend> SuspendedCheckoutGuard<B> {
                         .mcp_handle
                         .telemetry_summary(entry.declared_tools.len()),
                 ),
+                mcp_handle: Some(Arc::clone(&entry.mcp_handle)),
             },
             false,
         );
@@ -1523,6 +1574,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 last_active_unix_ms: now_ms,
                 last_response_id: None,
                 mcp_summary: None,
+                mcp_handle: None,
             },
             true,
         );
@@ -1550,7 +1602,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
             .as_ref()
             .map(|h| h.telemetry_summary(self.declared_tools.len()));
         self.pool
-            .update_lease_mcp_summary(&self.session_id, summary);
+            .update_lease_mcp(&self.session_id, summary, mcp_handle.clone());
         self.mcp_handle = mcp_handle;
         self
     }
@@ -1582,6 +1634,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                     .mcp_handle
                     .as_ref()
                     .map(|h| h.telemetry_summary(cached.declared_tools.len())),
+                mcp_handle: cached.mcp_handle.clone(),
             },
             false,
         );

@@ -7,7 +7,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Mutex, OnceLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -21,11 +21,11 @@ use axum::{
     routing::post,
 };
 pub use liftgate_tool_virtualizer::{
-    CALL_CLIENT_TOOL_MCP_NAME, ClaudeCodeToolProfile, CodexToolProfile, DetectedHarness,
-    GATEWAY_WEB_FETCH_MCP_NAME, GenericToolProfile, HarnessToolProfile, LocalReplyKind,
-    MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog, McpSessionOptions,
-    McpWireTool, NAMESPACE_HUB_MCP_PREFIX, OmpToolProfile, OpenCodeToolProfile, ProtocolHint,
-    READ_CONTEXT_SPILL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement,
+    CALL_CLIENT_TOOL_MCP_NAME, CatalogDescription, ClaudeCodeToolProfile, CodexToolProfile,
+    DetectedHarness, GATEWAY_WEB_FETCH_MCP_NAME, GenericToolProfile, HarnessToolProfile,
+    LocalReplyKind, MAX_NATIVE_MCP_TOOLS, McpBridgedTool, McpRoutingTable, McpSessionCatalog,
+    McpSessionOptions, McpWireTool, NAMESPACE_HUB_MCP_PREFIX, OmpToolProfile, OpenCodeToolProfile,
+    ProtocolHint, READ_CONTEXT_SPILL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME, ToolPlacement,
     VirtualizedCallDecision, VirtualizerBudget, apply_patch_input_schema, detect_harness,
     extract_custom_tool_input, freeform_custom_input_schema, gateway_web_fetch_input_schema,
     normalize_apply_patch_text, partition_tools_for_harness, partition_tools_for_mcp,
@@ -141,7 +141,11 @@ pub struct McpSessionHandle {
     routing: RwLock<Arc<McpRoutingTable>>,
     call_rx: tokio::sync::Mutex<mpsc::Receiver<IncomingMcpToolCall>>,
     registry: Arc<SessionRegistryMap>,
+    bridge_rules: OnceLock<Box<str>>,
 }
+
+const BRIDGE_RULES_OPEN: &str = "<api_gateway_bridge_rules>";
+const BRIDGE_RULES_CLOSE: &str = "</api_gateway_bridge_rules>";
 
 impl fmt::Debug for McpSessionHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -182,6 +186,45 @@ impl McpSessionHandle {
     #[must_use]
     pub const fn call_rx(&self) -> &tokio::sync::Mutex<mpsc::Receiver<IncomingMcpToolCall>> {
         &self.call_rx
+    }
+
+    /// Remembers the `<api_gateway_bridge_rules>` block of the `session/new` system append so the
+    /// tool catalog can show exactly what the model was told. Only the first call takes effect.
+    pub fn record_bridge_rules(&self, system_append: &str) {
+        let Some(start) = system_append.find(BRIDGE_RULES_OPEN) else {
+            return;
+        };
+        let Some(close) = system_append
+            .get(start..)
+            .and_then(|tail| tail.find(BRIDGE_RULES_CLOSE))
+        else {
+            return;
+        };
+        let end = start
+            .saturating_add(close)
+            .saturating_add(BRIDGE_RULES_CLOSE.len());
+        if let Some(rules) = system_append.get(start..end) {
+            let _ = self.bridge_rules.set(Box::from(rules));
+        }
+    }
+
+    /// `<api_gateway_bridge_rules>` sent when this session was created.
+    #[must_use]
+    pub fn bridge_rules(&self) -> Option<&str> {
+        self.bridge_rules.get().map(AsRef::as_ref)
+    }
+
+    /// Tier, serving wire tool, and byte attribution of every active client tool.
+    #[must_use]
+    pub fn describe_catalog(&self) -> CatalogDescription {
+        let table = {
+            let guard = match self.routing.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Arc::clone(&guard)
+        };
+        table.describe(&self.catalog)
     }
 
     /// Synchronizes the session's live in-memory routing and search index with `client_tools`
@@ -435,6 +478,7 @@ impl LoopbackMcpServer {
             routing,
             call_rx: tokio::sync::Mutex::new(call_rx),
             registry: Arc::clone(&self.registry),
+            bridge_rules: OnceLock::new(),
         })
     }
 }

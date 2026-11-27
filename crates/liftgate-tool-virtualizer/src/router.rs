@@ -7,6 +7,7 @@ use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     parser::ApplyPatchPreflightError,
     session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
+    telemetry::{CatalogToolEntry, CatalogToolTier, CatalogWireRole, CatalogWireTool},
 };
 use serde_json::Value;
 
@@ -14,11 +15,13 @@ use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, READ_CONTEXT_SPILL_MCP_NAME,
     SEARCH_CLIENT_TOOLS_MCP_NAME,
     budget::VirtualizerBudget,
+    planner::McpSessionCatalog,
     profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract},
     schema::{
         McpBridgedTool, code_mode_exec_input_schema, coerce_stringified_container_fields,
-        extract_custom_tool_input, extract_schema_metadata, normalize_apply_patch_text,
-        normalize_mcp_object_schema, truncate_utf8_prefix, validate_apply_patch_preflight,
+        estimate_wire_tool_bytes, extract_custom_tool_input, extract_schema_metadata,
+        normalize_apply_patch_text, normalize_mcp_object_schema, truncate_utf8_prefix,
+        validate_apply_patch_preflight,
     },
 };
 
@@ -58,9 +61,32 @@ pub enum VirtualizedCallDecision {
     },
 }
 
+/// Profile placement of a client tool, retained so the catalog can explain the final tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementTier {
+    Orchestrator,
+    CoreDirect,
+    Namespaced,
+    Standalone,
+    FoldedIntoOrchestrator,
+}
+
+impl PlacementTier {
+    const fn of(placement: &ToolPlacement<'_>) -> Self {
+        match placement {
+            ToolPlacement::Orchestrator { .. } => Self::Orchestrator,
+            ToolPlacement::CoreDirect { .. } => Self::CoreDirect,
+            ToolPlacement::Namespaced { .. } => Self::Namespaced,
+            ToolPlacement::Standalone { .. } => Self::Standalone,
+            ToolPlacement::FoldedIntoOrchestrator => Self::FoldedIntoOrchestrator,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct IndexedClientTool {
     pub(crate) client_name: String,
+    pub(crate) placement: PlacementTier,
     pub(crate) namespace: Option<String>,
     pub(crate) short_action: Option<String>,
     pub(crate) invoke_via_mcp_name: String,
@@ -304,6 +330,7 @@ impl McpRoutingTable {
         let mut all_indexed_tools = Vec::with_capacity(client_tools.len());
         for spec in client_tools {
             let placement = profile.classify_tool(spec, prepass);
+            let placement_tier = PlacementTier::of(&placement);
             let profile_v4a_patch = profile.v4a_patch_contract(spec);
             let is_orchestrator = matches!(placement, ToolPlacement::Orchestrator { .. });
             let folded_into_orchestrator =
@@ -417,6 +444,7 @@ impl McpRoutingTable {
 
             let indexed = IndexedClientTool {
                 client_name: spec.name.clone(),
+                placement: placement_tier,
                 namespace,
                 short_action,
                 invoke_via_mcp_name: invoke_via_mcp_name.clone(),
@@ -492,6 +520,184 @@ impl McpRoutingTable {
         self.all_indexed_tools.iter().fold(0usize, |acc, item| {
             acc.saturating_add(item.estimated_heap_bytes())
         })
+    }
+
+    /// Budget this table was planned against.
+    #[must_use]
+    pub const fn budget(&self) -> VirtualizerBudget {
+        self.budget
+    }
+
+    /// Explains how every active client tool maps onto the `lg` wire tools of `catalog`:
+    /// tier, serving wire tool, client vs. wire definitions, and per-tool byte attribution.
+    #[must_use]
+    pub fn describe(&self, catalog: &McpSessionCatalog) -> CatalogDescription {
+        let specs: HashMap<&str, &CanonicalToolSpec> = self
+            .source_tools
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec))
+            .collect();
+        let indexed_by_client: HashMap<&str, &IndexedClientTool> = self
+            .all_indexed_tools
+            .iter()
+            .map(|t| (t.client_name.as_str(), t))
+            .collect();
+        let mcp_by_client: HashMap<&str, &str> = self
+            .direct_by_mcp
+            .values()
+            .map(|b| (b.client_name.as_str(), b.mcp_name.as_str()))
+            .collect();
+        let orchestrator_mcp: Option<&str> = self
+            .direct_by_mcp
+            .values()
+            .filter(|b| {
+                indexed_by_client
+                    .get(b.client_name.as_str())
+                    .is_some_and(|t| t.placement == PlacementTier::Orchestrator)
+            })
+            .map(|b| b.mcp_name.as_str())
+            .find(|name| *name != "wait");
+        let folded_clients: Vec<String> = self
+            .all_indexed_tools
+            .iter()
+            .filter(|t| t.folded_into_orchestrator)
+            .map(|t| t.client_name.clone())
+            .collect();
+
+        let mut wire_tools = Vec::with_capacity(catalog.wire_tools.len());
+        let mut wire_bytes_by_name: HashMap<&str, usize> =
+            HashMap::with_capacity(catalog.wire_tools.len());
+        let mut wire_by_name: HashMap<&str, &crate::schema::McpWireTool> =
+            HashMap::with_capacity(catalog.wire_tools.len());
+        for wire in catalog.wire_tools.iter() {
+            let bytes = estimate_wire_tool_bytes(
+                &wire.name,
+                wire.description.as_deref(),
+                &wire.input_schema,
+            );
+            wire_bytes_by_name.insert(wire.name.as_str(), bytes);
+            wire_by_name.insert(wire.name.as_str(), wire);
+            let (role, folded_actions) = if is_gateway_wire_tool(&wire.name) {
+                (CatalogWireRole::Gateway, Vec::new())
+            } else if let Some(hub) = self.hubs_by_mcp.get(&wire.name) {
+                (
+                    CatalogWireRole::NamespaceHub,
+                    hub.actions.iter().map(|a| a.client_name.clone()).collect(),
+                )
+            } else if let Some(bridged) = self.direct_by_mcp.get(&wire.name) {
+                let role = direct_wire_role(
+                    indexed_by_client
+                        .get(bridged.client_name.as_str())
+                        .map(|t| t.placement),
+                    catalog.is_passthrough,
+                );
+                let folded = if role == CatalogWireRole::Orchestrator
+                    && orchestrator_mcp == Some(wire.name.as_str())
+                {
+                    folded_clients.clone()
+                } else {
+                    Vec::new()
+                };
+                (role, folded)
+            } else {
+                (CatalogWireRole::Unknown, Vec::new())
+            };
+            wire_tools.push(CatalogWireTool {
+                wire_name: wire.name.clone(),
+                role,
+                description: wire.description.clone(),
+                input_schema: wire.input_schema.to_string(),
+                bytes,
+                folded_actions,
+            });
+        }
+
+        let mut client_tools_bytes = 0usize;
+        let mut tools = Vec::with_capacity(self.all_indexed_tools.len());
+        for item in &self.all_indexed_tools {
+            let spec = specs.get(item.client_name.as_str()).copied();
+            let (client_kind, client_schema) = match spec.map(|s| &s.kind) {
+                Some(CanonicalToolKind::Function { parameters_json }) => {
+                    ("function", Some(parameters_json.clone()))
+                }
+                Some(CanonicalToolKind::Custom { format_json }) => ("custom", format_json.clone()),
+                None => ("function", None),
+            };
+            let client_description = spec.and_then(|s| s.description.clone());
+            let client_bytes = item
+                .client_name
+                .len()
+                .saturating_add(client_description.as_deref().map_or(0, str::len))
+                .saturating_add(client_schema.as_deref().map_or(0, str::len));
+            client_tools_bytes = client_tools_bytes.saturating_add(client_bytes);
+
+            let direct_mcp = mcp_by_client.get(item.client_name.as_str()).copied();
+            let (tier, wire_name, wire_bytes, wire_def) = if item.folded_into_orchestrator {
+                (
+                    CatalogToolTier::FoldedIntoOrchestrator,
+                    orchestrator_mcp.map(str::to_owned),
+                    0,
+                    None,
+                )
+            } else if let Some(mcp_name) = direct_mcp {
+                let tier = match direct_wire_role(Some(item.placement), catalog.is_passthrough) {
+                    CatalogWireRole::Orchestrator => CatalogToolTier::Orchestrator,
+                    CatalogWireRole::SlackBackfill => CatalogToolTier::SlackBackfill,
+                    CatalogWireRole::Direct
+                    | CatalogWireRole::NamespaceHub
+                    | CatalogWireRole::Gateway
+                    | CatalogWireRole::Unknown => CatalogToolTier::Direct,
+                };
+                (
+                    tier,
+                    Some(mcp_name.to_owned()),
+                    wire_bytes_by_name.get(mcp_name).copied().unwrap_or(0),
+                    wire_by_name.get(mcp_name).copied(),
+                )
+            } else if let Some(hub) = self.hubs_by_mcp.get(&item.invoke_via_mcp_name) {
+                let hub_bytes = wire_bytes_by_name
+                    .get(item.invoke_via_mcp_name.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                (
+                    CatalogToolTier::NamespaceHubAction,
+                    Some(hub.hub_mcp_name.clone()),
+                    hub_bytes / hub.actions.len().max(1),
+                    None,
+                )
+            } else {
+                (
+                    CatalogToolTier::SearchIndexOnly,
+                    self.has_virtualized_dispatch
+                        .then(|| CALL_CLIENT_TOOL_MCP_NAME.to_owned()),
+                    0,
+                    None,
+                )
+            };
+
+            tools.push(CatalogToolEntry {
+                client_name: item.client_name.clone(),
+                tier,
+                wire_name,
+                client_kind: client_kind.to_owned(),
+                client_description,
+                client_schema,
+                client_bytes,
+                wire_description: wire_def.and_then(|w| w.description.clone()),
+                wire_schema: wire_def.map(|w| w.input_schema.to_string()),
+                wire_bytes,
+                ts_signature: item.ts_declaration.clone(),
+            });
+        }
+
+        CatalogDescription {
+            tools,
+            wire_tools,
+            search_index_entries: self.all_indexed_tools.len(),
+            client_tools_bytes,
+            wire_budget_bytes: self.budget.max_eager_wire_bytes,
+            eager_tool_budget: self.budget.max_eager_tools,
+        }
     }
 
     /// Pure synchronous resolution of an incoming MCP `tools/call` invocation.
@@ -916,6 +1122,49 @@ impl McpRoutingTable {
         }
 
         out
+    }
+}
+
+/// How a session's active client tools map onto its `lg` wire tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogDescription {
+    /// Every active client tool, in declaration order.
+    pub tools: Vec<CatalogToolEntry>,
+    /// Every tool mounted on `lg`, in `tools/list` order.
+    pub wire_tools: Vec<CatalogWireTool>,
+    /// Entries reachable through 0-RTT `search_client_tools`.
+    pub search_index_entries: usize,
+    /// Bytes of the client-declared tool list (names, descriptions, schemas).
+    pub client_tools_bytes: usize,
+    pub wire_budget_bytes: usize,
+    pub eager_tool_budget: usize,
+}
+
+fn is_gateway_wire_tool(name: &str) -> bool {
+    matches!(
+        name,
+        SEARCH_CLIENT_TOOLS_MCP_NAME
+            | CALL_CLIENT_TOOL_MCP_NAME
+            | GATEWAY_WEB_FETCH_MCP_NAME
+            | READ_CONTEXT_SPILL_MCP_NAME
+    )
+}
+
+/// Role of a client tool mounted 1:1 on `lg`: core tools stay direct, while long-tail tools that
+/// only fit because the virtualized plan had spare slots are slack-slot backfills.
+const fn direct_wire_role(
+    placement: Option<PlacementTier>,
+    is_passthrough: bool,
+) -> CatalogWireRole {
+    match placement {
+        Some(PlacementTier::Orchestrator) => CatalogWireRole::Orchestrator,
+        _ if is_passthrough => CatalogWireRole::Direct,
+        Some(PlacementTier::CoreDirect) | None => CatalogWireRole::Direct,
+        Some(
+            PlacementTier::Standalone
+            | PlacementTier::Namespaced
+            | PlacementTier::FoldedIntoOrchestrator,
+        ) => CatalogWireRole::SlackBackfill,
     }
 }
 

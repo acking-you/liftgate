@@ -29,7 +29,7 @@ pub use profiles::{
     ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OmpToolProfile,
     OpenCodeToolProfile,
 };
-pub use router::{LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
+pub use router::{CatalogDescription, LocalReplyKind, McpRoutingTable, VirtualizedCallDecision};
 pub use schema::{
     McpBridgedTool, McpWireTool, apply_patch_input_schema, code_mode_exec_input_schema,
     coerce_stringified_container_fields, estimate_wire_tool_bytes, extract_custom_tool_input,

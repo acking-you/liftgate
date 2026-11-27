@@ -309,6 +309,23 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "low_cache_capture_payload")]
     pub no_low_cache_capture_payload: bool,
 
+    /// Capture the complete context (messages, reasoning, ACP prompt, output) of every turn to
+    /// `~/.liftgate/context-captures` (`false` by default; toggle live from the dashboard).
+    #[arg(long, env = "AGY_CAPTURE_FULL_CONTEXT")]
+    pub capture_full_context: Option<bool>,
+
+    /// Disable full-context capture for this server run.
+    #[arg(long, conflicts_with = "capture_full_context")]
+    pub no_capture_full_context: bool,
+
+    /// Maximum retained full-context captures before the oldest is deleted (`200` by default).
+    #[arg(long, env = "AGY_MAX_CONTEXT_CAPTURES")]
+    pub max_context_captures: Option<usize>,
+
+    /// Disk quota in MiB for full-context captures (`512` by default, `16..=65536`).
+    #[arg(long, env = "AGY_MAX_CONTEXT_CAPTURE_MIB")]
+    pub max_context_capture_mib: Option<usize>,
+
     /// Maximum ACP stdout JSON-RPC line size in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
     pub max_line_bytes: usize,
@@ -400,6 +417,19 @@ impl Default for ServeArgs {
                 "0" | "false" | "off" | "no" => Some(false),
                 _ => None,
             });
+        let capture_full_context = std::env::var("AGY_CAPTURE_FULL_CONTEXT")
+            .ok()
+            .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            });
+        let max_context_captures = std::env::var("AGY_MAX_CONTEXT_CAPTURES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        let max_context_capture_mib = std::env::var("AGY_MAX_CONTEXT_CAPTURE_MIB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
 
         Self {
             listen,
@@ -421,6 +451,10 @@ impl Default for ServeArgs {
             low_cache_threshold_pct,
             low_cache_capture_payload,
             no_low_cache_capture_payload: false,
+            capture_full_context,
+            no_capture_full_context: false,
+            max_context_captures,
+            max_context_capture_mib,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -514,6 +548,22 @@ pub struct RestartArgs {
     /// Disable full request payload capture on low-cache turns.
     #[arg(long, conflicts_with = "low_cache_capture_payload")]
     pub no_low_cache_capture_payload: bool,
+
+    /// Override full-context capture of every turn (`true` or `false`, `false` by default).
+    #[arg(long)]
+    pub capture_full_context: Option<bool>,
+
+    /// Disable full-context capture.
+    #[arg(long, conflicts_with = "capture_full_context")]
+    pub no_capture_full_context: bool,
+
+    /// Override the retained full-context capture count (`200` by default).
+    #[arg(long)]
+    pub max_context_captures: Option<usize>,
+
+    /// Override the full-context capture disk quota in MiB (`512` by default).
+    #[arg(long)]
+    pub max_context_capture_mib: Option<usize>,
 
     /// Open the Web observability dashboard in the default browser after restarting.
     #[arg(long)]

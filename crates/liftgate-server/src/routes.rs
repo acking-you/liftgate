@@ -22,7 +22,9 @@ use liftgate_types::{
         AnthropicWebSearchResultItem, estimate_anthropic_tokens, normalize_anthropic_request,
     },
     canonical::{extract_markdown_links, extract_search_query_hint},
-    config::{CacheHitThresholdBps, LowCacheRecordLimit},
+    config::{
+        CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit, LowCacheRecordLimit,
+    },
     openai::{
         CreateResponseRequest, LocalShellAction, ModelCard, ModelChatMetadata, ModelListResponse,
         ModelModalities, OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError,
@@ -40,9 +42,11 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     acp_client::AcpBackend,
+    context_capture::ContextCaptureIoError,
     error::{AcpError, GatewayError, RequestBodyError},
     session_pool::SessionPool,
     telemetry::{TelemetryHub, unix_timestamp_ms},
+    tool_catalog::build_session_tool_catalog,
     turn_runner::{
         ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
         generate_short_nonce,
@@ -224,6 +228,31 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/api/telemetry/cache-config",
             post(handle_set_cache_config::<B>),
+        )
+        .route("/api/telemetry/tool-calls", get(handle_get_tool_calls::<B>))
+        .route(
+            "/api/telemetry/tool-calls/{call_id}",
+            get(handle_get_tool_call_detail::<B>),
+        )
+        .route(
+            "/api/telemetry/sessions/{session_id}/tool-catalog",
+            get(handle_get_session_tool_catalog::<B>),
+        )
+        .route(
+            "/api/telemetry/context-captures",
+            get(handle_get_context_captures::<B>),
+        )
+        .route(
+            "/api/telemetry/context-captures/clear",
+            post(handle_clear_context_captures::<B>),
+        )
+        .route(
+            "/api/telemetry/context-captures/{task_id}",
+            get(handle_get_context_capture_detail::<B>),
+        )
+        .route(
+            "/api/telemetry/context-capture",
+            post(handle_set_context_capture::<B>),
         )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
@@ -3570,6 +3599,8 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         metrics,
         cache_telemetry,
         elastic_io,
+        tool_call_telemetry: state.telemetry.tool_call_summary(),
+        context_capture: state.telemetry.context_capture_summary(),
         active_tasks,
         recent_tasks,
         available_models,
@@ -3972,6 +4003,231 @@ async fn handle_set_cache_config<B: AcpBackend>(
         parsed.capture_request_details,
     );
     Json(summary).into_response()
+}
+
+fn telemetry_error(status: StatusCode, kind: &'static str, message: String) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": kind,
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn handle_get_tool_calls<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let since = match query_param(&uri, "since").map(str::parse::<u64>) {
+        None => None,
+        Some(Ok(rev)) => Some(rev),
+        Some(Err(_)) => {
+            return telemetry_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`since` must be a non-negative integer revision".to_owned(),
+            );
+        }
+    };
+    Json(state.telemetry.tool_calls(since)).into_response()
+}
+
+async fn handle_get_tool_call_detail<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    Path(call_id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    match state.telemetry.tool_call_detail(call_id.trim()) {
+        Some(detail) => Json(detail).into_response(),
+        None => telemetry_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("tool call `{}` is not in the buffer", call_id.trim()),
+        ),
+    }
+}
+
+async fn handle_get_session_tool_catalog<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let session_id = session_id.trim();
+    let Some((handle, model_id)) = state.pool.mcp_handle_for(session_id) else {
+        return telemetry_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("session `{session_id}` is not in the pool or has no MCP tool bridge"),
+        );
+    };
+    let sample = state.telemetry.session_context_sample(session_id);
+    Json(build_session_tool_catalog(
+        session_id, &handle, model_id, sample,
+    ))
+    .into_response()
+}
+
+async fn handle_get_context_captures<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    Json(state.telemetry.context_captures()).into_response()
+}
+
+async fn handle_get_context_capture_detail<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let task_id = task_id.trim().to_owned();
+    let telemetry = Arc::clone(&state.telemetry);
+    let lookup_id = task_id.clone();
+    let loaded =
+        tokio::task::spawn_blocking(move || telemetry.context_capture_detail(&lookup_id)).await;
+    let not_found = || {
+        telemetry_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("no full-context capture for `{task_id}`"),
+        )
+    };
+    match loaded {
+        Ok(Ok(Some(detail))) => Json(detail).into_response(),
+        Ok(Ok(None)) => not_found(),
+        Ok(Err(ContextCaptureIoError::Read { source, .. }))
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            not_found()
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(error = ?err, "failed to load full-context capture");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "the capture file could not be read".to_owned(),
+            )
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, "full-context capture loader task failed");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "the capture file could not be read".to_owned(),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextCaptureUpdatePayload {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    max_records: Option<usize>,
+    #[serde(default)]
+    max_total_mib: Option<usize>,
+}
+
+async fn handle_set_context_capture<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let parsed: ContextCaptureUpdatePayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return GatewayError::from(RequestBodyError::from(err)).into_openai_response();
+        }
+    };
+    let max_records = match parsed.max_records.map(ContextCaptureRecordLimit::try_new) {
+        None => None,
+        Some(Ok(limit)) => Some(limit),
+        Some(Err(err)) => {
+            return telemetry_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                err.to_string(),
+            );
+        }
+    };
+    let max_disk = match parsed.max_total_mib.map(ContextCaptureDiskMib::try_new) {
+        None => None,
+        Some(Ok(quota)) => Some(quota),
+        Some(Err(err)) => {
+            return telemetry_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                err.to_string(),
+            );
+        }
+    };
+    let telemetry = Arc::clone(&state.telemetry);
+    let updated = tokio::task::spawn_blocking(move || {
+        telemetry.update_context_capture(parsed.enabled, max_records, max_disk)
+    })
+    .await;
+    match updated {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => {
+            tracing::warn!(error = ?err, "full-context capture settings task failed");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "capture settings could not be applied".to_owned(),
+            )
+        }
+    }
+}
+
+async fn handle_clear_context_captures<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let telemetry = Arc::clone(&state.telemetry);
+    match tokio::task::spawn_blocking(move || telemetry.clear_context_captures()).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => {
+            tracing::warn!(error = ?err, "full-context capture clear task failed");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "captures could not be cleared".to_owned(),
+            )
+        }
+    }
 }
 
 async fn handle_admin_shutdown<B: AcpBackend>(

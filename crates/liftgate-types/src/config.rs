@@ -17,6 +17,11 @@ pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 pub const DEFAULT_MAX_LOW_CACHE_RECORDS: usize = 1_000;
 pub const MAX_ALLOWED_LOW_CACHE_RECORDS: usize = 50_000;
 pub const DEFAULT_LOW_CACHE_THRESHOLD_BPS: u16 = 5_000;
+pub const DEFAULT_MAX_CONTEXT_CAPTURES: usize = 200;
+pub const MAX_ALLOWED_CONTEXT_CAPTURES: usize = 10_000;
+pub const DEFAULT_CONTEXT_CAPTURE_DISK_MIB: usize = 512;
+pub const MIN_CONTEXT_CAPTURE_DISK_MIB: usize = 16;
+pub const MAX_CONTEXT_CAPTURE_DISK_MIB: usize = 64 * 1024;
 pub const DEFAULT_GATEWAY_PORT: u16 = 8787;
 
 const _: () = assert!(
@@ -30,6 +35,16 @@ const _: () = assert!(
 const _: () = assert!(
     DEFAULT_LOW_CACHE_THRESHOLD_BPS <= 10_000,
     "default low-cache threshold must be valid basis points (0..=10,000)"
+);
+const _: () = assert!(
+    DEFAULT_MAX_CONTEXT_CAPTURES >= 1
+        && DEFAULT_MAX_CONTEXT_CAPTURES <= MAX_ALLOWED_CONTEXT_CAPTURES,
+    "default full-context capture retention must lie inside its validated range"
+);
+const _: () = assert!(
+    DEFAULT_CONTEXT_CAPTURE_DISK_MIB >= MIN_CONTEXT_CAPTURE_DISK_MIB
+        && DEFAULT_CONTEXT_CAPTURE_DISK_MIB <= MAX_CONTEXT_CAPTURE_DISK_MIB,
+    "default full-context capture disk quota must lie inside its validated range"
 );
 
 /// Validated non-empty ACP session identifier.
@@ -578,6 +593,100 @@ impl From<CacheHitThresholdBps> for u16 {
     }
 }
 
+/// Validated retention bound for full-context captures (`1..=10_000`; `200` by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "usize", into = "usize")]
+pub struct ContextCaptureRecordLimit(usize);
+
+impl ContextCaptureRecordLimit {
+    pub fn try_new(raw: usize) -> Result<Self, ValidationError> {
+        if raw == 0 || raw > MAX_ALLOWED_CONTEXT_CAPTURES {
+            return Err(ValidationError::LimitOutOfRange {
+                field: "max_context_captures",
+                value: raw,
+                min: 1,
+                max: MAX_ALLOWED_CONTEXT_CAPTURES,
+            });
+        }
+        Ok(Self(raw))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for ContextCaptureRecordLimit {
+    fn default() -> Self {
+        Self(DEFAULT_MAX_CONTEXT_CAPTURES)
+    }
+}
+
+impl TryFrom<usize> for ContextCaptureRecordLimit {
+    type Error = ValidationError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<ContextCaptureRecordLimit> for usize {
+    fn from(value: ContextCaptureRecordLimit) -> Self {
+        value.0
+    }
+}
+
+/// Validated disk quota in MiB for full-context captures (`16..=65_536`; `512` by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "usize", into = "usize")]
+pub struct ContextCaptureDiskMib(usize);
+
+impl ContextCaptureDiskMib {
+    pub fn try_new(raw: usize) -> Result<Self, ValidationError> {
+        if !(MIN_CONTEXT_CAPTURE_DISK_MIB..=MAX_CONTEXT_CAPTURE_DISK_MIB).contains(&raw) {
+            return Err(ValidationError::LimitOutOfRange {
+                field: "max_context_capture_mib",
+                value: raw,
+                min: MIN_CONTEXT_CAPTURE_DISK_MIB,
+                max: MAX_CONTEXT_CAPTURE_DISK_MIB,
+            });
+        }
+        Ok(Self(raw))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    /// Quota in bytes (`MiB * 1_048_576`).
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        (self.0 as u64).saturating_mul(1024 * 1024)
+    }
+}
+
+impl Default for ContextCaptureDiskMib {
+    fn default() -> Self {
+        Self(DEFAULT_CONTEXT_CAPTURE_DISK_MIB)
+    }
+}
+
+impl TryFrom<usize> for ContextCaptureDiskMib {
+    type Error = ValidationError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<ContextCaptureDiskMib> for usize {
+    fn from(value: ContextCaptureDiskMib) -> Self {
+        value.0
+    }
+}
+
 /// Returns `true` when `raw` is a keyword switching target mode back to the local managed daemon.
 #[must_use]
 pub fn is_endpoint_local_keyword(raw: &str) -> bool {
@@ -953,6 +1062,18 @@ mod tests {
         );
         assert!(CacheHitThresholdBps::try_from_percent(101).is_err());
         assert!(CacheHitThresholdBps::try_new(10_001).is_err());
+
+        assert_eq!(ContextCaptureRecordLimit::default().get(), 200);
+        assert!(ContextCaptureRecordLimit::try_new(0).is_err());
+        assert_eq!(ContextCaptureRecordLimit::try_new(1).unwrap().get(), 1);
+        assert!(ContextCaptureRecordLimit::try_new(10_001).is_err());
+        assert_eq!(ContextCaptureDiskMib::default().bytes(), 512 * 1024 * 1024);
+        assert!(ContextCaptureDiskMib::try_new(15).is_err());
+        assert_eq!(ContextCaptureDiskMib::try_new(16).unwrap().get(), 16);
+        assert!(ContextCaptureDiskMib::try_new(64 * 1024 + 1).is_err());
+        let decoded: ContextCaptureDiskMib = serde_json::from_str("2048").unwrap();
+        assert_eq!(decoded.bytes(), 2 * 1024 * 1024 * 1024);
+        assert!(serde_json::from_str::<ContextCaptureRecordLimit>("0").is_err());
 
         assert_eq!(compute_cache_hit_bps(0, 0), None);
         assert_eq!(compute_cache_hit_bps(0, 2_000), Some(0));

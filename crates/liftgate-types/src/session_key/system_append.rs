@@ -104,6 +104,63 @@ pub struct McpBridgePromptSpec<'a> {
     pub orchestrator: Option<McpOrchestratorContract<'a>>,
 }
 
+/// Renders the `<api_gateway_bridge_rules>` bullet that teaches the model how to drive the
+/// session's CodeMode or compound-I/O orchestrator (byte-identical to the rules sent at `session/new`).
+#[must_use]
+pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> String {
+    let mut out = String::with_capacity(1024);
+    match contract {
+        McpOrchestratorContract::CodexExec {
+            mcp_name,
+            has_apply_patch,
+        } => {
+            out.push_str(&format!(
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with `{{\"code\": \"<plain JavaScript>\"}}` (raw JS inside `code`, no markdown fences). Inside `exec`, fan out concurrent local read-only commands via `await Promise.all([tools.exec_command(...), ...])`, persist full outputs in `store(key, raw)` / `load(key)`, emit `<= 8 KB` filtered excerpts via `text(...)`, and call `mcp_lg_wait` if a cell yields a `cell_id`."
+            ));
+            if has_apply_patch {
+                out.push_str(&format!(
+                    " For 5+ existing-file patches needing per-file fault isolation, run `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `mcp_lg_{mcp_name}` cell; when `<collaboration_mode>` / `<permissions instructions>` allow non-interactive workspace writes (NEVER in `Plan Mode`, `read-only`, or manual `on-request` shell approval), stream large new files or mechanical 5+-file updates plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`)."
+                ));
+            }
+            out.push('\n');
+        }
+        McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name } => {
+            out.push_str(&format!(
+                "- Elastic Bash-First I/O (`mcp_lg_{bash_mcp_name}`): override default single-command habits — combine multi-file search and ranged inspection (`rg -n`, `rg --files`, `sed -n 'start,endp'`, `git status -sb`) into ONE `mcp_lg_{bash_mcp_name}` call returning `<= 8 KB` line-numbered slices; use `mcp_lg_Read` directly for images/PDFs/notebooks, single known slices, or when `Bash` requires manual approval while `Read` is pre-approved. For edits: use `mcp_lg_Edit` (or `mcp_lg_MultiEdit`) for surgical 1-3 file changes to preserve `/rewind` checkpoints and UI diffs; when write permissions are non-interactive (`acceptEdits` / `auto` / `bypassPermissions` — NEVER in `Plan Mode`, `read-only`, or manual shell approval), stream large new files or mechanical 5+-file rewrites plus verification (`git diff --stat`, tests) in a single `mcp_lg_{bash_mcp_name}` script (`python3 - <<'PY'` or `cat <<'EOF' > path`).\n"
+            ));
+        }
+        McpOrchestratorContract::OpenCodeExecute {
+            mcp_name,
+            full_code_mode,
+        } => {
+            out.push_str(&format!(
+                "- OpenCode Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with JSON arguments `{{\"code\": \"<plain JavaScript>\", ...}}` (pass raw JavaScript inside the `code` string property with no markdown code fences or nested JSON wrapper). Inside `execute` scripts, call `# Code Mode` catalog tools via `await tools.<path>({{ ... }})` using their exact unprefixed catalog paths (never `mcp_lg_*`), discover unlisted Code Mode catalog entries with the global `search(...)` helper inside `execute` (do NOT call `mcp_lg_call_client_tool` or `mcp_lg_search_client_tools` for `# Code Mode` tools, which run exclusively inside `mcp_lg_{mcp_name}`), and slice/filter returned text to `<= 8 KB` so single calls never spill."
+            ));
+            if full_code_mode {
+                out.push_str(&format!(
+                    " Built-in workspace tools (`tools.read`, `tools.shell`, `tools.edit`, `tools.write`, etc.) plus `Bun.file` / `Bun.write` / `Bun.Glob` and `fetch` run inside `mcp_lg_{mcp_name}`; use `mcp_lg_{mcp_name}` as your primary compound workspace inspection, search, edit/stream-write (when permissions allow), and shell verification tool, and invoke top-level `mcp_lg_subagent` / `mcp_lg_question` / `mcp_lg_skill` directly when needed."
+                ));
+            }
+            out.push('\n');
+        }
+        McpOrchestratorContract::OmpPolyglotEval {
+            mcp_name,
+            elided_subordinate_tools,
+        } => {
+            out.push_str(&format!(
+                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`), filtering printed output to `<= 8 KB` and caching raw text in kernel variables; inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code), and ensure newlines inside JSON string literals are properly escaped."
+            ));
+            if elided_subordinate_tools {
+                out.push_str(&format!(
+                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, ALWAYS read the exact target line range via `await tool.read({{\"i\": \"Read target lines\", \"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` (never prelude `read(...)`/`Bun.file`, which do not register `[FILENAME#TAG]` line-hash snapshots and cause `unseen_lines` rejections), then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for surgical mutations (or stream large new files + checks inside `mcp_lg_{mcp_name}` when write permissions allow)."
+                ));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Builds a 100% pure-MCP, nonce-free, byte-deterministic `_meta.antigravity.systemPrompt.append`
 /// for sessions backed by the `lg` Loopback MCP server.
 ///
@@ -201,55 +258,8 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
             "- File edits (`mcp_lg_{mcp_ap}`): invoke native `mcp_lg_{mcp_ap}` with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target line ranges verbatim (use `mcp_lg_read_context_spill` if a prior read was truncated). Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call to avoid serial MCP round-trips (merging all edits to the same file under one `*** Update File:` header with 1-3 exact context lines per `@@` hunk); if verification fails, re-read exact lines and retry ONLY the failed file.\n"
         ));
     }
-    match mcp_spec.orchestrator {
-        Some(McpOrchestratorContract::CodexExec {
-            mcp_name,
-            has_apply_patch,
-        }) => {
-            header_rules.push_str(&format!(
-                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with `{{\"code\": \"<plain JavaScript>\"}}` (raw JS inside `code`, no markdown fences). Inside `exec`, fan out concurrent local read-only commands via `await Promise.all([tools.exec_command(...), ...])`, persist full outputs in `store(key, raw)` / `load(key)`, emit `<= 8 KB` filtered excerpts via `text(...)`, and call `mcp_lg_wait` if a cell yields a `cell_id`."
-            ));
-            if has_apply_patch {
-                header_rules.push_str(&format!(
-                    " For 5+ existing-file patches needing per-file fault isolation, run `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `mcp_lg_{mcp_name}` cell; when `<collaboration_mode>` / `<permissions instructions>` allow non-interactive workspace writes (NEVER in `Plan Mode`, `read-only`, or manual `on-request` shell approval), stream large new files or mechanical 5+-file updates plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`)."
-                ));
-            }
-            header_rules.push('\n');
-        }
-        Some(McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }) => {
-            header_rules.push_str(&format!(
-                "- Elastic Bash-First I/O (`mcp_lg_{bash_mcp_name}`): override default single-command habits — combine multi-file search and ranged inspection (`rg -n`, `rg --files`, `sed -n 'start,endp'`, `git status -sb`) into ONE `mcp_lg_{bash_mcp_name}` call returning `<= 8 KB` line-numbered slices; use `mcp_lg_Read` directly for images/PDFs/notebooks, single known slices, or when `Bash` requires manual approval while `Read` is pre-approved. For edits: use `mcp_lg_Edit` (or `mcp_lg_MultiEdit`) for surgical 1-3 file changes to preserve `/rewind` checkpoints and UI diffs; when write permissions are non-interactive (`acceptEdits` / `auto` / `bypassPermissions` — NEVER in `Plan Mode`, `read-only`, or manual shell approval), stream large new files or mechanical 5+-file rewrites plus verification (`git diff --stat`, tests) in a single `mcp_lg_{bash_mcp_name}` script (`python3 - <<'PY'` or `cat <<'EOF' > path`).\n"
-            ));
-        }
-        Some(McpOrchestratorContract::OpenCodeExecute {
-            mcp_name,
-            full_code_mode,
-        }) => {
-            header_rules.push_str(&format!(
-                "- OpenCode Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with JSON arguments `{{\"code\": \"<plain JavaScript>\", ...}}` (pass raw JavaScript inside the `code` string property with no markdown code fences or nested JSON wrapper). Inside `execute` scripts, call `# Code Mode` catalog tools via `await tools.<path>({{ ... }})` using their exact unprefixed catalog paths (never `mcp_lg_*`), discover unlisted Code Mode catalog entries with the global `search(...)` helper inside `execute` (do NOT call `mcp_lg_call_client_tool` or `mcp_lg_search_client_tools` for `# Code Mode` tools, which run exclusively inside `mcp_lg_{mcp_name}`), and slice/filter returned text to `<= 8 KB` so single calls never spill."
-            ));
-            if full_code_mode {
-                header_rules.push_str(&format!(
-                    " Built-in workspace tools (`tools.read`, `tools.shell`, `tools.edit`, `tools.write`, etc.) plus `Bun.file` / `Bun.write` / `Bun.Glob` and `fetch` run inside `mcp_lg_{mcp_name}`; use `mcp_lg_{mcp_name}` as your primary compound workspace inspection, search, edit/stream-write (when permissions allow), and shell verification tool, and invoke top-level `mcp_lg_subagent` / `mcp_lg_question` / `mcp_lg_skill` directly when needed."
-                ));
-            }
-            header_rules.push('\n');
-        }
-        Some(McpOrchestratorContract::OmpPolyglotEval {
-            mcp_name,
-            elided_subordinate_tools,
-        }) => {
-            header_rules.push_str(&format!(
-                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`), filtering printed output to `<= 8 KB` and caching raw text in kernel variables; inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code), and ensure newlines inside JSON string literals are properly escaped."
-            ));
-            if elided_subordinate_tools {
-                header_rules.push_str(&format!(
-                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, ALWAYS read the exact target line range via `await tool.read({{\"i\": \"Read target lines\", \"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` (never prelude `read(...)`/`Bun.file`, which do not register `[FILENAME#TAG]` line-hash snapshots and cause `unseen_lines` rejections), then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for surgical mutations (or stream large new files + checks inside `mcp_lg_{mcp_name}` when write permissions allow)."
-                ));
-            }
-            header_rules.push('\n');
-        }
-        None => {}
+    if let Some(contract) = mcp_spec.orchestrator {
+        header_rules.push_str(&orchestrator_contract_rules(contract));
     }
 
     if mcp_spec.has_virtualized_dispatch {
