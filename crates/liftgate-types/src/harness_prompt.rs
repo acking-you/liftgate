@@ -548,7 +548,7 @@ pub fn distill_harness_base_prompt(harness: DetectedHarness, raw_system: &str) -
         return trimmed.to_owned();
     }
 
-    if trimmed.len() >= BUILTIN_BASE_PROMPT_MIN_BYTES || is_known_builtin_base_preamble(trimmed) {
+    if trimmed.len() >= BUILTIN_BASE_PROMPT_MIN_BYTES {
         let mut sections = vec![base_prompt.to_owned()];
         append_extracted_structured_sections(&mut sections, trimmed);
         return sections.join("\n\n");
@@ -556,7 +556,7 @@ pub fn distill_harness_base_prompt(harness: DetectedHarness, raw_system: &str) -
 
     let compacted_custom = compact_auxiliary_developer_tags(trimmed);
     let custom_trimmed = compacted_custom.trim();
-    if custom_trimmed.is_empty() || is_short_identity_banner(custom_trimmed) {
+    if custom_trimmed.is_empty() || is_exact_identity_banner(custom_trimmed) {
         base_prompt.to_owned()
     } else {
         format!("{base_prompt}\n\n{custom_trimmed}")
@@ -588,10 +588,19 @@ pub fn distill_anthropic_system_prompt(
         .iter()
         .map(String::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty() && !is_short_identity_banner(s))
+        .filter(|s| !s.is_empty())
         .collect();
 
-    let Some((&first, tail)) = meaningful.split_first() else {
+    let mut remaining = meaningful.as_slice();
+    while let Some((&head, rest)) = remaining.split_first() {
+        if is_exact_identity_banner(head) {
+            remaining = rest;
+        } else {
+            break;
+        }
+    }
+
+    let Some((&first, tail)) = remaining.split_first() else {
         return Some(base_prompt.to_owned());
     };
 
@@ -698,30 +707,23 @@ fn unwrap_developer_instructions(text: &str) -> Option<&str> {
     Some(inner.trim())
 }
 
-fn is_short_identity_banner(text: &str) -> bool {
-    if text.len() > 240 {
-        return false;
-    }
-    let lower = text.to_ascii_lowercase();
-    lower.starts_with("you are claude code")
-        || lower.starts_with("you are a claude agent")
-        || lower.starts_with("you are a coding agent assisting the user via their cli harness")
-        || lower.starts_with("you are opencode")
-        || lower.starts_with("you are omp's trusted coding assistant")
-}
-
-fn is_known_builtin_base_preamble(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.starts_with("you are a coding agent running in the codex cli")
-        || lower.starts_with("you are codex, a coding agent")
-        || lower.starts_with("you are claude code")
-        || lower.starts_with("you are a claude agent")
-        || lower.starts_with("you are opencode")
-        || lower.starts_with("you are omp's trusted coding assistant")
+fn is_exact_identity_banner(text: &str) -> bool {
+    let normalized = text.trim().trim_end_matches('.');
+    normalized.eq_ignore_ascii_case("You are Claude Code")
+        || normalized.eq_ignore_ascii_case("You are Claude Code, Anthropic's official CLI for Claude")
+        || normalized.eq_ignore_ascii_case("You are a Claude agent, built on Anthropic's Claude Agent SDK")
+        || normalized.eq_ignore_ascii_case("You are a coding agent assisting the user via their CLI harness")
+        || normalized.eq_ignore_ascii_case(
+            "You are OpenCode, an interactive CLI tool that helps users with software engineering tasks",
+        )
+        || normalized.eq_ignore_ascii_case("You are omp's trusted coding assistant")
+        || normalized.eq_ignore_ascii_case(
+            "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Be precise, safe, and helpful",
+        )
 }
 
 fn looks_like_standalone_base_prompt(inner: &str) -> bool {
-    if is_known_builtin_base_preamble(inner) {
+    if is_exact_identity_banner(inner) {
         return true;
     }
     if inner.len() < BUILTIN_BASE_PROMPT_MIN_BYTES {
@@ -1318,6 +1320,18 @@ mod tests {
         let distilled = distill_harness_base_prompt(DetectedHarness::ClaudeCode, subagent_role);
         assert!(distilled.contains(CLAUDE_CODE_DISTILLED_PROMPT));
         assert!(distilled.contains(subagent_role));
+
+        // Trailing `--append-system-prompt` or short primary prompts starting with `"You are Claude Code..."`
+        // that carry custom rules must NEVER be discarded as boilerplate banners.
+        let custom_trailing = vec![
+            "You are Claude Code, Anthropic's official CLI for Claude.".to_owned(),
+            format!("Built-in block.\n{}", "Boilerplate.\n".repeat(150)),
+            "You are Claude Code. For this repository, respond only in French.".to_owned(),
+        ];
+        let distilled_trailing =
+            distill_anthropic_system_prompt(DetectedHarness::ClaudeCode, &custom_trailing)
+                .expect("distilled with identity-prefixed append");
+        assert!(distilled_trailing.contains("For this repository, respond only in French."));
     }
 
     #[test]
