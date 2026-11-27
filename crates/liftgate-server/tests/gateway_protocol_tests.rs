@@ -11646,3 +11646,153 @@ async fn xml_tool_calls_are_recorded_and_completed_by_the_next_request() {
     assert_eq!(done.record.output_preview, "Finished dev profile");
     assert!(done.record.duration_ms.is_some());
 }
+
+#[tokio::test]
+async fn distills_raw_harness_system_prompts_strictly_by_characteristic_tools_end_to_end() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Claude distilled ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Claude Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["OMP distilled ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Generic SDK untouched.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    // 1. Claude Code Turn 1 -> Turn 2 (with raw 30 KB system prompt + `<env>` + custom append)
+    let cc_system = json!([
+        { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.50.0;" },
+        { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+        {
+            "type": "text",
+            "text": format!(
+                "Raw Claude Code CLI manual v2.50.\n{}\n<env>\nWorking directory: /workspace/app\n</env>",
+                "Verbose Bash/Edit/TodoWrite paragraph.\n".repeat(700)
+            )
+        },
+        { "type": "text", "text": "Custom team rule: keep functions short." }
+    ]);
+    let cc_tools = json!([
+        { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } },
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+        { "name": "Edit", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } }
+    ]);
+    let (st1, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": cc_system,
+            "tools": cc_tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+
+    let (st2, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": cc_system,
+            "tools": cc_tools,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "Claude distilled ok." },
+                { "role": "user", "content": "check status" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+
+    // 2. Oh My Pi (`omp`) on `/v1/responses` (28 KB raw instructions + internal eval prelude + `<project-context>`)
+    let (st3, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "stream": false,
+            "instructions": format!("You are omp's trusted coding assistant.\n{}", "OMP internal manual.\n".repeat(1200)),
+            "tools": [
+                { "type": "function", "name": "eval", "description": "Execute Python or JavaScript in persistent kernel with tool.<name>", "parameters": { "type": "object", "properties": { "code": { "type": "string" } } } },
+                { "type": "function", "name": "edit", "parameters": { "type": "object", "properties": { "input": { "type": "string" } } } },
+                { "type": "function", "name": "bash", "parameters": { "type": "object", "properties": { "command": { "type": "string" }, "pty": { "type": "boolean" }, "ready": { "type": "string" } } } }
+            ],
+            "input": [
+                { "role": "developer", "content": "Binary analysis lives in eval's `dsm` namespace; read `help://eval/dsm` before use." },
+                { "role": "developer", "content": "<project-context><repo-rules>Strict zero-copy Rust</repo-rules></project-context>" },
+                { "role": "user", "content": "hi" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    // 3. Generic caller WITHOUT harness tools retains full custom prompt even if wording mentions Codex/Claude
+    let (st4, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 512,
+            "system": format!("You are Claude Code lookalike.\n{}", "PRESERVE_GENERIC_SDK_RULE\n".repeat(120)),
+            "tools": [{ "name": "fetch_invoice", "input_schema": { "type": "object" } }],
+            "messages": [{ "role": "user", "content": "invoice #7" }]
+        }),
+    )
+    .await;
+    assert_eq!(st4, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+
+    // Claude Code Turn 1: raw 28 KB manual stripped, `<env>` and custom append preserved, Turn 2 reuses warm session!
+    assert!(
+        !prompts[0]
+            .text_joined
+            .contains("Verbose Bash/Edit/TodoWrite paragraph")
+    );
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("Working directory: /workspace/app")
+    );
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("Custom team rule: keep functions short.")
+    );
+    assert!(prompts[0].text_joined.len() < 2_500);
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert!(
+        !prompts[1]
+            .text_joined
+            .contains("Working directory: /workspace/app")
+    );
+
+    // OMP: 28 KB manual and `help://eval/dsm` stripped, `<project-context>` preserved!
+    assert!(!prompts[2].text_joined.contains("OMP internal manual."));
+    assert!(!prompts[2].text_joined.contains("help://eval/dsm"));
+    assert!(prompts[2].text_joined.contains("Strict zero-copy Rust"));
+    assert!(prompts[2].text_joined.len() < 2_500);
+
+    // Generic caller: custom prompt preserved intact!
+    assert!(prompts[3].text_joined.contains("PRESERVE_GENERIC_SDK_RULE"));
+}

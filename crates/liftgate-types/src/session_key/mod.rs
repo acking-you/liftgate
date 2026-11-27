@@ -399,10 +399,21 @@ pub fn materialize_system_prompt_into_messages(
     let Some(sys_raw) = raw_system else {
         return;
     };
-    let Some(wrapped) = wrap_developer_instructions_block(sys_raw) else {
+    let is_compaction = client_tools.is_empty() && is_compaction_instructions_prompt(sys_raw);
+    let effective_sys: std::borrow::Cow<'_, str> = if !is_compaction
+        && !is_compaction_instructions_prompt(sys_raw)
+        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(client_tools)
+    {
+        std::borrow::Cow::Owned(crate::harness_prompt::distill_harness_base_prompt(
+            harness, sys_raw,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(sys_raw)
+    };
+    let Some(wrapped) = wrap_developer_instructions_block(&effective_sys) else {
         return;
     };
-    if client_tools.is_empty() && is_compaction_instructions_prompt(&wrapped) {
+    if is_compaction {
         if let Some(last_user) = messages
             .last_mut()
             .filter(|m| m.role == CanonicalRole::User)

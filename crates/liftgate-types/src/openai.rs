@@ -196,6 +196,7 @@ pub fn normalize_responses_request(
     let mut aux_system_parts = Vec::new();
     let mut messages: Vec<CanonicalMessage> = Vec::new();
     let mut has_conversational_input = false;
+    let mut has_base_instructions_slot = false;
     let mut deferred_compaction_instructions: Option<String> = None;
     let mut latest_config_effort: Option<ReasoningEffort> = None;
     let mut dynamic_tools: Vec<Value> = Vec::new();
@@ -209,6 +210,7 @@ pub fn normalize_responses_request(
                 if is_compaction_instructions_prompt(trimmed) {
                     deferred_compaction_instructions = Some(trimmed.to_owned());
                 } else if let Some(wrapped) = wrap_developer_instructions_block(trimmed) {
+                    has_base_instructions_slot = true;
                     messages.push(CanonicalMessage {
                         role: CanonicalRole::User,
                         parts: vec![CanonicalPart::Text(wrapped)],
@@ -570,6 +572,22 @@ pub fn normalize_responses_request(
             enable_native_web_search = false;
             enable_native_web_fetch = false;
         }
+    }
+
+    if auxiliary_task.is_none()
+        && !crate::session_key::is_compaction_summarization_turn(
+            aux_system_hint.as_deref(),
+            &messages,
+            &client_tools,
+        )
+        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&client_tools)
+    {
+        crate::harness_prompt::distill_responses_developer_messages(
+            harness,
+            has_base_instructions_slot,
+            req.previous_response_id.is_none(),
+            &mut messages,
+        );
     }
 
     let force_native_web_search = enable_native_web_search
@@ -1335,24 +1353,7 @@ pub const fn codex_truncation_limit_bytes(context_window: u64) -> i64 {
     }
 }
 
-const CODEX_AGY_BASE_INSTRUCTIONS: &str = "\
-You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Be precise, safe, and helpful.
-
-# Working Principles
-- Keep going autonomously until the user's request is completely resolved before yielding back. Do not guess when you can inspect the workspace directly.
-- Obey any `AGENTS.md` instructions whose directory scope covers files you touch; deeper `AGENTS.md` files take precedence over parent ones, and direct user/developer instructions take precedence over `AGENTS.md`.
-- Before grouped tool calls or long edits, send a brief 1-sentence preamble so the user can follow progress.
-- When searching text or file paths in the shell, prefer `rg` and `rg --files`.
-- Top-level tool calls execute sequentially over ACP (~1.3s overhead per call) and single tool outputs `> 9.6 KB` spill to disk: when Code Mode (`exec` and `wait`) is active, coalesce multi-file searches, symbol lookups, and ranged reads into a single `exec` JavaScript cell (`await Promise.all([tools.exec_command(...), ...])`), store reusable raw outputs in `store(key, value)` / `load(key)`, slice `text(...)` replies to `<= 8 KB` (~200 lines) to avoid spill round-trips, and call `wait` if `exec` yields a running cell ID.
-- Tiered file edits: batch surgical edits across 1-4 files into a single multi-file `apply_patch` call (`*** Begin Patch` ... `*** End Patch`), or isolate 5+ existing-file patches via `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `exec` cell; when creating large new files or performing mechanical bulk updates under non-interactive write permissions (never in Plan Mode, read-only sandboxes, or manual `on-request` command approval), you may stream file creation/rewrites plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`), and never commit or create git branches unless asked.
-- Validate changes with targeted builds/tests when appropriate in non-interactive or test-focused runs; do not fix unrelated issues outside the user's scope.
-- When `request_user_input_async` or `request_user_input` is available and a critical requirement cannot be derived from workspace inspection, ask concise questions while continuing independent work.
-- For live web searches or reading HTTP/HTTPS URLs, prefer your built-in `search_web` and server-managed `__gateway_web_fetch` tools rather than running `curl` or `Invoke-WebRequest` in local shell commands (which may be blocked by Codex's network sandbox).
-
-# Response Style
-- Respond concisely and naturally like a direct teammate. Skip heavy section headers for simple greetings, confirmations, or short answers.
-- Wrap commands, paths, env vars, and identifiers in backticks (`...`).
-- Format file references as standalone inline code paths such as `src/lib.rs:42` (never emit `file://` URIs or `【F:...】` citations in Codex CLI output).";
+const CODEX_AGY_BASE_INSTRUCTIONS: &str = crate::harness_prompt::CODEX_DISTILLED_PROMPT;
 
 /// Builds a complete Codex `model_catalog_json` document from the live ACP `AvailableModel` list,
 /// ordering `default_model` first (`priority = 0`) followed by all remaining Antigravity models.
@@ -1799,5 +1800,139 @@ mod tests {
         );
         assert_eq!(efforts_of("gemini-pro-orchestrator-neon"), vec!["high"]);
         assert_eq!(efforts_of("gpt-oss-120b-medium"), vec!["medium"]);
+    }
+
+    #[test]
+    fn distills_codex_and_omp_prompts_by_tools_while_keeping_stateful_and_stateless_hashes_identical()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{WebToolBridgeConfig, hash_conversation_state};
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        let raw_upstream_codex_inst = format!(
+            "You are Codex, based on GPT-5.\n{}",
+            "Upstream Codex CLI boilerplate rule.\n".repeat(300)
+        );
+        let raw_codex_dev = format!(
+            "<skills_instructions>\n## Skills\n### Skill roots\n- `r0` = `/Users/dev/.agents/skills`\n### Available skills\n- skill-creator: {} (file: r0/skill-creator/SKILL.md)\n</skills_instructions>\n<permissions instructions>\nApproval policy is never. Do not pass sandbox_permissions.\n</permissions instructions>\n<collaboration_mode>\n# Collaboration Mode: Default\n{}\n</collaboration_mode>\n<apps_instructions>\nApps prose\n</apps_instructions>",
+            "Verbose skill blurb ".repeat(60),
+            "Verbose collaboration blurb ".repeat(40)
+        );
+        let codex_tools = json!([
+            { "type": "custom", "name": "exec", "description": "Run JS Code Mode" },
+            { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+            { "type": "custom", "name": "apply_patch", "description": "Apply V4A patch" }
+        ]);
+
+        let turn1_req: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": raw_codex_dev },
+                { "role": "user", "content": [
+                    { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nStrict Rust rules\n</INSTRUCTIONS>" },
+                    { "type": "input_text", "text": "<environment_context><cwd>/repo</cwd></environment_context>" },
+                    { "type": "input_text", "text": "hi" }
+                ] }
+            ]
+        }))
+        .expect("valid Turn 1 Codex request");
+
+        let norm1 = normalize_responses_request(&turn1_req).expect("normalized Turn 1");
+        let joined1: String = norm1
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                CanonicalPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined1.contains("Upstream Codex CLI boilerplate rule"));
+        assert!(!joined1.contains("Verbose skill blurb"));
+        assert!(!joined1.contains("<apps_instructions>"));
+        assert!(joined1.contains("- skill-creator (file: r0/skill-creator/SKILL.md)"));
+        assert!(joined1.contains("Do not pass sandbox_permissions."));
+        assert!(joined1.contains("Strict Rust rules"));
+        assert!(joined1.contains("<cwd>/repo</cwd>"));
+
+        // Simulate Turn 2 with mid-turn collaboration mode switch: stateful delta vs stateless replay.
+        let assistant_1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Hey!".to_owned())],
+        };
+        let mid_dev = "<collaboration_mode>\n# Collaboration Mode: Plan\nEmit <proposed_plan> block.\n</collaboration_mode>";
+
+        let stateful_t2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "previous_response_id": "resp_t1",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": mid_dev },
+                { "role": "user", "content": "Plan the refactor" }
+            ]
+        }))
+        .expect("stateful Turn 2");
+        let norm_stateful_t2 = normalize_responses_request(&stateful_t2).expect("norm stateful t2");
+        let mut combined = norm1.messages.clone();
+        combined.push(assistant_1);
+        combined.extend(norm_stateful_t2.messages);
+
+        let stateless_t2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": raw_codex_dev },
+                { "role": "user", "content": [
+                    { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nStrict Rust rules\n</INSTRUCTIONS>" },
+                    { "type": "input_text", "text": "<environment_context><cwd>/repo</cwd></environment_context>" },
+                    { "type": "input_text", "text": "hi" }
+                ] },
+                { "role": "assistant", "content": "Hey!" },
+                { "role": "developer", "content": mid_dev },
+                { "role": "user", "content": "Plan the refactor" }
+            ]
+        }))
+        .expect("stateless Turn 2");
+        let norm_stateless_t2 =
+            normalize_responses_request(&stateless_t2).expect("norm stateless t2");
+
+        assert_eq!(combined, norm_stateless_t2.messages);
+        assert_eq!(
+            hash_conversation_state(
+                None,
+                &norm_stateless_t2.client_tools,
+                web_cfg,
+                &model,
+                &combined
+            ),
+            hash_conversation_state(
+                None,
+                &norm_stateless_t2.client_tools,
+                web_cfg,
+                &model,
+                &norm_stateless_t2.messages,
+            )
+        );
+
+        // Generic OpenAI Responses SDK caller without Codex/OMP/OpenCode tools keeps instructions verbatim.
+        let generic_req: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": format!("Custom domain prompt.\n{}", "Domain rule.\n".repeat(200)),
+            "tools": [{ "type": "function", "name": "lookup_order", "parameters": { "type": "object" } }],
+            "input": "Check order #42"
+        }))
+        .expect("generic request");
+        let norm_generic = normalize_responses_request(&generic_req).expect("norm generic");
+        assert!(matches!(
+            norm_generic.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Domain rule.")
+        ));
     }
 }

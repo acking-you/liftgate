@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Tool-signature-driven harness system prompt distillation**:
+  - Added strict tool-fingerprint harness identification (`detect_harness_by_tools` in `liftgate-types::harness_prompt`) that identifies OpenAI Codex, Claude Code, OpenCode, and Oh My Pi (`omp`) exclusively from characteristic caller tool definitions and JSON schemas — never from fragile version-dependent system prompt prose — while leaving generic SDK callers, zero-tool chats, auxiliary sub-requests, and `/compact` summarization turns untouched.
+  - Replaced multi-kilobyte raw built-in CLI system prompts (`15–45 KB`) on `/v1/responses` and `/v1/messages` (as well as `/v1/messages/count_tokens` and `/v1/codex-models` `base_instructions`) with compact ACP-aligned harness contracts (`< 600B`) that eliminate conflicting persona/tool tutorials while deterministically preserving workspace environment metadata (`<env>`, `<environment_context>`, `gitStatus:`), project/user rules (`AGENTS.md`, `CLAUDE.md`, `<project-context>`, `Instructions from:`, `--append-system-prompt`, specialized subagent roles), `<permissions instructions>`, Plan Mode contracts, and compact `SKILL.md` path indexes without breaking `SessionPool` prefix or compaction hashes.
+
 ## [0.2.16] - 2026-11-28
 
 ### Added
