@@ -2,12 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.19] - 2026-11-28
 
 ### Added
+- **Hosted `find_in_page` and native ACP `fetch` tool mapping**:
+  - `mcp_lg_gateway_web_fetch` and XML `__gateway_web_fetch` accept an optional `pattern` filter to scan the full untruncated webpage before bounding to the 48 KB excerpt budget (while still persisting the full lossless webpage to `spills/` when oversized), emitting OpenAI Responses `web_search_call` items with `action.type = "find_in_page"` (`url` + `pattern`) alongside `open_page` and `search`.
+  - Native ACP `fetch`-kind tool notifications (`kind: "fetch"` / `web_fetch` / `fetch_url` / `read_url_content` / `open_page`) now map into Liftgate's hosted `WebFetchStart` / `WebFetchComplete` pipeline across OpenAI `/v1/responses`, Anthropic `/v1/messages`, and live telemetry (`native_web_fetches`), including terminal `failed` / `cancelled` error outcomes (`status: "failed"` / `web_fetch_tool_error`).
+  - Warm MCP sessions started without `web_search` / `web_fetch` automatically upgrade with lossless history preservation when a later turn enables hosted web fetching.
 - **Harness on every request**: each recent and in-flight request records the harness it came from (`harness_profile` on `TaskSnapshot`: Codex, Claude Code, OpenCode, Oh My Pi, or generic), and the overview's recent-requests table, the running-request cards, and the request detail sheet show it.
 - **Recent-request filters**: the overview's recent requests filter by harness, session, model, and protocol, plus "problems only" (failed, cancelled, or with failed / rejected tool calls) and "hit rate below threshold" toggles. Every option shows how many requests it would match, clicking a row's harness or session filters to it (click again to clear), and one button clears all filters.
 - **Recent-request search and scope summary**: a search box matches task / session ids, models, and prompt, output, or error previews; while filters are active a strip summarizes the matching requests (count and sessions, problems, token-weighted hit rate, TTFT p50 / p90, total cost), the cache-trend chart plots only the matching requests, and the filter survives switching views and reloads within the tab.
+
+### Fixed
+- **ACP `session/update` `RawValue` deserialization**: replaced `#[serde(tag = "sessionUpdate")]` internal-tag buffering on `SessionUpdatePayload` with a two-step `RawValue` slice deserializer so `tool_call`, `tool_call_update`, and `error` notifications carrying non-null `args`, `rawInput`, or `error` payloads decode losslessly instead of failing `serde`'s `Content` buffer and dropping native `search_web` (`web_search_call` / `server_tool_use`) events.
+- **Hosted web tool streaming & telemetry**: OpenAI `/v1/responses` SSE now emits the complete 5-frame lifecycle (`added` -> `in_progress` -> `searching` -> `completed` -> `done`) and closes incomplete or failed searches/fetches with `status: "failed"`; Anthropic `/v1/messages` gates `web_fetch` server blocks symmetrically via `emit_web_fetch` and pairs incomplete fetches with `web_fetch_tool_error`; gateway-local MCP tools (`gateway_web_fetch`, `read_context_spill`, `search_client_tools`) no longer flip `TaskPhase` to `calling_client_tool`.
 
 ## [0.2.18] - 2026-11-28
 

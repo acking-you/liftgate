@@ -23,7 +23,7 @@ use liftgate_types::{
     config::{AcpModeId, GatewayLimits, ModelId, ProxyUrl, SessionId},
     telemetry::{AcpProcessTelemetry, StderrLogEntry},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use tokio::{
     io::AsyncWriteExt,
@@ -127,6 +127,22 @@ pub trait AcpBackend: Send + Sync + 'static {
         let allowed = allowed_domains.to_vec();
         let blocked = blocked_domains.to_vec();
         async move { crate::web_fetch::fetch_url_sanitized(&url_owned, &allowed, &blocked).await }
+    }
+
+    /// Performs a server-managed URL fetch with optional full-page `pattern` filtering (`find_in_page`).
+    fn fetch_web_url_with_pattern(
+        &self,
+        url: &str,
+        pattern: Option<&str>,
+        allowed_domains: &[String],
+        blocked_domains: &[String],
+    ) -> impl Future<Output = crate::web_fetch::WebFetchOutcome> + Send {
+        let pat_owned = pattern.map(str::to_owned);
+        let base_fut = self.fetch_web_url(url, allowed_domains, blocked_domains);
+        async move {
+            let out = base_fut.await;
+            crate::web_fetch::apply_pattern_to_outcome(out, pat_owned.as_deref())
+        }
     }
 
     /// Snapshot of ACP master process health and JSON-RPC statistics for the companion UI.
@@ -1043,6 +1059,24 @@ impl AcpBackend for Arc<LiveAcpClient> {
         .await
     }
 
+    async fn fetch_web_url_with_pattern(
+        &self,
+        url: &str,
+        pattern: Option<&str>,
+        allowed_domains: &[String],
+        blocked_domains: &[String],
+    ) -> crate::web_fetch::WebFetchOutcome {
+        crate::web_fetch::fetch_url_sanitized_with_options_and_pattern(
+            url,
+            allowed_domains,
+            blocked_domains,
+            self.cfg.agy_proxy.as_ref(),
+            self.cfg.spill_dir.as_deref(),
+            pattern,
+        )
+        .await
+    }
+
     fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
         (**self).process_telemetry(default_model, acp_mode)
     }
@@ -1239,12 +1273,7 @@ async fn run_stdout_reader(
                     .fetch_add(1, Ordering::Relaxed);
                 if let Some(params_raw) = frame.params {
                     match serde_json::from_str::<SessionUpdateNotification>(params_raw.get()) {
-                        Ok(mut notif) => {
-                            if matches!(notif.update, SessionUpdatePayload::Unknown)
-                                && let Some(rescued) = rescue_unknown_error_update(params_raw.get())
-                            {
-                                notif.update = rescued;
-                            }
+                        Ok(notif) => {
                             let sender = match session_streams.lock() {
                                 Ok(guard) => guard.get(&notif.session_id).cloned(),
                                 Err(poisoned) => {
@@ -1260,7 +1289,11 @@ async fn run_stdout_reader(
                             }
                         }
                         Err(err) => {
-                            tracing::debug!(error = ?err, "failed to decode session/update payload");
+                            tracing::warn!(
+                                error = ?err,
+                                raw_snippet = %truncate_snippet(params_raw.get(), 256),
+                                "failed to decode session/update payload"
+                            );
                         }
                     }
                 }
@@ -1403,42 +1436,6 @@ fn format_rpc_error_message(rpc_err: JsonRpcErrorPayload) -> String {
         base.to_owned()
     } else {
         format!("{base} — {snippet}")
-    }
-}
-
-#[derive(Deserialize)]
-struct RawUpdateNotificationProbe<'a> {
-    #[serde(default, borrow)]
-    update: Option<&'a RawValue>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UntaggedUpdateErrorFields {
-    #[serde(default)]
-    session_update: String,
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    error: Option<Box<RawValue>>,
-}
-
-fn rescue_unknown_error_update(params_json: &str) -> Option<SessionUpdatePayload> {
-    let outer: RawUpdateNotificationProbe<'_> = serde_json::from_str(params_json).ok()?;
-    let update_raw = outer.update?;
-    let fields: UntaggedUpdateErrorFields = serde_json::from_str(update_raw.get()).ok()?;
-    let kind_lower = fields.session_update.to_ascii_lowercase();
-    let has_non_null_error = fields
-        .error
-        .as_ref()
-        .is_some_and(|raw| !matches!(raw.get().trim(), "" | "null" | "{}"));
-    if kind_lower.contains("error") || kind_lower.contains("fail") || has_non_null_error {
-        Some(SessionUpdatePayload::Error {
-            message: fields.message,
-            error: fields.error,
-        })
-    } else {
-        None
     }
 }
 

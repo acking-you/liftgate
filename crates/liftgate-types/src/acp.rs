@@ -365,8 +365,11 @@ pub struct SessionUpdateNotification {
 }
 
 /// Tagged variants inside `session/update` notifications.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+///
+/// Deserialized via a two-step `RawValue` slice rather than `#[serde(tag = "sessionUpdate")]`
+/// because `serde`'s internal-tag `Content` buffer rejects `Box<RawValue>` fields (`args`,
+/// `rawInput`, `error`), which would otherwise drop real `tool_call` / `tool_call_update` frames.
+#[derive(Clone, Debug)]
 pub enum SessionUpdatePayload {
     AgentMessageChunk {
         content: AcpChunkContent,
@@ -374,54 +377,164 @@ pub enum SessionUpdatePayload {
     AgentThoughtChunk {
         content: AcpChunkContent,
     },
-    #[serde(rename_all = "camelCase")]
     ToolCall {
-        #[serde(default)]
         tool_call_id: String,
-        #[serde(default)]
         name: String,
-        #[serde(default)]
         status: String,
-        #[serde(default)]
         kind: String,
-        #[serde(default)]
         title: String,
-        #[serde(default)]
         args: Option<Box<RawValue>>,
-        #[serde(default)]
         raw_input: Option<Box<RawValue>>,
     },
-    #[serde(rename_all = "camelCase")]
     ToolCallUpdate {
-        #[serde(default)]
         tool_call_id: String,
-        #[serde(default)]
         name: String,
-        #[serde(default)]
         status: String,
-        #[serde(default)]
         kind: String,
-        #[serde(default)]
         title: String,
-        #[serde(default)]
         args: Option<Box<RawValue>>,
-        #[serde(default)]
         raw_input: Option<Box<RawValue>>,
     },
     UsageUpdate {
-        #[serde(default)]
         used: u64,
-        #[serde(default)]
         size: u64,
     },
     Error {
-        #[serde(default)]
         message: String,
-        #[serde(default)]
         error: Option<Box<RawValue>>,
     },
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for SessionUpdatePayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        Self::from_raw_update_json(raw.get()).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SessionUpdatePayload {
+    fn from_raw_update_json(raw_json: &str) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UpdateDiscriminator<'a> {
+            #[serde(default, borrow)]
+            session_update: Cow<'a, str>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawChunkFields {
+            #[serde(default)]
+            content: AcpChunkContent,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawToolCallFields {
+            #[serde(default)]
+            tool_call_id: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            status: String,
+            #[serde(default)]
+            kind: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            args: Option<Box<RawValue>>,
+            #[serde(default)]
+            raw_input: Option<Box<RawValue>>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawUsageFields {
+            #[serde(default)]
+            used: u64,
+            #[serde(default)]
+            size: u64,
+        }
+
+        #[derive(Deserialize)]
+        struct RawErrorFields {
+            #[serde(default)]
+            message: String,
+            #[serde(default)]
+            error: Option<Box<RawValue>>,
+        }
+
+        let disc: UpdateDiscriminator<'_> = serde_json::from_str(raw_json)?;
+        match disc.session_update.as_ref() {
+            "agent_message_chunk" => {
+                let f: RawChunkFields = serde_json::from_str(raw_json)?;
+                Ok(Self::AgentMessageChunk { content: f.content })
+            }
+            "agent_thought_chunk" => {
+                let f: RawChunkFields = serde_json::from_str(raw_json)?;
+                Ok(Self::AgentThoughtChunk { content: f.content })
+            }
+            "tool_call" => {
+                let f: RawToolCallFields = serde_json::from_str(raw_json)?;
+                Ok(Self::ToolCall {
+                    tool_call_id: f.tool_call_id,
+                    name: f.name,
+                    status: f.status,
+                    kind: f.kind,
+                    title: f.title,
+                    args: f.args,
+                    raw_input: f.raw_input,
+                })
+            }
+            "tool_call_update" => {
+                let f: RawToolCallFields = serde_json::from_str(raw_json)?;
+                Ok(Self::ToolCallUpdate {
+                    tool_call_id: f.tool_call_id,
+                    name: f.name,
+                    status: f.status,
+                    kind: f.kind,
+                    title: f.title,
+                    args: f.args,
+                    raw_input: f.raw_input,
+                })
+            }
+            "usage_update" => {
+                let f: RawUsageFields = serde_json::from_str(raw_json)?;
+                Ok(Self::UsageUpdate {
+                    used: f.used,
+                    size: f.size,
+                })
+            }
+            "error" => {
+                let f: RawErrorFields = serde_json::from_str(raw_json)?;
+                Ok(Self::Error {
+                    message: f.message,
+                    error: f.error,
+                })
+            }
+            other => {
+                if let Ok(f) = serde_json::from_str::<RawErrorFields>(raw_json) {
+                    let kind_lower = other.to_ascii_lowercase();
+                    let has_non_null_error = f
+                        .error
+                        .as_ref()
+                        .is_some_and(|r| !matches!(r.get().trim(), "" | "null" | "{}"));
+                    if kind_lower.contains("error")
+                        || kind_lower.contains("fail")
+                        || has_non_null_error
+                    {
+                        return Ok(Self::Error {
+                            message: f.message,
+                            error: f.error,
+                        });
+                    }
+                }
+                Ok(Self::Unknown)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -460,4 +573,106 @@ pub enum PermissionOutcome {
         #[serde(rename = "optionId")]
         option_id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_update_deserializes_tool_call_and_error_with_raw_value_fields() {
+        let tc_json = r#"{
+            "sessionId": "8e4d22e6-a67d-4b9e-8c18-111111111111",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_3949974099485412213",
+                "name": "search_web",
+                "args": { "query": "Shenzhen weather tomorrow" },
+                "status": "in_progress",
+                "kind": "search",
+                "title": "\"Shenzhen weather tomorrow\" on Web",
+                "rawInput": { "query": "Shenzhen weather tomorrow" }
+            }
+        }"#;
+        let parsed: SessionUpdateNotification =
+            serde_json::from_str(tc_json).expect("tool_call with RawValue must deserialize");
+        match parsed.update {
+            SessionUpdatePayload::ToolCall {
+                tool_call_id,
+                name,
+                status,
+                kind,
+                title,
+                args,
+                raw_input,
+            } => {
+                assert_eq!(tool_call_id, "call_3949974099485412213");
+                assert_eq!(name, "search_web");
+                assert_eq!(status, "in_progress");
+                assert_eq!(kind, "search");
+                assert_eq!(title, "\"Shenzhen weather tomorrow\" on Web");
+                assert!(
+                    args.expect("args")
+                        .get()
+                        .contains("Shenzhen weather tomorrow")
+                );
+                assert!(
+                    raw_input
+                        .expect("rawInput")
+                        .get()
+                        .contains("Shenzhen weather tomorrow")
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        let upd_json = r#"{
+            "sessionId": "8e4d22e6-a67d-4b9e-8c18-111111111111",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_3949974099485412213",
+                "name": "search_web",
+                "args": { "query": "Shenzhen weather tomorrow" },
+                "status": "completed",
+                "kind": "search",
+                "title": "\"Shenzhen weather tomorrow\" on Web",
+                "rawInput": { "query": "Shenzhen weather tomorrow" }
+            }
+        }"#;
+        let parsed_upd: SessionUpdateNotification =
+            serde_json::from_str(upd_json).expect("tool_call_update must deserialize");
+        assert!(matches!(
+            parsed_upd.update,
+            SessionUpdatePayload::ToolCallUpdate { ref status, .. } if status == "completed"
+        ));
+
+        let err_json = r#"{
+            "sessionId": "sess_err",
+            "update": {
+                "sessionUpdate": "turn_failed",
+                "message": "RESOURCE_EXHAUSTED",
+                "error": { "code": 429, "status": "RESOURCE_EXHAUSTED" }
+            }
+        }"#;
+        let parsed_err: SessionUpdateNotification =
+            serde_json::from_str(err_json).expect("rescued error update must deserialize");
+        match parsed_err.update {
+            SessionUpdatePayload::Error { message, error } => {
+                assert_eq!(message, "RESOURCE_EXHAUSTED");
+                assert!(error.expect("error raw").get().contains("429"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let info_json = r#"{
+            "sessionId": "sess_info",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "Shenzhen Weather Forecast"
+            }
+        }"#;
+        let parsed_info: SessionUpdateNotification =
+            serde_json::from_str(info_json).expect("unknown update must map to Unknown");
+        assert!(matches!(parsed_info.update, SessionUpdatePayload::Unknown));
+    }
 }

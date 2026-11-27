@@ -516,7 +516,19 @@ fn zero_tool_session_with_gateway_web_fetch_hot_syncs_dynamic_tools_without_recr
             &[],
         ),
         VirtualizedCallDecision::GatewayWebFetch {
-            url: "https://example.com/docs".to_owned()
+            url: "https://example.com/docs".to_owned(),
+            pattern: None,
+        }
+    );
+    assert_eq!(
+        cat.routing_table.resolve_call(
+            GATEWAY_WEB_FETCH_MCP_NAME,
+            &json!({ "url": "https://example.com/docs", "pattern": "rate limit" }),
+            &[],
+        ),
+        VirtualizedCallDecision::GatewayWebFetch {
+            url: "https://example.com/docs".to_owned(),
+            pattern: Some("rate limit".to_owned()),
         }
     );
 

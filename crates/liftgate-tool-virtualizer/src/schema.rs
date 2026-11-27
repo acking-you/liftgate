@@ -111,6 +111,10 @@ pub fn gateway_web_fetch_input_schema() -> Value {
             "url": {
                 "type": "string",
                 "description": "Full http:// or https:// URL to fetch server-side."
+            },
+            "pattern": {
+                "type": "string",
+                "description": "Optional case-insensitive substring or keyword to scan for within the fetched page (hosted `find_in_page`)."
             }
         },
         "required": ["url"]

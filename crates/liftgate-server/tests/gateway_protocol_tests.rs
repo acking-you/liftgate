@@ -21,7 +21,8 @@ use liftgate_server::{
 use liftgate_types::{
     acp::{
         AcpChunkContent, AcpPromptBlock, AcpUsage, AvailableModel, McpServerConfig, ModelsCatalog,
-        ModesCatalog, PromptTurnResult, SessionNewResult, SessionUpdatePayload,
+        ModesCatalog, PromptTurnResult, SessionNewResult, SessionUpdateNotification,
+        SessionUpdatePayload,
     },
     config::{
         AcpModeId, CacheHitThresholdBps, GatewayLimits, LowCacheRecordLimit, ModelId, SessionId,
@@ -56,6 +57,10 @@ enum MockScript {
     UpdatesThenHang {
         initial_chunk_template: String,
         trailing_updates: Vec<SessionUpdatePayload>,
+    },
+    RawJsonUpdateFrames {
+        frames: Vec<Value>,
+        usage: AcpUsage,
     },
     WebSearchSplitDelta {
         query: String,
@@ -475,19 +480,42 @@ impl AcpBackend for MockAcpBackend {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 Ok(PromptTurnResult::default())
             }
-            MockScript::WebSearchSplitDelta { query, answer } => {
-                let raw_in = RawValue::from_string(json!({ "query": query }).to_string()).unwrap();
-                let _ = updates_tx
-                    .send(SessionUpdatePayload::ToolCall {
-                        tool_call_id: "search_1".to_owned(),
-                        name: "search_web".to_owned(),
-                        status: "in_progress".to_owned(),
-                        kind: "search".to_owned(),
-                        title: format!("\"{query}\" on Web"),
-                        args: None,
-                        raw_input: Some(raw_in),
+            MockScript::RawJsonUpdateFrames { frames, usage } => {
+                for frame in frames {
+                    let raw_params = json!({
+                        "sessionId": session_id.as_str(),
+                        "update": frame,
                     })
-                    .await;
+                    .to_string();
+                    let notif: SessionUpdateNotification = serde_json::from_str(&raw_params)
+                        .expect("mock raw JSON session/update frame must deserialize");
+                    let _ = updates_tx.send(notif.update).await;
+                }
+                Ok(PromptTurnResult {
+                    stop_reason: "end_turn".to_owned(),
+                    usage,
+                    error: None,
+                })
+            }
+            MockScript::WebSearchSplitDelta { query, answer } => {
+                let tc_notif: SessionUpdateNotification = serde_json::from_str(
+                    &json!({
+                        "sessionId": session_id.as_str(),
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "search_1",
+                            "name": "search_web",
+                            "args": { "query": query },
+                            "status": "in_progress",
+                            "kind": "search",
+                            "title": format!("\"{query}\" on Web"),
+                            "rawInput": { "query": query }
+                        }
+                    })
+                    .to_string(),
+                )
+                .expect("real agy acp search_web tool_call frame must deserialize");
+                let _ = updates_tx.send(tc_notif.update).await;
                 // ACP `tool_call_update` omits unchanged `kind` and `rawInput`
                 let _ = updates_tx
                     .send(SessionUpdatePayload::ToolCallUpdate {
@@ -12237,4 +12265,358 @@ async fn previous_response_id_mcp_toggle_retains_historical_developer_slots_on_c
             .text_joined
             .contains("third question after MCP toggle")
     );
+}
+
+#[tokio::test]
+async fn real_acp_wire_updates_and_hosted_web_fetch_find_in_page_and_warm_upgrade() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1: Real `agy acp 1.5.18` JSON `session/update` frames for `search_web` + native `fetch`
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Checking Shenzhen forecast." }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_ws_real_1",
+                    "name": "search_web",
+                    "args": { "query": "Shenzhen weather tomorrow" },
+                    "status": "in_progress",
+                    "kind": "search",
+                    "title": "\"Shenzhen weather tomorrow\" on Web",
+                    "rawInput": { "query": "Shenzhen weather tomorrow" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_ws_real_1",
+                    "name": "search_web",
+                    "args": { "query": "Shenzhen weather tomorrow" },
+                    "status": "completed",
+                    "kind": "search",
+                    "title": "\"Shenzhen weather tomorrow\" on Web",
+                    "rawInput": { "query": "Shenzhen weather tomorrow" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_fetch_real_1",
+                    "name": "fetch_url",
+                    "args": { "url": "https://weather.sz.gov.cn/forecast" },
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "title": "Fetching https://weather.sz.gov.cn/forecast",
+                    "rawInput": { "url": "https://weather.sz.gov.cn/forecast" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_fetch_real_1",
+                    "name": "fetch_url",
+                    "args": { "url": "https://weather.sz.gov.cn/forecast" },
+                    "status": "completed",
+                    "kind": "fetch",
+                    "title": "Shenzhen Meteorological Bureau",
+                    "rawInput": { "url": "https://weather.sz.gov.cn/forecast" }
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Sunny, 17C-25C ([SZ Weather](https://weather.sz.gov.cn/forecast))." }
+                }),
+            ],
+            usage: mock_acp_usage(120, 45, 80),
+        },
+        // Turn 2: Cold session WITHOUT `web_search` (`enable_native_web_fetch == false`)
+        MockScript::McpInteractive {
+            steps: vec![McpMockStep::FinalReply {
+                usage_used: 1_000,
+                thoughts: vec![],
+                chunks_template: vec!["Turn without web tools.".to_owned()],
+                final_usage: mock_acp_usage(1_000, 30, 0),
+            }],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Turn 3: Warm continuation enables hosted `web_search` + invokes `gateway_web_fetch` with `pattern` (`find_in_page`)
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 1_400,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "gateway_web_fetch".to_owned(),
+                    arguments: json!({
+                        "url": "https://www.weather.gov.sg/weather-forecast-24hrforecast/",
+                        "pattern": "humidity"
+                    }),
+                    expect_reply_substrings: vec![
+                        "pattern=\"humidity\"",
+                        "Matched 1 line(s)",
+                        "humidity 70%-75%",
+                    ],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 1_800,
+                    thoughts: vec![],
+                    chunks_template: vec!["Humidity is 70%-75%.".to_owned()],
+                    final_usage: mock_acp_usage(1_800, 40, 900),
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state);
+
+    // 1. Streamed `/v1/responses` with real JSON `search_web` + native `fetch` updates
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "tools": [{ "type": "web_search" }],
+                        "input": "Shenzhen weather tomorrow"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let sse1 = String::from_utf8(
+        resp1
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(sse1.contains("\"type\":\"search\",\"query\":\"Shenzhen weather tomorrow\""));
+    assert!(sse1.contains("\"type\":\"open_page\",\"url\":\"https://weather.sz.gov.cn/forecast\""));
+    assert_eq!(
+        sse1.matches("event: response.web_search_call.searching")
+            .count(),
+        2,
+        "both search and open_page must emit response.web_search_call.searching"
+    );
+
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap: Value =
+        serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(snap["recent_tasks"][0]["native_web_searches"], 1);
+    assert_eq!(snap["recent_tasks"][0]["native_web_fetches"], 1);
+
+    // 2. Turn without `web_search` -> Turn with `web_search` + `gateway_web_fetch(pattern)` upgrades cleanly
+    let client_exec_tool = json!({
+        "type": "function",
+        "name": "exec_command",
+        "description": "Execute shell command",
+        "parameters": {
+            "type": "object",
+            "properties": { "cmd": { "type": "string" } },
+            "required": ["cmd"]
+        }
+    });
+    let (st2, body2) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "tools": [client_exec_tool],
+            "input": "hello without web search"
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+    let prev_id = body2["id"].as_str().expect("response id").to_owned();
+
+    let resp3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "store": true,
+                        "previous_response_id": prev_id,
+                        "tools": [client_exec_tool, { "type": "web_search" }],
+                        "input": "check humidity on official page"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
+    let sse3 = String::from_utf8(
+        resp3
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        sse3.contains("\"type\":\"find_in_page\",\"url\":\"https://www.weather.gov.sg/weather-forecast-24hrforecast/\",\"pattern\":\"humidity\""),
+        "expected find_in_page web_search_call in SSE: {sse3}"
+    );
+    assert!(sse3.contains("event: response.web_search_call.searching"));
+    assert!(sse3.contains("Humidity is 70%-75%."));
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_native_acp_fetch_emits_error_outcome_on_openai_and_anthropic() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_fail_oai",
+                    "name": "fetch_url",
+                    "args": { "url": "https://unreachable.example.org/spec" },
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "title": "Fetching https://unreachable.example.org/spec"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_fail_oai",
+                    "name": "fetch_url",
+                    "status": "failed",
+                    "kind": "fetch",
+                    "title": "HTTP 502 Bad Gateway"
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Upstream page was unreachable." }
+                }),
+            ],
+            usage: mock_acp_usage(80, 20, 0),
+        },
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_fail_anth",
+                    "name": "fetch_url",
+                    "args": { "url": "https://unreachable.example.org/spec" },
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "title": "Fetching https://unreachable.example.org/spec"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_fail_anth",
+                    "name": "fetch_url",
+                    "status": "failed",
+                    "kind": "fetch",
+                    "title": "HTTP 502 Bad Gateway"
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Could not fetch page." }
+                }),
+            ],
+            usage: mock_acp_usage(80, 20, 0),
+        },
+    ]));
+
+    let app = test_app(backend, 30);
+
+    let resp_oai = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "tools": [{ "type": "web_search" }],
+                        "input": "Read https://unreachable.example.org/spec"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_oai.status(), StatusCode::OK);
+    let sse_oai = String::from_utf8(
+        resp_oai
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        sse_oai.contains("\"type\":\"web_search_call\"")
+            && sse_oai.contains("\"status\":\"failed\""),
+        "failed native fetch must close web_search_call with status=failed: {sse_oai}"
+    );
+    assert!(
+        !sse_oai.contains("event: response.web_search_call.completed"),
+        "failed native fetch must not emit response.web_search_call.completed: {sse_oai}"
+    );
+
+    let resp_anth = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "stream": false,
+                        "tools": [{ "type": "web_fetch_20250910", "name": "web_fetch" }],
+                        "messages": [{ "role": "user", "content": "Read https://unreachable.example.org/spec" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_anth.status(), StatusCode::OK);
+    let body_anth: Value =
+        serde_json::from_slice(&resp_anth.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let blocks = body_anth["content"].as_array().expect("content array");
+    let wf_result = blocks
+        .iter()
+        .find(|b| b["type"] == "web_fetch_tool_result")
+        .expect("expected web_fetch_tool_result block");
+    assert_eq!(wf_result["content"]["type"], "web_fetch_tool_error");
+    assert_eq!(wf_result["content"]["error_code"], "url_not_accessible");
 }
