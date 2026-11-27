@@ -2604,6 +2604,7 @@ mod tests {
                             metrics: liftgate_types::telemetry::GatewayMetricsSummary::default(),
                             cache_telemetry:
                                 liftgate_types::telemetry::CacheTelemetrySummary::default(),
+                            elastic_io: liftgate_types::telemetry::ElasticIoTelemetry::default(),
                             active_tasks: Vec::new(),
                             recent_tasks: Vec::new(),
                             available_models: Vec::new(),

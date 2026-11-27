@@ -144,14 +144,15 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
         prepass: &Self::Prepass,
     ) -> ToolPlacement<'a>;
 
-    /// Returns the Code Mode orchestration prompt contract to inject into `<api_gateway_bridge_rules>`
-    /// when `spec` is mounted directly on `lg` under `mcp_name`.
+    /// Returns the Code Mode or compound-I/O orchestration prompt contract to inject into
+    /// `<api_gateway_bridge_rules>` when `spec` is mounted directly on `lg` under `mcp_name`.
     #[inline]
     fn orchestrator_prompt_contract<'a>(
         self,
         _spec: &CanonicalToolSpec,
         _mcp_name: &'a str,
         _has_folded_tools: bool,
+        _client_tools: &[CanonicalToolSpec],
     ) -> Option<McpOrchestratorContract<'a>> {
         None
     }

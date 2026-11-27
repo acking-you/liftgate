@@ -37,6 +37,16 @@ export type SessionSlotState = "running" | "suspended" | "idle";
 
 export type PromptCacheWarmth = "active" | "hot" | "warm" | "cold" | "unknown";
 
+export interface SessionMcpSummary {
+  harness_profile: string;
+  orchestrator_mode?: string | null;
+  is_passthrough: boolean;
+  declared_tools: number;
+  eager_tools: number;
+  virtualized_hubs: number;
+  wire_bytes: number;
+}
+
 export interface SessionSummary {
   session_id: string;
   model_id: string;
@@ -51,6 +61,7 @@ export interface SessionSummary {
   created_at_unix_ms: number;
   last_active_unix_ms: number;
   last_response_id: string | null;
+  mcp?: SessionMcpSummary | null;
 }
 
 export interface SessionPoolTelemetry {
@@ -109,6 +120,8 @@ export interface TaskSnapshot {
   native_web_searches: number;
   native_web_fetches: number;
   vision_offloaded_images?: number;
+  zero_rtt_mcp_ops?: number;
+  spilled_tool_results?: number;
   prompt_preview: string;
   output_preview: string;
   stop_reason: string | null;
@@ -343,6 +356,24 @@ export interface GatewayMetricsSummary {
   cache_hit_rate_bps?: number | null;
 }
 
+export interface ElasticIoTelemetry {
+  passthrough_sessions: number;
+  virtualized_sessions: number;
+  mcp_forwarded_tool_calls: number;
+  mcp_orchestrator_calls: number;
+  mcp_tool_using_turns: number;
+  mcp_patch_calls: number;
+  mcp_multi_file_patch_calls: number;
+  mcp_patch_files_total: number;
+  mcp_zero_rtt_searches: number;
+  mcp_zero_rtt_spill_reads: number;
+  mcp_zero_rtt_preflight_heals: number;
+  mcp_tool_results_total: number;
+  mcp_tool_results_spilled: number;
+  context_spills_created: number;
+  context_spills_bytes: number;
+}
+
 export interface AvailableModel {
   modelId: string;
   name: string;
@@ -357,6 +388,7 @@ export interface GatewayTelemetrySnapshot {
   session_pool: SessionPoolTelemetry;
   metrics: GatewayMetricsSummary;
   cache_telemetry?: CacheTelemetrySummary;
+  elastic_io?: ElasticIoTelemetry;
   active_tasks: TaskSnapshot[];
   recent_tasks: TaskSnapshot[];
   available_models: AvailableModel[];

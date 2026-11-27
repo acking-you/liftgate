@@ -4524,16 +4524,14 @@ async fn codex_code_mode_multi_turn_sse_guardian_classifier_and_effort_update() 
         "only 1 main session + 1 ephemeral Guardian classifier session should be created"
     );
     assert!(appends[0].len() <= liftgate_types::session_key::MAX_SYSTEM_APPEND_BYTES);
+    assert!(
+        appends[0].contains("mcp__workspace__connector_219"),
+        "full 18 KB+ `exec` TypeScript declarations fit inline inside the calibrated 48 KB `MAX_SYSTEM_APPEND_BYTES` window"
+    );
 
     let prompts = backend.recorded_prompts.lock().unwrap();
     assert_eq!(prompts.len(), 3);
     assert_eq!(prompts[0].session_id, "sess_1");
-    assert!(
-        prompts[0]
-            .text_joined
-            .contains("mcp__workspace__connector_219"),
-        "full 18 KB+ `exec` TypeScript declarations must spill losslessly into Turn 1"
-    );
     assert_eq!(prompts[1].session_id, "sess_2");
     assert_eq!(
         prompts[2].session_id, "sess_1",
@@ -9520,7 +9518,7 @@ async fn omp_profile_virtualizes_eval_codemode_preserves_hashline_edit_and_route
             }
         }));
     }
-    for idx in 0..20 {
+    for idx in 0..32 {
         tools.push(json!({
             "type": "function",
             "name": format!("mcp__github_issue_op_{idx:02}"),
@@ -9746,7 +9744,7 @@ async fn opencode_profile_virtualizes_codemode_execute_heals_patchtext_and_route
         json!({"name": "subagent", "description": "Run subagent", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}),
         json!({"name": "question", "description": "Ask user", "input_schema": {"type": "object", "properties": {"questions": {"type": "array"}}, "required": ["questions"]}}),
     ];
-    for idx in 0..25 {
+    for idx in 0..30 {
         tools.push(json!({
             "name": format!("playwright_browser_op_{idx:02}"),
             "description": "Playwright browser action",
@@ -10816,6 +10814,252 @@ async fn mcp_tool_spill_below_10kb_cliff_zero_rtt_read_context_spill_and_no_fals
         "warm session must not be falsely retired as compacted after multi-subcall MCP turn"
     );
     assert_eq!(pool_snap.total_sessions_closed_or_evicted, 0);
+
+    let _ = std::fs::remove_dir_all(&spill_dir);
+}
+
+#[tokio::test]
+async fn elastic_io_telemetry_tracks_30_tool_codex_passthrough_compound_exec_multi_file_patch_and_zero_rtt_spill()
+ {
+    let large_exec_output = (1..=300)
+        .map(|ln| format!("src/mod_{ln:03}.rs:{ln}: pub fn handler_{ln:03}() -> bool {{ true }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(large_exec_output.len() > 14_000);
+    let spill_filename = liftgate_types::session_key::format_content_addressed_spill_filename(
+        "tool_result:exec",
+        &large_exec_output,
+    );
+    let coalesced_patch = "*** Begin Patch\n\
+*** Update File: src/mod_001.rs\n\
+@@\n\
+-pub fn handler_001() -> bool { true }\n\
++pub fn handler_001() -> bool { false }\n\
+*** Update File: src/mod_150.rs\n\
+@@\n\
+-pub fn handler_150() -> bool { true }\n\
++pub fn handler_150() -> bool { false }\n\
+*** End Patch";
+
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 42_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "exec".to_owned(),
+                arguments: json!({
+                    "code": "const [a, b] = await Promise.all([tools.exec_command({ cmd: 'rg handler src' }), tools.exec_command({ cmd: 'git status -s' })]); store('scan', a.output); text(a.output);"
+                }),
+                expect_reply_substrings: vec!["mcp_lg_read_context_spill", "tool-result-exec-"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 44_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "read_context_spill".to_owned(),
+                arguments: json!({
+                    "path": spill_filename,
+                    "start_line": 149,
+                    "max_lines": 4
+                }),
+                expect_reply_substrings: vec!["L150: src/mod_150.rs:150: pub fn handler_150()"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 45_500,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "apply_patch".to_owned(),
+                arguments: json!({ "patch": coalesced_patch }),
+                expect_reply_substrings: vec!["Success. Updated 2 files."],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 46_200,
+                thoughts: vec![],
+                chunks_template: vec!["Updated both handlers in one atomic patch.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 12_000,
+                    output_tokens: 1_200,
+                    cached_read_tokens: 120_000,
+                    cached_write_tokens: 0,
+                    thought_tokens: 200,
+                    total_tokens: 133_200,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let spill_dir =
+        std::env::temp_dir().join(format!("liftgate-elastic-io-e2e-{}", uuid::Uuid::new_v4()));
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    state.config.spill_dir = Some(spill_dir.clone());
+    let app = build_router(state.clone());
+
+    let mut tools_arr = vec![
+        json!({
+            "type": "custom",
+            "name": "exec",
+            "description": "Run JavaScript code to orchestrate tool calls.\nTool TypeScript declarations:\n```ts\ndeclare const tools: { exec_command(args: { cmd: string }): Promise<{ output: string }>; };\n```",
+            "format": { "type": "grammar", "syntax": "lark", "definition": "start: /[\\s\\S]+/" }
+        }),
+        json!({
+            "type": "function",
+            "name": "wait",
+            "description": "Wait on a running exec cell.",
+            "parameters": {
+                "type": "object",
+                "properties": { "cell_id": { "type": "string" } },
+                "required": ["cell_id"]
+            }
+        }),
+        json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Patch files with V4A format."
+        }),
+    ];
+    for idx in 0..27 {
+        tools_arr.push(json!({
+            "type": "function",
+            "name": format!("mcp__linear__op_{idx:02}"),
+            "description": format!("Linear connector operation {idx}"),
+            "parameters": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        }));
+    }
+    assert_eq!(tools_arr.len(), 30);
+
+    // Step 1: initial turn -> suspends on `exec`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "tools": tools_arr,
+                        "input": "Update handlers 001 and 150."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp1_id = b1["id"].as_str().unwrap().to_owned();
+    let exec_call_id = b1["output"][0]["call_id"].as_str().unwrap().to_owned();
+
+    // Step 2: client returns >14KB `exec` output -> gateway spills, answers `read_context_spill`
+    // in 0-RTT, and suspends on coalesced 2-file `apply_patch`
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp1_id,
+                        "tools": tools_arr,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": exec_call_id,
+                            "output": large_exec_output
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let b2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp2_id = b2["id"].as_str().unwrap().to_owned();
+    let patch_call_id = b2["output"][0]["call_id"].as_str().unwrap().to_owned();
+
+    // Step 3: client returns `apply_patch` success -> final assistant completion
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp2_id,
+                        "tools": tools_arr,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": patch_call_id,
+                            "output": "Success. Updated 2 files."
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+
+    // Inspect `/api/telemetry/snapshot` for Elastic I/O & per-session MCP summary
+    let snap_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/telemetry/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snap_resp.status(), StatusCode::OK);
+    let snap: Value =
+        serde_json::from_slice(&snap_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    let eio = &snap["elastic_io"];
+    assert_eq!(eio["passthrough_sessions"], 1);
+    assert_eq!(eio["virtualized_sessions"], 0);
+    assert_eq!(eio["mcp_forwarded_tool_calls"], 2);
+    assert_eq!(eio["mcp_orchestrator_calls"], 1);
+    assert_eq!(eio["mcp_tool_using_turns"], 2);
+    assert_eq!(eio["mcp_patch_calls"], 1);
+    assert_eq!(eio["mcp_multi_file_patch_calls"], 1);
+    assert_eq!(eio["mcp_patch_files_total"], 2);
+    assert_eq!(eio["mcp_zero_rtt_spill_reads"], 1);
+    assert_eq!(eio["mcp_tool_results_total"], 2);
+    assert_eq!(eio["mcp_tool_results_spilled"], 1);
+    assert!(eio["context_spills_created"].as_u64().unwrap_or(0) >= 1);
+    assert!(eio["context_spills_bytes"].as_u64().unwrap_or(0) > 14_000);
+
+    let sess_mcp = &snap["session_pool"]["sessions"][0]["mcp"];
+    assert_eq!(sess_mcp["harness_profile"], "codex");
+    assert_eq!(sess_mcp["orchestrator_mode"], "codex_exec");
+    assert_eq!(sess_mcp["is_passthrough"], true);
+    assert_eq!(sess_mcp["declared_tools"], 30);
+    assert_eq!(sess_mcp["virtualized_hubs"], 0);
 
     let _ = std::fs::remove_dir_all(&spill_dir);
 }

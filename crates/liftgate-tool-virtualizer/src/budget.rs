@@ -3,11 +3,14 @@
 /// Wire and search budget governing how a [`crate::HarnessToolProfile`] partitions tools
 /// onto the `lg` loopback MCP server.
 ///
-/// Upstream `agy acp` enforces a hard `50`-tool Eager ceiling across *all* attached MCP servers
-/// and sorts candidates ascending by definition byte length when trimming excess tools into `Lazy`.
-/// Keeping `max_eager_tools <= 24` and `max_eager_wire_bytes <= 28 KiB` leaves `26+` Eager slots
-/// for host-side plugins while guaranteeing large orchestrators (`exec`, `exec_command`, `Bash`,
-/// `REPL`, `Agent`) are never evicted.
+/// Empirical black-box probes on `agy acp 1.5.18` showed that the legacy `50`-tool count cap no
+/// longer applies (`120` uniform tools at `~48 KB` stay `100% Eager`); instead, `agy acp` enforces
+/// a **`~55–58 KiB` serialized byte budget** across attached MCP servers, packing tools ascending
+/// by definition byte length and **silently dropping** (`lazy: 0`) oversized tools past the cliff.
+/// Setting `max_eager_tools = 40`, `direct_passthrough_max_tools = 36`, and `max_eager_wire_bytes = 34 KiB`
+/// lets medium-sized plugin sessions (`<= 36` tools, `<= 28 KiB`) run in 1:1 zero-virtualization
+/// passthrough while keeping `21+ KiB` of headroom below the silent-drop cliff so large
+/// orchestrators (`exec`, `execute`, `eval`, `Bash`) are never dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VirtualizerBudget {
     /// Hard ceiling on total MCP tools exposed in `lg` `tools/list` (including hubs + dispatchers).
@@ -37,13 +40,13 @@ pub struct VirtualizerBudget {
 }
 
 impl VirtualizerBudget {
-    /// Default `agy acp`-safe budget shared across general harnesses.
+    /// Default `agy acp 1.5.18`-calibrated budget shared across general harnesses.
     pub const DEFAULT_AGY_ACP: Self = Self {
-        max_eager_tools: 24,
-        max_eager_wire_bytes: 28 * 1024,
-        direct_passthrough_max_tools: 20,
-        direct_passthrough_max_non_orchestrator_bytes: 22 * 1024,
-        max_direct_core_tools: 12,
+        max_eager_tools: 40,
+        max_eager_wire_bytes: 34 * 1024,
+        direct_passthrough_max_tools: 36,
+        direct_passthrough_max_non_orchestrator_bytes: 28 * 1024,
+        max_direct_core_tools: 18,
         small_hub_enum_max_actions: 12,
         max_orchestrator_desc_bytes: 64 * 1024,
         max_standard_desc_bytes: 8 * 1024,
@@ -53,41 +56,43 @@ impl VirtualizerBudget {
         max_single_schema_in_search_bytes: 12 * 1024,
     };
 
-    /// Budget tuned for OpenAI Codex CLI / Codex App (`exec` + PTY pair + many `codex_apps` hubs).
+    /// Budget tuned for OpenAI Codex CLI / Codex App (`exec` + PTY pair + `apply_patch` + `codex_apps` hubs).
     pub const CODEX_AGY_ACP: Self = Self {
-        max_direct_core_tools: 10,
+        max_direct_core_tools: 16,
         ..Self::DEFAULT_AGY_ACP
     };
 
     /// Budget tuned for Anthropic Claude Code (`Bash`/`Read`/`Edit`/`Write`/`Grep`/`Glob`/`Agent`
-    /// + PascalCase built-in hubs + MCP plugins).
+    /// + `AskUserQuestion`/`Skill` + PascalCase built-in hubs + MCP plugins).
     pub const CLAUDE_CODE_AGY_ACP: Self = Self {
-        max_direct_core_tools: 13,
+        max_direct_core_tools: 18,
         ..Self::DEFAULT_AGY_ACP
     };
 
     /// Budget tuned for OpenCode (`execute` `@opencode/codemode` orchestrator + lowercase core
     /// coding primitives + `opencode_*`/`automation_*`/`<server>_*` hubs).
     pub const OPENCODE_AGY_ACP: Self = Self {
-        max_direct_core_tools: 12,
+        max_direct_core_tools: 18,
         ..Self::DEFAULT_AGY_ACP
     };
 
     /// Budget tuned for Oh My Pi (`omp` — `eval` polyglot Python/Bun Code Mode kernel + `wait`
-    /// + 14-18 default built-in tools in 1:1 passthrough + `mcp__<server>_<tool>` hubs).
+    /// + built-in tools in 1:1 passthrough + `mcp__<server>_<tool>` hubs).
     pub const OMP_AGY_ACP: Self = Self {
-        max_eager_wire_bytes: 34 * 1024,
-        direct_passthrough_max_tools: 21,
         direct_passthrough_max_non_orchestrator_bytes: 30 * 1024,
-        max_direct_core_tools: 13,
+        max_direct_core_tools: 18,
         ..Self::DEFAULT_AGY_ACP
     };
 
     /// Compile-time invariant check relating all budget thresholds.
     pub const fn assert_valid(&self) {
         assert!(
-            self.max_eager_tools >= 4 && self.max_eager_tools <= 40,
-            "max_eager_tools must leave room for dispatchers while staying below agy acp's 50-tool ceiling"
+            self.max_eager_tools >= 4 && self.max_eager_tools <= 48,
+            "max_eager_tools must leave room for dispatchers and host MCP plugins"
+        );
+        assert!(
+            self.max_eager_wire_bytes <= 40 * 1024,
+            "max_eager_wire_bytes must stay well below agy acp 1.5.18's ~55 KiB silent-drop cliff"
         );
         assert!(
             self.direct_passthrough_max_tools <= self.max_eager_tools,

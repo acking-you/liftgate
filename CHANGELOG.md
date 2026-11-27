@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.15] - 2026-11-27
+
+### Added
+- **Elastic I/O Orchestration Contracts (`CodexExec` & `ClaudeBashFirst`) & Calibrated `agy acp 1.5.18` Budgets**:
+  - Added `McpOrchestratorContract::CodexExec` (`CodexToolProfile`) and `McpOrchestratorContract::ClaudeBashFirst` (`ClaudeCodeToolProfile` when `REPL` is absent) alongside `OpenCodeExecute` and `OmpPolyglotEval`, replacing obsolete "emit parallel `mcp_lg_*` calls" and "single-file `apply_patch` only" bridge prompts with calibrated sequential-aware compound I/O rules (`<= 8 KB` filtered `exec` / `execute` / `eval` / `Bash` reads, `store(key, raw)` / `load(key)`, `1–4` file atomic `mcp_lg_apply_patch` coalescing, `5+` isolated `tools.apply_patch` inside `exec`, and permission-gated bulk file streaming).
+  - Calibrated `VirtualizerBudget` (`MAX_NATIVE_MCP_TOOLS = 40`, `max_eager_wire_bytes = 34 KiB`, `direct_passthrough_max_tools = 36`, `direct_passthrough_max_non_orchestrator_bytes = 28 KiB` / `30 KiB` for `omp`, `max_direct_core_tools = 16..18`) and raised `MAX_SYSTEM_APPEND_BYTES` to `48,000` (`compact_caller_system` threshold `24,000`) against `agy acp 1.5.18`'s empirical `50`-tool / `~55–58 KiB` Eager ceiling (`lazy: 0` silent drop) and `> 256 KB` `systemPrompt.append` capacity, enabling `1:1` Direct Eager Passthrough for 21–36 tool sessions with zero `ns__*` hub wrapping.
+- **Elastic I/O & Per-Session MCP Virtualization Telemetry Across API, Web Dashboard, CLI & TUI**:
+  - Extended `/api/telemetry/snapshot` (`GatewayTelemetrySnapshot.elastic_io`, `SessionSummary.mcp`, `TaskSnapshot.{zero_rtt_mcp_ops,spilled_tool_results}`) and `SpillStore` to track `1:1` passthrough vs `ns__*` hub-virtualized sessions, compound orchestrator share, multi-file `apply_patch` coalescing, `< 9.6 KB` inline tool-result fit rate, lossless spill file counts/bytes, and `0-RTT` gateway-local searches, spill reads, and preflight self-heals.
+  - Updated the embedded React observability dashboard (`web/`), `lg status`, and `lg top` with a real-time Elastic I/O & `agy acp 1.5.18` telemetry card, per-task `0-RTT` / `Spill` badges, and per-session harness profile, orchestrator mode, `1:1` passthrough vs `Hub×N`, and `Eager / Wire` budget utilization columns.
+
 ## [0.2.14] - 2026-11-27
 
 ### Added

@@ -3,13 +3,14 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use liftgate_types::session_key::{TruncationSpillSink, format_content_addressed_spill_filename};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::platform::canonicalize_clean;
+use crate::{platform::canonicalize_clean, telemetry::TelemetryHub};
 
 /// Default cap on retained spill files inside `~/.liftgate/spills`.
 pub const DEFAULT_MAX_SPILL_FILES: usize = 256;
@@ -88,6 +89,7 @@ pub struct SpillStore {
     dir: PathBuf,
     max_files: usize,
     max_total_bytes: u64,
+    telemetry: Option<Arc<TelemetryHub>>,
 }
 
 impl SpillStore {
@@ -97,6 +99,7 @@ impl SpillStore {
             dir: dir.into(),
             max_files: DEFAULT_MAX_SPILL_FILES,
             max_total_bytes: DEFAULT_MAX_SPILL_TOTAL_BYTES,
+            telemetry: None,
         }
     }
 
@@ -106,7 +109,16 @@ impl SpillStore {
             dir: dir.into(),
             max_files: max_files.max(1),
             max_total_bytes: max_total_bytes.max(1024),
+            telemetry: None,
         }
+    }
+
+    /// Attaches a [`TelemetryHub`] so newly persisted lossless spill files increment
+    /// `ElasticIoTelemetry::context_spills_created` and `context_spills_bytes`.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Arc<TelemetryHub>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Atomically writes `full_content` into a content-addressed file under `self.dir`,
@@ -171,6 +183,9 @@ impl SpillStore {
             }
         } else {
             temp_guard.disarm();
+            if let Some(ref hub) = self.telemetry {
+                hub.record_context_spill(expected_len);
+            }
         }
         drop(temp_guard);
 

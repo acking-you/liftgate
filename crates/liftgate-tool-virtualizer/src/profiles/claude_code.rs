@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::CanonicalToolSpec,
-    session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
+    session_key::{
+        McpOrchestratorContract, is_code_mode_custom_exec, is_code_mode_orchestrator_tool,
+    },
 };
 
 use crate::{
@@ -201,6 +203,24 @@ impl HarnessToolProfile for ClaudeCodeToolProfile {
         }
 
         ToolPlacement::Standalone { backfill_rank: 16 }
+    }
+
+    fn orchestrator_prompt_contract<'a>(
+        self,
+        spec: &CanonicalToolSpec,
+        mcp_name: &'a str,
+        _has_folded_tools: bool,
+        client_tools: &[CanonicalToolSpec],
+    ) -> Option<McpOrchestratorContract<'a>> {
+        if !matches!(spec.name.as_str(), "Bash" | "PowerShell") {
+            return None;
+        }
+        let has_code_mode_repl = client_tools
+            .iter()
+            .any(|t| t.name == "REPL" || is_code_mode_orchestrator_tool(t));
+        (!has_code_mode_repl).then_some(McpOrchestratorContract::ClaudeBashFirst {
+            bash_mcp_name: mcp_name,
+        })
     }
 
     fn search_aliases(self, _spec: &CanonicalToolSpec, namespace: Option<&str>) -> &'static str {

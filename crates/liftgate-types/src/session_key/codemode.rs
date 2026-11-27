@@ -7,10 +7,22 @@ use super::spill::{
 };
 use super::strip_tag_blocks;
 
-/// Explicit Code Mode orchestration contract discovered by the active harness tool profile and
-/// forwarded into `_meta.antigravity.systemPrompt.append` without name-based guessing.
+/// Explicit Code Mode or compound-I/O orchestration contract discovered by the active harness tool
+/// profile and forwarded into `_meta.antigravity.systemPrompt.append` without name-based guessing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpOrchestratorContract<'a> {
+    /// OpenAI Codex Code Mode (`exec` V8 isolate wrapping `tools.exec_command`, `tools.apply_patch`, etc.).
+    CodexExec {
+        /// Sanitized MCP tool name mounted on `lg` (e.g. `"exec"` -> `mcp_lg_exec`).
+        mcp_name: &'a str,
+        /// Whether top-level `apply_patch` (`mcp_lg_apply_patch`) is also declared on the session.
+        has_apply_patch: bool,
+    },
+    /// Anthropic Claude Code Bash-first compound I/O (`Bash` alongside `Read`/`Edit`/`Write`).
+    ClaudeBashFirst {
+        /// Sanitized MCP tool name for `Bash` (e.g. `"Bash"` -> `mcp_lg_Bash`).
+        bash_mcp_name: &'a str,
+    },
     /// OpenCode (`@opencode/codemode` / `@opencode-ai/codemode`) `execute` JavaScript runtime.
     OpenCodeExecute {
         /// Sanitized MCP tool name mounted on `lg` (e.g. `"execute"` -> `mcp_lg_execute`).
@@ -30,6 +42,26 @@ pub enum McpOrchestratorContract<'a> {
     },
 }
 
+impl McpOrchestratorContract<'_> {
+    /// Stable lowercase telemetry label describing the active orchestration strategy.
+    #[must_use]
+    pub const fn mode_id(&self) -> &'static str {
+        match self {
+            Self::CodexExec { .. } => "codex_exec",
+            Self::ClaudeBashFirst { .. } => "claude_bash_first",
+            Self::OpenCodeExecute {
+                full_code_mode: true,
+                ..
+            } => "opencode_execute_full",
+            Self::OpenCodeExecute {
+                full_code_mode: false,
+                ..
+            } => "opencode_execute",
+            Self::OmpPolyglotEval { .. } => "omp_eval",
+        }
+    }
+}
+
 pub(super) const MAX_CODE_MODE_TOOL_DESC_BYTES: usize = 36_000;
 pub(super) const MAX_SLIM_CODE_MODE_TOOL_DESC_BYTES: usize = 24_000;
 
@@ -47,6 +79,17 @@ Execute Python (\"py\") or JavaScript/Bun (\"js\") in persistent Code Mode kerne
 pub fn is_code_mode_custom_exec(tool: &CanonicalToolSpec) -> bool {
     matches!(tool.kind, CanonicalToolKind::Custom { .. })
         && (matches!(tool.name.as_str(), "exec" | "execute") || tool.name.ends_with(".exec"))
+}
+
+/// Returns `true` when `tool` is OpenAI Codex's V8 JavaScript Code Mode `exec` orchestrator
+/// (`"exec"` or `"*.exec"`, either `CanonicalToolKind::Custom` or carrying `declare const tools` /
+/// `globalThis.tools` TypeScript declarations), excluding OpenCode's `"execute"` tool.
+#[must_use]
+pub fn is_codex_exec_orchestrator_tool(tool: &CanonicalToolSpec) -> bool {
+    if tool.name != "exec" && !tool.name.ends_with(".exec") {
+        return false;
+    }
+    is_code_mode_custom_exec(tool) || is_code_mode_orchestrator_tool(tool)
 }
 
 /// Returns `true` when `tool` is OpenCode's `@opencode/codemode` (`v2`) or `@opencode-ai/codemode`

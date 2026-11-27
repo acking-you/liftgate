@@ -231,7 +231,10 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     let mcp_enabled = cfg.mcp_tool_bridge.load(Ordering::Relaxed);
     let vision_offload_enabled = cfg.vision_offload.load(Ordering::Relaxed);
     let cap = cfg.limits.channel_capacity().get();
-    let mut spill_store = cfg.spill_dir.as_ref().map(SpillStore::new);
+    let mut spill_store = cfg
+        .spill_dir
+        .as_ref()
+        .map(|dir| SpillStore::new(dir).with_telemetry(Arc::clone(telemetry)));
 
     // 0. Fast-path check for a parked MCP-suspended session (`session/prompt` awaiting `tools/call`
     //    reply). Either resumes directly inside the live `session/prompt` or gracefully unwinds via
@@ -539,6 +542,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     let (mut guard, mut combined) = checkout.into_lease_guard(combined_len);
                     let session_idle_ms = guard.idle_before_checkout_ms();
                     let session_turn_index = guard.turn_count();
+                    guard.refresh_mcp_summary(req.client_tools.len());
                     let mut model_switched = false;
                     let mut previous_model = None;
                     if guard.model_id() != &resolved_model {
@@ -655,8 +659,10 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         &mut spill_store,
                     )?;
                     let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                    guard.refresh_mcp_summary(req.client_tools.len());
                     let session_idle_ms = guard.idle_before_checkout_ms();
                     let session_turn_index = guard.turn_count();
+                    guard.refresh_mcp_summary(req.client_tools.len());
                     let mut model_switched = false;
                     let mut previous_model = None;
                     if guard.model_id() != &resolved_model {
@@ -813,6 +819,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 &nonce,
                 &mut spill_store,
             );
+            telemetry.record_mcp_session_registered(catalog.is_passthrough);
             mcp_session_handle = Some(mcp_srv.register_session(catalog));
             out
         } else {
@@ -3692,10 +3699,11 @@ impl AcpBannerFilter {
 
 /// Inline byte ceiling for a single MCP `tools/call` text result when `SpillStore` is active.
 ///
-/// Kept strictly below `agy acp`'s internal ~10,240-byte MCP tool-output middle-truncation cliff
-/// so `agy acp` never silently excises middle lines into an unreadable host-private brain file;
-/// instead, Liftgate persists 100% of the lossless output in `~/.liftgate/spills` and exposes it
-/// in 0-RTT via `mcp_lg_read_context_spill`.
+/// Empirically calibrated on `agy acp 1.5.18`: MCP `CallToolResult` payloads where
+/// `raw_text_bytes + 78B_envelope > 10,240 B` (`raw >= 10,163 B`) trigger middle-truncation inside
+/// `agy acp` (retaining `9,894 B` and dumping the middle into an unreadable host-private brain file).
+/// Capping inline output at `9,600 B` leaves `640 B` of JSON/UTF-8 margin while persisting 100% of
+/// the lossless output in `~/.liftgate/spills` for 0-RTT retrieval via `mcp_lg_read_context_spill`.
 const MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES: usize = 9_600;
 const MAX_SINGLE_MCP_TOOL_RESULT_BYTES: usize = 96 * 1024;
 
@@ -3846,6 +3854,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
         step_lease.tool_nonce(),
         &mut spill_store,
     );
+    step_lease.refresh_mcp_summary(req.client_tools.len());
     let full_messages = std::mem::take(&mut promoted.accumulated_messages);
     let base_state_hash = hash_conversation_state(
         req.system_instructions.as_deref(),
@@ -3928,12 +3937,14 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             }
         }
 
-        let (tool_replies, diag_blocks) = build_mcp_tool_replies(
+        let built_replies = build_mcp_tool_replies(
             &promoted.pending_calls,
             &delta_for_reply,
             tools_delta.as_deref(),
             &mut spill_store,
         );
+        task_guard
+            .record_mcp_tool_results(built_replies.total_results, built_replies.spilled_results);
         let sid = step_lease.session_id().clone();
         let raw_lease = step_lease.into_raw_parts();
         let resumed = McpResumedStepInput {
@@ -3943,9 +3954,9 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             web_cfg,
             full_messages,
             route_meta,
-            outbound_diag_blocks: diag_blocks,
+            outbound_diag_blocks: built_replies.diag_blocks,
             response_id: worker_resp_id,
-            tool_replies,
+            tool_replies: built_replies.replies,
             vision_offload_usage,
             events_tx,
             step_cancel: turn_cancel,
@@ -4041,12 +4052,14 @@ fn sanitize_mcp_tool_result_text(
     raw_output: &str,
     client_tool_name: &str,
     spill_store: &mut Option<SpillStore>,
-) -> String {
+) -> (String, bool) {
     let billing_clean = strip_billing_noise(raw_output);
     let term_clean = scrub_terminal_control_noise(&billing_clean);
+    let mut spilled = false;
     let mut sanitized = if spill_store.is_some()
         && term_clean.len() > MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES
     {
+        spilled = true;
         let label = format!("tool_result:{client_tool_name}");
         truncate_head_tail_lines_with_spill(
             &term_clean,
@@ -4055,6 +4068,7 @@ fn sanitize_mcp_tool_result_text(
             spill_store,
         )
     } else if term_clean.len() > MAX_SINGLE_MCP_TOOL_RESULT_BYTES {
+        spilled = true;
         let label = format!("tool_result:{client_tool_name}");
         truncate_head_tail_lines_with_spill(
             &term_clean,
@@ -4071,10 +4085,17 @@ fn sanitize_mcp_tool_result_text(
             .starts_with("apply_patch verification failed:")
     {
         sanitized.push_str(
-            "\n[Hint: read the exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated) and keep each `mcp_lg_apply_patch` call scoped to a single file.]",
+            "\n[Hint: re-read the failed file's exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated), then retry `mcp_lg_apply_patch` for only the failed file with 1-3 exact unchanged context lines.]",
         );
     }
-    sanitized
+    (sanitized, spilled)
+}
+
+struct BuiltMcpToolReplies {
+    replies: Vec<(String, McpToolCallReply)>,
+    diag_blocks: Arc<[AcpPromptBlock]>,
+    total_results: usize,
+    spilled_results: usize,
 }
 
 fn build_mcp_tool_replies(
@@ -4082,7 +4103,7 @@ fn build_mcp_tool_replies(
     delta_messages: &[CanonicalMessage],
     tools_delta_xml: Option<&str>,
     spill_store: &mut Option<SpillStore>,
-) -> (Vec<(String, McpToolCallReply)>, Arc<[AcpPromptBlock]>) {
+) -> BuiltMcpToolReplies {
     let pending_set: HashSet<&str> = pending_calls
         .iter()
         .map(|p| p.nonce_suffix.as_str())
@@ -4137,12 +4158,19 @@ fn build_mcp_tool_replies(
     let total_pending = pending_calls.len();
     let mut replies = Vec::with_capacity(total_pending);
     let mut diag_summary = String::new();
+    let mut total_results = 0usize;
+    let mut spilled_results = 0usize;
 
     for (idx, pending) in pending_calls.iter().enumerate() {
         let (raw_out, is_error) = matched_results
             .remove(&pending.nonce_suffix)
             .unwrap_or_else(|| (String::new(), false));
-        let sanitized = sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        let (sanitized, did_spill) =
+            sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        total_results = total_results.saturating_add(1);
+        if did_spill {
+            spilled_results = spilled_results.saturating_add(1);
+        }
         if !diag_summary.is_empty() {
             diag_summary.push('\n');
         }
@@ -4155,7 +4183,12 @@ fn build_mcp_tool_replies(
 
         if idx + 1 == total_pending {
             for (xml_id, xml_out, xml_err) in &extra_xml_results {
-                let clean_xml = sanitize_mcp_tool_result_text(xml_out, "xml_tool", spill_store);
+                let (clean_xml, xml_spilled) =
+                    sanitize_mcp_tool_result_text(xml_out, "xml_tool", spill_store);
+                total_results = total_results.saturating_add(1);
+                if xml_spilled {
+                    spilled_results = spilled_results.saturating_add(1);
+                }
                 content.push(McpContentItem::Text {
                     text: format!(
                         "<client_tool_result tool_call_id=\"{xml_id}\" is_error=\"{xml_err}\">\n{clean_xml}\n</client_tool_result>"
@@ -4191,7 +4224,12 @@ fn build_mcp_tool_replies(
 
     let diag_blocks: Arc<[AcpPromptBlock]> =
         Arc::from(vec![AcpPromptBlock::Text { text: diag_summary }]);
-    (replies, diag_blocks)
+    BuiltMcpToolReplies {
+        replies,
+        diag_blocks,
+        total_results,
+        spilled_results,
+    }
 }
 
 const fn estimate_tokens_from_chars(chars: usize) -> u64 {
@@ -4297,7 +4335,7 @@ fn record_forwarded_mcp_call(
     let nonce_suffix = generate_short_nonce();
     let call_id = format!("call_{nonce_suffix}");
 
-    task_guard.record_client_tool(&client_name);
+    task_guard.record_mcp_forwarded_tool(&client_name, &arguments);
     task_guard.record_tool_delta(arg_chars);
     state.emitted_client_tool = true;
     state.assistant_parts.push(CanonicalPart::ToolCall {
@@ -4567,6 +4605,10 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         }
                         maybe_call = call_rx_guard.recv() => {
                             if let Some(first_call) = maybe_call {
+                                // `agy acp 1.5.18` executes `mcp_lg_*` `tools/call` RPCs sequentially
+                                // (`max_concurrent == 1`, ~820 ms/call), while custom/mock MCP drivers may
+                                // still enqueue concurrent calls on the same tick; yield briefly to drain
+                                // any co-arriving calls without introducing timer latency.
                                 pending_mcp_incoming.push(first_call);
                                 tokio::task::yield_now().await;
                                 tokio::task::yield_now().await;
@@ -4827,9 +4869,16 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 reply,
                                 kind,
                             } => match kind {
-                                LocalReplyKind::Search | LocalReplyKind::SpillRead => {
+                                LocalReplyKind::Search => {
                                     disabled_mcp_rejections = 0;
                                     preflight_mcp_rejections = 0;
+                                    cur_task_guard.record_zero_rtt_search();
+                                    let _ = reply_tx.send(reply);
+                                }
+                                LocalReplyKind::SpillRead => {
+                                    disabled_mcp_rejections = 0;
+                                    preflight_mcp_rejections = 0;
+                                    cur_task_guard.record_zero_rtt_spill_read();
                                     let _ = reply_tx.send(reply);
                                 }
                                 LocalReplyKind::PreflightError => {
@@ -4842,6 +4891,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                             "\"model repeatedly failed virtualized MCP tool preflight\"",
                                         );
                                     } else {
+                                        cur_task_guard.record_zero_rtt_preflight_heal();
                                         let _ = reply_tx.send(reply);
                                     }
                                 }
@@ -4877,6 +4927,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                         Ok(slice_text) => {
                                             disabled_mcp_rejections = 0;
                                             preflight_mcp_rejections = 0;
+                                            cur_task_guard.record_zero_rtt_spill_read();
                                             (slice_text, false)
                                         }
                                         Err(err) => (err.to_string(), true),

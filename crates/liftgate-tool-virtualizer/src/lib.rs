@@ -3,8 +3,8 @@
 //! This crate contains zero async runtime, HTTP, or OS I/O dependencies. Each coding harness
 //! implements [`HarnessToolProfile`] as a zero-sized unit struct (`Copy + Default + 'static`),
 //! monomorphized into [`plan_virtualization`] to keep `lg` loopback MCP tool exposure strictly
-//! within `agy acp`'s 50-tool Eager ceiling while providing 0-RTT in-memory schema search and
-//! required-parameter preflight self-healing.
+//! within `agy acp 1.5.18`'s `~55–58 KiB` Eager wire byte budget while enabling 1:1 passthrough
+//! up to `36` tools, 0-RTT in-memory schema search, and required-parameter preflight self-healing.
 
 pub mod budget;
 pub mod planner;

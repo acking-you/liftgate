@@ -6,6 +6,7 @@ use std::sync::Arc;
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::{McpOrchestratorContract, TruncationSpillSink, compact_mcp_tool_description},
+    telemetry::SessionMcpSummary,
 };
 use serde_json::{Value, json};
 
@@ -37,6 +38,13 @@ pub struct McpSessionOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedOrchestratorContract {
+    CodexExec {
+        mcp_name: String,
+        has_apply_patch: bool,
+    },
+    ClaudeBashFirst {
+        bash_mcp_name: String,
+    },
     OpenCodeExecute {
         mcp_name: String,
         full_code_mode: bool,
@@ -50,6 +58,16 @@ enum OwnedOrchestratorContract {
 impl OwnedOrchestratorContract {
     fn from_borrowed(contract: McpOrchestratorContract<'_>) -> Self {
         match contract {
+            McpOrchestratorContract::CodexExec {
+                mcp_name,
+                has_apply_patch,
+            } => Self::CodexExec {
+                mcp_name: mcp_name.to_owned(),
+                has_apply_patch,
+            },
+            McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name } => Self::ClaudeBashFirst {
+                bash_mcp_name: bash_mcp_name.to_owned(),
+            },
             McpOrchestratorContract::OpenCodeExecute {
                 mcp_name,
                 full_code_mode,
@@ -69,6 +87,16 @@ impl OwnedOrchestratorContract {
 
     fn as_borrowed(&self) -> McpOrchestratorContract<'_> {
         match self {
+            Self::CodexExec {
+                mcp_name,
+                has_apply_patch,
+            } => McpOrchestratorContract::CodexExec {
+                mcp_name,
+                has_apply_patch: *has_apply_patch,
+            },
+            Self::ClaudeBashFirst { bash_mcp_name } => {
+                McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }
+            }
             Self::OpenCodeExecute {
                 mcp_name,
                 full_code_mode,
@@ -97,6 +125,12 @@ pub struct McpSessionCatalog {
     pub bridged_pairs: Vec<(String, String)>,
     /// `(hub_mcp_name, namespace_label, action_count)` summaries when namespace virtualization is active.
     pub virtualized_hubs: Vec<(String, String, usize)>,
+    /// `true` when all eligible tools mounted 1:1 in zero-virtualization passthrough (`0` namespace hubs).
+    pub is_passthrough: bool,
+    /// Initial number of caller-declared tools partitioned into this session catalog.
+    pub declared_tool_count: usize,
+    /// Estimated total serialized wire bytes across `wire_tools`.
+    pub wire_tool_bytes: usize,
     /// Whether `search_client_tools` and `call_client_tool` are mounted on `lg`.
     pub has_virtualized_dispatch: bool,
     /// Whether server-managed `gateway_web_fetch` (`mcp_lg_gateway_web_fetch`) is mounted on `lg`.
@@ -119,12 +153,29 @@ impl McpSessionCatalog {
         self.by_mcp_name.get(mcp_name)
     }
 
-    /// Active Code Mode orchestrator prompt contract for `<api_gateway_bridge_rules>`, if any.
+    /// Active Code Mode or compound-I/O orchestrator prompt contract for `<api_gateway_bridge_rules>`.
     #[must_use]
     pub fn orchestrator_contract(&self) -> Option<McpOrchestratorContract<'_>> {
         self.orchestrator
             .as_ref()
             .map(OwnedOrchestratorContract::as_borrowed)
+    }
+
+    /// Builds a wire-serializable [`SessionMcpSummary`] reflecting `declared_tools_len` on the session.
+    #[must_use]
+    pub fn telemetry_summary(&self, declared_tools_len: usize) -> SessionMcpSummary {
+        let orchestrator_mode = self
+            .orchestrator_contract()
+            .map_or("direct", |c| c.mode_id());
+        SessionMcpSummary {
+            harness_profile: self.profile_id.to_owned(),
+            orchestrator_mode: orchestrator_mode.to_owned(),
+            is_passthrough: self.is_passthrough,
+            declared_tools: declared_tools_len,
+            eager_tools: self.wire_tools.len(),
+            virtualized_hubs: self.virtualized_hubs.len(),
+            wire_bytes: self.wire_tool_bytes,
+        }
     }
 }
 
@@ -475,8 +526,12 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
             if orchestrator.is_none()
-                && let Some(contract) =
-                    profile.orchestrator_prompt_contract(spec, &mcp_name, has_folded_tools)
+                && let Some(contract) = profile.orchestrator_prompt_contract(
+                    spec,
+                    &mcp_name,
+                    has_folded_tools,
+                    client_tools,
+                )
             {
                 orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
             }
@@ -679,8 +734,12 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
             if orchestrator.is_none()
-                && let Some(contract) =
-                    profile.orchestrator_prompt_contract(spec, &mcp_name, has_folded_tools)
+                && let Some(contract) = profile.orchestrator_prompt_contract(
+                    spec,
+                    &mcp_name,
+                    has_folded_tools,
+                    client_tools,
+                )
             {
                 orchestrator = Some(OwnedOrchestratorContract::from_borrowed(contract));
             }
@@ -727,6 +786,14 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         wire_tools.push(search_tool_wire);
     }
 
+    let wire_tool_bytes = wire_tools.iter().fold(0usize, |acc, wt| {
+        acc.saturating_add(estimate_wire_tool_bytes(
+            &wt.name,
+            wt.description.as_deref(),
+            &wt.input_schema,
+        ))
+    });
+
     let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_session_options(
         profile,
         &prepass,
@@ -744,6 +811,9 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         by_mcp_name,
         bridged_pairs,
         virtualized_hubs,
+        is_passthrough: !should_virtualize,
+        declared_tool_count: client_tools.len(),
+        wire_tool_bytes,
         has_virtualized_dispatch: true,
         has_gateway_web_fetch: options.enable_gateway_web_fetch,
         has_context_spill_reader: options.enable_context_spill_reader,

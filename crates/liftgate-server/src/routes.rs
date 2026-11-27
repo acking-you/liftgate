@@ -3557,6 +3557,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
     );
     let session_pool = state.pool.snapshot();
     let (metrics, cache_telemetry, active_tasks, recent_tasks) = state.telemetry.snapshot_tasks();
+    let elastic_io = state.telemetry.elastic_io_snapshot();
     let available_models = state.backend.available_models();
 
     GatewayTelemetrySnapshot {
@@ -3568,6 +3569,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         session_pool,
         metrics,
         cache_telemetry,
+        elastic_io,
         active_tasks,
         recent_tasks,
         available_models,

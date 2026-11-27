@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_types::{
@@ -15,10 +19,10 @@ use liftgate_types::{
     session_key::{WebToolBridgeConfig, truncate_head_tail_lines},
     telemetry::{
         CacheTelemetrySummary, CapturedAcpPromptBlock, CapturedFullMessage, CapturedFullPart,
-        CapturedMessageSummary, CapturedToolSpec, GatewayMetricsSummary, LowCacheDiagnosticCause,
-        LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord, LowCacheHitsResponse,
-        LowCachePayloadDetailResponse, LowCacheRequestCapture, LowCacheRequestMetrics,
-        LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
+        CapturedMessageSummary, CapturedToolSpec, ElasticIoTelemetry, GatewayMetricsSummary,
+        LowCacheDiagnosticCause, LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord,
+        LowCacheHitsResponse, LowCachePayloadDetailResponse, LowCacheRequestCapture,
+        LowCacheRequestMetrics, LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -525,8 +529,15 @@ pub struct TelemetryHub {
     shutdown_tx: watch::Sender<bool>,
 }
 
+impl fmt::Debug for TelemetryHub {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelemetryHub").finish_non_exhaustive()
+    }
+}
+
 struct TelemetryInner {
     metrics: GatewayMetricsSummary,
+    elastic_io: ElasticIoTelemetry,
     cache_store: CacheTelemetryStore,
     active_tasks: BTreeMap<String, TaskSnapshot>,
     recent_tasks: VecDeque<TaskSnapshot>,
@@ -552,6 +563,7 @@ impl TelemetryHub {
         Self {
             inner: Mutex::new(TelemetryInner {
                 metrics: GatewayMetricsSummary::default(),
+                elastic_io: ElasticIoTelemetry::default(),
                 cache_store,
                 active_tasks: BTreeMap::new(),
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
@@ -646,6 +658,8 @@ impl TelemetryHub {
             native_web_searches: 0,
             native_web_fetches: 0,
             vision_offloaded_images: 0,
+            zero_rtt_mcp_ops: 0,
+            spilled_tool_results: 0,
             prompt_preview,
             output_preview: String::new(),
             stop_reason: None,
@@ -672,8 +686,49 @@ impl TelemetryHub {
         ActiveTaskGuard {
             hub: Arc::clone(self),
             task_id,
+            recorded_mcp_turn: AtomicBool::new(false),
             armed: true,
         }
+    }
+
+    /// Returns a copy of cumulative Elastic I/O & `agy acp 1.5.18` MCP virtualization counters.
+    #[must_use]
+    pub fn elastic_io_snapshot(&self) -> ElasticIoTelemetry {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.elastic_io
+    }
+
+    /// Records registration of a new MCP-bridged session (`1:1` Direct Passthrough vs `ns__*` Virtualized).
+    pub fn record_mcp_session_registered(&self, is_passthrough: bool) {
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if is_passthrough {
+                guard.elastic_io.passthrough_sessions =
+                    guard.elastic_io.passthrough_sessions.saturating_add(1);
+            } else {
+                guard.elastic_io.virtualized_sessions =
+                    guard.elastic_io.virtualized_sessions.saturating_add(1);
+            }
+        }
+        self.notify_change();
+    }
+
+    /// Records creation of a new lossless context spill file in `~/.liftgate/spills`.
+    pub fn record_context_spill(&self, bytes: u64) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.elastic_io.context_spills_created =
+            guard.elastic_io.context_spills_created.saturating_add(1);
+        guard.elastic_io.context_spills_bytes =
+            guard.elastic_io.context_spills_bytes.saturating_add(bytes);
     }
 
     /// Returns `(metrics, cache_telemetry, active_tasks, recent_tasks)` with live `elapsed_ms`.
@@ -973,10 +1028,46 @@ fn stamp_ttft_if_first(task: &mut TaskSnapshot, now_ms: u64) -> bool {
     }
 }
 
+fn is_compound_orchestrator_or_shell_tool(tool_name: &str) -> bool {
+    let trimmed = tool_name.trim();
+    trimmed.eq_ignore_ascii_case("exec")
+        || trimmed.eq_ignore_ascii_case("execute")
+        || trimmed.eq_ignore_ascii_case("eval")
+        || trimmed.eq_ignore_ascii_case("repl")
+        || trimmed.eq_ignore_ascii_case("bash")
+        || trimmed.eq_ignore_ascii_case("powershell")
+        || trimmed.eq_ignore_ascii_case("exec_command")
+        || trimmed.eq_ignore_ascii_case("shell")
+        || trimmed == "__codex_local_shell"
+}
+
+fn count_v4a_patch_files(arguments: &str) -> usize {
+    let extracted_json_patch = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|val| {
+            val.get("patch")
+                .or_else(|| val.get("input"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let patch_text = extracted_json_patch.as_deref().unwrap_or(arguments);
+    let headers = patch_text
+        .lines()
+        .filter(|line| {
+            let l = line.trim_start();
+            l.starts_with("*** Add File:")
+                || l.starts_with("*** Update File:")
+                || l.starts_with("*** Delete File:")
+        })
+        .count();
+    headers.max(usize::from(!patch_text.trim().is_empty()))
+}
+
 /// RAII tracker for an in-flight gateway turn.
 pub struct ActiveTaskGuard {
     hub: Arc<TelemetryHub>,
     task_id: String,
+    recorded_mcp_turn: AtomicBool,
     armed: bool,
 }
 
@@ -1130,6 +1221,128 @@ impl ActiveTaskGuard {
             }
         }
         self.hub.notify_change();
+    }
+
+    /// Records a validated native MCP client tool call forwarded over SSE/JSON to the caller,
+    /// classifying compound orchestrators (`exec`/`execute`/`eval`/`Bash`/shell) and V4A multi-file patches.
+    pub fn record_mcp_forwarded_tool(&self, tool_name: &str, arguments: &str) {
+        let now_ms = unix_timestamp_ms();
+        let is_first_for_turn = !self.recorded_mcp_turn.swap(true, Ordering::Relaxed);
+        let is_compound = is_compound_orchestrator_or_shell_tool(tool_name);
+        let patch_files = tool_name
+            .eq_ignore_ascii_case("apply_patch")
+            .then(|| count_v4a_patch_files(arguments));
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                let _ = stamp_ttft_if_first(task, now_ms);
+                task.phase = TaskPhase::CallingClientTool;
+                task.client_tool_calls.push(tool_name.to_owned());
+            }
+            guard.elastic_io.mcp_forwarded_tool_calls =
+                guard.elastic_io.mcp_forwarded_tool_calls.saturating_add(1);
+            if is_first_for_turn {
+                guard.elastic_io.mcp_tool_using_turns =
+                    guard.elastic_io.mcp_tool_using_turns.saturating_add(1);
+            }
+            if is_compound {
+                guard.elastic_io.mcp_orchestrator_calls =
+                    guard.elastic_io.mcp_orchestrator_calls.saturating_add(1);
+            }
+            if let Some(files) = patch_files {
+                guard.elastic_io.mcp_patch_calls =
+                    guard.elastic_io.mcp_patch_calls.saturating_add(1);
+                guard.elastic_io.mcp_patch_files_total = guard
+                    .elastic_io
+                    .mcp_patch_files_total
+                    .saturating_add(files as u64);
+                if files >= 2 {
+                    guard.elastic_io.mcp_multi_file_patch_calls = guard
+                        .elastic_io
+                        .mcp_multi_file_patch_calls
+                        .saturating_add(1);
+                }
+            }
+        }
+        self.hub.notify_change();
+    }
+
+    pub fn record_zero_rtt_search(&self) {
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.elastic_io.mcp_zero_rtt_searches =
+                guard.elastic_io.mcp_zero_rtt_searches.saturating_add(1);
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                task.zero_rtt_mcp_ops = task.zero_rtt_mcp_ops.saturating_add(1);
+            }
+        }
+        self.hub.notify_change();
+    }
+
+    pub fn record_zero_rtt_spill_read(&self) {
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.elastic_io.mcp_zero_rtt_spill_reads =
+                guard.elastic_io.mcp_zero_rtt_spill_reads.saturating_add(1);
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                task.zero_rtt_mcp_ops = task.zero_rtt_mcp_ops.saturating_add(1);
+            }
+        }
+        self.hub.notify_change();
+    }
+
+    pub fn record_zero_rtt_preflight_heal(&self) {
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.elastic_io.mcp_zero_rtt_preflight_heals = guard
+                .elastic_io
+                .mcp_zero_rtt_preflight_heals
+                .saturating_add(1);
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                task.zero_rtt_mcp_ops = task.zero_rtt_mcp_ops.saturating_add(1);
+            }
+        }
+        self.hub.notify_change();
+    }
+
+    pub fn record_mcp_tool_results(&self, total: usize, spilled: usize) {
+        if total == 0 {
+            return;
+        }
+        {
+            let mut guard = match self.hub.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.elastic_io.mcp_tool_results_total = guard
+                .elastic_io
+                .mcp_tool_results_total
+                .saturating_add(total as u64);
+            guard.elastic_io.mcp_tool_results_spilled = guard
+                .elastic_io
+                .mcp_tool_results_spilled
+                .saturating_add(spilled as u64);
+            if spilled > 0
+                && let Some(task) = guard.active_tasks.get_mut(&self.task_id)
+            {
+                task.spilled_tool_results = task.spilled_tool_results.saturating_add(spilled);
+            }
+        }
+        if spilled > 0 {
+            self.hub.notify_change();
+        }
     }
 
     pub fn record_tool_delta(&self, delta_chars: usize) {

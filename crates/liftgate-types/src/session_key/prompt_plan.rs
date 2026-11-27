@@ -15,6 +15,12 @@ use super::{
     strip_unstable_harness_noise,
 };
 
+/// Maximum UTF-8 text budget across all blocks of a single ACP `session/prompt` RPC.
+///
+/// Empirical canary probes on `agy acp 1.5.18` proved that `session/prompt` concatenates all
+/// `Text` blocks and enforces a hard **tail-truncation** cliff at `191,579` bytes (`<truncated N bytes>`),
+/// which would silently sever the trailing user prompt on cold replays. Keeping our middle-waterfill
+/// budget at `176,000` bytes leaves `~15.5 KB` of safety margin while preserving both head and tail.
 pub const MAX_ACP_PROMPT_TEXT_BYTES: usize = 176_000;
 
 /// Progressive schema-compaction ceiling for spilled or incremental `<client_tools_update>` blocks.
@@ -26,7 +32,7 @@ const RECENT_TAIL_HISTORY_MESSAGES: usize = 28;
 
 const _: () = {
     assert!(
-        MAX_SYSTEM_APPEND_BYTES * 4 < MAX_ACP_PROMPT_TEXT_BYTES,
+        MAX_SYSTEM_APPEND_BYTES * 3 < MAX_ACP_PROMPT_TEXT_BYTES,
         "systemPrompt.append cap must stay well below a single ACP prompt turn budget"
     );
     assert!(

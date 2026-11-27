@@ -9,7 +9,10 @@ use liftgate_types::{
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
-    telemetry::{PromptCacheWarmth, SessionPoolTelemetry, SessionSlotState, SessionSummary},
+    telemetry::{
+        PromptCacheWarmth, SessionMcpSummary, SessionPoolTelemetry, SessionSlotState,
+        SessionSummary,
+    },
 };
 use tokio::sync::{oneshot, watch};
 
@@ -222,6 +225,7 @@ struct ActiveLeaseMeta {
     created_at_unix_ms: u64,
     last_active_unix_ms: u64,
     last_response_id: Option<String>,
+    mcp_summary: Option<SessionMcpSummary>,
 }
 
 struct StoredResponseEntry {
@@ -934,6 +938,7 @@ impl SessionPool {
                 created_at_unix_ms: meta.created_at_unix_ms,
                 last_active_unix_ms: meta.last_active_unix_ms,
                 last_response_id: meta.last_response_id.clone(),
+                mcp: meta.mcp_summary.clone(),
             });
         }
         for susp in guard.suspended_sessions.iter().rev() {
@@ -958,6 +963,7 @@ impl SessionPool {
                 created_at_unix_ms: susp.created_at_unix_ms,
                 last_active_unix_ms: susp.last_active_unix_ms,
                 last_response_id: susp.last_response_id.clone(),
+                mcp: Some(susp.mcp_handle.telemetry_summary(susp.declared_tools.len())),
             });
         }
         for idle in guard.idle_sessions.iter().rev() {
@@ -982,6 +988,10 @@ impl SessionPool {
                 created_at_unix_ms: idle.created_at_unix_ms,
                 last_active_unix_ms: idle.last_active_unix_ms,
                 last_response_id: idle.last_response_id.clone(),
+                mcp: idle
+                    .mcp_handle
+                    .as_ref()
+                    .map(|h| h.telemetry_summary(idle.declared_tools.len())),
             });
         }
 
@@ -1019,6 +1029,16 @@ impl SessionPool {
         };
         if let Some(meta) = guard.active_leases.get_mut(sid.as_str()) {
             meta.model_id = model_id.clone();
+        }
+    }
+
+    fn update_lease_mcp_summary(&self, sid: &SessionId, summary: Option<SessionMcpSummary>) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(meta) = guard.active_leases.get_mut(sid.as_str()) {
+            meta.mcp_summary = summary;
         }
     }
 
@@ -1376,6 +1396,11 @@ impl<B: AcpBackend> SuspendedCheckoutGuard<B> {
                 created_at_unix_ms: entry.created_at_unix_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: entry.last_response_id.clone(),
+                mcp_summary: Some(
+                    entry
+                        .mcp_handle
+                        .telemetry_summary(entry.declared_tools.len()),
+                ),
             },
             false,
         );
@@ -1497,6 +1522,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 created_at_unix_ms: now_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: None,
+                mcp_summary: None,
             },
             true,
         );
@@ -1520,6 +1546,11 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
 
     #[must_use]
     pub fn with_mcp_handle(mut self, mcp_handle: Option<Arc<McpSessionHandle>>) -> Self {
+        let summary = mcp_handle
+            .as_ref()
+            .map(|h| h.telemetry_summary(self.declared_tools.len()));
+        self.pool
+            .update_lease_mcp_summary(&self.session_id, summary);
         self.mcp_handle = mcp_handle;
         self
     }
@@ -1547,6 +1578,10 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 created_at_unix_ms: cached.created_at_unix_ms,
                 last_active_unix_ms: now_ms,
                 last_response_id: cached.last_response_id.clone(),
+                mcp_summary: cached
+                    .mcp_handle
+                    .as_ref()
+                    .map(|h| h.telemetry_summary(cached.declared_tools.len())),
             },
             false,
         );
@@ -1652,6 +1687,15 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
     pub fn set_model_id(&mut self, model_id: ModelId) {
         self.pool.update_lease_model(&self.session_id, &model_id);
         self.model_id = model_id;
+    }
+
+    pub fn refresh_mcp_summary(&self, declared_tools_len: usize) {
+        if let Some(ref handle) = self.mcp_handle {
+            self.pool.update_lease_mcp_summary(
+                &self.session_id,
+                Some(handle.telemetry_summary(declared_tools_len)),
+            );
+        }
     }
 
     /// Reconciles prior step estimates in a multi-step MCP cascade with authoritative cumulative tokens.

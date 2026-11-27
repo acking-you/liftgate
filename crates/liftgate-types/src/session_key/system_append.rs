@@ -70,7 +70,7 @@ fn serialize_full_client_tools_catalog(tools: &[&CanonicalToolSpec]) -> String {
 fn compact_caller_system<S: TruncationSpillSink>(raw_sys: &str, spill: &mut S) -> String {
     let cleaned = strip_billing_noise(raw_sys);
     let trimmed = cleaned.trim();
-    if trimmed.len() <= 8_000 {
+    if trimmed.len() <= 24_000 {
         return trimmed.to_owned();
     }
     let without_examples = strip_tag_blocks(trimmed, "<examples>", "</examples>");
@@ -131,25 +131,31 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         );
     }
 
-    let mut header_rules = String::with_capacity(2048);
+    let mut header_rules = String::with_capacity(2816);
     header_rules.push_str("<api_gateway_bridge_rules>\n");
     let batch_clause = match mcp_spec.orchestrator {
+        Some(McpOrchestratorContract::CodexExec { mcp_name, .. }) => format!(
+            "Top-level `mcp_lg_*` calls execute sequentially (~1.3s overhead per call); coalesce multi-file searches, symbol lookups, and ranged reads into a SINGLE `mcp_lg_{mcp_name}` Code Mode cell (`await Promise.all([tools.exec_command(...), ...])`), cache raw outputs in `store(key, raw)` / `load(key)`, and filter `text(...)` output to <= 8 KB (~200 lines) to avoid context spills."
+        ),
+        Some(McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }) => format!(
+            "Top-level `mcp_lg_*` calls execute sequentially (~1.3s overhead per call); coalesce multi-file searches, ranged reads, and checks into a SINGLE compound `mcp_lg_{bash_mcp_name}` command instead of separate `Read`/`Grep`/`Glob` calls, keeping stdout <= 8 KB (~200 lines)."
+        ),
         Some(McpOrchestratorContract::OpenCodeExecute {
             mcp_name,
             full_code_mode: true,
         }) => format!(
-            "Compose multi-step or parallel file reads, searches, edits, and shell commands inside a single `mcp_lg_{mcp_name}` Code Mode script (`Promise.all` / `Promise.allSettled`)."
+            "Top-level `mcp_lg_*` calls execute sequentially; compose multi-step or concurrent file reads, searches, edits, and shell commands inside a SINGLE `mcp_lg_{mcp_name}` Code Mode script (`Promise.all` / `Promise.allSettled`), filtering returned output to <= 8 KB to avoid context spills."
         ),
         Some(McpOrchestratorContract::OpenCodeExecute {
             mcp_name,
             full_code_mode: false,
         }) => format!(
-            "Compose multi-step or parallel `# Code Mode` catalog calls inside `mcp_lg_{mcp_name}`, and batch independent direct `mcp_lg_*` calls in a single turn."
+            "Top-level `mcp_lg_*` calls execute sequentially; compose multi-step `# Code Mode` catalog calls inside a SINGLE `mcp_lg_{mcp_name}` script and combine independent shell/search steps so each returned payload stays <= 8 KB."
         ),
         Some(McpOrchestratorContract::OmpPolyglotEval { mcp_name, .. }) => format!(
-            "Batch multi-step or parallel reads, searches, and shell inspections inside a single `mcp_lg_{mcp_name}` Code Mode cell."
+            "Top-level `mcp_lg_*` calls execute sequentially; batch multi-step reads, searches, and shell inspections inside a SINGLE `mcp_lg_{mcp_name}` Code Mode cell, filtering printed output to <= 8 KB and caching raw state in persistent kernel variables."
         ),
-        None => "Batch independent read-only searches, reads, or checks as parallel `mcp_lg_*` calls in a single turn.".to_owned(),
+        None => "Top-level `mcp_lg_*` calls execute sequentially (~1.3s overhead per call) — minimize round-trips by combining multi-step read/search/check work into a single compound shell/tool call when available and bounding each tool output to <= 8 KB.".to_owned(),
     };
     header_rules.push_str(
         "You are serving an external API harness via a structured protocol gateway.\n\
@@ -192,20 +198,39 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         .find(|(client_name, _)| client_name.eq_ignore_ascii_case("apply_patch"))
     {
         header_rules.push_str(&format!(
-            "- File edits: invoke native `mcp_lg_{mcp_ap}` directly with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` (prefer native `mcp_lg_{mcp_ap}` over embedding multi-line patches inside `exec` JavaScript template literals; scope each `mcp_lg_{mcp_ap}` call to a single target file — issuing parallel per-file `mcp_lg_{mcp_ap}` calls when editing multiple files so one context mismatch never rolls back other files; always read exact target line ranges verbatim first and use `mcp_lg_read_context_spill` if a prior read was truncated; keep `@@` hunks surgical with 1-3 exact context lines and merge multiple edits to the same file under one `*** Update File:` header).\n"
+            "- File edits (`mcp_lg_{mcp_ap}`): invoke native `mcp_lg_{mcp_ap}` with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target line ranges verbatim (use `mcp_lg_read_context_spill` if a prior read was truncated). Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call to avoid serial MCP round-trips (merging all edits to the same file under one `*** Update File:` header with 1-3 exact context lines per `@@` hunk); if verification fails, re-read exact lines and retry ONLY the failed file.\n"
         ));
     }
     match mcp_spec.orchestrator {
+        Some(McpOrchestratorContract::CodexExec {
+            mcp_name,
+            has_apply_patch,
+        }) => {
+            header_rules.push_str(&format!(
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with `{{\"code\": \"<plain JavaScript>\"}}` (raw JS inside `code`, no markdown fences). Inside `exec`, fan out concurrent local read-only commands via `await Promise.all([tools.exec_command(...), ...])`, persist full outputs in `store(key, raw)` / `load(key)`, emit `<= 8 KB` filtered excerpts via `text(...)`, and call `mcp_lg_wait` if a cell yields a `cell_id`."
+            ));
+            if has_apply_patch {
+                header_rules.push_str(&format!(
+                    " For 5+ existing-file patches needing per-file fault isolation, run `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `mcp_lg_{mcp_name}` cell; when `<collaboration_mode>` / `<permissions instructions>` allow non-interactive workspace writes (NEVER in `Plan Mode`, `read-only`, or manual `on-request` shell approval), stream large new files or mechanical 5+-file updates plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`)."
+                ));
+            }
+            header_rules.push('\n');
+        }
+        Some(McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }) => {
+            header_rules.push_str(&format!(
+                "- Elastic Bash-First I/O (`mcp_lg_{bash_mcp_name}`): override default single-command habits — combine multi-file search and ranged inspection (`rg -n`, `rg --files`, `sed -n 'start,endp'`, `git status -sb`) into ONE `mcp_lg_{bash_mcp_name}` call returning `<= 8 KB` line-numbered slices; use `mcp_lg_Read` directly for images/PDFs/notebooks, single known slices, or when `Bash` requires manual approval while `Read` is pre-approved. For edits: use `mcp_lg_Edit` (or `mcp_lg_MultiEdit`) for surgical 1-3 file changes to preserve `/rewind` checkpoints and UI diffs; when write permissions are non-interactive (`acceptEdits` / `auto` / `bypassPermissions` — NEVER in `Plan Mode`, `read-only`, or manual shell approval), stream large new files or mechanical 5+-file rewrites plus verification (`git diff --stat`, tests) in a single `mcp_lg_{bash_mcp_name}` script (`python3 - <<'PY'` or `cat <<'EOF' > path`).\n"
+            ));
+        }
         Some(McpOrchestratorContract::OpenCodeExecute {
             mcp_name,
             full_code_mode,
         }) => {
             header_rules.push_str(&format!(
-                "- OpenCode Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with JSON arguments `{{\"code\": \"<plain JavaScript>\", ...}}` (pass raw JavaScript inside the `code` string property with no markdown code fences or nested JSON wrapper). Inside `execute` scripts, call `# Code Mode` catalog tools via `await tools.<path>({{ ... }})` using their exact unprefixed catalog paths (never `mcp_lg_*`) and discover unlisted Code Mode catalog entries with the global `search(...)` helper inside `execute` (do NOT call `mcp_lg_call_client_tool` or `mcp_lg_search_client_tools` for `# Code Mode` tools, which run exclusively inside `mcp_lg_{mcp_name}`)."
+                "- OpenCode Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with JSON arguments `{{\"code\": \"<plain JavaScript>\", ...}}` (pass raw JavaScript inside the `code` string property with no markdown code fences or nested JSON wrapper). Inside `execute` scripts, call `# Code Mode` catalog tools via `await tools.<path>({{ ... }})` using their exact unprefixed catalog paths (never `mcp_lg_*`), discover unlisted Code Mode catalog entries with the global `search(...)` helper inside `execute` (do NOT call `mcp_lg_call_client_tool` or `mcp_lg_search_client_tools` for `# Code Mode` tools, which run exclusively inside `mcp_lg_{mcp_name}`), and slice/filter returned text to `<= 8 KB` so single calls never spill."
             ));
             if full_code_mode {
                 header_rules.push_str(&format!(
-                    " Built-in workspace tools (`tools.read`, `tools.shell`, `tools.edit`, `tools.write`, etc.) plus `Bun.file` / `Bun.write` / `Bun.Glob` and `fetch` run inside `mcp_lg_{mcp_name}`; use `mcp_lg_{mcp_name}` as your primary workspace inspection, search, edit, and shell tool, and invoke top-level `mcp_lg_subagent` / `mcp_lg_question` / `mcp_lg_skill` directly when needed."
+                    " Built-in workspace tools (`tools.read`, `tools.shell`, `tools.edit`, `tools.write`, etc.) plus `Bun.file` / `Bun.write` / `Bun.Glob` and `fetch` run inside `mcp_lg_{mcp_name}`; use `mcp_lg_{mcp_name}` as your primary compound workspace inspection, search, edit/stream-write (when permissions allow), and shell verification tool, and invoke top-level `mcp_lg_subagent` / `mcp_lg_question` / `mcp_lg_skill` directly when needed."
                 ));
             }
             header_rules.push('\n');
@@ -215,11 +240,11 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
             elided_subordinate_tools,
         }) => {
             header_rules.push_str(&format!(
-                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`); inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code), and ensure newlines inside JSON string literals are properly escaped."
+                "- Polyglot Code Mode (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` as your primary workspace inspection, search, and shell execution tool in persistent Python (`py`) / JavaScript (`js`) cells (e.g. `await Promise.all([tool.read(...), tool.grep(...), sh(...)])` in `js`, or `await tool.<name>(args)` / `sh(...)` in `py`), filtering printed output to `<= 8 KB` and caching raw text in kernel variables; inside `eval` scripts (and `bash` tool-commands), call `tool.<name>(args)` and MCP eval globals by their unprefixed client names (never `mcp_lg_*` inside `eval` code), and ensure newlines inside JSON string literals are properly escaped."
             ));
             if elided_subordinate_tools {
                 header_rules.push_str(&format!(
-                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, ALWAYS read the exact target line range via `await tool.read({{\"i\": \"Read target lines\", \"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` (never prelude `read(...)`/`Bun.file`, which do not register `[FILENAME#TAG]` line-hash snapshots and cause `unseen_lines` rejections), then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for file mutations."
+                    " Subordinate read/search/shell tools (`read`, `bash`, `glob`, `grep`, `find`, `lsp`, `todo`, `web_search`, etc.) are folded into `mcp_lg_{mcp_name}` rather than exposed as separate `mcp_lg_*` tools (do NOT invoke them via `mcp_lg_call_client_tool`); before editing an existing file with native `mcp_lg_edit`, ALWAYS read the exact target line range via `await tool.read({{\"i\": \"Read target lines\", \"path\": \"<file>:<start>-<end>\"}})` inside `mcp_lg_{mcp_name}` (never prelude `read(...)`/`Bun.file`, which do not register `[FILENAME#TAG]` line-hash snapshots and cause `unseen_lines` rejections), then invoke native `mcp_lg_edit` / `mcp_lg_write` directly for surgical mutations (or stream large new files + checks inside `mcp_lg_{mcp_name}` when write permissions allow)."
                 ));
             }
             header_rules.push('\n');
@@ -532,11 +557,12 @@ fn append_xml_invocation_bridge_rules(
 
 /// Maximum UTF-8 byte budget for `_meta.antigravity.systemPrompt.append` on `session/new`.
 ///
-/// Upstream `agy acp` rejects oversized `systemPrompt.append` payloads with `429 RESOURCE_EXHAUSTED`.
-/// Capping `systemPrompt.append` at `16,000` bytes and spilling any excess `<client_tools>`
-/// schemas into the initial `session/prompt` directive protects tool-heavy harnesses (such as
-/// OpenCode or multi-MCP setups) without dropping a single tool definition.
-pub const MAX_SYSTEM_APPEND_BYTES: usize = 16_000;
+/// Empirical canary probes on `agy acp 1.5.18` verified lossless acceptance up to `160,265` bytes
+/// with zero `429` rejections. Setting `MAX_SYSTEM_APPEND_BYTES` to `48,000` bytes preserves full
+/// custom caller system prompts and XML-mode Code Mode declarations without premature `<example>`
+/// stripping while keeping first-turn TTFT snappy (dynamic `<developer_instructions>` remain in
+/// `messages` so mid-session collaboration/permission switches never bust `SessionPool` reuse).
+pub const MAX_SYSTEM_APPEND_BYTES: usize = 48_000;
 
 /// Builds `_meta.antigravity.systemPrompt.append` bounded to `MAX_SYSTEM_APPEND_BYTES`, returning
 /// `(system_append, overflow_tools_directive_xml)` when a large `<client_tools>` catalog spills

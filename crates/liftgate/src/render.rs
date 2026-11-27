@@ -404,6 +404,53 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
             Cell::new(cache_detail),
         ]);
 
+        let eio = &snap.elastic_io;
+        let zero_rtt_total = eio
+            .mcp_zero_rtt_searches
+            .saturating_add(eio.mcp_zero_rtt_spill_reads)
+            .saturating_add(eio.mcp_zero_rtt_preflight_heals);
+        let inline_fit = eio
+            .mcp_tool_results_total
+            .saturating_sub(eio.mcp_tool_results_spilled)
+            .saturating_mul(100)
+            .checked_div(eio.mcp_tool_results_total)
+            .map_or_else(
+                || "no mcp outputs".to_owned(),
+                |pct| {
+                    format!(
+                        "{pct}% <9.6KB ({}/{} spilled)",
+                        eio.mcp_tool_results_spilled, eio.mcp_tool_results_total,
+                    )
+                },
+            );
+        let eio_status = eio
+            .mcp_orchestrator_calls
+            .saturating_mul(100)
+            .checked_div(eio.mcp_forwarded_tool_calls)
+            .map_or_else(|| "calibrated".to_owned(), |pct| format!("{pct}% compound"));
+        let eio_detail = format!(
+            "orchestrators {}/{} · multi-patch {}/{} ({} files) · {inline_fit} · 0-RTT {zero_rtt_total} · sessions {} direct / {} hub",
+            eio.mcp_orchestrator_calls,
+            eio.mcp_forwarded_tool_calls,
+            eio.mcp_multi_file_patch_calls,
+            eio.mcp_patch_calls,
+            eio.mcp_patch_files_total,
+            eio.passthrough_sessions,
+            eio.virtualized_sessions,
+        );
+        table.add_row(vec![
+            ui::accent_cell("Elastic I/O"),
+            ui::status_cell(
+                &eio_status,
+                if eio.mcp_forwarded_tool_calls > 0 {
+                    Tone::Ok
+                } else {
+                    Tone::Info
+                },
+            ),
+            Cell::new(eio_detail),
+        ]);
+
         if let Some(list) = &report.models {
             let model_tone = if list.len() > 1 { Tone::Ok } else { Tone::Warn };
             table.add_row(vec![
