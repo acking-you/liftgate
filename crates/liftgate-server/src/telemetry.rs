@@ -1457,6 +1457,8 @@ pub const GENERIC_HARNESS_PROFILE: &str = "generic";
 struct TurnTextCapture {
     reasoning: String,
     output: String,
+    reasoning_truncated: bool,
+    output_truncated: bool,
 }
 
 /// A completed turn's capture, waiting for its payload to be written off the async workers.
@@ -1469,22 +1471,17 @@ struct PendingContextCapture {
     payload: FullContextPayload,
 }
 
-fn push_bounded(buf: &mut String, delta: &str, cap: usize) {
+/// Appends as much of `delta` as fits in `cap` bytes; `true` when anything was dropped.
+fn push_bounded(buf: &mut String, delta: &str, cap: usize) -> bool {
     let room = cap.saturating_sub(buf.len());
-    if room == 0 {
-        return;
-    }
     if delta.len() <= room {
         buf.push_str(delta);
-        return;
+        return false;
     }
-    let mut end = room;
-    while end > 0 && !delta.is_char_boundary(end) {
-        end -= 1;
-    }
-    if let Some(prefix) = delta.get(..end) {
+    if let Some(prefix) = delta.get(..delta.floor_char_boundary(room)) {
         buf.push_str(prefix);
     }
+    true
 }
 
 /// RAII tracker for an in-flight gateway turn.
@@ -1595,12 +1592,20 @@ impl ActiveTaskGuard {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let target = if reasoning {
-            &mut buf.reasoning
+        let TurnTextCapture {
+            reasoning: reasoning_text,
+            output,
+            reasoning_truncated,
+            output_truncated,
+        } = &mut *buf;
+        let (target, truncated) = if reasoning {
+            (reasoning_text, reasoning_truncated)
         } else {
-            &mut buf.output
+            (output, output_truncated)
         };
-        push_bounded(target, delta, MAX_CAPTURED_TURN_TEXT_BYTES);
+        if push_bounded(target, delta, MAX_CAPTURED_TURN_TEXT_BYTES) {
+            *truncated = true;
+        }
     }
 
     pub fn record_vision_offload(&self, image_count: usize) {
@@ -2210,15 +2215,17 @@ impl ActiveTaskGuard {
             // Reserved now, in completion order; the blocking writer may finish later.
             (slot, guard.context_store.reserve(), fields)
         };
-        let (reasoning, output) = {
+        let TurnTextCapture {
+            reasoning,
+            output,
+            reasoning_truncated,
+            output_truncated,
+        } = {
             let mut buf = match capture.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            (
-                std::mem::take(&mut buf.reasoning),
-                std::mem::take(&mut buf.output),
-            )
+            std::mem::take(&mut *buf)
         };
         let request = build_full_request_payload(
             &self.task_id,
@@ -2243,11 +2250,15 @@ impl ActiveTaskGuard {
             payload_bytes: 0,
             prompt_preview,
         };
-        let payload = FullContextPayload {
+        let mut payload = FullContextPayload {
             request,
             assistant_reasoning: (!reasoning.is_empty()).then_some(reasoning),
             assistant_output: (!output.is_empty()).then_some(output),
+            assistant_reasoning_truncated: reasoning_truncated,
+            assistant_output_truncated: output_truncated,
         };
+        // One indicator for "this capture is incomplete", wherever the cut happened.
+        payload.request.payload_truncated |= reasoning_truncated || output_truncated;
         Some(PendingContextCapture {
             slot,
             ticket,
@@ -3239,7 +3250,52 @@ mod tests {
         // Clearing resets the skip counter along with the captures.
         let cleared = hub.clear_context_captures();
         assert_eq!((cleared.stored_records, cleared.skipped_records), (0, 0));
+
+        // Output beyond the per-field cap is dropped, and the capture says so.
+        let guard = hub.begin_task(
+            "task_long_output".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &messages,
+        );
+        guard.bind_session("sess_capture", false, "gemini-4-carbon-high");
+        guard.record_thought("short reasoning");
+        let chunk = "é".repeat(64 * 1024);
+        for _ in 0..12 {
+            guard.record_text(&chunk);
+        }
+        guard.complete_with_diagnostics(
+            "end_turn".to_owned(),
+            AcpUsage::default(),
+            Some(capture_test_diagnostics(&messages)),
+        );
+        let detail = hub
+            .context_capture_detail("task_long_output")
+            .expect("read capture")
+            .expect("captured");
+        let output = detail.payload.assistant_output.unwrap_or_default();
+        assert!(output.len() <= MAX_CAPTURED_TURN_TEXT_BYTES);
+        assert!(output.len() > MAX_CAPTURED_TURN_TEXT_BYTES - 4);
+        assert!(detail.payload.assistant_output_truncated);
+        assert!(!detail.payload.assistant_reasoning_truncated);
+        assert!(detail.payload.request.payload_truncated);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn push_bounded_reports_dropped_text_on_char_boundaries() {
+        let mut buf = String::new();
+        assert!(!push_bounded(&mut buf, "abc", 5));
+        assert!(
+            push_bounded(&mut buf, "dé", 5),
+            "`é` does not fit in the last byte"
+        );
+        assert_eq!(buf, "abcd");
+        assert!(push_bounded(&mut buf, "x", 4));
+        assert!(!push_bounded(&mut buf, "", 4));
+        assert_eq!(buf, "abcd");
     }
 
     #[test]

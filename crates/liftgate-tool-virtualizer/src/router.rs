@@ -42,6 +42,8 @@ pub enum VirtualizedCallDecision {
         client_name: String,
         arguments: String,
         is_custom: bool,
+        /// V4A auto-repair rewrote the patch text the model sent before it was forwarded.
+        patch_repaired: bool,
     },
     /// Resolve immediately inside the gateway in 0-RTT without contacting the caller.
     LocalReply {
@@ -790,18 +792,19 @@ impl McpRoutingTable {
                     live_bridged.v4a_patch,
                 );
             }
-            let serialized = match format_direct_tool_arguments(
+            let (serialized, patch_repaired) = match format_direct_tool_arguments(
                 arguments,
                 &live_bridged,
                 self.budget.max_single_schema_in_search_bytes,
             ) {
-                Ok(s) => s,
+                Ok(formatted) => formatted,
                 Err(preflight_msg) => return preflight_error_decision(preflight_msg),
             };
             return VirtualizedCallDecision::ForwardToClient {
                 client_name: live_bridged.client_name.clone(),
                 arguments: serialized,
                 is_custom: false,
+                patch_repaired,
             };
         }
 
@@ -1202,6 +1205,7 @@ fn resolve_custom_tool_call(
         }
         return VirtualizedCallDecision::ForwardToClient {
             client_name: client_name.to_owned(),
+            patch_repaired: normalized != extracted,
             arguments: normalized,
             is_custom: true,
         };
@@ -1210,22 +1214,26 @@ fn resolve_custom_tool_call(
         client_name: client_name.to_owned(),
         arguments: extracted,
         is_custom: true,
+        patch_repaired: false,
     }
 }
 
+/// Repairs and validates a JSON-carried V4A patch; `Ok(true)` when the repair changed its text.
 fn heal_and_validate_json_patch_field(
     v4a_patch: Option<V4aPatchContract>,
     map: &mut serde_json::Map<String, Value>,
-) -> Result<(), ApplyPatchPreflightError> {
+) -> Result<bool, ApplyPatchPreflightError> {
     let Some(V4aPatchContract::JsonField(field_key)) = v4a_patch else {
-        return Ok(());
+        return Ok(false);
     };
-    if let Some(Value::String(raw_patch)) = map.get_mut(field_key) {
-        let normalized = normalize_apply_patch_text(raw_patch);
-        validate_apply_patch_preflight(&normalized)?;
-        *raw_patch = normalized;
-    }
-    Ok(())
+    let Some(Value::String(raw_patch)) = map.get_mut(field_key) else {
+        return Ok(false);
+    };
+    let normalized = normalize_apply_patch_text(raw_patch);
+    validate_apply_patch_preflight(&normalized)?;
+    let repaired = normalized != *raw_patch;
+    *raw_patch = normalized;
+    Ok(repaired)
 }
 
 fn backfill_intent_i_from_summary(
@@ -1348,17 +1356,19 @@ fn refresh_bridged_tool_if_changed<'a>(
     }
 }
 
+/// Arguments forwarded for a direct (1:1) tool, plus whether V4A auto-repair changed its patch.
 fn format_direct_tool_arguments(
     raw_args: &Value,
     bridged: &McpBridgedTool,
     max_schema_bytes: usize,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     if bridged.is_custom {
-        return Ok(extract_custom_tool_input(
-            raw_args,
-            bridged.unwrap_custom_key,
+        return Ok((
+            extract_custom_tool_input(raw_args, bridged.unwrap_custom_key),
+            false,
         ));
     }
+    let mut patch_repaired = false;
     let mut args_val = raw_args.clone();
     if args_val.is_null() {
         args_val = Value::Object(serde_json::Map::new());
@@ -1371,7 +1381,7 @@ fn format_direct_tool_arguments(
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
-        heal_and_validate_json_patch_field(bridged.v4a_patch, map)
+        patch_repaired = heal_and_validate_json_patch_field(bridged.v4a_patch, map)
             .map_err(|err| err.to_string())?;
         if !bridged.has_root_combinator {
             check_missing_non_nullable_required(
@@ -1384,7 +1394,10 @@ fn format_direct_tool_arguments(
             )?;
         }
     }
-    Ok(serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned()))
+    Ok((
+        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_owned()),
+        patch_repaired,
+    ))
 }
 
 enum InnerArgsError {
@@ -1474,9 +1487,10 @@ fn finalize_indexed_tool_call(
     if let Some(ref params_json) = indexed.parameters_json {
         let _ = coerce_stringified_container_fields(&mut map, params_json);
     }
-    if let Err(preflight_err) = heal_and_validate_json_patch_field(indexed.v4a_patch, &mut map) {
-        return preflight_error_decision(preflight_err.to_string());
-    }
+    let patch_repaired = match heal_and_validate_json_patch_field(indexed.v4a_patch, &mut map) {
+        Ok(repaired) => repaired,
+        Err(preflight_err) => return preflight_error_decision(preflight_err.to_string()),
+    };
 
     if enforce_required_preflight
         && !indexed.has_root_combinator
@@ -1497,6 +1511,7 @@ fn finalize_indexed_tool_call(
         client_name: indexed.client_name.clone(),
         arguments,
         is_custom: false,
+        patch_repaired,
     }
 }
 

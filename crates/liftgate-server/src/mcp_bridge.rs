@@ -105,6 +105,8 @@ pub enum ResolvedMcpIncoming {
         client_name: String,
         arguments: String,
         is_custom: bool,
+        /// V4A auto-repair rewrote the patch before forwarding.
+        patch_repaired: bool,
         reply_tx: oneshot::Sender<McpToolCallReply>,
     },
     /// Server-managed `gateway_web_fetch` executed inside the gateway in-flight.
@@ -284,10 +286,12 @@ impl McpSessionHandle {
                 client_name,
                 arguments,
                 is_custom,
+                patch_repaired,
             } => ResolvedMcpIncoming::ForwardToClient {
                 client_name,
                 arguments,
                 is_custom,
+                patch_repaired,
                 reply_tx: incoming.reply_tx,
             },
             VirtualizedCallDecision::GatewayWebFetch { url } => {

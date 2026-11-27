@@ -128,6 +128,7 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             client_name: "sql_lark".to_owned(),
             arguments: "SELECT 1;".to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -168,9 +169,15 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             &json!({"patch": "```diff\n*** Update File: src/lib.rs\n@@\n-a\n+b\n\n ctx\n*** Update File: src/lib.rs\n@@\n-c\n+d\n```"}),
             &tools,
         ) {
-            VirtualizedCallDecision::ForwardToClient { client_name, arguments, is_custom } => {
+            VirtualizedCallDecision::ForwardToClient {
+                client_name,
+                arguments,
+                is_custom,
+                patch_repaired,
+            } => {
                 assert_eq!(client_name, "apply_patch");
                 assert!(is_custom);
+                assert!(patch_repaired, "fenced, split patch is reported as repaired");
                 assert_eq!(
                     arguments,
                     "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n \n ctx\n@@\n-c\n+d\n*** End Patch"
@@ -363,6 +370,7 @@ fn claude_code_profile_groups_pascal_families_dedupes_plugins_and_backfills_stan
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "TaskCreate");
             assert!(!is_custom);
@@ -538,8 +546,25 @@ fn zero_tool_session_with_gateway_web_fetch_hot_syncs_dynamic_tools_without_recr
                 client_name: "apply_patch".to_owned(),
                 arguments: "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch".to_owned(),
                 is_custom: true,
-            }
+                patch_repaired: false,
+            },
+            "a valid patch behind the dispatcher envelope is not a repair"
         );
+    match rebuilt.resolve_call(
+        CALL_CLIENT_TOOL_MCP_NAME,
+        &json!({ "name": "apply_patch", "arguments": { "patch": "```diff\n*** Update File: a.rs\n@@\n-x\n+y\n```" } }),
+        &hot_tools,
+    ) {
+        VirtualizedCallDecision::ForwardToClient {
+            arguments,
+            patch_repaired,
+            ..
+        } => {
+            assert!(patch_repaired, "a fenced patch behind the dispatcher is repaired");
+            assert!(arguments.starts_with("*** Begin Patch"), "got: {arguments}");
+        }
+        other => panic!("expected the repaired patch to be forwarded, got {other:?}"),
+    }
 }
 
 #[test]
@@ -702,6 +727,7 @@ fn opencode_profile_virtualizes_namespaces_mcps_backfills_and_heals_patchtext() 
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "patch");
             assert!(!is_custom);
@@ -739,6 +765,7 @@ fn opencode_profile_virtualizes_namespaces_mcps_backfills_and_heals_patchtext() 
             client_name: "playwright_browser_op_04".to_owned(),
             arguments: "{\"selector\":\"#login\"}".to_owned(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 }
@@ -793,6 +820,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json.clone(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -807,6 +835,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json.clone(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -832,6 +861,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: unified_diff.to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -861,6 +891,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json,
             is_custom: false,
+            patch_repaired: false,
         }
     );
 }
@@ -1126,6 +1157,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "edit".to_owned(),
             arguments: json!({ "input": hashline_payload }).to_string(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -1152,6 +1184,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "edit".to_owned(),
             arguments: hashline_payload.to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -1182,6 +1215,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "mcp__google_drive_file_op_03".to_owned(),
             arguments: json!({ "fileId": "doc-77" }).to_string(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
     assert_eq!(
@@ -1525,6 +1559,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "edit");
             assert!(!is_custom);
@@ -1627,6 +1662,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name,
             arguments,
             is_custom: false,
+            ..
         } => {
             assert_eq!(client_name, "edit");
             let parsed: Value = serde_json::from_str(&arguments).unwrap();
@@ -1663,6 +1699,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name: "emit_event".to_owned(),
             arguments: r#"{"payload":null,"meta":null}"#.to_owned(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
     assert!(matches!(

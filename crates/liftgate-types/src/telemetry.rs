@@ -1211,6 +1211,12 @@ pub struct FullContextPayload {
     /// Complete text output of this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_output: Option<String>,
+    /// Reasoning beyond the per-field capture cap was dropped.
+    #[serde(default)]
+    pub assistant_reasoning_truncated: bool,
+    /// Output beyond the per-field capture cap was dropped.
+    #[serde(default)]
+    pub assistant_output_truncated: bool,
 }
 
 /// Response served by `GET /api/telemetry/context-captures/{task_id}`.

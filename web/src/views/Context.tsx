@@ -140,11 +140,21 @@ function ContextSheet({
           {payload && tab === "output" && (
             <div className="flex flex-col gap-3">
               {payload.assistant_reasoning && (
-                <ProseBlock text={payload.assistant_reasoning} title="思考" maxHeight={360} />
+                <ProseBlock
+                  text={payload.assistant_reasoning}
+                  title={payload.assistant_reasoning_truncated ? "思考 · 超出上限的部分未保存" : "思考"}
+                  maxHeight={360}
+                />
               )}
               <ProseBlock
                 text={payload.assistant_output ?? payload.assistant_output_preview}
-                title={payload.assistant_output != null ? "输出" : "输出摘要"}
+                title={
+                  payload.assistant_output == null
+                    ? "输出摘要"
+                    : payload.assistant_output_truncated
+                      ? "输出 · 超出上限的部分未保存"
+                      : "输出"
+                }
                 maxHeight={520}
               />
             </div>

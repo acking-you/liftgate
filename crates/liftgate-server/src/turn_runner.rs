@@ -4543,6 +4543,9 @@ struct ForwardedMcpCall {
     wire_mcp_name: String,
     /// Arguments exactly as the model sent them to the wire tool.
     wire_arguments: String,
+    /// The virtualizer's V4A auto-repair rewrote the patch (judged on the unwrapped call, so hub
+    /// and dispatcher envelopes never look like repairs).
+    patch_repaired: bool,
 }
 
 fn record_forwarded_mcp_call(
@@ -4564,6 +4567,7 @@ fn record_forwarded_mcp_call(
         reply_tx,
         wire_mcp_name,
         wire_arguments,
+        patch_repaired,
     } = forwarded;
     let arg_chars = arguments.chars().count();
     let nonce_suffix = generate_short_nonce();
@@ -4584,7 +4588,7 @@ fn record_forwarded_mcp_call(
         } else {
             None
         },
-        v4a_auto_repaired: patch_was_repaired(&client_name, &wire_arguments, &arguments),
+        v4a_auto_repaired: patch_repaired,
         client_arguments: (wire_arguments != arguments).then(|| arguments.clone()),
         wire_arguments,
     });
@@ -5233,6 +5237,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 client_name,
                                 arguments,
                                 is_custom,
+                                patch_repaired,
                                 reply_tx,
                             } => {
                                 disabled_mcp_rejections = 0;
@@ -5244,6 +5249,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     reply_tx,
                                     wire_mcp_name,
                                     wire_arguments,
+                                    patch_repaired,
                                 });
                             }
                             ResolvedMcpIncoming::GatewayWebFetch { url, reply_tx } => {

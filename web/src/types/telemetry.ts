@@ -642,6 +642,10 @@ export interface FullContextPayload extends LowCacheFullRequestPayload {
   assistant_reasoning?: string | null;
   /** Complete text output of this turn. */
   assistant_output?: string | null;
+  /** Reasoning beyond the per-field capture cap was dropped. */
+  assistant_reasoning_truncated?: boolean;
+  /** Output beyond the per-field capture cap was dropped. */
+  assistant_output_truncated?: boolean;
 }
 
 /** `GET /api/telemetry/context-captures/{task_id}`. */
