@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use liftgate_types::{
     acp::{AcpUsage, compute_cache_hit_bps},
-    canonical::{CanonicalMessage, CanonicalToolSpec},
+    canonical::{CanonicalMessage, CanonicalToolSpec, ProtocolDeveloperSlot},
     config::{GatewayLimits, ModelId, SessionId},
     openai::ResponseObject,
     session_key::ConversationHash,
@@ -46,6 +46,7 @@ pub struct IdleSessionEntry {
     pub total_cached_read_tokens: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub accumulated_developer_slots: Vec<ProtocolDeveloperSlot>,
     pub message_count: usize,
     pub turn_count: u64,
     pub created_at_unix_ms: u64,
@@ -63,6 +64,12 @@ impl IdleSessionEntry {
         let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
             acc.saturating_add(m.estimated_heap_bytes())
         });
+        let slot_bytes = self
+            .accumulated_developer_slots
+            .iter()
+            .fold(0usize, |acc, s| {
+                acc.saturating_add(s.estimated_heap_bytes())
+            });
         let mcp_bytes = self
             .mcp_handle
             .as_deref()
@@ -75,6 +82,7 @@ impl IdleSessionEntry {
             .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
             .saturating_add(tool_bytes)
             .saturating_add(msg_bytes)
+            .saturating_add(slot_bytes)
             .saturating_add(mcp_bytes)
     }
 }
@@ -139,6 +147,7 @@ pub struct SuspendedMcpEntry {
     pub total_cached_read_tokens: u64,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub accumulated_developer_slots: Vec<ProtocolDeveloperSlot>,
     pub message_count: usize,
     pub pre_step_message_count: usize,
     pub turn_count: u64,
@@ -167,6 +176,12 @@ impl SuspendedMcpEntry {
         let msg_bytes = self.accumulated_messages.iter().fold(0usize, |acc, m| {
             acc.saturating_add(m.estimated_heap_bytes())
         });
+        let slot_bytes = self
+            .accumulated_developer_slots
+            .iter()
+            .fold(0usize, |acc, s| {
+                acc.saturating_add(s.estimated_heap_bytes())
+            });
         let pending_bytes = self.pending_calls.iter().fold(0usize, |acc, p| {
             acc.saturating_add(p.nonce_suffix.len() + p.call_id.len() + p.client_name.len())
         });
@@ -178,6 +193,7 @@ impl SuspendedMcpEntry {
             .saturating_add(self.last_response_id.as_deref().map_or(0, str::len))
             .saturating_add(tool_bytes)
             .saturating_add(msg_bytes)
+            .saturating_add(slot_bytes)
             .saturating_add(pending_bytes)
             .saturating_add(self.mcp_handle.estimated_retained_bytes())
     }
@@ -189,6 +205,7 @@ pub(crate) struct PromotedMcpSession {
     pub pending_calls: Vec<PendingMcpCallInfo>,
     pub declared_tools: Vec<CanonicalToolSpec>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub accumulated_developer_slots: Vec<ProtocolDeveloperSlot>,
     pub last_context_used: u64,
     pub post_turn_hash: ConversationHash,
 }
@@ -211,6 +228,7 @@ pub(crate) struct SuspendedMcpTurn {
     pub pre_step_message_count: usize,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub accumulated_developer_slots: Vec<ProtocolDeveloperSlot>,
 }
 
 #[derive(Clone, Debug)]
@@ -1137,6 +1155,8 @@ impl SessionPool {
         if entry_bytes > self.max_idle_retained_bytes && !entry.accumulated_messages.is_empty() {
             entry.accumulated_messages.clear();
             entry.accumulated_messages.shrink_to_fit();
+            entry.accumulated_developer_slots.clear();
+            entry.accumulated_developer_slots.shrink_to_fit();
             entry_bytes = entry.estimated_retained_bytes();
         }
         entry.retained_bytes = entry_bytes;
@@ -1210,6 +1230,8 @@ impl SessionPool {
         if entry_bytes > self.max_idle_retained_bytes && !entry.accumulated_messages.is_empty() {
             entry.accumulated_messages.clear();
             entry.accumulated_messages.shrink_to_fit();
+            entry.accumulated_developer_slots.clear();
+            entry.accumulated_developer_slots.shrink_to_fit();
             entry_bytes = entry.estimated_retained_bytes();
         }
         entry.retained_bytes = entry_bytes;
@@ -1301,6 +1323,7 @@ pub struct CommittedSessionTurn {
     pub message_count: usize,
     pub last_response_id: Option<String>,
     pub accumulated_messages: Vec<CanonicalMessage>,
+    pub accumulated_developer_slots: Vec<ProtocolDeveloperSlot>,
 }
 
 /// RAII guard that notifies any waiting follow-up request as soon as a soft-cancelled warm
@@ -1363,24 +1386,30 @@ impl<B: AcpBackend> IdleCheckoutGuard<B> {
     }
 
     /// Disarms idle-restore-on-drop and promotes this checked-out session into an active
-    /// [`SessionLeaseGuard`], returning any previously accumulated messages by value.
+    /// [`SessionLeaseGuard`], returning any previously accumulated messages and protocol
+    /// developer-slot metadata by value.
     #[must_use]
     pub fn into_lease_guard(
         mut self,
         new_message_count: usize,
-    ) -> (SessionLeaseGuard<B>, Vec<CanonicalMessage>) {
+    ) -> (
+        SessionLeaseGuard<B>,
+        Vec<CanonicalMessage>,
+        Vec<ProtocolDeveloperSlot>,
+    ) {
         let mut entry = self
             .entry
             .take()
             .expect("IdleCheckoutGuard entry invariant: populated until into_lease_guard or drop");
         let accumulated = std::mem::take(&mut entry.accumulated_messages);
+        let accumulated_slots = std::mem::take(&mut entry.accumulated_developer_slots);
         let lease = SessionLeaseGuard::from_cached(
             &entry,
             new_message_count,
             Arc::clone(&self.pool),
             Arc::clone(&self.backend),
         );
-        (lease, accumulated)
+        (lease, accumulated, accumulated_slots)
     }
 }
 
@@ -1476,6 +1505,7 @@ impl<B: AcpBackend> SuspendedCheckoutGuard<B> {
             pending_calls: entry.pending_calls,
             declared_tools: entry.declared_tools,
             accumulated_messages: std::mem::take(&mut entry.accumulated_messages),
+            accumulated_developer_slots: std::mem::take(&mut entry.accumulated_developer_slots),
             last_context_used: entry.last_context_used,
             post_turn_hash: entry.post_turn_hash,
         };
@@ -1797,6 +1827,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 .saturating_add(suspended.step_cached_read_tokens),
             last_response_id: suspended.last_response_id,
             accumulated_messages: suspended.accumulated_messages,
+            accumulated_developer_slots: suspended.accumulated_developer_slots,
             message_count: suspended.message_count,
             pre_step_message_count: suspended.pre_step_message_count,
             turn_count: self.turn_count,
@@ -1829,6 +1860,7 @@ impl<B: AcpBackend> SessionLeaseGuard<B> {
                 .saturating_add(committed.turn_cached_read_tokens),
             last_response_id: committed.last_response_id,
             accumulated_messages: committed.accumulated_messages,
+            accumulated_developer_slots: committed.accumulated_developer_slots,
             message_count: committed.message_count,
             turn_count: self.turn_count,
             created_at_unix_ms: self.created_at_unix_ms,

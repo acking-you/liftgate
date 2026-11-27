@@ -280,6 +280,10 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 let combined_len = delta_start_index.saturating_add(req.messages.len());
                 let (mut promoted, step_lease) =
                     susp_checkout.promote_for_mcp_continuation(combined_len);
+                req.shift_developer_slots(delta_start_index);
+                let mut merged_slots = std::mem::take(&mut promoted.accumulated_developer_slots);
+                merged_slots.append(&mut req.developer_slots);
+                req.developer_slots = merged_slots;
                 promoted
                     .accumulated_messages
                     .extend(std::mem::take(&mut req.messages));
@@ -304,6 +308,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             }
 
             let saved_history = susp_checkout.entry().accumulated_messages.clone();
+            let saved_slots = susp_checkout.entry().accumulated_developer_slots.clone();
+            let prior_harness = detect_harness_by_tools(&susp_checkout.entry().declared_tools);
             let unwound_opt = if mcp_enabled {
                 unwind_suspended_to_idle_entry(&backend, susp_checkout, deadline).await
             } else {
@@ -317,11 +323,10 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     Arc::clone(&backend),
                 ));
             } else if !saved_history.is_empty() {
-                let saved_len = saved_history.len();
-                let mut rebuilt = saved_history;
-                rebuilt.extend(std::mem::take(&mut req.messages));
-                req.messages = rebuilt;
-                req.shift_developer_slots(saved_len);
+                req.prepend_history_with_slots(saved_history, saved_slots);
+                if req.detected_harness.is_none() {
+                    req.detected_harness = prior_harness;
+                }
             }
         } else if req.previous_response_id.is_none() {
             let susp_routing = compute_routing_plan(
@@ -530,13 +535,14 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         && cfg.mcp_server.is_some()
                         && checkout.entry().mcp_handle.is_none());
                 if mcp_mode_mismatch {
-                    let (retired_lease, mut saved_history) = checkout.into_lease_guard(0);
+                    let prior_harness = detect_harness_by_tools(&checkout.entry().declared_tools);
+                    let (retired_lease, saved_history, saved_slots) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
                     if !saved_history.is_empty() {
-                        let saved_len = saved_history.len();
-                        saved_history.extend(std::mem::take(&mut req.messages));
-                        req.messages = saved_history;
-                        req.shift_developer_slots(saved_len);
+                        req.prepend_history_with_slots(saved_history, saved_slots);
+                        if req.detected_harness.is_none() {
+                            req.detected_harness = prior_harness;
+                        }
                     }
                 } else {
                     let delta_start_index = checkout.entry().accumulated_messages.len();
@@ -567,7 +573,8 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         tools_delta.as_deref(),
                         &mut spill_store,
                     )?;
-                    let (mut guard, mut combined) = checkout.into_lease_guard(combined_len);
+                    let (mut guard, mut combined, mut combined_slots) =
+                        checkout.into_lease_guard(combined_len);
                     let session_idle_ms = guard.idle_before_checkout_ms();
                     let session_turn_index = guard.turn_count();
                     guard.refresh_mcp_summary(req.client_tools.len());
@@ -586,6 +593,9 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         })??;
                         guard.set_model_id(resolved_model.clone());
                     }
+                    req.shift_developer_slots(delta_start_index);
+                    combined_slots.append(&mut req.developer_slots);
+                    req.developer_slots = combined_slots;
                     combined.extend(std::mem::take(&mut req.messages));
                     let base_state_hash_hex =
                         format_conversation_hash_hex(&hash_conversation_state(
@@ -668,7 +678,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         && cfg.mcp_server.is_some()
                         && checkout.entry().mcp_handle.is_none());
                 if mcp_mode_mismatch {
-                    let (retired_lease, _) = checkout.into_lease_guard(0);
+                    let (retired_lease, _, _) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
                 } else if req.messages.get(delta_start..).is_some() {
                     let previous_session_context_tokens = checkout.entry().last_context_used;
@@ -691,7 +701,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         tools_delta.as_deref(),
                         &mut spill_store,
                     )?;
-                    let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                    let (mut guard, _, _) = checkout.into_lease_guard(req.messages.len());
                     guard.refresh_mcp_summary(req.client_tools.len());
                     let session_idle_ms = guard.idle_before_checkout_ms();
                     let session_turn_index = guard.turn_count();
@@ -769,7 +779,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     directive.as_deref(),
                     &mut spill_store,
                 )?;
-                let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                let (mut guard, _, _) = checkout.into_lease_guard(req.messages.len());
                 guard.refresh_mcp_summary(req.client_tools.len());
                 let session_idle_ms = guard.idle_before_checkout_ms();
                 let session_turn_index = guard.turn_count();
@@ -1680,10 +1690,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         let pending_guard =
                             cancelled_lease.register_pending_checkin(pending_hashes);
                         let message_count = full_messages.len();
-                        let retained_messages = if req.retain_response_history {
-                            full_messages
+                        let (retained_messages, retained_slots) = if req.retain_response_history {
+                            (full_messages, req.developer_slots)
                         } else {
-                            Vec::new()
+                            (Vec::new(), Vec::new())
                         };
                         let declared_tools = req.client_tools;
                         let approx_ctx = if state.turn_peak_context_used > 0 {
@@ -1723,6 +1733,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                         message_count,
                                         last_response_id: None,
                                         accumulated_messages: retained_messages,
+                                        accumulated_developer_slots: retained_slots,
                                     });
                                 }
                                 _ => {
@@ -2266,10 +2277,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
             }
             full_messages.push(assistant_msg);
             let message_count = full_messages.len();
-            let retained_messages = if req.retain_response_history {
-                full_messages
+            let (retained_messages, retained_slots) = if req.retain_response_history {
+                (full_messages, req.developer_slots)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             let committed_context_used = if state.turn_peak_context_used > 0 {
                 state.latest_context_used
@@ -2287,6 +2298,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 message_count,
                 last_response_id: Some(response_id),
                 accumulated_messages: retained_messages,
+                accumulated_developer_slots: retained_slots,
             };
             if let Some(pending_fut) = deferred_soft_cancel_drain.take() {
                 let pending_guard =
@@ -3843,6 +3855,8 @@ async fn unwind_suspended_to_idle_entry<B: AcpBackend>(
         Ok(Ok(Ok((unwound_ctx, unwound_delta, mcp_handle)))) => {
             let now_ms = unix_timestamp_ms();
             let accumulated_messages = std::mem::take(&mut entry.accumulated_messages);
+            let accumulated_developer_slots =
+                std::mem::take(&mut entry.accumulated_developer_slots);
             Some(IdleSessionEntry {
                 session_id: sid,
                 tool_nonce: entry.tool_nonce,
@@ -3865,6 +3879,7 @@ async fn unwind_suspended_to_idle_entry<B: AcpBackend>(
                     .saturating_add(unwound_delta.cached_read_tokens),
                 last_response_id: entry.last_response_id,
                 accumulated_messages,
+                accumulated_developer_slots,
                 message_count: entry.message_count,
                 turn_count: entry.turn_count,
                 created_at_unix_ms: entry.created_at_unix_ms,
@@ -4820,11 +4835,15 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 let pending_guard =
                                     cur_lease.register_pending_checkin(pending_hashes);
                                 let message_count = cur_full_messages.len();
-                                let retained_messages = if cur_req.retain_response_history {
-                                    cur_full_messages
-                                } else {
-                                    Vec::new()
-                                };
+                                let (retained_messages, retained_slots) =
+                                    if cur_req.retain_response_history {
+                                        (
+                                            cur_full_messages,
+                                            std::mem::take(&mut cur_req.developer_slots),
+                                        )
+                                    } else {
+                                        (Vec::new(), Vec::new())
+                                    };
                                 let declared_tools = cur_req.client_tools;
                                 let step_bytes: usize = cur_outbound_blocks
                                     .iter()
@@ -4871,6 +4890,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                                 message_count,
                                                 last_response_id: None,
                                                 accumulated_messages: retained_messages,
+                                                accumulated_developer_slots: retained_slots,
                                             });
                                         }
                                         _ => {
@@ -5568,10 +5588,13 @@ async fn run_mcp_session_driver<B: AcpBackend>(
 
                 cur_full_messages.push(assistant_msg);
                 let message_count = cur_full_messages.len();
-                let retained_messages = if cur_req.retain_response_history {
-                    std::mem::take(&mut cur_full_messages)
+                let (retained_messages, retained_slots) = if cur_req.retain_response_history {
+                    (
+                        std::mem::take(&mut cur_full_messages),
+                        std::mem::take(&mut cur_req.developer_slots),
+                    )
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 let (cmd_tx, mut cmd_rx) = oneshot::channel::<McpDriverCommand>();
 
@@ -5594,6 +5617,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     pre_step_message_count: pre_step_len,
                     last_response_id: Some(cur_response_id.clone()),
                     accumulated_messages: retained_messages,
+                    accumulated_developer_slots: retained_slots,
                 });
 
                 let _ = cur_events_tx
@@ -6039,10 +6063,14 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         }
                         cur_full_messages.push(assistant_msg);
                         let message_count = cur_full_messages.len();
-                        let retained_messages = if cur_req.retain_response_history {
-                            cur_full_messages
+                        let (retained_messages, retained_slots) = if cur_req.retain_response_history
+                        {
+                            (
+                                cur_full_messages,
+                                std::mem::take(&mut cur_req.developer_slots),
+                            )
                         } else {
-                            Vec::new()
+                            (Vec::new(), Vec::new())
                         };
                         let committed_context_used = if state.turn_peak_context_used > 0 {
                             state.latest_context_used
@@ -6077,6 +6105,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             message_count,
                             last_response_id: Some(cur_response_id),
                             accumulated_messages: retained_messages,
+                            accumulated_developer_slots: retained_slots,
                         });
                     }
 

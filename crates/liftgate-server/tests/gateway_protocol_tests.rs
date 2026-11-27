@@ -11925,3 +11925,120 @@ async fn warm_session_survives_tool_threshold_mutations_and_literal_assistant_de
     assert!(!prompts[3].text_joined.contains("Verbose CLI manual line."));
     assert!(prompts[3].text_joined.contains(literal_assistant));
 }
+
+#[tokio::test]
+async fn previous_response_id_mcp_toggle_retains_historical_developer_slots_on_cold_rebuild() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 1 ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 3 rebuilt cold ok.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let raw_codex_inst = format!(
+        "You are Codex.\n{}",
+        "Upstream Codex CLI manual line.\n".repeat(450)
+    );
+    let codex_tools = json!([
+        { "type": "custom", "name": "exec", "description": "Run JS Code Mode" },
+        { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+        { "type": "custom", "name": "apply_patch", "description": "Apply V4A patch" }
+    ]);
+
+    let (st1, body1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn1 apps</apps_instructions>\n<permissions instructions>danger-full-access</permissions instructions>" },
+                { "role": "user", "content": "first question" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+    let resp1_id = body1["id"].as_str().expect("resp1 id").to_owned();
+
+    let (st2, body2) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "previous_response_id": resp1_id,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn2 apps</apps_instructions>\n<collaboration_mode># Collaboration Mode: Plan\nEmit <proposed_plan>.</collaboration_mode>" },
+                { "role": "user", "content": "second question" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+    let resp2_id = body2["id"].as_str().expect("resp2 id").to_owned();
+
+    // Flip live MCP bridge off to trigger `mcp_mode_mismatch` history reconstruction on Turn 3.
+    state
+        .config
+        .mcp_tool_bridge
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let (st3, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "previous_response_id": resp2_id,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn3 apps</apps_instructions>" },
+                { "role": "user", "content": "third question after MCP toggle" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert_ne!(prompts[2].session_id, prompts[0].session_id);
+
+    // Replacement cold session 2 must still receive distilled historical base + developer slots!
+    assert!(
+        !prompts[2]
+            .text_joined
+            .contains("Upstream Codex CLI manual line.")
+    );
+    assert!(!prompts[2].text_joined.contains("drop turn1 apps"));
+    assert!(!prompts[2].text_joined.contains("drop turn2 apps"));
+    assert!(!prompts[2].text_joined.contains("drop turn3 apps"));
+    assert!(prompts[2].text_joined.contains("danger-full-access"));
+    assert!(prompts[2].text_joined.contains("<proposed_plan>"));
+    assert!(prompts[2].text_joined.contains("first question"));
+    assert!(prompts[2].text_joined.contains("Turn 2 warm ok."));
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("third question after MCP toggle")
+    );
+}

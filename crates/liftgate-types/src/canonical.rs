@@ -204,6 +204,25 @@ pub struct ProtocolDeveloperSlot {
     pub kind: ProtocolDeveloperSlotKind,
 }
 
+impl ProtocolDeveloperSlot {
+    /// Estimates structural plus heap bytes retained by this slot metadata.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let kind_bytes = match &self.kind {
+            ProtocolDeveloperSlotKind::PrimaryBase
+            | ProtocolDeveloperSlotKind::DeveloperItem { .. } => 0,
+            ProtocolDeveloperSlotKind::AnthropicSystem {
+                segments,
+                json_schema_directive,
+            } => segments
+                .iter()
+                .fold(0usize, |acc, s| acc.saturating_add(s.len()))
+                .saturating_add(json_schema_directive.as_deref().map_or(0, str::len)),
+        };
+        std::mem::size_of::<Self>().saturating_add(kind_bytes)
+    }
+}
+
 /// Protocol-agnostic normalized turn request ready for ACP session routing.
 #[derive(Clone, Debug)]
 #[expect(
@@ -296,6 +315,24 @@ impl NormalizedTurnRequest {
         for slot in &mut self.developer_slots {
             slot.msg_index = slot.msg_index.saturating_add(msg_offset);
         }
+    }
+
+    /// Prepends cached conversation history and its protocol developer-slot provenance ahead of
+    /// `self.messages`, shifting current-turn developer slot indices by `prior_messages.len()`.
+    pub fn prepend_history_with_slots(
+        &mut self,
+        mut prior_messages: Vec<CanonicalMessage>,
+        mut prior_slots: Vec<ProtocolDeveloperSlot>,
+    ) {
+        let saved_len = prior_messages.len();
+        if saved_len == 0 {
+            return;
+        }
+        self.shift_developer_slots(saved_len);
+        prior_slots.append(&mut self.developer_slots);
+        self.developer_slots = prior_slots;
+        prior_messages.extend(std::mem::take(&mut self.messages));
+        self.messages = prior_messages;
     }
 
     /// Renders `self.messages[range_start..]` for outbound ACP prompt delivery, distilling only
