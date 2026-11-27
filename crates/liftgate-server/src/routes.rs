@@ -673,7 +673,9 @@ async fn collect_openai_response(
     let mut msg_text = String::new();
     let mut tool_items: Vec<ResponseOutputItem> = Vec::new();
     let mut search_items: Vec<(String, Option<String>)> = Vec::new();
-    let mut fetch_urls: Vec<(String, String)> = Vec::new();
+    let mut search_index_by_id: HashMap<String, usize> = HashMap::new();
+    let mut fetch_items: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut fetch_index_by_id: HashMap<String, usize> = HashMap::new();
     let mut final_usage = AcpUsage::default();
 
     while let Some(ev) = turn.rx.recv().await {
@@ -681,21 +683,81 @@ async fn collect_openai_response(
             TurnEvent::ThoughtDelta(delta) => thought_text.push_str(&delta),
             TurnEvent::WebSearch {
                 call_id,
-                status,
+                status: _,
                 query,
             } => {
-                if opts.emit_web_search_items && status == "completed" {
-                    search_items.push((call_id, query));
+                if opts.emit_web_search_items {
+                    if !call_id.is_empty()
+                        && let Some(&idx) = search_index_by_id.get(&call_id)
+                    {
+                        if query.is_some()
+                            && let Some(slot) = search_items.get_mut(idx)
+                        {
+                            slot.1 = query;
+                        }
+                    } else {
+                        let idx = search_items.len();
+                        if !call_id.is_empty() {
+                            search_index_by_id.insert(call_id.clone(), idx);
+                        }
+                        search_items.push((call_id, query));
+                    }
                 }
             }
-            TurnEvent::WebFetchStart { .. } => {}
-            TurnEvent::WebFetchComplete { call_id, outcome } => {
+            TurnEvent::WebFetchStart {
+                call_id,
+                url,
+                pattern,
+            } => {
+                if opts.emit_web_fetch_items || opts.emit_web_search_items {
+                    if !call_id.is_empty()
+                        && let Some(&idx) = fetch_index_by_id.get(&call_id)
+                    {
+                        if let Some(slot) = fetch_items.get_mut(idx) {
+                            if !url.is_empty() {
+                                slot.1 = url;
+                            }
+                            if pattern.is_some() {
+                                slot.2 = pattern;
+                            }
+                        }
+                    } else {
+                        let idx = fetch_items.len();
+                        if !call_id.is_empty() {
+                            fetch_index_by_id.insert(call_id.clone(), idx);
+                        }
+                        fetch_items.push((call_id, url, pattern));
+                    }
+                }
+            }
+            TurnEvent::WebFetchComplete {
+                call_id,
+                pattern,
+                outcome,
+            } => {
                 if opts.emit_web_fetch_items || opts.emit_web_search_items {
                     let url = match outcome {
                         WebFetchOutcome::Success { url, .. }
                         | WebFetchOutcome::Error { url, .. } => url,
                     };
-                    fetch_urls.push((call_id, url));
+                    if !call_id.is_empty()
+                        && let Some(&idx) = fetch_index_by_id.get(&call_id)
+                    {
+                        if let Some(slot) = fetch_items.get_mut(idx) {
+                            if !url.is_empty() {
+                                slot.1 = url;
+                            }
+                            if pattern.is_some() {
+                                slot.2 = pattern;
+                            }
+                        }
+                    } else {
+                        let idx = fetch_items.len();
+                        if !call_id.is_empty() {
+                            fetch_index_by_id.insert(call_id.clone(), idx);
+                        }
+                        fetch_items.push((call_id, url, pattern));
+                    }
                 }
             }
             TurnEvent::TextDelta(delta) => msg_text.push_str(&delta),
@@ -741,7 +803,7 @@ async fn collect_openai_response(
         });
     }
 
-    let extracted_links = if !search_items.is_empty() || !fetch_urls.is_empty() {
+    let extracted_links = if !search_items.is_empty() || !fetch_items.is_empty() {
         extract_markdown_links(&msg_text)
     } else {
         Vec::new()
@@ -756,21 +818,17 @@ async fn collect_openai_response(
                 action_type: "search".to_owned(),
                 query: query.or_else(|| opts.query_hint.clone()),
                 url: None,
+                pattern: None,
                 sources: (!ws_sources.is_empty()).then(|| ws_sources.clone()),
             }),
         });
     }
 
-    for (fetch_id, url) in fetch_urls {
+    for (fetch_id, url, pattern) in fetch_items {
         resp.output.push(ResponseOutputItem::WebSearchCall {
             id: format!("ws_{}", sanitize_call_suffix(&fetch_id)),
             status: "completed".to_owned(),
-            action: Some(WebSearchAction {
-                action_type: "open_page".to_owned(),
-                query: None,
-                url: Some(url),
-                sources: None,
-            }),
+            action: Some(build_openai_web_fetch_action(url, pattern)),
         });
     }
 
@@ -858,7 +916,8 @@ fn stream_openai_responses(
         let mut active_reasoning: Option<(usize, String, String)> = None;
         let mut active_message: Option<(usize, String, String)> = None;
         let mut open_searches: HashMap<String, (usize, String, Option<String>)> = HashMap::new();
-        let mut open_fetches: HashMap<String, (usize, String, String)> = HashMap::new();
+        let mut open_fetches: HashMap<String, (usize, String, String, Option<String>)> =
+            HashMap::new();
         let mut open_client_tools: HashMap<String, OpenStreamingToolItem> = HashMap::new();
         let mut used_web_grounding = false;
         let mut emitted_search_count: usize = 0;
@@ -983,6 +1042,7 @@ fn stream_openai_responses(
                                     action_type: "search".to_owned(),
                                     query: resolved_q.clone(),
                                     url: None,
+                                    pattern: None,
                                     sources: None,
                                 }),
                             };
@@ -1037,6 +1097,7 @@ fn stream_openai_responses(
                                         action_type: "search".to_owned(),
                                         query: init_q.clone(),
                                         url: None,
+                                        pattern: None,
                                         sources: None,
                                     }),
                                 };
@@ -1083,6 +1144,7 @@ fn stream_openai_responses(
                                 action_type: "search".to_owned(),
                                 query: query.or(prev_q).or_else(|| opts.query_hint.clone()),
                                 url: None,
+                                pattern: None,
                                 sources: None,
                             }),
                         };
@@ -1111,7 +1173,11 @@ fn stream_openai_responses(
                         finalized_items.push(done_item);
                     }
                 }
-                TurnEvent::WebFetchStart { call_id, url } => {
+                TurnEvent::WebFetchStart {
+                    call_id,
+                    url,
+                    pattern,
+                } => {
                     if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
                         continue;
                     }
@@ -1139,12 +1205,7 @@ fn stream_openai_responses(
                     let added_item = ResponseOutputItem::WebSearchCall {
                         id: ws_id.clone(),
                         status: "in_progress".to_owned(),
-                        action: Some(WebSearchAction {
-                            action_type: "open_page".to_owned(),
-                            query: None,
-                            url: Some(url.clone()),
-                            sources: None,
-                        }),
+                        action: Some(build_openai_web_fetch_action(url.clone(), pattern.clone())),
                     };
                     let _ = send_sse_frame(
                         &sse_tx,
@@ -1168,9 +1229,24 @@ fn stream_openai_responses(
                         }),
                     )
                     .await;
-                    open_fetches.insert(call_id, (idx, ws_id, url));
+                    let _ = send_sse_frame(
+                        &sse_tx,
+                        "response.web_search_call.searching",
+                        &json!({
+                            "type": "response.web_search_call.searching",
+                            "sequence_number": next_seq(&mut seq),
+                            "output_index": idx,
+                            "item_id": ws_id,
+                        }),
+                    )
+                    .await;
+                    open_fetches.insert(call_id, (idx, ws_id, url, pattern));
                 }
-                TurnEvent::WebFetchComplete { call_id, outcome } => {
+                TurnEvent::WebFetchComplete {
+                    call_id,
+                    pattern,
+                    outcome,
+                } => {
                     if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
                         continue;
                     }
@@ -1178,23 +1254,67 @@ fn stream_openai_responses(
                         WebFetchOutcome::Success { url, .. }
                         | WebFetchOutcome::Error { url, .. } => url,
                     };
-                    let (idx, ws_id, url) = if let Some(opened) = open_fetches.remove(&call_id) {
-                        opened
-                    } else {
-                        let idx = output_index;
-                        output_index += 1;
-                        let ws_id = format!("ws_{}", sanitize_call_suffix(&call_id));
-                        (idx, ws_id, outcome_url)
-                    };
+                    let (idx, ws_id, url, resolved_pat) =
+                        if let Some((idx, ws_id, prev_url, prev_pat)) =
+                            open_fetches.remove(&call_id)
+                        {
+                            let u = if prev_url.is_empty() {
+                                outcome_url
+                            } else {
+                                prev_url
+                            };
+                            (idx, ws_id, u, pattern.or(prev_pat))
+                        } else {
+                            let idx = output_index;
+                            output_index += 1;
+                            let ws_id = format!("ws_{}", sanitize_call_suffix(&call_id));
+                            let added_item = ResponseOutputItem::WebSearchCall {
+                                id: ws_id.clone(),
+                                status: "in_progress".to_owned(),
+                                action: Some(build_openai_web_fetch_action(
+                                    outcome_url.clone(),
+                                    pattern.clone(),
+                                )),
+                            };
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.output_item.added",
+                                &json!({
+                                    "type": "response.output_item.added",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": idx,
+                                    "item": &added_item,
+                                }),
+                            )
+                            .await;
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.web_search_call.in_progress",
+                                &json!({
+                                    "type": "response.web_search_call.in_progress",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": idx,
+                                    "item_id": ws_id,
+                                }),
+                            )
+                            .await;
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.web_search_call.searching",
+                                &json!({
+                                    "type": "response.web_search_call.searching",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": idx,
+                                    "item_id": ws_id,
+                                }),
+                            )
+                            .await;
+                            (idx, ws_id, outcome_url, pattern)
+                        };
                     let done_item = ResponseOutputItem::WebSearchCall {
                         id: ws_id.clone(),
                         status: "completed".to_owned(),
-                        action: Some(WebSearchAction {
-                            action_type: "open_page".to_owned(),
-                            query: None,
-                            url: Some(url),
-                            sources: None,
-                        }),
+                        action: Some(build_openai_web_fetch_action(url, resolved_pat)),
                     };
                     let _ = send_sse_frame(
                         &sse_tx,
@@ -1246,6 +1366,7 @@ fn stream_openai_responses(
                                 action_type: "search".to_owned(),
                                 query: opts.query_hint.clone(),
                                 url: None,
+                                pattern: None,
                                 sources: None,
                             }),
                         };
@@ -1846,8 +1967,39 @@ fn stream_openai_responses(
                     action_type: "search".to_owned(),
                     query: q,
                     url: None,
+                    pattern: None,
                     sources: None,
                 }),
+            };
+            let _ = send_sse_frame(
+                &sse_tx,
+                "response.web_search_call.completed",
+                &json!({
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": next_seq(&mut seq),
+                    "output_index": idx,
+                    "item_id": ws_id,
+                }),
+            )
+            .await;
+            let _ = send_sse_frame(
+                &sse_tx,
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": next_seq(&mut seq),
+                    "output_index": idx,
+                    "item": &done_item,
+                }),
+            )
+            .await;
+            finalized_items.push(done_item);
+        }
+        for (_, (idx, ws_id, url, pat)) in open_fetches.drain() {
+            let done_item = ResponseOutputItem::WebSearchCall {
+                id: ws_id.clone(),
+                status: "completed".to_owned(),
+                action: Some(build_openai_web_fetch_action(url, pat)),
             };
             let _ = send_sse_frame(
                 &sse_tx,
@@ -2097,6 +2249,26 @@ fn build_openai_web_sources(
     out
 }
 
+fn build_openai_web_fetch_action(url: String, pattern: Option<String>) -> WebSearchAction {
+    if pattern.is_some() {
+        WebSearchAction {
+            action_type: "find_in_page".to_owned(),
+            query: None,
+            url: Some(url),
+            pattern,
+            sources: None,
+        }
+    } else {
+        WebSearchAction {
+            action_type: "open_page".to_owned(),
+            query: None,
+            url: Some(url),
+            pattern: None,
+            sources: None,
+        }
+    }
+}
+
 fn build_openai_url_annotations(text: &str) -> Vec<Value> {
     extract_markdown_links(text)
         .into_iter()
@@ -2262,6 +2434,7 @@ async fn close_active_message(
 struct AnthropicRenderOptions {
     emit_web_search: bool,
     force_web_search: bool,
+    emit_web_fetch: bool,
     query_hint: Option<String>,
 }
 
@@ -2296,6 +2469,7 @@ async fn handle_anthropic_messages<B: AcpBackend>(
     let render_opts = AnthropicRenderOptions {
         emit_web_search: normalized.enable_native_web_search,
         force_web_search: normalized.force_native_web_search,
+        emit_web_fetch: normalized.enable_native_web_fetch,
         query_hint: extract_search_query_hint(&normalized.messages),
     };
     let msg_id = format!("msg_{}", generate_short_nonce());
@@ -2346,6 +2520,7 @@ async fn collect_anthropic_messages(
     let mut tool_uses: Vec<AnthropicOutputBlock> = Vec::new();
     let mut seen_searches: HashMap<String, Option<String>> = HashMap::new();
     let mut search_order: Vec<String> = Vec::new();
+    let mut pending_fetch_srv_ids: Vec<(String, String)> = Vec::new();
     let mut web_search_requests: u64 = 0;
     let mut web_fetch_requests: u64 = 0;
     let mut final_usage = AcpUsage::default();
@@ -2375,25 +2550,65 @@ async fn collect_anthropic_messages(
                     web_search_requests = web_search_requests.saturating_add(1);
                 }
             }
-            TurnEvent::WebFetchStart { call_id, url } => {
-                if !current_text.trim().is_empty() {
-                    content.push(AnthropicOutputBlock::Text {
-                        text: current_text.trim().to_owned(),
+            TurnEvent::WebFetchStart {
+                call_id,
+                url,
+                pattern: _,
+            } => {
+                if opts.emit_web_fetch {
+                    if !current_text.trim().is_empty() {
+                        content.push(AnthropicOutputBlock::Text {
+                            text: current_text.trim().to_owned(),
+                        });
+                        current_text.clear();
+                    }
+                    let srv_id = ensure_srvtoolu_id(&call_id);
+                    web_fetch_requests = web_fetch_requests.saturating_add(1);
+                    pending_fetch_srv_ids.push((srv_id.clone(), url.clone()));
+                    content.push(AnthropicOutputBlock::ServerToolUse {
+                        id: srv_id,
+                        name: "web_fetch".to_owned(),
+                        input: json!({ "url": url }),
                     });
-                    current_text.clear();
                 }
-                web_fetch_requests = web_fetch_requests.saturating_add(1);
-                content.push(AnthropicOutputBlock::ServerToolUse {
-                    id: ensure_srvtoolu_id(&call_id),
-                    name: "web_fetch".to_owned(),
-                    input: json!({ "url": url }),
-                });
             }
-            TurnEvent::WebFetchComplete { call_id, outcome } => {
-                content.push(AnthropicOutputBlock::WebFetchToolResult {
-                    tool_use_id: ensure_srvtoolu_id(&call_id),
-                    content: build_anthropic_web_fetch_result_content(&outcome),
-                });
+            TurnEvent::WebFetchComplete {
+                call_id,
+                pattern: _,
+                outcome,
+            } => {
+                if opts.emit_web_fetch {
+                    let srv_id = ensure_srvtoolu_id(&call_id);
+                    if let Some(pos) = pending_fetch_srv_ids
+                        .iter()
+                        .position(|(id, _)| id == &srv_id)
+                    {
+                        pending_fetch_srv_ids.remove(pos);
+                    } else {
+                        if !current_text.trim().is_empty() {
+                            content.push(AnthropicOutputBlock::Text {
+                                text: current_text.trim().to_owned(),
+                            });
+                            current_text.clear();
+                        }
+                        let outcome_url = match &outcome {
+                            WebFetchOutcome::Success { url, .. }
+                            | WebFetchOutcome::Error { url, .. } => url.clone(),
+                        };
+                        web_fetch_requests = web_fetch_requests.saturating_add(1);
+                        content.push(AnthropicOutputBlock::ServerToolUse {
+                            id: srv_id.clone(),
+                            name: "web_fetch".to_owned(),
+                            input: json!({ "url": outcome_url }),
+                        });
+                    }
+                    content.push(AnthropicOutputBlock::WebFetchToolResult {
+                        tool_use_id: srv_id,
+                        content: build_anthropic_web_fetch_result_content(&outcome),
+                    });
+                } else {
+                    web_fetch_requests = web_fetch_requests.saturating_add(1);
+                }
             }
             TurnEvent::TextDelta(delta) => current_text.push_str(&delta),
             TurnEvent::ClientToolCallStart { .. } | TurnEvent::ClientToolCallDelta { .. } => {}
@@ -2422,6 +2637,19 @@ async fn collect_anthropic_messages(
                 return GatewayError::SharedAcp { source: err }.into_anthropic_response();
             }
         }
+    }
+
+    for (srv_id, url) in pending_fetch_srv_ids {
+        let synth_outcome = WebFetchOutcome::Success {
+            url,
+            title: None,
+            media_type: "text/html".to_owned(),
+            content: String::new(),
+        };
+        content.push(AnthropicOutputBlock::WebFetchToolResult {
+            tool_use_id: srv_id,
+            content: build_anthropic_web_fetch_result_content(&synth_outcome),
+        });
     }
 
     if opts.emit_web_search && opts.force_web_search && search_order.is_empty() {
@@ -2521,6 +2749,7 @@ fn stream_anthropic_messages(
         let mut has_tool_use = false;
         let mut emitted_search_srv_ids: HashSet<String> = HashSet::new();
         let mut pending_search_result_srv_ids: Vec<String> = Vec::new();
+        let mut pending_fetch_srv_ids: Vec<(String, String)> = Vec::new();
         let mut open_tool_blocks: HashMap<String, usize> = HashMap::new();
         let mut post_search_text_buf = String::new();
         let mut web_search_requests: u64 = 0;
@@ -2628,7 +2857,14 @@ fn stream_anthropic_messages(
                         web_search_requests = web_search_requests.saturating_add(1);
                     }
                 }
-                TurnEvent::WebFetchStart { call_id, url } => {
+                TurnEvent::WebFetchStart {
+                    call_id,
+                    url,
+                    pattern: _,
+                } => {
+                    if !opts.emit_web_fetch {
+                        continue;
+                    }
                     if !ensure_anthropic_message_started(
                         &sse_tx,
                         &mut message_started,
@@ -2659,10 +2895,19 @@ fn stream_anthropic_messages(
                         &json!({ "url": url }),
                     )
                     .await;
+                    pending_fetch_srv_ids.push((srv_id, url));
                     emitted_any_block = true;
                     web_fetch_requests = web_fetch_requests.saturating_add(1);
                 }
-                TurnEvent::WebFetchComplete { call_id, outcome } => {
+                TurnEvent::WebFetchComplete {
+                    call_id,
+                    pattern: _,
+                    outcome,
+                } => {
+                    if !opts.emit_web_fetch {
+                        web_fetch_requests = web_fetch_requests.saturating_add(1);
+                        continue;
+                    }
                     if !ensure_anthropic_message_started(
                         &sse_tx,
                         &mut message_started,
@@ -2674,6 +2919,36 @@ fn stream_anthropic_messages(
                         return;
                     }
                     let srv_id = ensure_srvtoolu_id(&call_id);
+                    if let Some(pos) = pending_fetch_srv_ids
+                        .iter()
+                        .position(|(id, _)| id == &srv_id)
+                    {
+                        pending_fetch_srv_ids.remove(pos);
+                    } else {
+                        flush_pending_anthropic_searches(
+                            &sse_tx,
+                            &mut next_block_idx,
+                            &mut pending_search_result_srv_ids,
+                            &mut post_search_text_buf,
+                            &mut emitted_any_block,
+                        )
+                        .await;
+                        close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                        close_anthropic_text(&sse_tx, &mut active_text_idx).await;
+                        let outcome_url = match &outcome {
+                            WebFetchOutcome::Success { url, .. }
+                            | WebFetchOutcome::Error { url, .. } => url.clone(),
+                        };
+                        emit_anthropic_server_tool_use(
+                            &sse_tx,
+                            &mut next_block_idx,
+                            &srv_id,
+                            "web_fetch",
+                            &json!({ "url": outcome_url }),
+                        )
+                        .await;
+                        web_fetch_requests = web_fetch_requests.saturating_add(1);
+                    }
                     let result_content = build_anthropic_web_fetch_result_content(&outcome);
                     let idx = next_block_idx;
                     next_block_idx += 1;
@@ -3004,6 +3279,40 @@ fn stream_anthropic_messages(
             &mut emitted_any_block,
         )
         .await;
+        for (srv_id, url) in pending_fetch_srv_ids.drain(..) {
+            close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+            close_anthropic_text(&sse_tx, &mut active_text_idx).await;
+            let synth_outcome = WebFetchOutcome::Success {
+                url,
+                title: None,
+                media_type: "text/html".to_owned(),
+                content: String::new(),
+            };
+            let result_content = build_anthropic_web_fetch_result_content(&synth_outcome);
+            let idx = next_block_idx;
+            next_block_idx += 1;
+            emitted_any_block = true;
+            let _ = send_sse_frame(
+                &sse_tx,
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "web_fetch_tool_result",
+                        "tool_use_id": srv_id,
+                        "content": result_content
+                    }
+                }),
+            )
+            .await;
+            let _ = send_sse_frame(
+                &sse_tx,
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": idx }),
+            )
+            .await;
+        }
         close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
         close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 

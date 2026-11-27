@@ -112,6 +112,7 @@ pub enum ResolvedMcpIncoming {
     /// Server-managed `gateway_web_fetch` executed inside the gateway in-flight.
     GatewayWebFetch {
         url: String,
+        pattern: Option<String>,
         reply_tx: oneshot::Sender<McpToolCallReply>,
     },
     /// Gateway-local 0-RTT context spill slice/search read (`mcp_lg_read_context_spill`).
@@ -174,6 +175,11 @@ impl McpSessionHandle {
     #[must_use]
     pub const fn has_virtualized_dispatch(&self) -> bool {
         self.catalog.has_virtualized_dispatch
+    }
+
+    #[must_use]
+    pub const fn has_gateway_web_fetch(&self) -> bool {
+        self.catalog.has_gateway_web_fetch
     }
 
     /// Builds a live MCP routing & virtualization telemetry summary for `SessionSummary.mcp`.
@@ -294,9 +300,10 @@ impl McpSessionHandle {
                 patch_repaired,
                 reply_tx: incoming.reply_tx,
             },
-            VirtualizedCallDecision::GatewayWebFetch { url } => {
+            VirtualizedCallDecision::GatewayWebFetch { url, pattern } => {
                 ResolvedMcpIncoming::GatewayWebFetch {
                     url,
+                    pattern,
                     reply_tx: incoming.reply_tx,
                 }
             }

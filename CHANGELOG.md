@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.19] - 2026-11-28
+
+### Added
+- **Hosted `find_in_page` and native ACP `fetch` tool mapping**:
+  - `mcp_lg_gateway_web_fetch` and XML `__gateway_web_fetch` accept an optional `pattern` filter to scan within fetched pages, emitting OpenAI Responses `web_search_call` items with `action.type = "find_in_page"` (`url` + `pattern`) alongside `open_page` and `search`.
+  - Native ACP `fetch`-kind tool notifications (`kind: "fetch"` / `web_fetch` / `fetch_url` / `read_url_content` / `open_page`) now map into Liftgate's hosted `WebFetchStart` / `WebFetchComplete` pipeline across OpenAI `/v1/responses`, Anthropic `/v1/messages`, and live telemetry (`native_web_fetches`).
+  - Warm MCP sessions started without `web_search` / `web_fetch` automatically upgrade with lossless history preservation when a later turn enables hosted web fetching.
+
+### Fixed
+- **ACP `session/update` `RawValue` deserialization**: replaced `#[serde(tag = "sessionUpdate")]` internal-tag buffering on `SessionUpdatePayload` with a two-step `RawValue` slice deserializer so `tool_call`, `tool_call_update`, and `error` notifications carrying non-null `args`, `rawInput`, or `error` payloads decode losslessly instead of failing `serde`'s `Content` buffer and dropping native `search_web` (`web_search_call` / `server_tool_use`) events.
+- **Hosted web tool streaming & telemetry**: OpenAI `/v1/responses` SSE now emits the complete 5-frame lifecycle (`added` -> `in_progress` -> `searching` -> `completed` -> `done`) and drains any unclosed `open_fetches` at stream teardown; Anthropic `/v1/messages` gates `web_fetch` server blocks symmetrically via `emit_web_fetch`; gateway-local MCP tools (`gateway_web_fetch`, `read_context_spill`, `search_client_tools`) no longer flip `TaskPhase` to `calling_client_tool`.
+
 ## [0.2.18] - 2026-11-28
 
 ### Added

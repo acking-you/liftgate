@@ -324,12 +324,13 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         if web_cfg.force_native_web_fetch {
             header_rules.push_str(
                 "- MANDATORY SERVER WEB FETCH: Before answering, fetch the requested web URL by invoking \
-                 native `mcp_lg_gateway_web_fetch` (`{\"url\": \"https://...\"}`) directly.\n",
+                 native `mcp_lg_gateway_web_fetch` (`{\"url\": \"https://...\", \"pattern\"?: \"...\"}`) directly.\n",
             );
         } else {
             header_rules.push_str(
                 "- Server-managed URL fetching IS enabled: to read the full content of any `http://` or `https://` URL, \
-                 invoke native `mcp_lg_gateway_web_fetch` (`{\"url\": \"https://...\"}`) directly.\n",
+                 invoke native `mcp_lg_gateway_web_fetch` (`{\"url\": \"https://...\", \"pattern\"?: \"...\"}`) directly \
+                 (pass optional `\"pattern\"` to scan/filter within a page).\n",
             );
         }
     }
@@ -552,13 +553,13 @@ fn append_xml_invocation_bridge_rules(
         if web_cfg.force_native_web_fetch {
             out.push_str(&format!(
                 "- MANDATORY SERVER WEB FETCH: Before answering, fetch the requested web URL by emitting \
-                 `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                 `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\", \"pattern\"?: \"...\"}}}}\n{close_tag}` \
                  and stop; the gateway will immediately fetch the live page and deliver `<gateway_web_fetch_result>`.\n"
             ));
         } else {
             out.push_str(&format!(
                 "- Server-managed URL fetching IS enabled: to read the full content of any `http://` or `https://` URL, \
-                 emit `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\"}}}}\n{close_tag}` \
+                 emit `{open_tag}\n{{\"name\": \"{INTERNAL_GATEWAY_WEB_FETCH_TOOL}\", \"arguments\": {{\"url\": \"https://...\", \"pattern\"?: \"...\"}}}}\n{close_tag}` \
                  and stop; the gateway will fetch the URL server-side and return `<gateway_web_fetch_result>` in the same turn.\n"
             ));
         }

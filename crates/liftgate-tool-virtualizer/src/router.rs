@@ -52,7 +52,10 @@ pub enum VirtualizedCallDecision {
         kind: LocalReplyKind,
     },
     /// Execute server-managed URL fetch inside the gateway and reply in-flight.
-    GatewayWebFetch { url: String },
+    GatewayWebFetch {
+        url: String,
+        pattern: Option<String>,
+    },
     /// Read a bounded line slice or search matches from a gateway-local context spill file in 0-RTT.
     ReadContextSpill {
         path: String,
@@ -721,8 +724,16 @@ impl McpRoutingTable {
                     "Missing non-empty `url` string for `mcp_lg_gateway_web_fetch`.".to_owned(),
                 );
             }
+            let pattern = arguments
+                .get("pattern")
+                .or_else(|| arguments.get("query"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             return VirtualizedCallDecision::GatewayWebFetch {
                 url: url.to_owned(),
+                pattern,
             };
         }
 
