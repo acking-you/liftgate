@@ -255,6 +255,15 @@ pub(super) async fn build_codex_invocation(
             format!("{CODEX_STREAM_IDLE_TIMEOUT_KEY}={DEFAULT_REQUEST_TIMEOUT_MS}"),
         );
     }
+    for remote_feature in [
+        "features.apps",
+        "features.remote_plugin",
+        "features.recommended_plugins",
+    ] {
+        if !has_explicit_codex_config_key(&args.passthrough_args, remote_feature) {
+            push_cfg(&mut full_args, format!("{remote_feature}=false"));
+        }
+    }
     if args.no_code_mode {
         push_cfg(&mut full_args, "features.code_mode=false".to_owned());
         push_cfg(&mut full_args, "features.code_mode_only=false".to_owned());

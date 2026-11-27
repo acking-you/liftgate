@@ -46,7 +46,6 @@ pub const CODEX_DISTILLED_PROMPT: &str = "\
 You are a coding agent running in the Codex CLI. Be precise, safe, and concise.
 - Resolve the user's request end-to-end; inspect the workspace directly (`rg`, `rg --files`) rather than guessing, and validate changes with targeted checks.
 - Obey scoped `AGENTS.md` files (deeper overrides parent; user/developer instructions take precedence). Never commit or create git branches unless asked.
-- Send a brief 1-sentence preamble before grouped tool calls.
 - Reply concisely in GitHub-flavored Markdown, wrap identifiers/paths/commands in backticks, and format file references as inline `path/to/file:line` (never emit `file://` URIs, `【F:...】` citations, or host `<appDataDir>/brain` artifacts).";
 
 /// Compact Claude Code (`claude`) system contract (`< 550B`).
@@ -976,8 +975,41 @@ fn compact_auxiliary_developer_tags(text: &str) -> String {
     out
 }
 
+fn is_excluded_codex_plugin_skill_path(raw_path: &str) -> bool {
+    let norm = raw_path
+        .trim()
+        .trim_matches('`')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    norm.contains("/plugins/cache/openai-")
+        || norm.contains("/plugins/openai-primary-runtime")
+        || norm.contains("/bundled-marketplaces/openai-bundled")
+}
+
+fn parse_codex_skill_root_bullet(bullet: &str) -> Option<(&str, &str)> {
+    let after_tick = bullet.strip_prefix('`')?;
+    let end_tick = after_tick.find('`')?;
+    let alias = after_tick.get(..end_tick)?.trim();
+    let rest = after_tick.get(end_tick.checked_add(1)?..)?.trim_start();
+    let path = rest.strip_prefix('=')?.trim();
+    (!alias.is_empty() && !path.is_empty()).then_some((alias, path))
+}
+
+fn extract_skill_target_path(paren_or_file_ref: &str) -> &str {
+    let inner = paren_or_file_ref
+        .trim()
+        .strip_prefix('(')
+        .unwrap_or(paren_or_file_ref)
+        .strip_suffix(')')
+        .unwrap_or(paren_or_file_ref)
+        .trim();
+    inner.strip_prefix("file:").map_or(inner, str::trim)
+}
+
 fn compact_codex_skills_instructions(inner: &str) -> Option<String> {
-    let mut roots = Vec::new();
+    let mut candidate_roots: Vec<(Option<String>, String)> = Vec::new();
+    let mut excluded_aliases: BTreeSet<String> = BTreeSet::new();
+    let mut used_aliases: BTreeSet<String> = BTreeSet::new();
     let mut skills = Vec::new();
 
     for raw_line in inner.lines() {
@@ -986,24 +1018,44 @@ fn compact_codex_skills_instructions(inner: &str) -> Option<String> {
             continue;
         };
         if bullet.starts_with('`') && bullet.contains(" = ") {
-            roots.push(line.to_owned());
+            if let Some((alias, path)) = parse_codex_skill_root_bullet(bullet) {
+                if is_excluded_codex_plugin_skill_path(path) {
+                    excluded_aliases.insert(alias.to_owned());
+                } else {
+                    candidate_roots.push((Some(alias.to_owned()), line.to_owned()));
+                }
+            } else if !is_excluded_codex_plugin_skill_path(bullet) {
+                candidate_roots.push((None, line.to_owned()));
+            }
             continue;
         }
         if let Some((raw_name, _)) = bullet.split_once(':') {
             let name = raw_name.trim();
             if !name.is_empty() {
-                if let Some(file_idx) = bullet.rfind("(file:")
+                let extracted_ref = if let Some(file_idx) = bullet.rfind("(file:")
                     && let Some(file_ref) = bullet.get(file_idx..)
                 {
-                    skills.push(format!("- {name} {file_ref}"));
-                    continue;
-                }
-                if let Some(paren_idx) = bullet.rfind('(')
+                    Some(file_ref)
+                } else if let Some(paren_idx) = bullet.rfind('(')
                     && let Some(paren_ref) = bullet.get(paren_idx..)
                     && paren_ref.contains("SKILL.md")
                 {
-                    skills.push(format!("- {name} {paren_ref}"));
-                    continue;
+                    Some(paren_ref)
+                } else {
+                    None
+                };
+                if let Some(target_ref) = extracted_ref {
+                    let target_path = extract_skill_target_path(target_ref);
+                    let root_alias = target_path.split(['/', '\\']).next().unwrap_or("");
+                    if excluded_aliases.contains(root_alias)
+                        || is_excluded_codex_plugin_skill_path(target_path)
+                    {
+                        continue;
+                    }
+                    if !root_alias.is_empty() {
+                        used_aliases.insert(root_alias.to_owned());
+                    }
+                    skills.push(format!("- {name} {target_ref}"));
                 }
             }
         }
@@ -1012,9 +1064,14 @@ fn compact_codex_skills_instructions(inner: &str) -> Option<String> {
     if !skills.is_empty() {
         let mut body =
             String::from("<skills_instructions>\nRead a skill's `SKILL.md` only when relevant:\n");
-        for root in &roots {
-            body.push_str(root);
-            body.push('\n');
+        for (alias_opt, root_line) in &candidate_roots {
+            if alias_opt
+                .as_ref()
+                .is_none_or(|alias| used_aliases.contains(alias))
+            {
+                body.push_str(root_line);
+                body.push('\n');
+            }
         }
         for skill in &skills {
             body.push_str(skill);
@@ -1022,6 +1079,10 @@ fn compact_codex_skills_instructions(inner: &str) -> Option<String> {
         }
         body.push_str("</skills_instructions>");
         return Some(body);
+    }
+
+    if !excluded_aliases.is_empty() {
+        return None;
     }
 
     if inner.len() < 1_200 {
@@ -1144,67 +1205,185 @@ fn extract_bounded_git_status(raw: &str) -> Option<String> {
     }
 }
 
-fn extract_all_tag_blocks<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
-    if !text.contains(open_tag) {
-        return Vec::new();
+fn count_run_of_byte(bytes: &[u8], start: usize, needle: u8) -> usize {
+    let mut count = 0usize;
+    while let Some(&b) = bytes.get(start.saturating_add(count)) {
+        if b != needle {
+            break;
+        }
+        count = count.saturating_add(1);
     }
+    count
+}
+
+fn skip_fenced_code_block_at_line_start(text: &str, idx: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let at_line_start = idx == 0 || bytes.get(idx.wrapping_sub(1)) == Some(&b'\n');
+    if !at_line_start {
+        return None;
+    }
+    let mut pos = idx;
+    while let Some(&b) = bytes.get(pos) {
+        if b == b' ' || b == b'\t' {
+            pos = pos.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    let fence_len = count_run_of_byte(bytes, pos, b'`');
+    if fence_len < 3 {
+        return None;
+    }
+    let after_open_fence = pos.checked_add(fence_len)?;
+    let rest = text.get(after_open_fence..)?;
+    let first_nl = rest.find('\n')?;
+    let mut scan = after_open_fence.checked_add(first_nl)?.checked_add(1)?;
+    while scan < text.len() {
+        let mut line_pos = scan;
+        while let Some(&b) = bytes.get(line_pos) {
+            if b == b' ' || b == b'\t' {
+                line_pos = line_pos.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        let close_ticks = count_run_of_byte(bytes, line_pos, b'`');
+        let after_ticks = line_pos.saturating_add(close_ticks);
+        let line_tail = text.get(after_ticks..).unwrap_or("");
+        let line_end_rel = line_tail.find('\n');
+        let trailing_slice = match line_end_rel {
+            Some(rel) => line_tail.get(..rel).unwrap_or(""),
+            None => line_tail,
+        };
+        if close_ticks >= fence_len
+            && trailing_slice
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t' || b == b'\r')
+        {
+            return match line_end_rel {
+                Some(rel) => after_ticks.checked_add(rel)?.checked_add(1),
+                None => Some(text.len()),
+            };
+        }
+        match text.get(scan..).and_then(|s| s.find('\n')) {
+            Some(rel_nl) => scan = scan.checked_add(rel_nl)?.checked_add(1)?,
+            None => return Some(text.len()),
+        }
+    }
+    Some(text.len())
+}
+
+fn skip_inline_backtick_span_on_line(text: &str, idx: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let ticks = count_run_of_byte(bytes, idx, b'`');
+    if ticks == 0 {
+        return None;
+    }
+    let after_open = idx.checked_add(ticks)?;
+    let tail = text.get(after_open..)?;
+    let line_len = tail.find('\n').unwrap_or(tail.len());
+    let line_bytes = tail.as_bytes().get(..line_len)?;
+    let mut rel = 0usize;
+    while rel < line_bytes.len() {
+        if line_bytes.get(rel) == Some(&b'`') {
+            let run = count_run_of_byte(line_bytes, rel, b'`');
+            if run == ticks {
+                return after_open.checked_add(rel)?.checked_add(run);
+            }
+            rel = rel.saturating_add(run);
+        } else {
+            rel = rel.saturating_add(1);
+        }
+    }
+    after_open.checked_add(0)
+}
+
+/// Finds the next top-level `(open_start, inner_start, inner_end, close_end)` span for
+/// `open_tag` .. `close_tag`, ignoring tag literals inside Markdown inline backticks or fenced
+/// code blocks and balancing nested occurrences of `open_tag`.
+fn find_unquoted_tag_span(
+    text: &str,
+    open_tag: &str,
+    close_tag: &str,
+) -> Option<(usize, usize, usize, usize)> {
+    if open_tag.is_empty() || close_tag.is_empty() || !text.contains(open_tag) {
+        return None;
+    }
+    let mut idx = 0usize;
+    let mut open_coords: Option<(usize, usize)> = None;
+    let mut depth = 0usize;
+
+    while let Some(sub) = text.get(idx..) {
+        if sub.is_empty() {
+            break;
+        }
+        if let Some(next_idx) = skip_fenced_code_block_at_line_start(text, idx) {
+            idx = next_idx;
+            continue;
+        }
+        if sub.as_bytes().first() == Some(&b'`')
+            && let Some(next_idx) = skip_inline_backtick_span_on_line(text, idx)
+        {
+            idx = next_idx;
+            continue;
+        }
+        if let Some((open_start, inner_start)) = open_coords {
+            if sub.starts_with(close_tag) {
+                depth = depth.saturating_sub(1);
+                let close_end = idx.checked_add(close_tag.len())?;
+                if depth == 0 {
+                    return Some((open_start, inner_start, idx, close_end));
+                }
+                idx = close_end;
+                continue;
+            }
+            if sub.starts_with(open_tag) {
+                depth = depth.saturating_add(1);
+                idx = idx.checked_add(open_tag.len())?;
+                continue;
+            }
+        } else if sub.starts_with(open_tag) {
+            let inner_start = idx.checked_add(open_tag.len())?;
+            open_coords = Some((idx, inner_start));
+            depth = 1;
+            idx = inner_start;
+            continue;
+        }
+        let ch = sub.chars().next()?;
+        idx = idx.checked_add(ch.len_utf8())?;
+    }
+    None
+}
+
+fn extract_all_tag_blocks<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
     let mut blocks = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(open_tag) {
-        let Some(after_open_idx) = start.checked_add(open_tag.len()) else {
-            break;
-        };
-        let Some(tail) = rest.get(after_open_idx..) else {
-            break;
-        };
-        let Some(rel_end) = tail.find(close_tag) else {
-            break;
-        };
-        let Some(end) = after_open_idx
-            .checked_add(rel_end)
-            .and_then(|i| i.checked_add(close_tag.len()))
-        else {
-            break;
-        };
-        if let Some(block) = rest.get(start..end) {
+    while let Some((open_start, _, _, close_end)) =
+        find_unquoted_tag_span(rest, open_tag, close_tag)
+    {
+        if let Some(block) = rest.get(open_start..close_end) {
             blocks.push(block);
         }
-        rest = rest.get(end..).unwrap_or("");
+        rest = rest.get(close_end..).unwrap_or("");
     }
     blocks
 }
 
 fn extract_tag_inner<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
-    let start = text.find(open_tag)?;
-    let after_open = start.checked_add(open_tag.len())?;
-    let tail = text.get(after_open..)?;
-    let rel_end = tail.find(close_tag)?;
-    tail.get(..rel_end)
+    let (_, inner_start, inner_end, _) = find_unquoted_tag_span(text, open_tag, close_tag)?;
+    text.get(inner_start..inner_end)
 }
 
 fn extract_all_tag_inners<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
-    if !text.contains(open_tag) {
-        return Vec::new();
-    }
     let mut inners = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(open_tag) {
-        let Some(after_open_idx) = start.checked_add(open_tag.len()) else {
-            break;
-        };
-        let Some(tail) = rest.get(after_open_idx..) else {
-            break;
-        };
-        let Some(rel_end) = tail.find(close_tag) else {
-            break;
-        };
-        if let Some(inner) = tail.get(..rel_end) {
+    while let Some((_, inner_start, inner_end, close_end)) =
+        find_unquoted_tag_span(rest, open_tag, close_tag)
+    {
+        if let Some(inner) = rest.get(inner_start..inner_end) {
             inners.push(inner);
         }
-        let Some(next_idx) = rel_end.checked_add(close_tag.len()) else {
-            break;
-        };
-        rest = tail.get(next_idx..).unwrap_or("");
+        rest = rest.get(close_end..).unwrap_or("");
     }
     inners
 }
@@ -1218,32 +1397,18 @@ where
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(open_tag) {
-        if let Some(before) = rest.get(..start) {
+    while let Some((open_start, inner_start, inner_end, close_end)) =
+        find_unquoted_tag_span(rest, open_tag, close_tag)
+    {
+        if let Some(before) = rest.get(..open_start) {
             out.push_str(before);
         }
-        let Some(after_open_idx) = start.checked_add(open_tag.len()) else {
-            break;
-        };
-        let Some(after_open) = rest.get(after_open_idx..) else {
-            break;
-        };
-        let Some(rel_close) = after_open.find(close_tag) else {
-            if let Some(rem) = rest.get(start..) {
-                out.push_str(rem);
-            }
-            return out;
-        };
-        let Some(inner) = after_open.get(..rel_close) else {
-            break;
-        };
-        if let Some(replacement) = f(inner) {
+        if let Some(inner) = rest.get(inner_start..inner_end)
+            && let Some(replacement) = f(inner)
+        {
             out.push_str(&replacement);
         }
-        let Some(next_idx) = rel_close.checked_add(close_tag.len()) else {
-            break;
-        };
-        rest = after_open.get(next_idx..).unwrap_or("");
+        rest = rest.get(close_end..).unwrap_or("");
     }
     out.push_str(rest);
     out
@@ -1461,5 +1626,56 @@ mod tests {
             .expect("project context");
         assert!(kept_proj.contains("Follow AGENTS.md"));
         assert!(!kept_proj.contains("Repeat rules"));
+    }
+
+    #[test]
+    fn codex_tui_nested_backtick_collaboration_mode_and_cloud_plugin_skills_compact_cleanly() {
+        let codex_tui_dev = "\
+<skills_instructions>
+## Skills
+### Skill roots
+- `r0` = `/Users/dev/.agents/skills`
+- `r1` = `/Users/dev/.codex/skills/.system`
+- `r2` = `/Users/dev/.codex/plugins/cache/openai-curated-remote/work-pets/0.1.6/skills`
+- `r3` = `/Users/dev/.codex/plugins/cache/openai-bundled`
+- `r4` = `/Users/dev/.codex/plugins/cache/openai-primary-runtime/spreadsheets/26.1123/skills`
+### Available skills
+- find-skills: Discover agent skills. (file: r0/find-skills/SKILL.md)
+- skill-creator: Create or update a skill. (file: r1/skill-creator/SKILL.md)
+- work-pets:pets: Manage animated pets in ChatGPT Work mode. (file: r2/pets/SKILL.md)
+- visualize: Render interactive widgets. (file: r3/visualize/1.0.0/skills/visualize/SKILL.md)
+- spreadsheets: Edit workbooks in ChatGPT runtime. (file: r4/spreadsheets/SKILL.md)
+</skills_instructions>
+<permissions instructions>
+Approval policy is currently never.
+</permissions instructions>
+<collaboration_mode># Collaboration Mode: Default
+
+Your active mode changes only when new developer instructions with a different `<collaboration_mode>...</collaboration_mode>` change it; user requests or tool descriptions do not change mode by themselves.
+
+## request_user_input availability
+
+Use the `request_user_input` tool only when it is listed in the available tools for this turn.
+</collaboration_mode>
+<apps_instructions>
+Apps prose.
+</apps_instructions>";
+
+        let distilled = distill_harness_developer_item(DetectedHarness::Codex, codex_tui_dev)
+            .expect("compacted codex developer item");
+        assert!(distilled.contains("- `r0` = `/Users/dev/.agents/skills`"));
+        assert!(distilled.contains("- `r1` = `/Users/dev/.codex/skills/.system`"));
+        assert!(distilled.contains("- find-skills (file: r0/find-skills/SKILL.md)"));
+        assert!(distilled.contains("- skill-creator (file: r1/skill-creator/SKILL.md)"));
+        assert!(!distilled.contains("r2"));
+        assert!(!distilled.contains("r3"));
+        assert!(!distilled.contains("r4"));
+        assert!(!distilled.contains("work-pets"));
+        assert!(!distilled.contains("visualize"));
+        assert!(!distilled.contains("spreadsheets"));
+        assert!(!distilled.contains("request_user_input availability"));
+        assert!(!distilled.contains("`<collaboration_mode>...</collaboration_mode>`"));
+        assert_eq!(distilled.matches("</collaboration_mode>").count(), 1);
+        assert!(!distilled.contains("<apps_instructions>"));
     }
 }

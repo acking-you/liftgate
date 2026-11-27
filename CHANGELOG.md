@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Codex CLI & Codex App TTFT and system-prompt compaction**:
+  - `lg cx` and isolated `lg cxa` now disable ChatGPT cloud connectors and remote plugin sync (`features.apps = false`, `features.remote_plugin = false`, `features.recommended_plugins = false`) unless explicitly overridden via `-c`, eliminating ~2.0s of pre-request `chatgpt.com` blocking HTTP round-trips and ~670 KB of unused ChatGPT connector tool schemas per request.
+  - Hardened `transform_tag_blocks` and `extract_all_tag_inners` in `harness_prompt` to match structural XML tags at line boundaries instead of backtick-quoted prose examples (such as `` `<collaboration_mode>...</collaboration_mode>` ``), fixing ~1.6 KB of leaked `# Collaboration Mode: Default` boilerplate in Codex developer prompts.
+  - Filtered non-executable ChatGPT cloud/bundled plugin skill roots (`/plugins/cache/openai-*`, `/plugins/openai-primary-runtime`, `/bundled-marketplaces/openai-bundled`) and orphaned root aliases out of compacted `<skills_instructions>`, removed the forced pre-tool preamble instruction from `CODEX_DISTILLED_PROMPT`, and deduplicated `CodexExec` / `apply_patch` instructions in `<api_gateway_bridge_rules>`.
+
 ## [0.2.19] - 2026-11-28
 
 ### Added

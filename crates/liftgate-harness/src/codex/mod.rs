@@ -38,6 +38,7 @@ const ISOLATED_CODEX_APP_EXTRA_ROOT_KEYS: &[&str] = &[
 ];
 
 const ISOLATED_DESKTOP_DISABLED_FEATURES: &[&str] = &[
+    "apps",
     "remote_control",
     "in_app_updates",
     "remote_plugin",

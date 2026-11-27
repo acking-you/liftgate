@@ -115,11 +115,11 @@ pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> Str
             has_apply_patch,
         } => {
             out.push_str(&format!(
-                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): invoke native `mcp_lg_{mcp_name}` with `{{\"code\": \"<plain JavaScript>\"}}` (raw JS inside `code`, no markdown fences). Inside `exec`, fan out concurrent local read-only commands via `await Promise.all([tools.exec_command(...), ...])`, persist full outputs in `store(key, raw)` / `load(key)`, emit `<= 8 KB` filtered excerpts via `text(...)`, and call `mcp_lg_wait` if a cell yields a `cell_id`."
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, and call `mcp_lg_wait` on `cell_id`."
             ));
             if has_apply_patch {
                 out.push_str(&format!(
-                    " For 5+ existing-file patches needing per-file fault isolation, run `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `mcp_lg_{mcp_name}` cell; when `<collaboration_mode>` / `<permissions instructions>` allow non-interactive workspace writes (NEVER in `Plan Mode`, `read-only`, or manual `on-request` shell approval), stream large new files or mechanical 5+-file updates plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`)."
+                    " For 5+ file patches needing fault isolation, use `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` in `mcp_lg_{mcp_name}`; when permissions allow non-interactive writes (never in `Plan Mode` or `read-only`), stream large new files + checks in one `exec_command`."
                 ));
             }
             out.push('\n');
@@ -192,7 +192,7 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
     header_rules.push_str("<api_gateway_bridge_rules>\n");
     let batch_clause = match mcp_spec.orchestrator {
         Some(McpOrchestratorContract::CodexExec { mcp_name, .. }) => format!(
-            "Top-level `mcp_lg_*` calls execute sequentially (~1.3s overhead per call); coalesce multi-file searches, symbol lookups, and ranged reads into a SINGLE `mcp_lg_{mcp_name}` Code Mode cell (`await Promise.all([tools.exec_command(...), ...])`), cache raw outputs in `store(key, raw)` / `load(key)`, and filter `text(...)` output to <= 8 KB (~200 lines) to avoid context spills."
+            "Top-level `mcp_lg_*` calls execute sequentially; batch multi-step searches and ranged reads into a SINGLE `mcp_lg_{mcp_name}` Code Mode cell (`<= 8 KB` output)."
         ),
         Some(McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }) => format!(
             "Top-level `mcp_lg_*` calls execute sequentially (~1.3s overhead per call); coalesce multi-file searches, ranged reads, and checks into a SINGLE compound `mcp_lg_{bash_mcp_name}` command instead of separate `Read`/`Grep`/`Glob` calls, keeping stdout <= 8 KB (~200 lines)."
@@ -255,7 +255,7 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         .find(|(client_name, _)| client_name.eq_ignore_ascii_case("apply_patch"))
     {
         header_rules.push_str(&format!(
-            "- File edits (`mcp_lg_{mcp_ap}`): invoke native `mcp_lg_{mcp_ap}` with `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target line ranges verbatim (use `mcp_lg_read_context_spill` if a prior read was truncated). Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call to avoid serial MCP round-trips (merging all edits to the same file under one `*** Update File:` header with 1-3 exact context lines per `@@` hunk); if verification fails, re-read exact lines and retry ONLY the failed file.\n"
+            "- File edits (`mcp_lg_{mcp_ap}`): pass `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target lines. Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call (1-3 context lines per `@@` hunk); on failure, re-read and retry only the failed file.\n"
         ));
     }
     if let Some(contract) = mcp_spec.orchestrator {
