@@ -130,6 +130,10 @@ pub fn read_context_spill_input_schema() -> Value {
                 "type": "integer",
                 "description": "1-based starting line number (default 1)."
             },
+            "byte_offset": {
+                "type": "integer",
+                "description": "0-based byte offset within `start_line` to resume reading an overlong single line (default 0; e.g. minified JSON)."
+            },
             "max_lines": {
                 "type": "integer",
                 "description": "Maximum lines to return (1..200, default 120)."

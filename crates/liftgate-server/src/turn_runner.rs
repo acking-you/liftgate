@@ -4861,6 +4861,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             ResolvedMcpIncoming::ReadContextSpill {
                                 path,
                                 start_line,
+                                byte_offset,
                                 max_lines,
                                 query,
                                 reply_tx,
@@ -4869,6 +4870,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     Some(store) => match store.read_slice(
                                         &path,
                                         start_line,
+                                        byte_offset,
                                         max_lines,
                                         query.as_deref(),
                                     ) {

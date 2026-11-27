@@ -302,7 +302,8 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
     if mcp_spec.has_context_spill_reader {
         header_rules.push_str(
             "- Context spills: when a prompt, tool output, or web fetch notes a truncated spill file saved in `spills`, \
-             inspect line ranges or search matches in 0-RTT via native `mcp_lg_read_context_spill` (`{\"path\": \"<spill_path_or_filename>\", \"start_line\": 1, \"max_lines\": 120}`) \
+             inspect line ranges, `byte_offset` continuations on overlong single lines, or search matches in 0-RTT via native `mcp_lg_read_context_spill` \
+             (`{\"path\": \"<spill_path_or_filename>\", \"start_line\": 1, \"byte_offset\": 0, \"max_lines\": 120}`) \
              rather than client file/shell tools (which execute on the caller's host, not the gateway host).\n",
         );
     }

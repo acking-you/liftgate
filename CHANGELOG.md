@@ -2,20 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.14] - 2026-11-27
 
 ### Added
 - **Remote Endpoint Mode (`lg remote`, `--remote <endpoint>`, `AGY_REMOTE`)**:
-  - Added `lg remote [<host:port>|local|status]` (alias `lg endpoint`, `--api-key`, `--clear-key`, `--no-verify`, `--json`) persisting `target_mode`, `remote_endpoint`, and `remote_api_key` in `~/.liftgate/settings.json`, plus one-off `--remote <endpoint>` overrides across `lg cx`, `lg cxa`, `lg cc`, `lg cd`, `lg oc`, `lg omp`, `lg config`, `lg status`, `lg models`, `lg ui`, `lg doctor`, `lg logs --acp`, and `lg top` without spawning a local daemon or requiring a local `agy` binary.
+  - Added `lg remote [<host:port>|local|status]` (alias `lg endpoint`, `--api-key`, `--clear-key`, `--no-verify`, `--json`) persisting `target_mode`, `remote_endpoint`, and `remote_api_key` in `~/.liftgate/settings.json` (honoring ambient `AGY_GATEWAY_API_KEY` / `LIFTGATE_API_KEY` during verification without leaking env secrets to disk), plus one-off `--remote <endpoint>` overrides across `lg cx`, `lg cxa`, `lg cc`, `lg cd`, `lg oc`, `lg omp`, `lg config`, `lg status`, `lg models`, `lg ui`, `lg doctor`, `lg logs --acp`, and `lg top` without spawning a local daemon or requiring a local `agy` binary.
   - Upgraded `GatewayClient` onto `GatewayEndpoint` supporting IPv4, bracketed IPv6 (`[fd00::1]:8787`), port shorthands, and DNS/Tailscale hostnames (`devbox.lan:8787`), and automatically merged the active gateway endpoint host into `NO_PROXY` / `no_proxy` across all CLI and desktop GUI harness launchers (`merge_endpoint_no_proxy`).
 - **Zero-RTT `mcp_lg_read_context_spill` gateway tool & lossless `< 9.6 KB` MCP output spilling**:
-  - Mounted `mcp_lg_read_context_spill` (`path`, `start_line`, `max_lines`, `query`) on `LoopbackMcpServer` when `SpillStore` is active and capped inline MCP `tools/call` text replies at `9,600` bytes (strictly below `agy acp`'s internal `~10 KiB` middle-truncation cliff) so oversized file reads and command outputs are persisted 100% losslessly in `~/.liftgate/spills/` (`.txt` and `.json`) and inspectable in `0-RTT` across both local sandboxes and `lg remote` clients.
+  - Mounted `mcp_lg_read_context_spill` (`path`, `start_line`, `byte_offset`, `max_lines`, `query`) on `LoopbackMcpServer` when `SpillStore` is active and capped inline MCP `tools/call` text replies at `9,600` bytes (strictly below `agy acp`'s internal `~10 KiB` middle-truncation cliff) so oversized file reads and command outputs (including `> 16 MiB` logs and overlong single-line minified `.json` payloads) are persisted 100% losslessly in `~/.liftgate/spills/` and inspectable in `0-RTT` across both local sandboxes and `lg remote` clients.
 
 ### Fixed
 - **Zero truncation of real `ToolCall` / assistant `output` payloads & `apply_patch` reliability**:
   - Exempted `CanonicalRole::Assistant` text and `CanonicalPart::ToolCall` arguments from Stage-4 active prompt waterfill truncation (`prompt_plan.rs`), raised recent-tail archival `max_tool_call_bytes` to `24 KiB` on cold history replays, steered `mcp_lg_apply_patch` to single-file surgical calls (parallelizing multi-file edits), and appended recovery hints on `apply_patch verification failed:` outputs.
-- **Oh My Pi (`lg omp`) tool-calling accuracy & multi-step MCP warm-session preservation**:
-  - Rendered compact TypeScript parameter types and string union `enum` literals inside `<eval_session_tools>` (`planner.rs`), auto-backfilled required `"i": string` intent parameters from `"toolSummary"` before stripping `"toolSummary"`, enforced `0-RTT` non-nullable required-field preflight on direct bridged function tools (preserving OpenAI-strict nullable optional fields), exposed `codeModeTs` in `mcp_lg_search_client_tools` for `omp` `eval` sessions, and reconciled final multi-step MCP `wire_usage` / `committed_context_used` to single-window context occupancy so cumulative sub-call token sums no longer trigger false-positive ACP compaction session retirements.
+- **Oh My Pi (`lg omp`) tool-calling accuracy, warm schema sync & multi-step MCP warm-session preservation**:
+  - Rendered compact nested TypeScript parameter types and string union `enum` literals inside `<eval_session_tools>` (`planner.rs`), auto-backfilled required `"i": string` intent parameters from `"toolSummary"` before stripping `"toolSummary"`, enforced `0-RTT` non-nullable required-field preflight on direct bridged function tools (preserving OpenAI-strict nullable optional fields and refreshing direct-tool schema metadata on warm mid-session updates), exposed `codeModeTs` in `mcp_lg_search_client_tools` for `omp` `eval` sessions, and reconciled final multi-step MCP `wire_usage` / `committed_context_used` to single-window context occupancy so cumulative sub-call token sums no longer trigger false-positive ACP compaction session retirements.
 
 ## [0.2.13] - 2026-11-27
 

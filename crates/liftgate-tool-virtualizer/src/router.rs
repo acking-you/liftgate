@@ -52,6 +52,7 @@ pub enum VirtualizedCallDecision {
     ReadContextSpill {
         path: String,
         start_line: usize,
+        byte_offset: usize,
         max_lines: usize,
         query: Option<String>,
     },
@@ -269,7 +270,7 @@ impl McpRoutingTable {
         profile: P,
         prepass: &P::Prepass,
         client_tools: &[CanonicalToolSpec],
-        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        mut direct_by_mcp: HashMap<String, McpBridgedTool>,
         hub_names_by_namespace: HashMap<String, String>,
         has_virtualized_dispatch: bool,
         has_gateway_web_fetch: bool,
@@ -280,10 +281,10 @@ impl McpRoutingTable {
             0,
             "HarnessToolProfile implementations must be zero-sized unit structs"
         );
-        let mut direct_by_client: HashMap<&str, &McpBridgedTool> =
+        let mut client_to_mcp_key: HashMap<String, String> =
             HashMap::with_capacity(direct_by_mcp.len());
-        for b in direct_by_mcp.values() {
-            direct_by_client.insert(b.client_name.as_str(), b);
+        for (mcp_key, b) in &direct_by_mcp {
+            client_to_mcp_key.insert(b.client_name.clone(), mcp_key.clone());
         }
 
         let mut hubs_by_mcp: HashMap<String, HubNamespaceTable> =
@@ -342,7 +343,20 @@ impl McpRoutingTable {
             let schema_meta = extract_schema_metadata(params_json.as_deref());
 
             let (namespace, short_action, invoke_via_mcp_name, is_custom, unwrap_key, v4a_patch) =
-                if let Some(direct) = direct_by_client.get(spec.name.as_str()) {
+                if let Some(mcp_key) = client_to_mcp_key.get(spec.name.as_str())
+                    && let Some(direct_mut) = direct_by_mcp.get_mut(mcp_key)
+                {
+                    direct_mut.is_custom = is_custom_eligible;
+                    direct_mut.unwrap_custom_key = custom_unwrap_key;
+                    direct_mut.v4a_patch = profile_v4a_patch;
+                    direct_mut.parameters_json.clone_from(&params_json);
+                    direct_mut
+                        .non_nullable_required_fields
+                        .clone_from(&schema_meta.non_nullable_required_fields);
+                    direct_mut.declares_tool_summary = schema_meta.declares_tool_summary;
+                    direct_mut.requires_string_intent_i = schema_meta.requires_string_intent_i;
+                    direct_mut.has_root_combinator = schema_meta.has_root_combinator;
+
                     let opt_ns = match &placement {
                         ToolPlacement::Namespaced { namespace, .. } => {
                             Some(namespace.clone().into_owned())
@@ -355,10 +369,10 @@ impl McpRoutingTable {
                     (
                         opt_ns,
                         None,
-                        direct.mcp_name.clone(),
-                        direct.is_custom,
-                        direct.unwrap_custom_key,
-                        direct.v4a_patch,
+                        direct_mut.mcp_name.clone(),
+                        direct_mut.is_custom,
+                        direct_mut.unwrap_custom_key,
+                        direct_mut.v4a_patch,
                     )
                 } else if let ToolPlacement::Namespaced { namespace, action } = placement {
                     let ns_owned = namespace.into_owned();
@@ -516,6 +530,11 @@ impl McpRoutingTable {
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(1)
                 .max(1);
+            let byte_offset = arguments
+                .get("byte_offset")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(0);
             let max_lines = arguments
                 .get("max_lines")
                 .and_then(Value::as_u64)
@@ -531,6 +550,7 @@ impl McpRoutingTable {
             return VirtualizedCallDecision::ReadContextSpill {
                 path: path.to_owned(),
                 start_line,
+                byte_offset,
                 max_lines,
                 query,
             };
@@ -546,27 +566,29 @@ impl McpRoutingTable {
         }
 
         if let Some(bridged) = self.direct_by_mcp.get(mcp_name) {
-            if !is_tool_active(&bridged.client_name, active_tools) {
+            let Some(active_spec) = active_tools.iter().find(|t| t.name == bridged.client_name)
+            else {
                 return disabled_tool_decision(&bridged.client_name);
-            }
-            if bridged.is_custom {
+            };
+            let live_bridged = refresh_bridged_tool_if_changed(bridged, active_spec);
+            if live_bridged.is_custom {
                 return resolve_custom_tool_call(
-                    &bridged.client_name,
+                    &live_bridged.client_name,
                     arguments,
-                    bridged.unwrap_custom_key,
-                    bridged.v4a_patch,
+                    live_bridged.unwrap_custom_key,
+                    live_bridged.v4a_patch,
                 );
             }
             let serialized = match format_direct_tool_arguments(
                 arguments,
-                bridged,
+                &live_bridged,
                 self.budget.max_single_schema_in_search_bytes,
             ) {
                 Ok(s) => s,
                 Err(preflight_msg) => return preflight_error_decision(preflight_msg),
             };
             return VirtualizedCallDecision::ForwardToClient {
-                client_name: bridged.client_name.clone(),
+                client_name: live_bridged.client_name.clone(),
                 arguments: serialized,
                 is_custom: false,
             };
@@ -1009,6 +1031,59 @@ fn check_missing_non_nullable_required(
         missing.join(", "),
         provided.join(", ")
     ))
+}
+
+fn refresh_bridged_tool_if_changed<'a>(
+    bridged: &'a McpBridgedTool,
+    active_spec: &CanonicalToolSpec,
+) -> Cow<'a, McpBridgedTool> {
+    match &active_spec.kind {
+        CanonicalToolKind::Custom { .. } => {
+            if bridged.is_custom {
+                Cow::Borrowed(bridged)
+            } else {
+                let unwrap_key = if active_spec.name == "apply_patch" {
+                    Some("patch")
+                } else if is_code_mode_custom_exec(active_spec) {
+                    Some("code")
+                } else {
+                    Some("input")
+                };
+                let mut updated = bridged.clone();
+                updated.is_custom = true;
+                updated.unwrap_custom_key = unwrap_key;
+                updated.parameters_json = None;
+                updated.non_nullable_required_fields.clear();
+                Cow::Owned(updated)
+            }
+        }
+        CanonicalToolKind::Function { parameters_json } => {
+            let normalized_opt = if parameters_json.trim().is_empty() {
+                Some(normalize_mcp_object_schema(parameters_json).to_string())
+            } else {
+                None
+            };
+            let effective_json = normalized_opt
+                .as_deref()
+                .unwrap_or(parameters_json.as_str());
+            if !bridged.is_custom && bridged.parameters_json.as_deref() == Some(effective_json) {
+                return Cow::Borrowed(bridged);
+            }
+            let meta = extract_schema_metadata(Some(effective_json));
+            Cow::Owned(McpBridgedTool {
+                mcp_name: bridged.mcp_name.clone(),
+                client_name: bridged.client_name.clone(),
+                is_custom: false,
+                unwrap_custom_key: None,
+                v4a_patch: bridged.v4a_patch,
+                parameters_json: Some(effective_json.to_owned()),
+                non_nullable_required_fields: meta.non_nullable_required_fields,
+                declares_tool_summary: meta.declares_tool_summary,
+                requires_string_intent_i: meta.requires_string_intent_i,
+                has_root_combinator: meta.has_root_combinator,
+            })
+        }
+    }
 }
 
 fn format_direct_tool_arguments(

@@ -344,9 +344,7 @@ pub fn resolve_effective_target_mode(
     let clean_cli_key = crate::cli::normalize_optional_api_key(explicit_api_key);
     let clean_saved_remote_key =
         crate::cli::normalize_optional_api_key(settings.remote_api_key.as_deref());
-    let env_key = crate::cli::normalize_optional_api_key(
-        std::env::var("AGY_GATEWAY_API_KEY").ok().as_deref(),
-    );
+    let env_key = ambient_gateway_api_key();
 
     if let Some(raw) = raw_override {
         if is_endpoint_local_keyword(raw) {
@@ -377,6 +375,17 @@ pub fn resolve_effective_target_mode(
     Ok(EffectiveTargetMode::Local {
         explicit_listen: None,
     })
+}
+
+/// Reads an ambient gateway API key from `AGY_GATEWAY_API_KEY` or `LIFTGATE_API_KEY`, if non-empty.
+#[must_use]
+pub fn ambient_gateway_api_key() -> Option<String> {
+    crate::cli::normalize_optional_api_key(
+        std::env::var("AGY_GATEWAY_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("LIFTGATE_API_KEY").ok())
+            .as_deref(),
+    )
 }
 
 /// Resolves the effective outbound `agy` proxy (`CLI/env override` -> `settings.json` -> `None`).

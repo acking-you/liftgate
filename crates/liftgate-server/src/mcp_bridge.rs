@@ -116,6 +116,7 @@ pub enum ResolvedMcpIncoming {
     ReadContextSpill {
         path: String,
         start_line: usize,
+        byte_offset: usize,
         max_lines: usize,
         query: Option<String>,
         reply_tx: oneshot::Sender<McpToolCallReply>,
@@ -246,11 +247,13 @@ impl McpSessionHandle {
             VirtualizedCallDecision::ReadContextSpill {
                 path,
                 start_line,
+                byte_offset,
                 max_lines,
                 query,
             } => ResolvedMcpIncoming::ReadContextSpill {
                 path,
                 start_line,
+                byte_offset,
                 max_lines,
                 query,
                 reply_tx: incoming.reply_tx,

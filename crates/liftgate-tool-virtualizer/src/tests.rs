@@ -1572,13 +1572,14 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
         other => panic!("expected Search reply, got {other:?}"),
     }
 
-    // 5. `read_context_spill` resolves to 0-RTT `VirtualizedCallDecision::ReadContextSpill`
+    // 5. `read_context_spill` resolves to 0-RTT `VirtualizedCallDecision::ReadContextSpill` (including `byte_offset`)
     assert_eq!(
         cat.routing_table.resolve_call(
             READ_CONTEXT_SPILL_MCP_NAME,
             &json!({
                 "path": "/Users/dev/.liftgate/spills/tool_result_exec-abcd1234.txt",
                 "start_line": 120,
+                "byte_offset": 8750,
                 "max_lines": 80,
                 "query": "planner"
             }),
@@ -1587,8 +1588,51 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
         VirtualizedCallDecision::ReadContextSpill {
             path: "/Users/dev/.liftgate/spills/tool_result_exec-abcd1234.txt".to_owned(),
             start_line: 120,
+            byte_offset: 8750,
             max_lines: 80,
             query: Some("planner".to_owned()),
         }
     );
+
+    // 6. Warm direct-tool schema mutation refreshes `direct_by_mcp` preflight metadata!
+    let mut updated_tools = tools.clone();
+    updated_tools[1] = fn_tool(
+        "edit",
+        "Hashline edit with optional `edits` on warm schema update",
+        json!({
+            "type": "object",
+            "properties": {
+                "i": { "type": "string" },
+                "path": { "type": "string" },
+                "edits": { "type": "array", "items": { "type": "object" } }
+            },
+            "required": ["i", "path"]
+        }),
+    );
+    let rebuilt = cat
+        .routing_table
+        .rebuild_if_changed(&updated_tools)
+        .expect("must detect warm direct-tool schema update");
+    match rebuilt.resolve_call(
+        "edit",
+        &json!({
+            "path": "src/main.rs",
+            "toolSummary": "Schema updated so `edits` is now optional"
+        }),
+        &updated_tools,
+    ) {
+        VirtualizedCallDecision::ForwardToClient {
+            client_name,
+            arguments,
+            is_custom: false,
+        } => {
+            assert_eq!(client_name, "edit");
+            let parsed: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(parsed["path"], "src/main.rs");
+            assert_eq!(parsed["i"], "Schema updated so `edits` is now optional");
+        }
+        other => panic!(
+            "warm direct-tool schema update must refresh required-field preflight, got {other:?}"
+        ),
+    }
 }

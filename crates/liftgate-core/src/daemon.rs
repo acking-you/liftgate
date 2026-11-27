@@ -1054,6 +1054,15 @@ pub async fn execute_remote(
     state_paths: &StatePaths,
     args: &RemoteArgs,
 ) -> Result<RemoteOutcome, CliError> {
+    execute_remote_with_ambient_key(state_paths, args, crate::state::ambient_gateway_api_key())
+        .await
+}
+
+async fn execute_remote_with_ambient_key(
+    state_paths: &StatePaths,
+    args: &RemoteArgs,
+    ambient_api_key: Option<String>,
+) -> Result<RemoteOutcome, CliError> {
     let mut settings = state_paths.read_settings()?;
     let raw_target = args
         .target
@@ -1076,7 +1085,7 @@ pub async fn execute_remote(
         updated = true;
     } else if !is_status_only && let Some(raw_ep) = raw_target {
         let endpoint = GatewayEndpoint::try_new(raw_ep)?;
-        let next_key = if args.clear_key {
+        let persisted_key = if args.clear_key {
             None
         } else if args.api_key.is_some() {
             normalize_optional_api_key(args.api_key.as_deref())
@@ -1086,15 +1095,16 @@ pub async fn execute_remote(
             None
         };
         if !args.no_verify {
-            probe = Some(probe_remote_endpoint(&endpoint, next_key.clone(), true).await?);
+            let verify_key = persisted_key.clone().or_else(|| ambient_api_key.clone());
+            probe = Some(probe_remote_endpoint(&endpoint, verify_key, true).await?);
         }
         settings.target_mode = GatewayTargetMode::Remote;
         settings.remote_endpoint = Some(endpoint);
-        settings.remote_api_key = next_key;
+        settings.remote_api_key = persisted_key;
         state_paths.write_settings(&settings)?;
         updated = true;
     } else if !is_status_only && (args.api_key.is_some() || args.clear_key) {
-        let next_key = if args.clear_key {
+        let persisted_key = if args.clear_key {
             None
         } else {
             normalize_optional_api_key(args.api_key.as_deref())
@@ -1102,9 +1112,10 @@ pub async fn execute_remote(
         if let Some(ref endpoint) = settings.remote_endpoint
             && !args.no_verify
         {
-            probe = Some(probe_remote_endpoint(endpoint, next_key.clone(), true).await?);
+            let verify_key = persisted_key.clone().or_else(|| ambient_api_key.clone());
+            probe = Some(probe_remote_endpoint(endpoint, verify_key, true).await?);
         }
-        settings.remote_api_key = next_key;
+        settings.remote_api_key = persisted_key;
         state_paths.write_settings(&settings)?;
         updated = true;
     }
@@ -1115,7 +1126,8 @@ pub async fn execute_remote(
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
 
-    let effective = resolve_effective_target_mode(None, None, None, &settings)?;
+    let effective =
+        resolve_effective_target_mode(None, None, ambient_api_key.as_deref(), &settings)?;
     let (effective_endpoint, effective_is_remote) = match &effective {
         EffectiveTargetMode::Remote { endpoint, api_key } => {
             if probe.is_none() && !args.no_verify {
@@ -2519,7 +2531,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            for _ in 0..16 {
+            for _ in 0..32 {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
@@ -2625,7 +2637,33 @@ mod tests {
             GatewayTargetMode::Local
         );
 
-        // 2. Setting remote endpoint with valid `--api-key` verifies and persists cleanly
+        // 1b. Ambient `AGY_GATEWAY_API_KEY` verifies protected remote endpoint without leaking
+        //     the ambient secret into persisted `settings.json`!
+        let env_verified = execute_remote_with_ambient_key(
+            &state_paths,
+            &RemoteArgs {
+                target: Some(addr.to_string()),
+                ..RemoteArgs::default()
+            },
+            Some("remote-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert!(env_verified.updated);
+        assert!(env_verified.effective_is_remote);
+        assert!(
+            !env_verified.has_saved_api_key,
+            "ambient environment API key must not be persisted into settings.json"
+        );
+        assert!(
+            state_paths
+                .read_settings()
+                .unwrap()
+                .remote_api_key
+                .is_none()
+        );
+
+        // 2. Setting remote endpoint with explicit `--api-key` verifies and persists cleanly
         let set_out = execute_remote(
             &state_paths,
             &RemoteArgs {
