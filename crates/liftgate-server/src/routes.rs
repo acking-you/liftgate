@@ -768,7 +768,9 @@ async fn collect_openai_response(
                 }
             }
             TurnEvent::TextDelta(delta) => msg_text.push_str(&delta),
-            TurnEvent::ClientToolCallStart { .. } | TurnEvent::ClientToolCallDelta { .. } => {}
+            TurnEvent::CommentaryBoundary
+            | TurnEvent::ClientToolCallStart { .. }
+            | TurnEvent::ClientToolCallDelta { .. } => {}
             TurnEvent::ClientToolCall {
                 call_id,
                 name,
@@ -861,10 +863,16 @@ async fn collect_openai_response(
         } else {
             Vec::new()
         };
+        let msg_phase = if tool_items.is_empty() {
+            "final_answer"
+        } else {
+            "commentary"
+        };
         resp.output.push(ResponseOutputItem::Message {
             id: format!("msg_{}", generate_short_nonce()),
             status: "completed".to_owned(),
             role: "assistant".to_owned(),
+            phase: Some(msg_phase.to_owned()),
             content: vec![OutputMessageContentPart {
                 part_type: "output_text".to_owned(),
                 text: final_text,
@@ -936,6 +944,7 @@ fn stream_openai_responses(
         let mut open_fetches: HashMap<String, (usize, String, String, Option<String>)> =
             HashMap::new();
         let mut open_client_tools: HashMap<String, OpenStreamingToolItem> = HashMap::new();
+        let mut emitted_client_tool_item = false;
         let mut used_web_grounding = false;
         let mut emitted_search_count: usize = 0;
         let mut leading_ws_buf = String::new();
@@ -954,8 +963,19 @@ fn stream_openai_responses(
             };
             match ev {
                 TurnEvent::ThoughtDelta(delta) => {
-                    if active_message.is_some() {
+                    if delta.is_empty() {
                         continue;
+                    }
+                    if active_message.is_some() {
+                        close_active_message(
+                            &sse_tx,
+                            &mut seq,
+                            &mut active_message,
+                            used_web_grounding,
+                            Some("commentary"),
+                            &mut finalized_items,
+                        )
+                        .await;
                     }
                     let (idx, item_id, acc) = active_reasoning.get_or_insert_with(|| {
                         let idx = output_index;
@@ -1016,15 +1036,8 @@ fn stream_openai_responses(
                         return;
                     }
                 }
-                TurnEvent::WebSearch {
-                    call_id,
-                    status,
-                    query,
-                } => {
-                    if !opts.emit_web_search_items {
-                        continue;
-                    }
-                    used_web_grounding = true;
+                TurnEvent::CommentaryBoundary => {
+                    leading_ws_buf.clear();
                     close_active_reasoning(
                         &sse_tx,
                         &mut seq,
@@ -1038,9 +1051,37 @@ fn stream_openai_responses(
                         &mut seq,
                         &mut active_message,
                         used_web_grounding,
+                        Some("commentary"),
                         &mut finalized_items,
                     )
                     .await;
+                }
+                TurnEvent::WebSearch {
+                    call_id,
+                    status,
+                    query,
+                } => {
+                    close_active_reasoning(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_reasoning,
+                        opts.include_encrypted_reasoning,
+                        &mut finalized_items,
+                    )
+                    .await;
+                    close_active_message(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_message,
+                        used_web_grounding,
+                        Some("commentary"),
+                        &mut finalized_items,
+                    )
+                    .await;
+                    if !opts.emit_web_search_items {
+                        continue;
+                    }
+                    used_web_grounding = true;
 
                     let is_terminal = matches!(status.as_str(), "completed" | "failed");
                     if !is_terminal {
@@ -1203,10 +1244,6 @@ fn stream_openai_responses(
                     url,
                     pattern,
                 } => {
-                    if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
-                        continue;
-                    }
-                    used_web_grounding = true;
                     close_active_reasoning(
                         &sse_tx,
                         &mut seq,
@@ -1220,9 +1257,14 @@ fn stream_openai_responses(
                         &mut seq,
                         &mut active_message,
                         used_web_grounding,
+                        Some("commentary"),
                         &mut finalized_items,
                     )
                     .await;
+                    if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
+                        continue;
+                    }
+                    used_web_grounding = true;
 
                     let idx = output_index;
                     output_index += 1;
@@ -1272,9 +1314,27 @@ fn stream_openai_responses(
                     pattern,
                     outcome,
                 } => {
+                    close_active_reasoning(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_reasoning,
+                        opts.include_encrypted_reasoning,
+                        &mut finalized_items,
+                    )
+                    .await;
+                    close_active_message(
+                        &sse_tx,
+                        &mut seq,
+                        &mut active_message,
+                        used_web_grounding,
+                        Some("commentary"),
+                        &mut finalized_items,
+                    )
+                    .await;
                     if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
                         continue;
                     }
+                    used_web_grounding = true;
                     let (outcome_url, done_status) = match outcome {
                         WebFetchOutcome::Success { url, .. } => (url, "completed"),
                         WebFetchOutcome::Error { url, .. } => (url, "failed"),
@@ -1444,6 +1504,16 @@ fn stream_openai_responses(
                     } else {
                         delta
                     };
+                    let effective_delta = if active_message.is_none() && !finalized_items.is_empty()
+                    {
+                        let trimmed = effective_delta.trim_start_matches(['\r', '\n']);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        trimmed.to_owned()
+                    } else {
+                        effective_delta
+                    };
 
                     let is_new = active_message.is_none();
                     let (idx, msg_id, acc) = active_message.get_or_insert_with(|| {
@@ -1529,9 +1599,11 @@ fn stream_openai_responses(
                         &mut seq,
                         &mut active_message,
                         used_web_grounding,
+                        Some("commentary"),
                         &mut finalized_items,
                     )
                     .await;
+                    emitted_client_tool_item = true;
 
                     if name == INTERNAL_CODEX_LOCAL_SHELL_TOOL
                         || (opts.emit_tool_search_items && name == INTERNAL_CODEX_TOOL_SEARCH_TOOL)
@@ -1637,9 +1709,11 @@ fn stream_openai_responses(
                         &mut seq,
                         &mut active_message,
                         used_web_grounding,
+                        Some("commentary"),
                         &mut finalized_items,
                     )
                     .await;
+                    emitted_client_tool_item = true;
 
                     if let Some(open) = open_client_tools.remove(&call_id) {
                         let (namespace, bare_name) = split_namespaced_tool_name(&name);
@@ -2039,11 +2113,17 @@ fn stream_openai_responses(
             &mut finalized_items,
         )
         .await;
+        let terminal_phase = if emitted_client_tool_item {
+            "commentary"
+        } else {
+            "final_answer"
+        };
         close_active_message(
             &sse_tx,
             &mut seq,
             &mut active_message,
             used_web_grounding,
+            Some(terminal_phase),
             &mut finalized_items,
         )
         .await;
@@ -2085,6 +2165,7 @@ fn stream_openai_responses(
                 id: msg_id,
                 status: "completed".to_owned(),
                 role: "assistant".to_owned(),
+                phase: Some(terminal_phase.to_owned()),
                 content: vec![OutputMessageContentPart {
                     part_type: "output_text".to_owned(),
                     text: leading_ws_buf,
@@ -2351,6 +2432,7 @@ async fn close_active_message(
     seq: &mut u64,
     active_message: &mut Option<(usize, String, String)>,
     emit_citations: bool,
+    phase: Option<&str>,
     finalized_items: &mut Vec<ResponseOutputItem>,
 ) {
     if let Some((idx, msg_id, full_text)) = active_message.take() {
@@ -2410,6 +2492,7 @@ async fn close_active_message(
             id: msg_id,
             status: "completed".to_owned(),
             role: "assistant".to_owned(),
+            phase: phase.map(str::to_owned),
             content: vec![OutputMessageContentPart {
                 part_type: "output_text".to_owned(),
                 text: full_text,
@@ -2616,7 +2699,9 @@ async fn collect_anthropic_messages(
                 }
             }
             TurnEvent::TextDelta(delta) => current_text.push_str(&delta),
-            TurnEvent::ClientToolCallStart { .. } | TurnEvent::ClientToolCallDelta { .. } => {}
+            TurnEvent::CommentaryBoundary
+            | TurnEvent::ClientToolCallStart { .. }
+            | TurnEvent::ClientToolCallDelta { .. } => {}
             TurnEvent::ClientToolCall {
                 call_id,
                 name,
@@ -3129,7 +3214,7 @@ fn stream_anthropic_messages(
                     }
                     open_tool_blocks.insert(call_id, idx);
                 }
-                TurnEvent::ClientToolCallDelta { .. } => {}
+                TurnEvent::CommentaryBoundary | TurnEvent::ClientToolCallDelta { .. } => {}
                 TurnEvent::ClientToolCall {
                     call_id,
                     name,

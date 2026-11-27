@@ -40,12 +40,13 @@ const BUILTIN_BASE_PROMPT_MIN_BYTES: usize = 1_500;
 /// Maximum UTF-8 bytes of trailing `gitStatus:` snapshot retained from a built-in system block.
 const MAX_PRESERVED_GIT_STATUS_BYTES: usize = 2_400;
 
-/// Compact Codex CLI & Codex App system contract (`< 600B`), delegating tool-routing rules to
+/// Compact Codex CLI & Codex App system contract (`< 760B`), delegating tool-routing rules to
 /// `<api_gateway_bridge_rules>` while overriding host `file://` and `<appDataDir>/brain` habits.
 pub const CODEX_DISTILLED_PROMPT: &str = "\
 You are a coding agent running in the Codex CLI. Be precise, safe, and concise.
 - Resolve the user's request end-to-end; inspect the workspace directly (`rg`, `rg --files`) rather than guessing, and validate changes with targeted checks.
 - Obey scoped `AGENTS.md` files (deeper overrides parent; user/developer instructions take precedence). Never commit or create git branches unless asked.
+- Call tools directly without routine pre-tool preamble chatter; reserve assistant text for findings, blockers, or the final answer.
 - Reply concisely in GitHub-flavored Markdown, wrap identifiers/paths/commands in backticks, and format file references as inline `path/to/file:line` (never emit `file://` URIs, `【F:...】` citations, or host `<appDataDir>/brain` artifacts).";
 
 /// Compact Claude Code (`claude`) system contract (`< 550B`).
@@ -1265,12 +1266,10 @@ fn skip_fenced_code_block_at_line_start(text: &str, idx: usize) -> Option<usize>
                 None => Some(text.len()),
             };
         }
-        match text.get(scan..).and_then(|s| s.find('\n')) {
-            Some(rel_nl) => scan = scan.checked_add(rel_nl)?.checked_add(1)?,
-            None => return Some(text.len()),
-        }
+        let rel_nl = text.get(scan..).and_then(|s| s.find('\n'))?;
+        scan = scan.checked_add(rel_nl)?.checked_add(1)?;
     }
-    Some(text.len())
+    None
 }
 
 fn skip_inline_backtick_span_on_line(text: &str, idx: usize) -> Option<usize> {
@@ -1677,5 +1676,26 @@ Apps prose.
         assert!(!distilled.contains("`<collaboration_mode>...</collaboration_mode>`"));
         assert_eq!(distilled.matches("</collaboration_mode>").count(), 1);
         assert!(!distilled.contains("<apps_instructions>"));
+    }
+
+    #[test]
+    fn unclosed_code_fence_inside_instructions_preserves_agents_md() {
+        let user_env = "\
+# AGENTS.md instructions for /workspace/demo
+
+<INSTRUCTIONS>
+# Project Rules
+Example snippet with an unclosed fence:
+```rust
+fn demo() {}
+</INSTRUCTIONS>
+<environment_context>
+  <cwd>/workspace/demo</cwd>
+</environment_context>";
+
+        let extracted = extract_all_tag_blocks(user_env, "<INSTRUCTIONS>", "</INSTRUCTIONS>");
+        assert_eq!(extracted.len(), 1);
+        assert!(extracted[0].contains("# Project Rules"));
+        assert!(CODEX_DISTILLED_PROMPT.contains("without routine pre-tool preamble chatter"));
     }
 }

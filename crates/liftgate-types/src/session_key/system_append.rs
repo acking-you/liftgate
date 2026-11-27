@@ -115,7 +115,7 @@ pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> Str
             has_apply_patch,
         } => {
             out.push_str(&format!(
-                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, and call `mcp_lg_wait` on `cell_id`."
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, call `mcp_lg_wait` on `cell_id`, and invoke `mcp_lg_*` tools directly without routine pre-tool preamble text."
             ));
             if has_apply_patch {
                 out.push_str(&format!(
