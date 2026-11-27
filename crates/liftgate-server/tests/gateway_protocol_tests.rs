@@ -1689,6 +1689,7 @@ async fn turn_timeout_aborts_leased_session_without_real_sleep() {
     });
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -12619,4 +12620,302 @@ async fn failed_native_acp_fetch_emits_error_outcome_on_openai_and_anthropic() {
         .expect("expected web_fetch_tool_result block");
     assert_eq!(wf_result["content"]["type"], "web_fetch_tool_error");
     assert_eq!(wf_result["content"]["error_code"], "url_not_accessible");
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_sse_flushes_commentary_to_restore_working_indicator_and_preserves_multi_message_cache()
+ {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1: Un-newlined preamble sentence followed by a 15s upstream tool-JSON generation gap
+        // (matching Gemini buffering a large `functionCall` after a short text chunk).
+        MockScript::PacedChunks {
+            chunk_delay: Duration::from_secs(15),
+            chunks_template: vec![
+                "正在检查当前工作区的最近改动与状态。".to_owned(),
+                "<agy_tool_call_{NONCE}>{\"name\": \"exec\", \"input\": \"const x = 1;\"}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        // Turn 2: Multi-step commentary -> native `search_web` -> second-step reasoning -> final answer
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "Planning Shenzhen forecast lookup\n" }
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "正在查询深圳明天的最新天气预报数据。" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_ws_sz",
+                    "name": "search_web",
+                    "args": { "query": "深圳明天天气" },
+                    "status": "in_progress",
+                    "kind": "search",
+                    "title": "Searching web"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_ws_sz",
+                    "name": "search_web",
+                    "status": "completed",
+                    "kind": "search",
+                    "title": "Searched web"
+                }),
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "Cross-checking wind and UV index\n" }
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "\n\n明天深圳多云转晴，14℃ ~ 23℃。" }
+                }),
+            ],
+            usage: mock_acp_usage(120, 45, 0),
+        },
+        // Turn 3: Stateless follow-up echoing both `commentary` and `final_answer` message items
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["后天同样晴好干燥。".to_owned()],
+        },
+    ]));
+
+    let app = test_app(Arc::clone(&backend), 60);
+    let codex_exec_tool = json!({
+        "type": "custom",
+        "name": "exec",
+        "description": "Run JavaScript code to orchestrate/compose tool calls"
+    });
+
+    // --- Case 1: Idle commentary flush restores Codex TUI `Working` indicator in 800ms (not 15s) ---
+    let mut stream_fut = tokio::spawn({
+        let app = app.clone();
+        let tool = codex_exec_tool.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "model": "gemini-4-carbon-high",
+                                "stream": true,
+                                "store": false,
+                                "tools": [tool],
+                                "input": "什么状况"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body()
+        }
+    });
+
+    let mut body1 = (&mut stream_fut).await.expect("response headers ready");
+    let mut early_sse = String::new();
+    let early_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < early_deadline {
+        if let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_millis(250), body1.frame()).await
+            && let Ok(bytes) = frame.into_data()
+        {
+            early_sse.push_str(&String::from_utf8_lossy(&bytes));
+            if early_sse.contains("event: response.output_item.done") {
+                break;
+            }
+        }
+    }
+    assert!(
+        early_sse.contains("event: response.output_item.done")
+            && early_sse.contains("\"phase\":\"commentary\"")
+            && early_sse.contains("正在检查当前工作区的最近改动与状态。"),
+        "commentary message must finalize with phase=commentary within <2s (800ms idle boundary) before 15s tool generation finishes; got:\n{early_sse}"
+    );
+    assert!(
+        !early_sse.contains("\"type\":\"custom_tool_call\""),
+        "tool call must still be generating at t < 2s"
+    );
+
+    let rem_bytes = body1.collect().await.unwrap().to_bytes();
+    let full_sse1 = format!("{early_sse}{}", String::from_utf8_lossy(&rem_bytes));
+    assert!(full_sse1.contains("\"type\":\"custom_tool_call\""));
+    assert!(full_sse1.contains("event: response.completed"));
+
+    // --- Case 2: Multi-step web search preserves post-commentary reasoning, phase tags & warm session ---
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "store": true,
+                        "reasoning": { "effort": "high", "summary": "auto" },
+                        "tools": [{ "type": "web_search" }],
+                        "input": [
+                            { "type": "message", "role": "user", "content": "明天深圳天气怎么样" }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let sse2 = String::from_utf8(
+        resp2
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        sse2.contains("\"phase\":\"commentary\""),
+        "pre-search message must carry phase=commentary: {sse2}"
+    );
+    assert!(
+        sse2.contains("Cross-checking wind and UV index"),
+        "second-step reasoning after commentary message must stream instead of being dropped: {sse2}"
+    );
+    assert!(
+        sse2.contains("\"phase\":\"final_answer\"")
+            && sse2.contains("\"text\":\"明天深圳多云转晴，14℃ ~ 23℃。\""),
+        "final message must carry phase=final_answer with leading blank lines stripped: {sse2}"
+    );
+
+    let sessions_before_followup = backend.next_session_num.load(Ordering::SeqCst);
+    let (st3, _body3) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "reasoning": { "effort": "high", "summary": "auto" },
+            "tools": [{ "type": "web_search" }],
+            "input": [
+                { "type": "message", "role": "user", "content": "明天深圳天气怎么样" },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{ "type": "output_text", "text": "正在查询深圳明天的最新天气预报数据。" }]
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_call_ws_sz",
+                    "status": "completed",
+                    "action": { "type": "search", "query": "深圳明天天气" }
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{ "type": "output_text", "text": "明天深圳多云转晴，14℃ ~ 23℃。" }]
+                },
+                { "type": "message", "role": "user", "content": "后天呢" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+    assert_eq!(
+        backend.next_session_num.load(Ordering::SeqCst),
+        sessions_before_followup,
+        "stateless follow-up echoing split commentary + final_answer messages must reuse the warm ACP session"
+    );
+}
+
+#[tokio::test]
+async fn mcp_zero_rtt_substep_closes_commentary_and_streams_second_step_reasoning_to_codex() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 18_000,
+                thoughts: vec!["Checking prior truncated context spill\n".to_owned()],
+                pre_text_templates: vec!["正在读取溢出的工具输出片段。".to_owned()],
+                mcp_name: "read_context_spill".to_owned(),
+                arguments: json!({ "path": "missing-spill.txt", "start_line": 1, "max_lines": 20 }),
+                expect_reply_substrings: vec![],
+            },
+            McpMockStep::CallTool {
+                usage_used: 20_500,
+                thoughts: vec!["Building batched Code Mode script\n".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "exec".to_owned(),
+                arguments: json!({ "code": "text('ok');" }),
+                expect_reply_substrings: vec![],
+            },
+        ],
+        cancelled_usage: mock_acp_usage(20_500, 120, 18_000),
+    }]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let app = build_router(state.clone());
+    let codex_exec_tool = json!({
+        "type": "custom",
+        "name": "exec",
+        "description": "Run JavaScript code to orchestrate/compose tool calls"
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "store": true,
+                        "reasoning": { "effort": "high", "summary": "auto" },
+                        "tools": [codex_exec_tool],
+                        "input": "Inspect workspace status"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    let commentary_done_pos = sse
+        .find("\"phase\":\"commentary\"")
+        .expect("0-RTT MCP boundary must finalize commentary message with phase=commentary");
+    let step2_reasoning_pos = sse
+        .find("Building batched Code Mode script")
+        .expect("second-step reasoning after 0-RTT MCP call must stream to Codex SSE");
+    let custom_tool_pos = sse
+        .find("\"type\":\"custom_tool_call\"")
+        .expect("custom_tool_call exec must follow second-step reasoning");
+    assert!(
+        commentary_done_pos < step2_reasoning_pos && step2_reasoning_pos < custom_tool_pos,
+        "expected commentary message completion before Step 2 reasoning and custom_tool_call; got:\n{sse}"
+    );
 }

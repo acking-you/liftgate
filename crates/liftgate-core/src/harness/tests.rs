@@ -295,6 +295,16 @@ async fn codex_terminal_session_disables_updates_after_passthrough_overrides()
             .map(std::ffi::OsStr::new)
         )
     );
+    for expected_flag in [
+        "features.apps=false",
+        "features.remote_plugin=false",
+        "features.recommended_plugins=false",
+    ] {
+        assert!(
+            argv.contains(&std::ffi::OsStr::new(expected_flag)),
+            "expected Codex launcher argv to contain {expected_flag}"
+        );
+    }
     assert!(command.get_envs().any(|(key, value)| {
         key == "AGY_GATEWAY_API_KEY" && value == Some(std::ffi::OsStr::new("test-gateway-key"))
     }));

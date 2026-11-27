@@ -9,7 +9,7 @@ use liftgate_types::{
     acp::{AcpPromptBlock, AcpUsage, PromptTurnResult, SessionUpdatePayload},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
-        NormalizedTurnRequest, ReasoningEffort,
+        CanonicalToolSpec, NormalizedTurnRequest, ReasoningEffort,
     },
     config::{AcpModeId, GatewayLimits, ModelId},
     error::format_error_chain,
@@ -97,6 +97,7 @@ pub enum TurnEvent {
         pattern: Option<String>,
         outcome: WebFetchOutcome,
     },
+    CommentaryBoundary,
     TextDelta(String),
     ClientToolCallStart {
         call_id: String,
@@ -1443,6 +1444,92 @@ const TRANSCRIPT_RUNAWAY_MARKERS: [&str; 8] = [
 ];
 
 const MAX_POST_TOOL_BRIDGE_NON_WS_CHARS: usize = 120;
+const COMMENTARY_IDLE_FLUSH_DELAY: Duration = Duration::from_millis(800);
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(dl) => tokio::time::sleep_until(dl).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn ends_at_commentary_boundary(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut in_fence = false;
+    let mut open_fence_ticks = 0usize;
+    for line in text.lines() {
+        let line_trimmed = line.trim_start_matches([' ', '\t']);
+        let ticks = line_trimmed.bytes().take_while(|&b| b == b'`').count();
+        if !in_fence {
+            if ticks >= 3 {
+                in_fence = true;
+                open_fence_ticks = ticks;
+            }
+        } else if ticks >= open_fence_ticks
+            && line_trimmed
+                .get(ticks..)
+                .is_some_and(|rest| rest.trim().is_empty())
+        {
+            in_fence = false;
+            open_fence_ticks = 0;
+        }
+    }
+    if in_fence {
+        return false;
+    }
+    let last_line = text.rsplit('\n').next().unwrap_or(text);
+    let inline_ticks = last_line.bytes().filter(|&b| b == b'`').count();
+    if !inline_ticks.is_multiple_of(2) {
+        return false;
+    }
+    if text.ends_with('\n') {
+        return true;
+    }
+    let core = trimmed.trim_end_matches(['"', '\'', '”', '’', ')', '）', ']', '】']);
+    core.ends_with(['.', '。', '!', '！', '?', '？', '…', ';', '；', ':', '：'])
+}
+
+fn compute_merged_text_alt_hash(
+    system: Option<&str>,
+    tools: &[CanonicalToolSpec],
+    web_cfg: WebToolBridgeConfig,
+    model: &ModelId,
+    prior_messages: &[CanonicalMessage],
+    assistant_msg: &CanonicalMessage,
+    raw_merged_text: &str,
+) -> Option<ConversationHash> {
+    let text_part_count = assistant_msg
+        .parts
+        .iter()
+        .filter(|p| matches!(p, CanonicalPart::Text(t) if !t.trim().is_empty()))
+        .count();
+    let has_only_text_parts = assistant_msg
+        .parts
+        .iter()
+        .all(|p| matches!(p, CanonicalPart::Text(_)));
+    if text_part_count < 2 || !has_only_text_parts {
+        return None;
+    }
+    let merged_trimmed = raw_merged_text.trim();
+    if merged_trimmed.is_empty() {
+        return None;
+    }
+    let alt_msg = CanonicalMessage {
+        role: CanonicalRole::Assistant,
+        parts: vec![CanonicalPart::Text(merged_trimmed.to_owned())],
+    };
+    Some(hash_conversation_with_reply(
+        system,
+        tools,
+        web_cfg,
+        model,
+        prior_messages,
+        &alt_msg,
+    ))
+}
 
 struct StreamingClientToolState {
     name: String,
@@ -1456,6 +1543,7 @@ struct TurnStreamState {
     parsed_buf: Vec<ParsedStreamItem>,
     assistant_parts: Vec<CanonicalPart>,
     text_accumulator: String,
+    raw_merged_text: String,
     post_tool_spill_buf: String,
     active_searches: HashMap<String, Option<String>>,
     seen_search_ids: HashSet<String>,
@@ -1464,6 +1552,7 @@ struct TurnStreamState {
     seen_client_tools: HashSet<(String, String)>,
     pending_web_fetches: Vec<(String, String, Option<String>)>,
     active_streaming_tool: Option<StreamingClientToolState>,
+    commentary_idle_deadline: Option<Instant>,
     truncated_tool_abort: Option<String>,
     emitted_client_tool: bool,
     halted_post_tool_runaway: bool,
@@ -1481,6 +1570,7 @@ impl TurnStreamState {
             parsed_buf: Vec::new(),
             assistant_parts: Vec::new(),
             text_accumulator: String::new(),
+            raw_merged_text: String::new(),
             post_tool_spill_buf: String::new(),
             active_searches: HashMap::new(),
             seen_search_ids: HashSet::new(),
@@ -1489,6 +1579,7 @@ impl TurnStreamState {
             seen_client_tools: HashSet::new(),
             pending_web_fetches: Vec::new(),
             active_streaming_tool: None,
+            commentary_idle_deadline: None,
             truncated_tool_abort: None,
             emitted_client_tool: false,
             halted_post_tool_runaway: false,
@@ -1534,13 +1625,46 @@ impl TurnStreamState {
     }
 
     fn flush_text_part(&mut self) {
+        let _ = self.flush_commentary_part();
+    }
+
+    fn flush_commentary_part(&mut self) -> bool {
+        self.commentary_idle_deadline = None;
         let trimmed = self.text_accumulator.trim();
-        if !trimmed.is_empty() {
+        let had_text = !trimmed.is_empty();
+        if had_text {
             self.assistant_parts
                 .push(CanonicalPart::Text(trimmed.to_owned()));
         }
         self.text_accumulator.clear();
+        had_text
     }
+
+    fn push_visible_text(&mut self, chunk: &str, allow_idle_flush: bool) {
+        self.text_accumulator.push_str(chunk);
+        self.raw_merged_text.push_str(chunk);
+        if allow_idle_flush
+            && !self.emitted_client_tool
+            && self.pending_web_fetches.is_empty()
+            && self.active_streaming_tool.is_none()
+            && ends_at_commentary_boundary(&self.text_accumulator)
+        {
+            self.commentary_idle_deadline = Some(Instant::now() + COMMENTARY_IDLE_FLUSH_DELAY);
+        } else {
+            self.commentary_idle_deadline = None;
+        }
+    }
+}
+
+async fn emit_commentary_boundary_if_needed(
+    state: &mut TurnStreamState,
+    events_tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) -> bool {
+    if state.flush_commentary_part() {
+        return send_cancel_safe(events_tx, TurnEvent::CommentaryBoundary, cancel).await;
+    }
+    true
 }
 
 #[expect(
@@ -1642,6 +1766,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
         state.halted_post_tool_runaway = false;
         state.post_tool_spill_buf.clear();
         state.active_streaming_tool = None;
+        state.commentary_idle_deadline = None;
         state.truncated_tool_abort = None;
 
         let (acp_tx, mut acp_rx) = mpsc::channel::<SessionUpdatePayload>(channel_cap);
@@ -1763,6 +1888,11 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         });
                     }
                     return;
+                }
+                () = sleep_until_opt(state.commentary_idle_deadline), if state.commentary_idle_deadline.is_some() => {
+                    if !emit_commentary_boundary_if_needed(&mut state, &events_tx, &cancel).await {
+                        return;
+                    }
                 }
                 maybe_upd = acp_rx.recv() => {
                     if let Some(upd) = maybe_upd {
@@ -2063,6 +2193,9 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 }
 
                 if !state.pending_web_fetches.is_empty() && !state.emitted_client_tool {
+                    if !emit_commentary_boundary_if_needed(&mut state, &events_tx, &cancel).await {
+                        return;
+                    }
                     let queued_fetches: Vec<(String, String, Option<String>)> =
                         std::mem::take(&mut state.pending_web_fetches);
                     let mut continuation_xml = String::new();
@@ -2270,6 +2403,15 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 &full_messages,
                 &assistant_msg,
             );
+            let alt_post_hash = compute_merged_text_alt_hash(
+                req_sys_inst.as_deref(),
+                &req.client_tools,
+                web_cfg,
+                final_lease.model_id(),
+                &full_messages,
+                &assistant_msg,
+                &state.raw_merged_text,
+            );
             let dialogue_hash =
                 hash_dialogue_with_reply(final_lease.model_id(), &full_messages, &assistant_msg);
             {
@@ -2313,7 +2455,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
             };
             let committed_turn = CommittedSessionTurn {
                 post_turn_hash: post_hash,
-                alt_post_turn_hash: None,
+                alt_post_turn_hash: alt_post_hash,
                 post_turn_dialogue_hash: dialogue_hash,
                 declared_tools: req.client_tools,
                 last_context_used: committed_context_used,
@@ -2535,6 +2677,9 @@ async fn forward_acp_update(
                 let thought_chars = content.text.chars().count();
                 state.step_thought_chars = state.step_thought_chars.saturating_add(thought_chars);
                 task_guard.record_thought(&content.text);
+                if !emit_commentary_boundary_if_needed(state, events_tx, cancel).await {
+                    return false;
+                }
                 if req.include_thinking && !req.omit_thinking_text {
                     return send_cancel_safe(
                         events_tx,
@@ -2574,7 +2719,7 @@ async fn forward_acp_update(
                 ) {
                     task_guard.mark_calling_client_tool();
                 }
-                return true;
+                return emit_commentary_boundary_if_needed(state, events_tx, cancel).await;
             }
             if state.emitted_client_tool || !state.pending_web_fetches.is_empty() {
                 tracing::info!(
@@ -2585,6 +2730,9 @@ async fn forward_acp_update(
                 state.tainted_session = true;
                 state.halted_post_tool_runaway = true;
                 return true;
+            }
+            if !emit_commentary_boundary_if_needed(state, events_tx, cancel).await {
+                return false;
             }
             if is_acp_web_search(&kind, &name, &title) {
                 if state.seen_search_ids.insert(tool_call_id.clone()) {
@@ -2695,13 +2843,16 @@ async fn forward_acp_update(
             raw_input,
         } => {
             if name.starts_with(ACP_MCP_TOOL_PREFIX) {
-                return true;
+                return emit_commentary_boundary_if_needed(state, events_tx, cancel).await;
             }
             let new_query = extract_acp_search_query(raw_input.as_deref(), args.as_deref(), &title);
             let is_known_search = state.active_searches.contains_key(&tool_call_id)
                 || state.seen_search_ids.contains(&tool_call_id)
                 || is_acp_web_search(&kind, &name, &title);
             if is_known_search {
+                if !emit_commentary_boundary_if_needed(state, events_tx, cancel).await {
+                    return false;
+                }
                 if !tool_call_id.is_empty() && state.seen_search_ids.insert(tool_call_id.clone()) {
                     task_guard.record_web_search();
                 }
@@ -2741,6 +2892,9 @@ async fn forward_acp_update(
                 || state.seen_fetch_ids.contains(&tool_call_id)
                 || is_acp_web_fetch(&kind, &name);
             if is_known_fetch {
+                if !emit_commentary_boundary_if_needed(state, events_tx, cancel).await {
+                    return false;
+                }
                 if !tool_call_id.is_empty() && state.seen_fetch_ids.insert(tool_call_id.clone()) {
                     task_guard.record_web_fetch();
                 }
@@ -3036,8 +3190,11 @@ async fn emit_parsed_items_inner(
                     if let Some((clean_prefix, _)) = delta.split_at_checked(cut_idx)
                         && !clean_prefix.is_empty()
                     {
+                        let allow_idle_flush = !req.client_tools.is_empty()
+                            || req.enable_native_web_search
+                            || req.enable_native_web_fetch;
                         task_guard.record_text(clean_prefix);
-                        state.text_accumulator.push_str(clean_prefix);
+                        state.push_visible_text(clean_prefix, allow_idle_flush);
                         if !send_cancel_safe(
                             events_tx,
                             TurnEvent::TextDelta(clean_prefix.to_owned()),
@@ -3056,13 +3213,17 @@ async fn emit_parsed_items_inner(
                     break;
                 }
 
+                let allow_idle_flush = !req.client_tools.is_empty()
+                    || req.enable_native_web_search
+                    || req.enable_native_web_fetch;
                 task_guard.record_text(&delta);
-                state.text_accumulator.push_str(&delta);
+                state.push_visible_text(&delta, allow_idle_flush);
                 if !send_cancel_safe(events_tx, TurnEvent::TextDelta(delta), cancel).await {
                     return false;
                 }
             }
             ParsedStreamItem::ToolCallStart { name, is_raw_input } => {
+                state.commentary_idle_deadline = None;
                 state.post_tool_spill_buf.clear();
 
                 if name == INTERNAL_GATEWAY_WEB_FETCH_TOOL && req.enable_native_web_fetch {
@@ -5181,6 +5342,12 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             step_timed_out = true;
                             break;
                         }
+                        () = sleep_until_opt(state.commentary_idle_deadline), if state.commentary_idle_deadline.is_some() => {
+                            if !emit_commentary_boundary_if_needed(&mut state, &cur_events_tx, &cur_cancel).await {
+                                cur_lease.finish_ephemeral();
+                                return;
+                            }
+                        }
                         maybe_call = call_rx_guard.recv() => {
                             if let Some(first_call) = maybe_call {
                                 // `agy acp 1.5.18` executes `mcp_lg_*` `tools/call` RPCs sequentially
@@ -5439,6 +5606,12 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                 }
 
                 if !pending_mcp_incoming.is_empty() && prompt_outcome.is_none() {
+                    if !emit_commentary_boundary_if_needed(&mut state, &cur_events_tx, &cur_cancel)
+                        .await
+                    {
+                        cur_lease.finish_ephemeral();
+                        return;
+                    }
                     mcp_handle.sync_client_tools(&cur_req.client_tools);
                     let mut exceeded_rejection_reason: Option<&'static str> = None;
                     for incoming in pending_mcp_incoming.drain(..) {
@@ -6051,6 +6224,16 @@ async fn run_mcp_session_driver<B: AcpBackend>(
 
                     // Server-side `__gateway_web_fetch` continuation loop.
                     if !state.pending_web_fetches.is_empty() && !state.emitted_client_tool {
+                        if !emit_commentary_boundary_if_needed(
+                            &mut state,
+                            &cur_events_tx,
+                            &cur_cancel,
+                        )
+                        .await
+                        {
+                            cur_lease.finish_ephemeral();
+                            return;
+                        }
                         let max_fetch_uses =
                             cur_req.web_fetch_max_uses.unwrap_or(5).clamp(1, 10) as usize;
                         let queued_fetches: Vec<(String, String, Option<String>)> =
@@ -6323,6 +6506,15 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             &cur_full_messages,
                             &assistant_msg,
                         );
+                        let alt_post_hash = compute_merged_text_alt_hash(
+                            req_sys_inst.as_deref(),
+                            &cur_req.client_tools,
+                            cur_web_cfg,
+                            cur_lease.model_id(),
+                            &cur_full_messages,
+                            &assistant_msg,
+                            &state.raw_merged_text,
+                        );
                         let dialogue_hash = hash_dialogue_with_reply(
                             cur_lease.model_id(),
                             &cur_full_messages,
@@ -6392,7 +6584,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         }
                         cur_lease.commit(CommittedSessionTurn {
                             post_turn_hash: post_hash,
-                            alt_post_turn_hash: None,
+                            alt_post_turn_hash: alt_post_hash,
                             post_turn_dialogue_hash: dialogue_hash,
                             declared_tools: cur_req.client_tools,
                             last_context_used: committed_context_used,

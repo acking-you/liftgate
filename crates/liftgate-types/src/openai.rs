@@ -413,10 +413,16 @@ pub fn normalize_responses_request(
                             let converted = convert_message_content(content)?;
                             if !converted.is_empty() {
                                 has_conversational_input = true;
-                                messages.push(CanonicalMessage {
-                                    role,
-                                    parts: converted,
-                                });
+                                if role == CanonicalRole::Assistant {
+                                    for part in converted {
+                                        push_part(&mut messages, CanonicalRole::Assistant, part);
+                                    }
+                                } else {
+                                    messages.push(CanonicalMessage {
+                                        role,
+                                        parts: converted,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1143,6 +1149,8 @@ pub enum ResponseOutputItem {
         id: String,
         status: String,
         role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
         content: Vec<OutputMessageContentPart>,
     },
     FunctionCall {

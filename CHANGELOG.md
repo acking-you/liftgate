@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.20] - 2026-11-28
+
+### Fixed
+- **Codex CLI & Codex App TTFT, live `Working` status indicator, and system-prompt compaction**:
+  - `lg cx` and isolated `lg cxa` now disable ChatGPT cloud connectors and remote plugin sync (`features.apps = false`, `features.remote_plugin = false`, `features.recommended_plugins = false`) unless explicitly overridden via `-c`, eliminating ~2.0s of pre-request `chatgpt.com` blocking HTTP round-trips and ~670 KB of unused ChatGPT connector tool schemas per request.
+  - Fixed Codex TUI's `Working` status indicator disappearing during tool-call argument generation and multi-step turns: OpenAI `/v1/responses` `message` items now carry explicit `phase` metadata (`"commentary"` vs `"final_answer"`), finalize mid-turn commentary immediately across ACP `tool_call` / `tool_call_update`, 0-RTT MCP calls, subsequent reasoning sub-steps, and an 800ms sentence-boundary idle flush while upstream models buffer large tool JSON payloads, and preserve warm `SessionPool` prefix hashes across multi-message assistant turns.
+  - Updated `CODEX_DISTILLED_PROMPT` and `CodexExec` `<api_gateway_bridge_rules>` to invoke tools directly without routine pre-tool preamble chatter so Codex's live reasoning shimmer stays continuously active.
+  - Hardened `transform_tag_blocks`, `extract_all_tag_inners`, and fenced-code skipping in `harness_prompt` to ignore backtick-quoted tag literals (such as `` `<collaboration_mode>...</collaboration_mode>` ``) without swallowing outer `<INSTRUCTIONS>` tags when `AGENTS.md` contains an unclosed code fence, and filtered non-executable ChatGPT cloud/bundled plugin skill roots out of compacted `<skills_instructions>`.
+
 ## [0.2.19] - 2026-11-28
 
 ### Added

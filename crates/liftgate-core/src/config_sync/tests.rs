@@ -381,6 +381,7 @@ openai_base_url = \"https://example.invalid/v1\"
 profile = \"work\"
 
 [features]
+apps = true
 remote_control = true
 in_app_updates = true
 remote_plugin = true
@@ -426,6 +427,7 @@ command = \"npx\"
     assert!(rendered.contains("check_for_update_on_startup = false"));
     assert!(rendered.contains("requires_openai_auth = false"));
     assert!(rendered.contains("experimental_bearer_token = \"local-agy\""));
+    assert!(rendered.contains("apps = false"));
     assert!(rendered.contains("remote_control = false"));
     assert!(rendered.contains("in_app_updates = false"));
     assert!(rendered.contains("remote_plugin = false"));
@@ -440,6 +442,7 @@ command = \"npx\"
     assert!(!rendered.contains("profile ="));
     assert!(!rendered.contains("[marketplaces.openai-bundled]"));
     assert!(!rendered.contains("[model_providers.agy.auth]"));
+    assert!(!rendered.contains("apps = true"));
     assert!(!rendered.contains("remote_control = true"));
     assert!(!rendered.contains("in_app_updates = true"));
     assert!(!rendered.contains("remote_plugin = true"));
