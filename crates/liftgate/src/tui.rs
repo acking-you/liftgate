@@ -2322,14 +2322,24 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             } else {
                 String::new()
             };
+            let zero_rtt_note = if selected.zero_rtt_mcp_ops > 0 {
+                format!(" · 0-rtt={}", selected.zero_rtt_mcp_ops)
+            } else {
+                String::new()
+            };
+            let spill_note = if selected.spilled_tool_results > 0 {
+                format!(" · spilled={}", selected.spilled_tool_results)
+            } else {
+                String::new()
+            };
             let tools_summary = if selected.client_tool_calls.is_empty() {
                 format!(
-                    "web_search={} · web_fetch={}{vision_note}",
+                    "web_search={} · web_fetch={}{vision_note}{zero_rtt_note}{spill_note}",
                     selected.native_web_searches, selected.native_web_fetches
                 )
             } else {
                 format!(
-                    "{} (web_search={} · web_fetch={}{vision_note})",
+                    "{} (web_search={} · web_fetch={}{vision_note}{zero_rtt_note}{spill_note})",
                     selected.client_tool_calls.join(", "),
                     selected.native_web_searches,
                     selected.native_web_fetches
@@ -2444,6 +2454,21 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             } else {
                 "—".to_owned()
             };
+            let mcp_label = match &s.mcp {
+                Some(m) if m.is_passthrough => {
+                    format!(
+                        "1:1 {}/{} ({})",
+                        m.eager_tools, m.declared_tools, m.harness_profile
+                    )
+                }
+                Some(m) => {
+                    format!(
+                        "hub×{} {}/{} ({})",
+                        m.virtualized_hubs, m.eager_tools, m.declared_tools, m.harness_profile
+                    )
+                }
+                None => "xml/none".to_owned(),
+            };
             Row::new(vec![
                 Cell::from(s.session_id.clone()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(st_label)
@@ -2451,6 +2476,7 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 Cell::from(kv_label)
                     .style(Style::default().fg(kv_color).add_modifier(Modifier::BOLD)),
                 Cell::from(s.model_id.clone()),
+                Cell::from(mcp_label).style(Style::default().fg(Color::Gray)),
                 Cell::from(ctx_label),
                 Cell::from(s.turn_count.to_string()),
                 Cell::from(s.message_count.to_string()),
@@ -2467,14 +2493,15 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(23),
+            Constraint::Percentage(19),
             Constraint::Length(12),
             Constraint::Length(10),
-            Constraint::Percentage(23),
+            Constraint::Percentage(19),
+            Constraint::Length(20),
             Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(11),
         ],
     )
     .header(
@@ -2483,6 +2510,7 @@ fn draw_sessions_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             "STATE",
             "KV CACHE",
             "MODEL",
+            "MCP TOOLS",
             "CTX",
             "TURNS",
             "MSGS",

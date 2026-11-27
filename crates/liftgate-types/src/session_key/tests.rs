@@ -518,10 +518,10 @@ fn bounded_single_turn_plan_archives_cold_history_preserves_active_turn_and_esca
 }
 
 #[test]
-fn spills_massive_mcp_tool_catalog_past_16kb_cap_and_slims_only_developer_instructions() {
-    let many_tools: Vec<CanonicalToolSpec> = (0..60)
+fn spills_massive_mcp_tool_catalog_past_48kb_cap_and_slims_only_developer_instructions() {
+    let many_tools: Vec<CanonicalToolSpec> = (0..190)
             .map(|i| CanonicalToolSpec {
-                name: format!("mcp__opencode_server__tool_{i:02}"),
+                name: format!("mcp__opencode_server__tool_{i:03}"),
                 description: Some(format!(
                     "Detailed OpenCode MCP tool {i} description: {}",
                     "capability ".repeat(35)
@@ -546,10 +546,10 @@ fn spills_massive_mcp_tool_catalog_past_16kb_cap_and_slims_only_developer_instru
         append.len(),
         MAX_SYSTEM_APPEND_BYTES
     );
-    let spill_xml = spill.expect("60 verbose MCP tools must spill excess schemas into Turn 1");
+    let spill_xml = spill.expect("190 verbose MCP tools must spill excess schemas into Turn 1");
     assert!(spill_xml.starts_with("<client_tools_update>"));
-    assert!(spill_xml.contains("mcp__opencode_server__tool_59"));
-    assert!(append.contains("mcp__opencode_server__tool_00"));
+    assert!(spill_xml.contains("mcp__opencode_server__tool_189"));
+    assert!(append.contains("mcp__opencode_server__tool_000"));
 
     // Giant 150 KB `<developer_instructions>` + 35 KB user prompt (> 176 KB total) must slim
     // ONLY `<developer_instructions>` while preserving 100% of the user prompt losslessly.
@@ -770,8 +770,8 @@ fn preserves_full_code_mode_exec_and_repl_tool_declarations_inline_and_on_spill(
     );
     assert!(inline_append.contains("{\"name\": \"exec\", \"input\":"));
 
-    // Now build a >18 KB Code Mode `exec` tool (45 nested MCP tools) and verify it keeps
-    // `systemPrompt.append <= 16 KB` while spilling 100% of `declare const tools` into Turn 1!
+    // Build a >18 KB Code Mode `exec` tool (~22 KB): under the calibrated 48 KB
+    // `MAX_SYSTEM_APPEND_BYTES` budget (`agy acp 1.5.18`), it now fits 100% inline in `session/new`!
     let mut big_decls = ts_decls;
     big_decls.truncate(big_decls.len().saturating_sub(6));
     for idx in 8..180 {
@@ -780,29 +780,60 @@ fn preserves_full_code_mode_exec_and_repl_tool_declarations_inline_and_on_spill(
             ));
     }
     big_decls.push_str("};\n```");
-    assert!(big_decls.len() > 18_000);
+    assert!(big_decls.len() > 18_000 && big_decls.len() < 36_000);
 
     let big_tools = vec![
         CanonicalToolSpec {
             name: "exec".to_owned(),
-            description: Some(big_decls),
+            description: Some(big_decls.clone()),
             kind: CanonicalToolKind::Custom { format_json: None },
         },
         inline_tools[1].clone(),
     ];
 
-    let (spilled_append, spilled_xml_opt) = build_session_system_append_with_spill(
+    let (mid_append, mid_spill_opt) = build_session_system_append_with_spill(
         None,
         &big_tools,
         WebToolBridgeConfig::default(),
         "9c2e",
     );
+    assert!(mid_spill_opt.is_none());
+    assert!(mid_append.len() <= MAX_SYSTEM_APPEND_BYTES);
+    assert!(mid_append.contains("mcp__enterprise__connector_action_179"));
+
+    // Now exceed the 48 KB `MAX_SYSTEM_APPEND_BYTES` ceiling with an additional Code Mode `REPL`
+    // + connector catalog (>56 KB total) and verify excess tools spill losslessly into Turn 1!
+    let mut huge_tools = big_tools;
+    huge_tools.push(CanonicalToolSpec {
+        name: "REPL".to_owned(),
+        description: Some(format!("Persistent REPL.\n{big_decls}")),
+        kind: CanonicalToolKind::Function {
+            parameters_json:
+                r#"{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}"#
+                    .to_owned(),
+        },
+    });
+    for extra_idx in 0..24 {
+        huge_tools.push(CanonicalToolSpec {
+            name: format!("extra_connector_tool_{extra_idx:02}"),
+            description: Some("Connector action.".to_owned()),
+            kind: CanonicalToolKind::Function {
+                parameters_json: r#"{"type":"object","properties":{"id":{"type":"string"},"filter":{"type":"string"}},"required":["id"]}"#.to_owned(),
+            },
+        });
+    }
+
+    let (spilled_append, spilled_xml_opt) = build_session_system_append_with_spill(
+        None,
+        &huge_tools,
+        WebToolBridgeConfig::default(),
+        "9c2e",
+    );
     assert!(spilled_append.len() <= MAX_SYSTEM_APPEND_BYTES);
     assert!(spilled_append.contains("{\"name\": \"exec\", \"input\":"));
-    let spilled_xml = spilled_xml_opt.expect("18 KB+ `exec` tool must spill into Turn 1");
-    assert!(spilled_xml.contains("mcp__enterprise__connector_action_008"));
-    assert!(spilled_xml.contains("mcp__enterprise__connector_action_179"));
-    assert!(spilled_xml.contains("- name: wait"));
+    let spilled_xml = spilled_xml_opt.expect(">48 KB tool catalog must spill excess into Turn 1");
+    assert!(spilled_xml.contains("- name: REPL"));
+    assert!(spilled_xml.contains("- name: extra_connector_tool_23"));
 
     // Claude Code Mode `REPL` tool (>1.5 KB Bun sandbox helper docs) is also preserved intact.
     let repl_desc = format!(
@@ -1432,4 +1463,77 @@ fn active_prompt_waterfill_never_truncates_assistant_output_or_real_tool_call_ar
         "oversized ToolResult should spill cleanly with 0-RTT mcp_lg_read_context_spill notice"
     );
     assert!(!spill.files().is_empty());
+}
+
+#[test]
+fn elastic_io_contracts_for_codex_and_claude_eliminate_serial_mcp_antipatterns() {
+    let mut spill = NoopSpillSink;
+
+    // 1. Codex Code Mode (`CodexExec`): steers into single `mcp_lg_exec` + `<= 8 KB` + multi-file `apply_patch`
+    let codex_bridged = vec![
+        ("exec".to_owned(), "exec".to_owned()),
+        ("wait".to_owned(), "wait".to_owned()),
+        ("exec_command".to_owned(), "exec_command".to_owned()),
+        ("apply_patch".to_owned(), "apply_patch".to_owned()),
+    ];
+    let (codex_append, codex_spill) = build_session_system_append_for_mcp_with_spill_sink(
+        Some(&format!(
+            "Custom caller rules.\n<example>\n{}\n</example>",
+            "x".repeat(16_000)
+        )),
+        McpBridgePromptSpec {
+            bridged_tools: &codex_bridged,
+            virtualized_hubs: &[],
+            has_virtualized_dispatch: true,
+            has_gateway_web_fetch: false,
+            has_context_spill_reader: true,
+            orchestrator: Some(McpOrchestratorContract::CodexExec {
+                mcp_name: "exec",
+                has_apply_patch: true,
+            }),
+        },
+        WebToolBridgeConfig::default(),
+        "nonce_codex_elastic",
+        &mut spill,
+    );
+    assert!(
+        codex_spill.is_none(),
+        "16 KB caller system with <example> must stay 100% inline under 24 KB / 48 KB thresholds"
+    );
+    assert!(codex_append.contains("<example>"));
+    assert!(codex_append.contains("Codex Code Mode & Elastic I/O (`mcp_lg_exec`)"));
+    assert!(codex_append.contains("<= 8 KB"));
+    assert!(codex_append.contains("Coalesce surgical edits across 1-4 files"));
+    assert!(codex_append.contains("Promise.allSettled(patches.map(p => tools.apply_patch(p)))"));
+    assert!(!codex_append.contains("parallel `mcp_lg_*` calls"));
+    assert!(!codex_append.contains("scope each `mcp_lg_apply_patch` call to a single target file"));
+
+    // 2. Claude Code (`ClaudeBashFirst`): steers compound reads/checks into `mcp_lg_Bash` + `<= 8 KB`
+    let claude_bridged = vec![
+        ("Bash".to_owned(), "Bash".to_owned()),
+        ("Read".to_owned(), "Read".to_owned()),
+        ("Edit".to_owned(), "Edit".to_owned()),
+        ("Write".to_owned(), "Write".to_owned()),
+    ];
+    let (claude_append, _) = build_session_system_append_for_mcp_with_spill_sink(
+        Some("You are Claude Code."),
+        McpBridgePromptSpec {
+            bridged_tools: &claude_bridged,
+            virtualized_hubs: &[],
+            has_virtualized_dispatch: true,
+            has_gateway_web_fetch: false,
+            has_context_spill_reader: true,
+            orchestrator: Some(McpOrchestratorContract::ClaudeBashFirst {
+                bash_mcp_name: "Bash",
+            }),
+        },
+        WebToolBridgeConfig::default(),
+        "nonce_claude_elastic",
+        &mut spill,
+    );
+    assert!(claude_append.contains("Elastic Bash-First I/O (`mcp_lg_Bash`)"));
+    assert!(claude_append.contains("SINGLE compound `mcp_lg_Bash` command"));
+    assert!(claude_append.contains("<= 8 KB"));
+    assert!(claude_append.contains("`/rewind`"));
+    assert!(!claude_append.contains("parallel `mcp_lg_*` calls"));
 }

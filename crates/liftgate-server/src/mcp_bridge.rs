@@ -170,6 +170,15 @@ impl McpSessionHandle {
         self.catalog.has_virtualized_dispatch
     }
 
+    /// Builds a live MCP routing & virtualization telemetry summary for `SessionSummary.mcp`.
+    #[must_use]
+    pub fn telemetry_summary(
+        &self,
+        declared_tools_len: usize,
+    ) -> liftgate_types::telemetry::SessionMcpSummary {
+        self.catalog.telemetry_summary(declared_tools_len)
+    }
+
     #[must_use]
     pub const fn call_rx(&self) -> &tokio::sync::Mutex<mpsc::Receiver<IncomingMcpToolCall>> {
         &self.call_rx

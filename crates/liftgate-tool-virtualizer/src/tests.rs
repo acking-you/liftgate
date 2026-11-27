@@ -432,7 +432,7 @@ fn custom_zst_harness_profile_monomorphizes_and_preserves_profile_across_warm_re
         "Run persistent kernel.",
         json!({"type": "object", "properties": {"code": {"type": "string"}}}),
     )];
-    for i in 0..24 {
+    for i in 0..40 {
         tools.push(fn_tool(
                 &format!("lsp_op_{i:02}"),
                 "LSP operation.",
@@ -442,6 +442,7 @@ fn custom_zst_harness_profile_monomorphizes_and_preserves_profile_across_warm_re
 
     let cat = plan_virtualization(ToyHarnessProfile, &tools, &mut NoopSpillSink);
     assert_eq!(cat.profile_id, "toy-harness");
+    assert!(!cat.is_passthrough);
     assert!(cat.by_mcp_name.contains_key("kernel_eval"));
     assert!(cat.virtualized_hubs.iter().any(|(h, _, _)| h == "ns__lsp"));
 
@@ -755,7 +756,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             "required": ["patch"]
         }),
     )];
-    for idx in 0..30 {
+    for idx in 0..40 {
         fn_tools.push(fn_tool(
             &format!("extra_tool_{idx:02}"),
             "Extra tool",
@@ -1063,7 +1064,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
     let cat =
         partition_tools_for_mcp_session(ProtocolHint::OpenAiResponses, &tools, true, &mut spill);
     assert!(cat.has_virtualized_dispatch);
-    assert!(cat.wire_tools.len() <= 24);
+    assert!(cat.wire_tools.len() <= VirtualizerBudget::OMP_AGY_ACP.max_eager_tools);
 
     let wire_names: Vec<&str> = cat.wire_tools.iter().map(|t| t.name.as_str()).collect();
     for direct in [
@@ -1673,4 +1674,117 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             ..
         }
     ));
+}
+
+#[test]
+fn calibrated_budget_enables_30_tool_direct_passthrough_and_codex_claude_contracts() {
+    use liftgate_types::session_key::McpOrchestratorContract;
+
+    let mut spill = NoopSpillSink;
+
+    // 1. Medium 30-tool Codex session (`<= 36` tools, `<= 28 KiB`) stays 100% 1:1 passthrough (`0` hubs)
+    let mut medium_codex = vec![
+        CanonicalToolSpec {
+            name: "exec".to_owned(),
+            description: Some("Run JavaScript in Code Mode (`declare const tools`).".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+        fn_tool(
+            "wait",
+            "Wait on an exec cell.",
+            json!({"type": "object", "properties": {"cell_id": {"type": "string"}}, "required": ["cell_id"]}),
+        ),
+        fn_tool(
+            "exec_command",
+            "Execute PTY shell command.",
+            json!({"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}),
+        ),
+        CanonicalToolSpec {
+            name: "apply_patch".to_owned(),
+            description: Some("Apply V4A patch.".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+    ];
+    for idx in 0..26 {
+        medium_codex.push(fn_tool(
+            &format!("mcp__linear__op_{idx:02}"),
+            "Medium MCP connector tool.",
+            json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        ));
+    }
+    assert_eq!(medium_codex.len(), 30);
+
+    let codex_cat = partition_tools_for_mcp_session_with_options(
+        ProtocolHint::OpenAiResponses,
+        &medium_codex,
+        McpSessionOptions {
+            enable_gateway_web_fetch: true,
+            enable_context_spill_reader: true,
+        },
+        &mut spill,
+    );
+    assert_eq!(codex_cat.profile_id, "codex");
+    assert!(
+        codex_cat.is_passthrough,
+        "30-tool session with <= 28 KiB schemas must use 1:1 Direct Passthrough"
+    );
+    assert!(codex_cat.virtualized_hubs.is_empty());
+    assert_eq!(
+        codex_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::CodexExec {
+            mcp_name: "exec",
+            has_apply_patch: true,
+        })
+    );
+    assert!(codex_cat.wire_tool_bytes <= VirtualizerBudget::CODEX_AGY_ACP.max_eager_wire_bytes);
+
+    // 2. Standard Claude Code session (no `REPL`, with `Bash` + 25 built-in/plugin tools = 28 tools)
+    //    achieves 1:1 Direct Passthrough AND emits `ClaudeBashFirst { bash_mcp_name: "Bash" }`!
+    let mut claude_std = Vec::new();
+    for core in [
+        "Bash", "Read", "Edit", "Write", "Grep", "Glob", "Agent", "LSP",
+    ] {
+        claude_std.push(fn_tool(
+            core,
+            &format!("Claude tool {core}."),
+            json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+        ));
+    }
+    for idx in 0..20 {
+        claude_std.push(fn_tool(
+            &format!("mcp__plugin_git__op_{idx:02}"),
+            "Git MCP tool.",
+            json!({"type": "object", "properties": {"repo": {"type": "string"}}}),
+        ));
+    }
+    let claude_cat = partition_tools_for_mcp_session(
+        ProtocolHint::AnthropicMessages,
+        &claude_std,
+        false,
+        &mut spill,
+    );
+    assert_eq!(claude_cat.profile_id, "claude-code");
+    assert!(claude_cat.is_passthrough);
+    assert_eq!(
+        claude_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::ClaudeBashFirst {
+            bash_mcp_name: "Bash",
+        })
+    );
+
+    // 3. When Claude Code `REPL` IS present (even after `Bash` in declaration order!),
+    //    `ClaudeBashFirst` is suppressed so `REPL` Code Mode is never shadowed.
+    let mut claude_with_repl = claude_std;
+    claude_with_repl.push(fn_tool(
+        "REPL",
+        "Persistent Code Mode REPL.",
+        json!({"type": "object", "properties": {"code": {"type": "string"}}}),
+    ));
+    let claude_repl_cat = partition_tools_for_mcp_session(
+        ProtocolHint::AnthropicMessages,
+        &claude_with_repl,
+        false,
+        &mut spill,
+    );
+    assert_eq!(claude_repl_cat.orchestrator_contract(), None);
 }

@@ -402,6 +402,7 @@ impl HarnessToolProfile for OmpToolProfile {
         spec: &CanonicalToolSpec,
         mcp_name: &'a str,
         has_folded_tools: bool,
+        _client_tools: &[CanonicalToolSpec],
     ) -> Option<McpOrchestratorContract<'a>> {
         if is_omp_eval_orchestrator_tool(spec) {
             Some(McpOrchestratorContract::OmpPolyglotEval {

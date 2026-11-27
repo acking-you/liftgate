@@ -14,7 +14,7 @@ use crate::config::ModelId;
 
 pub use codemode::{
     McpOrchestratorContract, compact_mcp_tool_description, is_code_mode_custom_exec,
-    is_code_mode_orchestrator_tool, is_omp_eval_orchestrator_tool,
+    is_code_mode_orchestrator_tool, is_codex_exec_orchestrator_tool, is_omp_eval_orchestrator_tool,
     is_opencode_execute_orchestrator_tool, is_opencode_full_code_mode_exec,
     split_code_mode_ts_declaration,
 };

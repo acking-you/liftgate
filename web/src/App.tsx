@@ -306,6 +306,23 @@ function classifyModelFamily(modelId: string): "gemini" | "claude" | "other" {
   return "other";
 }
 
+function formatOrchestratorMode(mode: string | null | undefined): string {
+  switch (mode) {
+    case "codex_exec":
+      return "Codex exec";
+    case "claude_bash_first":
+      return "Bash 聚合";
+    case "opencode_execute_full":
+      return "OpenCode Full";
+    case "opencode_execute":
+      return "OpenCode JS";
+    case "omp_eval":
+      return "OMP eval";
+    default:
+      return "直调";
+  }
+}
+
 export function App(): React.JSX.Element {
   const {
     snapshot,
@@ -392,6 +409,7 @@ export function App(): React.JSX.Element {
   const pool = snapshot?.session_pool;
   const metrics = snapshot?.metrics;
   const cacheSummary = snapshot?.cache_telemetry;
+  const elasticIo = snapshot?.elastic_io;
   const activeTasks = snapshot?.active_tasks ?? [];
   const recentTasks = snapshot?.recent_tasks ?? [];
   const models = snapshot?.available_models ?? [];
@@ -485,6 +503,65 @@ export function App(): React.JSX.Element {
     const parked = pool.idle_cached_sessions + (pool.suspended_mcp_sessions ?? 0);
     return Math.min(100, Math.round((parked / pool.max_idle_sessions) * 100));
   }, [pool]);
+
+  const elasticStats = useMemo(() => {
+    const forwarded = elasticIo?.mcp_forwarded_tool_calls ?? 0;
+    const orchestrator = elasticIo?.mcp_orchestrator_calls ?? 0;
+    const toolTurns = elasticIo?.mcp_tool_using_turns ?? 0;
+    const patchCalls = elasticIo?.mcp_patch_calls ?? 0;
+    const multiFilePatches = elasticIo?.mcp_multi_file_patch_calls ?? 0;
+    const patchFilesTotal = elasticIo?.mcp_patch_files_total ?? 0;
+    const zeroRttSearches = elasticIo?.mcp_zero_rtt_searches ?? 0;
+    const zeroRttSpillReads = elasticIo?.mcp_zero_rtt_spill_reads ?? 0;
+    const zeroRttPreflight = elasticIo?.mcp_zero_rtt_preflight_heals ?? 0;
+    const zeroRttTotal = zeroRttSearches + zeroRttSpillReads + zeroRttPreflight;
+    const resultsTotal = elasticIo?.mcp_tool_results_total ?? 0;
+    const resultsSpilled = elasticIo?.mcp_tool_results_spilled ?? 0;
+    const inlineKept = Math.max(0, resultsTotal - resultsSpilled);
+    const spillsCreated = elasticIo?.context_spills_created ?? 0;
+    const spillsBytes = elasticIo?.context_spills_bytes ?? 0;
+    const passthroughSessions = elasticIo?.passthrough_sessions ?? 0;
+    const virtualizedSessions = elasticIo?.virtualized_sessions ?? 0;
+
+    let peakWireBytes = 0;
+    let peakEagerTools = 0;
+    for (const s of pool?.sessions ?? []) {
+      if (s.mcp) {
+        if (s.mcp.wire_bytes > peakWireBytes) peakWireBytes = s.mcp.wire_bytes;
+        if (s.mcp.eager_tools > peakEagerTools) peakEagerTools = s.mcp.eager_tools;
+      }
+    }
+
+    return {
+      forwarded,
+      orchestrator,
+      orchestrationPct:
+        forwarded > 0 ? Math.round((orchestrator * 100) / forwarded) : null,
+      avgCallsPerToolTurn:
+        toolTurns > 0 ? (forwarded / toolTurns).toFixed(2) : "—",
+      patchCalls,
+      multiFilePatches,
+      patchFilesTotal,
+      zeroRttSearches,
+      zeroRttSpillReads,
+      zeroRttPreflight,
+      zeroRttTotal,
+      resultsTotal,
+      resultsSpilled,
+      inlineFitPct:
+        resultsTotal > 0 ? Math.round((inlineKept * 100) / resultsTotal) : null,
+      spillsCreated,
+      spillsBytes,
+      passthroughSessions,
+      virtualizedSessions,
+      peakWireBytes,
+      peakEagerTools,
+      wireBudgetPct: Math.min(
+        100,
+        Math.round((peakWireBytes * 100) / (34 * 1024)),
+      ),
+    };
+  }, [elasticIo, pool?.sessions]);
 
   const filteredRecentTasks = useMemo(() => {
     if (protocolFilter === "all") return recentTasks;
@@ -1198,6 +1275,130 @@ claude`,
                 </div>
               </section>
 
+              {/* Elastic I/O & agy acp 1.5.18 Calibration Telemetry Card */}
+              <section className="sf-card" aria-label="弹性读写与 MCP 虚拟化遥测">
+                <div className="sf-card__header">
+                  <div>
+                    <h2 className="sf-card__title">
+                      弹性读写与 MCP 虚拟化遥测（Elastic I/O ·{" "}
+                      <code>agy acp 1.5.18</code> 实测标定）
+                    </h2>
+                    <p className="sf-card__sub">
+                      针对上游串行工具循环（~1.3s/次）与 10 KB 输出截断悬崖，实时监测复合编排聚合度、多文件原子
+                      Patch、&lt; 9.6 KB 无损分片及 0-RTT 本地闭环效率
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="sf-tag">
+                      Eager &le;40 · Wire &le;34 KiB · 直通 &le;36
+                    </span>
+                    <button
+                      type="button"
+                      className="sf-btn sf-btn--ghost sf-btn--sm"
+                      onClick={() => setActiveTab("sessions")}
+                    >
+                      会话虚拟化明细 →
+                    </button>
+                  </div>
+                </div>
+                <div className="sf-card__body">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                        <span>复合编排 / 批处理占比</span>
+                        <Terminal className="h-3.5 w-3.5 text-[var(--primary)]" />
+                      </div>
+                      <div className="font-mono text-lg font-semibold text-[var(--text)] tabular-nums">
+                        {elasticStats.orchestrationPct !== null
+                          ? `${elasticStats.orchestrationPct}%`
+                          : "—"}{" "}
+                        <span className="text-xs font-normal text-[var(--faint)]">
+                          ({formatNumber(elasticStats.orchestrator)} /{" "}
+                          {formatNumber(elasticStats.forwarded)})
+                        </span>
+                      </div>
+                      <div className="font-mono text-[11px] text-[var(--faint)] flex flex-wrap justify-between gap-1">
+                        <span>均值 {elasticStats.avgCallsPerToolTurn} 次/工具轮</span>
+                        <span>
+                          多文件 Patch {elasticStats.multiFilePatches}/
+                          {elasticStats.patchCalls} ({elasticStats.patchFilesTotal} 文件)
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                        <span>&lt; 9.6 KB 内联无损达标率</span>
+                        <Database className="h-3.5 w-3.5 text-[var(--ok)]" />
+                      </div>
+                      <div className="font-mono text-lg font-semibold text-[var(--text)] tabular-nums">
+                        {elasticStats.inlineFitPct !== null
+                          ? `${elasticStats.inlineFitPct}%`
+                          : "—"}{" "}
+                        <span className="text-xs font-normal text-[var(--faint)]">
+                          (超限分片 {formatNumber(elasticStats.resultsSpilled)} /{" "}
+                          {formatNumber(elasticStats.resultsTotal)})
+                        </span>
+                      </div>
+                      <div className="font-mono text-[11px] text-[var(--faint)] flex flex-wrap justify-between gap-1">
+                        <span>无损 Spill {formatNumber(elasticStats.spillsCreated)} 个</span>
+                        <span>落盘 {formatBytes(elasticStats.spillsBytes)}</span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                        <span>0-RTT 网关本地闭环</span>
+                        <Wrench className="h-3.5 w-3.5 text-[var(--info)]" />
+                      </div>
+                      <div className="font-mono text-lg font-semibold text-[var(--text)] tabular-nums">
+                        {formatNumber(elasticStats.zeroRttTotal)}{" "}
+                        <span className="text-xs font-normal text-[var(--faint)]">
+                          次免客户端往返
+                        </span>
+                      </div>
+                      <div className="font-mono text-[11px] text-[var(--faint)] flex flex-wrap justify-between gap-1">
+                        <span>检索 {elasticStats.zeroRttSearches}</span>
+                        <span>分片读 {elasticStats.zeroRttSpillReads}</span>
+                        <span>预检自愈 {elasticStats.zeroRttPreflight}</span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface-alt)] p-3.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                        <span>MCP 直通 vs Hub 虚拟化</span>
+                        <Layers className="h-3.5 w-3.5 text-[var(--ok)]" />
+                      </div>
+                      <div className="font-mono text-lg font-semibold text-[var(--text)] tabular-nums">
+                        {formatNumber(elasticStats.passthroughSessions)} 直通{" "}
+                        <span className="text-xs font-normal text-[var(--faint)]">
+                          · {formatNumber(elasticStats.virtualizedSessions)} 虚拟化
+                        </span>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="sf-progress">
+                          <span
+                            style={{
+                              width: `${elasticStats.wireBudgetPct}%`,
+                              background:
+                                elasticStats.wireBudgetPct > 90
+                                  ? "var(--warn)"
+                                  : "var(--ok)",
+                            }}
+                          />
+                        </div>
+                        <div className="font-mono text-[11px] text-[var(--faint)] flex justify-between gap-1">
+                          <span>
+                            峰值 {formatBytes(elasticStats.peakWireBytes)} / 34.0 KB
+                          </span>
+                          <span>Eager {elasticStats.peakEagerTools}/40</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
               {/* Cache Hit Rate Trend Chart Card */}
               <section className="sf-card">
                 <div className="sf-card__header">
@@ -1324,6 +1525,16 @@ claude`,
                             {(task.native_web_fetches ?? 0) > 0 && (
                               <span className="text-[var(--ok)]">
                                 网页抓取 ×{task.native_web_fetches}
+                              </span>
+                            )}
+                            {(task.zero_rtt_mcp_ops ?? 0) > 0 && (
+                              <span className="text-[var(--ok)]">
+                                0-RTT ×{task.zero_rtt_mcp_ops}
+                              </span>
+                            )}
+                            {(task.spilled_tool_results ?? 0) > 0 && (
+                              <span className="text-[var(--info)]">
+                                Spill ×{task.spilled_tool_results}
                               </span>
                             )}
                             {task.client_tool_calls.length > 0 && (
@@ -1480,6 +1691,16 @@ claude`,
                                     {(task.vision_offloaded_images ?? 0) > 0 && (
                                       <span className="sf-pill sf-pill--accent">
                                         Vision×{task.vision_offloaded_images}
+                                      </span>
+                                    )}
+                                    {(task.zero_rtt_mcp_ops ?? 0) > 0 && (
+                                      <span className="sf-pill sf-pill--ok">
+                                        0-RTT×{task.zero_rtt_mcp_ops}
+                                      </span>
+                                    )}
+                                    {(task.spilled_tool_results ?? 0) > 0 && (
+                                      <span className="sf-pill sf-pill--info">
+                                        Spill×{task.spilled_tool_results}
                                       </span>
                                     )}
                                   </div>
@@ -2340,6 +2561,9 @@ claude`,
                       MCP 原生续接 {formatNumber(mcpContinuationCount)} 次
                     </span>
                     <span className="sf-tag">
+                      预算: Eager &le;40 · Wire &le;34 KiB · 直通 &le;36
+                    </span>
+                    <span className="sf-tag">
                       空闲驻留 {pool?.idle_cached_sessions ?? 0} /{" "}
                       {pool?.max_idle_sessions ?? 0}
                     </span>
@@ -2361,6 +2585,7 @@ claude`,
                             <th>Session ID</th>
                             <th>状态 / KV 温区</th>
                             <th>绑定模型</th>
+                            <th>工具编排 / 虚拟化</th>
                             <th className="num">单会话命中率</th>
                             <th className="num">上下文占用</th>
                             <th className="num">轮次 / 消息数</th>
@@ -2417,6 +2642,44 @@ claude`,
                               </td>
                               <td className="font-mono text-xs text-[var(--text-2)]">
                                 {sess.model_id}
+                              </td>
+                              <td className="whitespace-nowrap text-xs">
+                                {sess.mcp ? (
+                                  <div className="space-y-0.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="font-mono font-medium text-[var(--text)]">
+                                        {sess.mcp.harness_profile}
+                                      </span>
+                                      <span
+                                        className={`sf-pill ${
+                                          sess.mcp.is_passthrough
+                                            ? "sf-pill--ok"
+                                            : "sf-pill--info"
+                                        }`}
+                                      >
+                                        {sess.mcp.is_passthrough
+                                          ? "1:1 直通"
+                                          : `Hub×${sess.mcp.virtualized_hubs}`}
+                                      </span>
+                                      {sess.mcp.orchestrator_mode && (
+                                        <span className="sf-tag">
+                                          {formatOrchestratorMode(
+                                            sess.mcp.orchestrator_mode,
+                                          )}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="font-mono text-[11px] text-[var(--faint)]">
+                                      Eager {sess.mcp.eager_tools}/
+                                      {sess.mcp.declared_tools} ·{" "}
+                                      {formatBytes(sess.mcp.wire_bytes)}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <span className="font-mono text-[var(--faint)]">
+                                    XML / 无工具
+                                  </span>
+                                )}
                               </td>
                               <td className="num whitespace-nowrap">
                                 {sess.cache_hit_rate_bps != null ? (
@@ -2773,6 +3036,8 @@ claude`,
               {(selectedTask.native_web_searches > 0 ||
                 (selectedTask.native_web_fetches ?? 0) > 0 ||
                 (selectedTask.vision_offloaded_images ?? 0) > 0 ||
+                (selectedTask.zero_rtt_mcp_ops ?? 0) > 0 ||
+                (selectedTask.spilled_tool_results ?? 0) > 0 ||
                 selectedTask.client_tool_calls.length > 0) && (
                 <div className="flex flex-wrap gap-2 text-xs">
                   {selectedTask.native_web_searches > 0 && (
@@ -2788,6 +3053,16 @@ claude`,
                   {(selectedTask.vision_offloaded_images ?? 0) > 0 && (
                     <span className="sf-pill sf-pill--accent">
                       视觉子会话旁路卸载 ×{selectedTask.vision_offloaded_images}
+                    </span>
+                  )}
+                  {(selectedTask.zero_rtt_mcp_ops ?? 0) > 0 && (
+                    <span className="sf-pill sf-pill--ok">
+                      0-RTT 本地闭环 ×{selectedTask.zero_rtt_mcp_ops}
+                    </span>
+                  )}
+                  {(selectedTask.spilled_tool_results ?? 0) > 0 && (
+                    <span className="sf-pill sf-pill--info">
+                      &gt;9.6KB 工具输出分片 ×{selectedTask.spilled_tool_results}
                     </span>
                   )}
                   {selectedTask.client_tool_calls.length > 0 && (

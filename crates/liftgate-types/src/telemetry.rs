@@ -105,6 +105,32 @@ impl PromptCacheWarmth {
     }
 }
 
+/// Per-session loopback MCP virtualization & Elastic I/O orchestration summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionMcpSummary {
+    /// Detected harness tool profile (`"codex"`, `"claude-code"`, `"opencode"`, `"omp"`, `"generic"`).
+    #[serde(default)]
+    pub harness_profile: String,
+    /// Active orchestration mode (`"codex_exec"`, `"claude_bash_first"`, `"opencode_execute_full"`, `"omp_eval"`, `"direct"`).
+    #[serde(default)]
+    pub orchestrator_mode: String,
+    /// `true` when all eligible caller tools fit in 1:1 Direct Eager passthrough (`0` namespace hubs).
+    #[serde(default)]
+    pub is_passthrough: bool,
+    /// Total tools declared by the caller on the session's latest turn.
+    #[serde(default)]
+    pub declared_tools: usize,
+    /// Total Eager MCP tools exposed on `lg` `tools/list` (`<= 40` budget).
+    #[serde(default)]
+    pub eager_tools: usize,
+    /// Number of `mcp_lg_ns__*` namespace hubs mounted (`0` when `is_passthrough`).
+    #[serde(default)]
+    pub virtualized_hubs: usize,
+    /// Estimated serialized wire schema bytes on `lg` `tools/list` (`<= 34 KiB` budget, `< 55 KiB` upstream cliff).
+    #[serde(default)]
+    pub wire_bytes: usize,
+}
+
 /// Metadata summary for a single active or cached ACP session worker.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionSummary {
@@ -123,6 +149,8 @@ pub struct SessionSummary {
     pub total_cached_read_tokens: u64,
     #[serde(default)]
     pub cache_hit_rate_bps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<SessionMcpSummary>,
     pub created_at_unix_ms: u64,
     pub last_active_unix_ms: u64,
     pub last_response_id: Option<String>,
@@ -195,6 +223,10 @@ pub struct TaskSnapshot {
     pub native_web_fetches: usize,
     #[serde(default)]
     pub vision_offloaded_images: usize,
+    #[serde(default)]
+    pub zero_rtt_mcp_ops: usize,
+    #[serde(default)]
+    pub spilled_tool_results: usize,
     pub prompt_preview: String,
     pub output_preview: String,
     pub stop_reason: Option<String>,
@@ -693,6 +725,56 @@ pub struct GatewayMetricsSummary {
     pub cache_hit_rate_bps: Option<u16>,
 }
 
+/// Cumulative Elastic I/O, 0-RTT MCP resolution, `< 9.6 KB` inline budget, and tool virtualization telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ElasticIoTelemetry {
+    /// MCP sessions registered in 1:1 Direct Eager passthrough (`<= 36` tools, `<= 28 KiB`, `0` hubs).
+    #[serde(default)]
+    pub passthrough_sessions: u64,
+    /// MCP sessions registered with 3-tier `mcp_lg_ns__*` namespace hub virtualization.
+    #[serde(default)]
+    pub virtualized_sessions: u64,
+    /// Total top-level `mcp_lg_*` client tool calls forwarded over HTTP/SSE.
+    #[serde(default)]
+    pub mcp_forwarded_tool_calls: u64,
+    /// Forwarded calls targeting compound orchestrator / Bash-first tools (`exec`, `execute`, `eval`, `REPL`, `Bash`, `exec_command`, `shell`, `bash`).
+    #[serde(default)]
+    pub mcp_orchestrator_calls: u64,
+    /// Completed or suspended turns that emitted at least one forwarded client tool call.
+    #[serde(default)]
+    pub mcp_tool_using_turns: u64,
+    /// Forwarded V4A `apply_patch` / `patch` calls containing at least one file operation header.
+    #[serde(default)]
+    pub mcp_patch_calls: u64,
+    /// Forwarded V4A patch calls coalescing `>= 2` target files in a single atomic call.
+    #[serde(default)]
+    pub mcp_multi_file_patch_calls: u64,
+    /// Total file operation headers (`*** Add/Update/Delete File:`) across V4A patch calls.
+    #[serde(default)]
+    pub mcp_patch_files_total: u64,
+    /// Gateway-local 0-RTT `mcp_lg_search_client_tools` lookups resolved in-memory (`< 0.1 ms`).
+    #[serde(default)]
+    pub mcp_zero_rtt_searches: u64,
+    /// Gateway-local 0-RTT `mcp_lg_read_context_spill` slices/queries resolved in-memory.
+    #[serde(default)]
+    pub mcp_zero_rtt_spill_reads: u64,
+    /// Gateway-local 0-RTT schema & V4A preflight self-healing rejections answered in-memory.
+    #[serde(default)]
+    pub mcp_zero_rtt_preflight_heals: u64,
+    /// Total MCP client tool results sanitized by the gateway.
+    #[serde(default)]
+    pub mcp_tool_results_total: u64,
+    /// MCP client tool results that exceeded `9,600 B` (`MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES`) and spilled.
+    #[serde(default)]
+    pub mcp_tool_results_spilled: u64,
+    /// Cumulative lossless spill files persisted to `~/.liftgate/spills` (prompts, tool results, schemas).
+    #[serde(default)]
+    pub context_spills_created: u64,
+    /// Cumulative UTF-8 bytes persisted across lossless spill files.
+    #[serde(default)]
+    pub context_spills_bytes: u64,
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -709,6 +791,8 @@ pub struct GatewayTelemetrySnapshot {
     pub acp_process: AcpProcessTelemetry,
     pub session_pool: SessionPoolTelemetry,
     pub metrics: GatewayMetricsSummary,
+    #[serde(default)]
+    pub elastic_io: ElasticIoTelemetry,
     #[serde(default)]
     pub cache_telemetry: CacheTelemetrySummary,
     pub active_tasks: Vec<TaskSnapshot>,

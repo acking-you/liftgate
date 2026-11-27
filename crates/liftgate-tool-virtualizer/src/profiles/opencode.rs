@@ -211,6 +211,7 @@ impl HarnessToolProfile for OpenCodeToolProfile {
         spec: &CanonicalToolSpec,
         mcp_name: &'a str,
         _has_folded_tools: bool,
+        _client_tools: &[CanonicalToolSpec],
     ) -> Option<McpOrchestratorContract<'a>> {
         is_opencode_execute_orchestrator_tool(spec).then(|| {
             McpOrchestratorContract::OpenCodeExecute {

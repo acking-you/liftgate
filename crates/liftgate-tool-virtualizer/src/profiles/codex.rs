@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::CanonicalToolSpec,
-    session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
+    session_key::{
+        McpOrchestratorContract, is_code_mode_custom_exec, is_code_mode_orchestrator_tool,
+        is_codex_exec_orchestrator_tool,
+    },
 };
 
 use crate::{
@@ -163,6 +166,21 @@ impl HarnessToolProfile for CodexToolProfile {
         }
 
         ToolPlacement::Standalone { backfill_rank: 16 }
+    }
+
+    fn orchestrator_prompt_contract<'a>(
+        self,
+        spec: &CanonicalToolSpec,
+        mcp_name: &'a str,
+        _has_folded_tools: bool,
+        client_tools: &[CanonicalToolSpec],
+    ) -> Option<McpOrchestratorContract<'a>> {
+        is_codex_exec_orchestrator_tool(spec).then(|| McpOrchestratorContract::CodexExec {
+            mcp_name,
+            has_apply_patch: client_tools
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case("apply_patch")),
+        })
     }
 
     fn search_aliases(self, _spec: &CanonicalToolSpec, namespace: Option<&str>) -> &'static str {
