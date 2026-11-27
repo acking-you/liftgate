@@ -3,17 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Liftgate · ACP 网关工作台</title>
+    <title>Liftgate 控制台</title>
     <meta
       name="description"
-      content="Liftgate 本地优先协议网关实时观测与审计工作台：OpenAI Responses / Anthropic Messages 双栈路由、Prompt 缓存命中率分析、低命中率记录持久化与 ACP 会话池监管。"
+      content="Liftgate 网关实时观测控制台：请求与缓存命中、工具调用 I/O、工具目录与上下文分布、ACP 会话池。"
     />
-    <meta name="theme-color" content="#FAF9F5" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#141413" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f5f6f8" />
     <link
       rel="icon"
       type="image/svg+xml"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23141413'/%3E%3Crect x='11' y='11' width='10' height='10' rx='1.5' transform='rotate(45 16 16)' fill='%23D97757'/%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f1115'/%3E%3Cpath d='M9 23V12.5a7 7 0 0 1 14 0V23' fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M12.5 17.5 16 14l3.5 3.5' fill='none' stroke='%236da7ec' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
     />
     <style>
       html[data-theme-transition]::view-transition-group(root),
@@ -46,26 +45,51 @@
           stored = localStorage.getItem("theme");
         } catch (_) {}
         if (stored !== "dark" && stored !== "light") stored = null;
-        var prefersDark =
-          window.matchMedia &&
-          window.matchMedia("(prefers-color-scheme: dark)").matches;
-        var initialTheme = stored || (prefersDark ? "dark" : "light");
+        var systemDark = window.matchMedia
+          ? window.matchMedia("(prefers-color-scheme: dark)")
+          : null;
+        var initialTheme = stored || (systemDark && systemDark.matches ? "dark" : "light");
         var root = document.documentElement;
+        var chrome = document.querySelector('meta[name="theme-color"]');
+
+        // Keep the mobile browser chrome the same colour as the canvas.
+        function paintChrome(theme) {
+          if (chrome) chrome.setAttribute("content", theme === "dark" ? "#0c0d0f" : "#f5f6f8");
+        }
+
         root.setAttribute("data-theme", initialTheme);
+        paintChrome(initialTheme);
 
         var desiredTheme = initialTheme;
+        var explicit = stored !== null;
         var inFlight = false;
+
+        function announce(next) {
+          paintChrome(next);
+          try {
+            window.dispatchEvent(
+              new CustomEvent("lg-theme-change", { detail: { theme: next } }),
+            );
+          } catch (_) {}
+        }
+
+        // Until the reader picks a theme, follow the system as it changes.
+        if (systemDark && typeof systemDark.addEventListener === "function") {
+          systemDark.addEventListener("change", function (ev) {
+            if (explicit) return;
+            desiredTheme = ev.matches ? "dark" : "light";
+            root.setAttribute("data-theme", desiredTheme);
+            announce(desiredTheme);
+          });
+        }
 
         function commitPreference(next) {
           desiredTheme = next;
+          explicit = true;
           try {
             localStorage.setItem("theme", next);
           } catch (_) {}
-          try {
-            window.dispatchEvent(
-              new CustomEvent("sf-theme-change", { detail: { theme: next } }),
-            );
-          } catch (_) {}
+          announce(next);
         }
 
         function resolveOrigin(evt, el) {

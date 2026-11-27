@@ -4,68 +4,43 @@ import { Check, Copy } from "lucide-react";
 
 export function CopyButton({
   value,
-  label = "复制",
-  compact = false,
-  id,
+  label,
+  title = "复制",
 }: {
-  value: string;
+  value: string | (() => string);
+  /** When set the button shows text; otherwise it is an icon-only control. */
   label?: string;
-  compact?: boolean;
-  id?: string;
+  title?: string;
 }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
 
-  const handleCopy = async (ev: React.MouseEvent): Promise<void> => {
+  const handleCopy = (ev: React.MouseEvent): void => {
     ev.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      // Clipboard API unavailable in non-secure context
-    }
-  };
-
-  if (compact) {
-    return (
-      <button
-        id={id}
-        type="button"
-        className="sf-btn sf-btn--ghost sf-btn--sm px-1.5 h-6 text-[11px]"
-        title={label}
-        onClick={(ev) => {
-          void handleCopy(ev);
-        }}
-      >
-        {copied ? (
-          <Check className="h-3 w-3 text-[var(--ok)]" />
-        ) : (
-          <Copy className="h-3 w-3" />
-        )}
-      </button>
+    const text = typeof value === "function" ? value() : value;
+    navigator.clipboard.writeText(text).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        // Clipboard is unavailable outside secure contexts; nothing to recover.
+      },
     );
-  }
+  };
 
   return (
     <button
-      id={id}
       type="button"
-      className="sf-btn sf-btn--sm"
-      onClick={(ev) => {
-        void handleCopy(ev);
-      }}
+      className="lg-btn"
+      data-size="sm"
+      data-variant={label ? undefined : "ghost"}
+      data-icon={label ? undefined : "true"}
+      title={label ? undefined : title}
+      aria-label={label ? undefined : title}
+      onClick={handleCopy}
     >
-      {copied ? (
-        <>
-          <Check className="h-3.5 w-3.5 text-[var(--ok)]" />
-          <span className="text-[var(--ok)]">已复制</span>
-        </>
-      ) : (
-        <>
-          <Copy className="h-3.5 w-3.5" />
-          <span>{label}</span>
-        </>
-      )}
+      {copied ? <Check className="text-ok" /> : <Copy />}
+      {label && <span>{copied ? "已复制" : label}</span>}
     </button>
   );
 }
