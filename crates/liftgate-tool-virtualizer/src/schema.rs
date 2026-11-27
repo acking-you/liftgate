@@ -31,6 +31,7 @@ pub struct McpBridgedTool {
     pub v4a_patch: Option<V4aPatchContract>,
     pub parameters_json: Option<String>,
     pub non_nullable_required_fields: Vec<String>,
+    pub present_required_fields: Vec<String>,
     pub declares_tool_summary: bool,
     pub requires_string_intent_i: bool,
     pub has_root_combinator: bool,
@@ -201,29 +202,103 @@ pub fn normalize_mcp_object_schema(parameters_json: &str) -> Value {
 #[derive(Clone, Debug, Default)]
 pub struct ExtractedSchemaMeta {
     pub required_fields: Vec<String>,
+    /// Required fields whose schema rejects `null` (must be both present AND non-null).
     pub non_nullable_required_fields: Vec<String>,
+    /// Required fields with unconstrained schemas (e.g. `{}`) where `null` is valid when present,
+    /// while complete key omission (`!map.contains_key`) is still missing.
+    pub present_required_fields: Vec<String>,
     pub declares_tool_summary: bool,
     pub requires_string_intent_i: bool,
     pub has_root_combinator: bool,
     pub prop_names_joined: String,
 }
 
-fn schema_property_allows_null(prop_schema: &Value) -> bool {
-    if let Some(ty) = prop_schema.get("type") {
+fn schema_explicitly_declares_null_or_ref(prop_schema: &Value) -> bool {
+    let Value::Object(obj) = prop_schema else {
+        return false;
+    };
+    if obj.contains_key("$ref") || obj.contains_key("$dynamicRef") {
+        return true;
+    }
+    if let Some(ty) = obj.get("type") {
         match ty {
             Value::String(s) if s == "null" => return true,
             Value::Array(arr) if arr.iter().any(|v| v.as_str() == Some("null")) => return true,
             _ => {}
         }
     }
+    if let Some(const_val) = obj.get("const")
+        && const_val.is_null()
+    {
+        return true;
+    }
+    if let Some(Value::Array(enum_vals)) = obj.get("enum")
+        && enum_vals.iter().any(Value::is_null)
+    {
+        return true;
+    }
     for union_key in ["anyOf", "oneOf"] {
-        if let Some(Value::Array(branches)) = prop_schema.get(union_key)
-            && branches.iter().any(schema_property_allows_null)
+        if let Some(Value::Array(branches)) = obj.get(union_key)
+            && branches.iter().any(schema_explicitly_declares_null_or_ref)
         {
             return true;
         }
     }
     false
+}
+
+fn schema_property_allows_null(prop_schema: &Value) -> bool {
+    match prop_schema {
+        Value::Bool(allow_all) => *allow_all,
+        Value::Object(obj) => {
+            if obj.contains_key("$ref") || obj.contains_key("$dynamicRef") {
+                return true;
+            }
+            if let Some(not_schema) = obj.get("not")
+                && (not_schema.get("type").and_then(Value::as_str) == Some("null")
+                    || not_schema.get("const").is_some_and(Value::is_null))
+            {
+                return false;
+            }
+            if let Some(const_val) = obj.get("const")
+                && !const_val.is_null()
+            {
+                return false;
+            }
+            if let Some(Value::Array(enum_vals)) = obj.get("enum")
+                && !enum_vals.iter().any(Value::is_null)
+            {
+                return false;
+            }
+            if let Some(ty) = obj.get("type") {
+                let allows_null = match ty {
+                    Value::String(s) => s == "null",
+                    Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some("null")),
+                    _ => false,
+                };
+                if !allows_null {
+                    return false;
+                }
+            }
+            if let Some(Value::Array(branches)) = obj.get("anyOf")
+                && !branches.iter().any(schema_property_allows_null)
+            {
+                return false;
+            }
+            if let Some(Value::Array(branches)) = obj.get("oneOf")
+                && !branches.iter().any(schema_property_allows_null)
+            {
+                return false;
+            }
+            if let Some(Value::Array(branches)) = obj.get("allOf")
+                && !branches.iter().all(schema_property_allows_null)
+            {
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 fn schema_property_is_string(prop_schema: &Value) -> bool {
@@ -256,15 +331,22 @@ pub fn extract_schema_metadata(parameters_json: Option<&str>) -> ExtractedSchema
     let has_root_combinator =
         map.contains_key("oneOf") || map.contains_key("anyOf") || map.contains_key("allOf");
     let props_opt = map.get("properties").and_then(Value::as_object);
-    let non_nullable_required_fields = required_fields
-        .iter()
-        .filter(|req_key| {
-            props_opt
-                .and_then(|props| props.get(req_key.as_str()))
-                .is_none_or(|prop_schema| !schema_property_allows_null(prop_schema))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut non_nullable_required_fields = Vec::new();
+    let mut present_required_fields = Vec::new();
+    for req_key in &required_fields {
+        match props_opt.and_then(|props| props.get(req_key.as_str())) {
+            Some(prop_schema) if !schema_property_allows_null(prop_schema) => {
+                non_nullable_required_fields.push(req_key.clone());
+            }
+            Some(prop_schema) if !schema_explicitly_declares_null_or_ref(prop_schema) => {
+                present_required_fields.push(req_key.clone());
+            }
+            None => {
+                present_required_fields.push(req_key.clone());
+            }
+            Some(_) => {}
+        }
+    }
     let requires_string_intent_i = required_fields.iter().any(|r| r == "i")
         && props_opt
             .and_then(|props| props.get("i"))
@@ -285,6 +367,7 @@ pub fn extract_schema_metadata(parameters_json: Option<&str>) -> ExtractedSchema
     ExtractedSchemaMeta {
         required_fields,
         non_nullable_required_fields,
+        present_required_fields,
         declares_tool_summary,
         requires_string_intent_i,
         has_root_combinator,

@@ -73,6 +73,7 @@ pub(crate) struct IndexedClientTool {
     pub(crate) parameters_json: Option<String>,
     pub(crate) required_fields: Vec<String>,
     pub(crate) non_nullable_required_fields: Vec<String>,
+    pub(crate) present_required_fields: Vec<String>,
     pub(crate) declares_tool_summary: bool,
     pub(crate) requires_string_intent_i: bool,
     pub(crate) has_root_combinator: bool,
@@ -353,6 +354,9 @@ impl McpRoutingTable {
                     direct_mut
                         .non_nullable_required_fields
                         .clone_from(&schema_meta.non_nullable_required_fields);
+                    direct_mut
+                        .present_required_fields
+                        .clone_from(&schema_meta.present_required_fields);
                     direct_mut.declares_tool_summary = schema_meta.declares_tool_summary;
                     direct_mut.requires_string_intent_i = schema_meta.requires_string_intent_i;
                     direct_mut.has_root_combinator = schema_meta.has_root_combinator;
@@ -425,6 +429,7 @@ impl McpRoutingTable {
                 parameters_json: params_json,
                 required_fields: schema_meta.required_fields,
                 non_nullable_required_fields: schema_meta.non_nullable_required_fields,
+                present_required_fields: schema_meta.present_required_fields,
                 declares_tool_summary: schema_meta.declares_tool_summary,
                 requires_string_intent_i: schema_meta.requires_string_intent_i,
                 has_root_combinator: schema_meta.has_root_combinator,
@@ -1007,18 +1012,24 @@ fn backfill_intent_i_from_summary(
 fn check_missing_non_nullable_required(
     map: &serde_json::Map<String, Value>,
     non_nullable_required_fields: &[String],
+    present_required_fields: &[String],
     client_name: &str,
     parameters_json: Option<&str>,
     max_schema_bytes: usize,
 ) -> Result<(), String> {
-    if non_nullable_required_fields.is_empty() {
+    if non_nullable_required_fields.is_empty() && present_required_fields.is_empty() {
         return Ok(());
     }
-    let missing: Vec<&str> = non_nullable_required_fields
+    let mut missing: Vec<&str> = non_nullable_required_fields
         .iter()
         .filter(|req_key| map.get(req_key.as_str()).is_none_or(Value::is_null))
         .map(String::as_str)
         .collect();
+    for req_key in present_required_fields {
+        if !map.contains_key(req_key.as_str()) {
+            missing.push(req_key.as_str());
+        }
+    }
     if missing.is_empty() {
         return Ok(());
     }
@@ -1054,6 +1065,7 @@ fn refresh_bridged_tool_if_changed<'a>(
                 updated.unwrap_custom_key = unwrap_key;
                 updated.parameters_json = None;
                 updated.non_nullable_required_fields.clear();
+                updated.present_required_fields.clear();
                 Cow::Owned(updated)
             }
         }
@@ -1078,6 +1090,7 @@ fn refresh_bridged_tool_if_changed<'a>(
                 v4a_patch: bridged.v4a_patch,
                 parameters_json: Some(effective_json.to_owned()),
                 non_nullable_required_fields: meta.non_nullable_required_fields,
+                present_required_fields: meta.present_required_fields,
                 declares_tool_summary: meta.declares_tool_summary,
                 requires_string_intent_i: meta.requires_string_intent_i,
                 has_root_combinator: meta.has_root_combinator,
@@ -1115,6 +1128,7 @@ fn format_direct_tool_arguments(
             check_missing_non_nullable_required(
                 map,
                 &bridged.non_nullable_required_fields,
+                &bridged.present_required_fields,
                 &bridged.client_name,
                 bridged.parameters_json.as_deref(),
                 max_schema_bytes,
@@ -1220,6 +1234,7 @@ fn finalize_indexed_tool_call(
         && let Err(msg) = check_missing_non_nullable_required(
             &map,
             &indexed.non_nullable_required_fields,
+            &indexed.present_required_fields,
             &indexed.client_name,
             indexed.parameters_json.as_deref(),
             max_schema_bytes,

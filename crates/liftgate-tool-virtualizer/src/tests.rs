@@ -1635,4 +1635,42 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             "warm direct-tool schema update must refresh required-field preflight, got {other:?}"
         ),
     }
+
+    // 7. Unconstrained `{}` or `$ref` required properties permit explicit `null` values (`{"payload": null}`)!
+    let unconstrained_tools = vec![fn_tool(
+        "emit_event",
+        "Emit structured event with unconstrained JSON payload",
+        json!({
+            "type": "object",
+            "properties": {
+                "payload": {},
+                "meta": { "$ref": "#/$defs/Meta" }
+            },
+            "required": ["payload", "meta"]
+        }),
+    )];
+    let unconst_cat =
+        partition_tools_for_mcp_with_hint(ProtocolHint::Unknown, &unconstrained_tools, &mut spill);
+    assert_eq!(
+        unconst_cat.routing_table.resolve_call(
+            "emit_event",
+            &json!({ "payload": null, "meta": null }),
+            &unconstrained_tools,
+        ),
+        VirtualizedCallDecision::ForwardToClient {
+            client_name: "emit_event".to_owned(),
+            arguments: r#"{"payload":null,"meta":null}"#.to_owned(),
+            is_custom: false,
+        }
+    );
+    assert!(matches!(
+        unconst_cat
+            .routing_table
+            .resolve_call("emit_event", &json!({}), &unconstrained_tools,),
+        VirtualizedCallDecision::LocalReply {
+            is_error: true,
+            kind: LocalReplyKind::PreflightError,
+            ..
+        }
+    ));
 }

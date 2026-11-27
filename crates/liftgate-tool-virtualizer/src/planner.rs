@@ -495,6 +495,7 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
                     v4a_patch: c.v4a_patch,
                     parameters_json: c.parameters_json,
                     non_nullable_required_fields: c.schema_meta.non_nullable_required_fields,
+                    present_required_fields: c.schema_meta.present_required_fields,
                     declares_tool_summary: c.schema_meta.declares_tool_summary,
                     requires_string_intent_i: c.schema_meta.requires_string_intent_i,
                     has_root_combinator: c.schema_meta.has_root_combinator,
@@ -701,6 +702,7 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
                         .schema_meta
                         .non_nullable_required_fields
                         .clone(),
+                    present_required_fields: c.schema_meta.present_required_fields.clone(),
                     declares_tool_summary: c.schema_meta.declares_tool_summary,
                     requires_string_intent_i: c.schema_meta.requires_string_intent_i,
                     has_root_combinator: c.schema_meta.has_root_combinator,

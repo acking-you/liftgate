@@ -266,16 +266,9 @@ impl SpillStore {
                     0
                 };
                 let haystack = line.get(search_start..).unwrap_or_default();
-                let maybe_rel_pos =
-                    haystack
-                        .to_ascii_lowercase()
-                        .find(&needle_lower)
-                        .or_else(|| {
-                            (!needle.is_ascii()
-                                && haystack.to_lowercase().contains(&needle.to_lowercase()))
-                            .then_some(0)
-                        });
-                let Some(rel_pos) = maybe_rel_pos else {
+                let Some(rel_pos) =
+                    find_case_insensitive_byte_offset(haystack, needle, &needle_lower)
+                else {
                     continue;
                 };
                 total_matches = total_matches.saturating_add(1);
@@ -457,6 +450,38 @@ fn floor_utf8_boundary(s: &str, index: usize) -> usize {
         pos -= 1;
     }
     pos
+}
+
+/// Finds the first case-insensitive match of `needle` inside `haystack`, returning the exact
+/// UTF-8 byte offset within `haystack` (including non-ASCII Unicode case folding where lowercasing
+/// a character may change its UTF-8 byte width).
+fn find_case_insensitive_byte_offset(
+    haystack: &str,
+    needle: &str,
+    needle_ascii_lower: &str,
+) -> Option<usize> {
+    if needle.is_ascii() {
+        return haystack.to_ascii_lowercase().find(needle_ascii_lower);
+    }
+    let needle_lower = needle.to_lowercase();
+    if needle_lower.is_empty() {
+        return Some(0);
+    }
+    let mut lowered = String::with_capacity(haystack.len());
+    let mut lower_to_orig: Vec<(usize, usize)> = Vec::new();
+    for (orig_idx, ch) in haystack.char_indices() {
+        lower_to_orig.push((lowered.len(), orig_idx));
+        for lc in ch.to_lowercase() {
+            lowered.push(lc);
+        }
+    }
+    let lower_pos = lowered.find(&needle_lower)?;
+    match lower_to_orig.binary_search_by_key(&lower_pos, |&(lp, _)| lp) {
+        Ok(i) => lower_to_orig.get(i).map(|&(_, orig)| orig),
+        Err(ins) => lower_to_orig
+            .get(ins.saturating_sub(1))
+            .map(|&(_, orig)| orig),
+    }
 }
 
 fn decode_line_lossless_or_lossy(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -867,6 +892,25 @@ mod tests {
         assert!(
             query_overlong.contains("TAIL_SECRET_42"),
             "query on overlong line must center window around the matching region:\n{query_overlong}"
+        );
+
+        // Non-ASCII Unicode case-insensitive search (`привет` matching `ПРИВЕТ` at byte >14,000)
+        // must also center the snippet around the actual match offset rather than byte 0!
+        let unicode_overlong = format!(
+            r#"{{"pad":"{}","greeting":"ПРИВЕТ_МИР_77","tail":"{}"}}"#,
+            "a".repeat(14_500),
+            "b".repeat(4_000)
+        );
+        let unicode_path = store
+            .try_spill("client tools catalog", &unicode_overlong)
+            .unwrap();
+        let unicode_query = store
+            .read_slice(&unicode_path, 1, 0, 5, Some("привет_мир_77"))
+            .unwrap();
+        assert!(unicode_query.len() < 10_000);
+        assert!(
+            unicode_query.contains("ПРИВЕТ_МИР_77"),
+            "Unicode case-insensitive query must preserve exact match offset on overlong lines:\n{unicode_query}"
         );
 
         // Multi-line byte cap emits exact next `start_line` continuation hint
