@@ -108,6 +108,8 @@ export interface TaskSnapshot {
   resolved_model: string;
   session_id: string | null;
   session_reused: boolean;
+  /** Harness profile (`codex`, `claude-code`, …); absent until attributed or on older gateways. */
+  harness_profile?: string | null;
   auxiliary_task?: string | null;
   phase: TaskPhase;
   started_at_unix_ms: number;

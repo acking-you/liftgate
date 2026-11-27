@@ -4,7 +4,7 @@ import { ProseBlock } from "@/components/CodeBlock";
 import { SegmentedBar } from "@/components/charts";
 import { ToolGlyph } from "@/components/ToolExchange";
 import { Sheet } from "@/components/ui/dialog";
-import { Figure, HitRate, KV, Latency, Note, Pill, Tag, type Tone, Usd } from "@/components/ui";
+import { Figure, HarnessBadge, HitRate, KV, Latency, Note, Pill, Tag, type Tone, Usd } from "@/components/ui";
 import {
   formatNumber,
   formatSmartTime,
@@ -208,6 +208,7 @@ export function TaskSheet({
           <KV
             items={[
               [t.model, <ModelRoute key="m" task={task} />],
+              [t.harness, <HarnessBadge key="h" id={task.harness_profile} />],
               [
                 t.session,
                 task.session_id ? (

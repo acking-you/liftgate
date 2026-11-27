@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Harness on every request**: each recent and in-flight request records the harness it came from (`harness_profile` on `TaskSnapshot`: Codex, Claude Code, OpenCode, Oh My Pi, or generic), and the overview's recent-requests table, the running-request cards, and the request detail sheet show it.
+- **Recent-request filters**: the overview's recent requests filter by harness, session, model, and protocol, plus "problems only" (failed, cancelled, or with failed / rejected tool calls) and "hit rate below threshold" toggles. Every option shows how many requests it would match, clicking a row's harness or session filters to it (click again to clear), and one button clears all filters.
+- **Recent-request search and scope summary**: a search box matches task / session ids, models, and prompt, output, or error previews; while filters are active a strip summarizes the matching requests (count and sessions, problems, token-weighted hit rate, TTFT p50 / p90, total cost), the cache-trend chart plots only the matching requests, and the filter survives switching views and reloads within the tab.
+
 ## [0.2.18] - 2026-11-28
 
 ### Added
