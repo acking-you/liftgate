@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod canonical;
 pub mod config;
 pub mod error;
+pub mod harness_prompt;
 pub mod model;
 pub mod openai;
 pub mod parser;

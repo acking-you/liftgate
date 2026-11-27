@@ -7,7 +7,8 @@ use serde_json::{Value, value::RawValue};
 use crate::acp::{AcpUsage, AvailableModel};
 use crate::canonical::{
     CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
-    NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task, parse_base64_data_url,
+    NormalizedTurnRequest, ProtocolDeveloperSlot, ProtocolDeveloperSlotKind, ReasoningEffort,
+    detect_auxiliary_task, parse_base64_data_url,
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
@@ -195,7 +196,9 @@ pub fn normalize_responses_request(
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
     let mut aux_system_parts = Vec::new();
     let mut messages: Vec<CanonicalMessage> = Vec::new();
+    let mut developer_slots: Vec<ProtocolDeveloperSlot> = Vec::new();
     let mut has_conversational_input = false;
+    let mut has_base_instructions_slot = false;
     let mut deferred_compaction_instructions: Option<String> = None;
     let mut latest_config_effort: Option<ReasoningEffort> = None;
     let mut dynamic_tools: Vec<Value> = Vec::new();
@@ -209,9 +212,16 @@ pub fn normalize_responses_request(
                 if is_compaction_instructions_prompt(trimmed) {
                     deferred_compaction_instructions = Some(trimmed.to_owned());
                 } else if let Some(wrapped) = wrap_developer_instructions_block(trimmed) {
+                    has_base_instructions_slot = true;
+                    let msg_index = messages.len();
                     messages.push(CanonicalMessage {
                         role: CanonicalRole::User,
                         parts: vec![CanonicalPart::Text(wrapped)],
+                    });
+                    developer_slots.push(ProtocolDeveloperSlot {
+                        msg_index,
+                        part_index: 0,
+                        kind: ProtocolDeveloperSlotKind::PrimaryBase,
                     });
                 }
             }
@@ -374,11 +384,21 @@ pub fn normalize_responses_request(
                                     if let Some(wrapped) =
                                         wrap_developer_instructions_block(trimmed)
                                     {
-                                        push_part(
+                                        let (msg_index, part_index) = push_part(
                                             &mut messages,
                                             CanonicalRole::User,
                                             CanonicalPart::Text(wrapped),
                                         );
+                                        let allow_standalone_base = !has_base_instructions_slot
+                                            && req.previous_response_id.is_none()
+                                            && msg_index == 0;
+                                        developer_slots.push(ProtocolDeveloperSlot {
+                                            msg_index,
+                                            part_index,
+                                            kind: ProtocolDeveloperSlotKind::DeveloperItem {
+                                                allow_standalone_base,
+                                            },
+                                        });
                                     }
                                 }
                             }
@@ -421,135 +441,138 @@ pub fn normalize_responses_request(
         return Err(ProtocolError::EmptyInput);
     }
 
-    let mut client_tools = Vec::new();
+    let mut declared_tools = Vec::new();
     let mut enable_native_web_search = false;
     let mut enable_native_web_fetch = false;
     let mut web_fetch_max_uses = None;
     let mut web_fetch_allowed_domains = Vec::new();
     let mut web_fetch_blocked_domains = Vec::new();
-    let tool_choice_is_none = req
-        .tool_choice
-        .as_ref()
-        .and_then(Value::as_str)
-        .is_some_and(|s| s == "none");
+    let tool_choice_is_none = req.tool_choice.as_ref().is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    });
 
-    if !tool_choice_is_none {
-        for tool in &req.tools {
-            match tool.tool_type.as_str() {
-                "function" | "custom" => {
-                    push_function_or_custom_spec(&mut client_tools, None, tool, None);
-                }
-                "namespace" => {
-                    if let Some(ns_name) = tool
-                        .name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        && should_activate_tool_namespace(ns_name, &messages)
-                    {
-                        for sub in &tool.tools {
-                            push_function_or_custom_spec(
-                                &mut client_tools,
-                                Some(ns_name),
-                                sub,
-                                tool.description.as_deref(),
-                            );
-                        }
-                    }
-                }
-                "tool_search" => {
-                    let params_json = tool.parameters.as_ref().map_or_else(
-                        || {
-                            "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}"
-                                .to_owned()
-                        },
-                        |raw| raw.get().to_owned(),
-                    );
-                    client_tools.push(CanonicalToolSpec {
-                        name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
-                        description: tool.description.clone().or_else(|| {
-                            Some("Search deferred tools and MCP connectors by query.".to_owned())
-                        }),
-                        kind: CanonicalToolKind::Function {
-                            parameters_json: params_json,
-                        },
-                    });
-                }
-                "local_shell" => {
-                    client_tools.push(CanonicalToolSpec {
-                        name: INTERNAL_CODEX_LOCAL_SHELL_TOOL.to_owned(),
-                        description: Some(
-                            "Execute a shell command in the Codex workspace. Pass `command` as an argv array of strings and optional `working_directory`."
-                                .to_owned(),
-                        ),
-                        kind: CanonicalToolKind::Function {
-                            parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"working_directory\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}".to_owned(),
-                        },
-                    });
-                }
-                "apply_patch" => {
-                    client_tools.push(CanonicalToolSpec {
-                        name: tool
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| "apply_patch".to_owned()),
-                        description: tool.description.clone().or_else(|| {
-                            Some(
-                                "Apply a file patch using `*** Begin Patch` ... `*** End Patch` format."
-                                    .to_owned(),
-                            )
-                        }),
-                        kind: CanonicalToolKind::Custom {
-                            format_json: tool.format.as_ref().map(|r| r.get().to_owned()),
-                        },
-                    });
-                }
-                t if t.starts_with("web_search") => {
-                    enable_native_web_search = true;
-                    // OpenAI Responses API & Codex CLI bundle both web search (`action.type = "search"`)
-                    // and URL page opening/fetching (`action.type = "open_page"`) under `{"type": "web_search"}`
-                    // whenever `external_web_access` is not explicitly `false`.
-                    if tool.external_web_access != Some(false) {
-                        enable_native_web_fetch = true;
-                    }
-                    if tool.max_uses.is_some() {
-                        web_fetch_max_uses = tool.max_uses;
-                    }
-                    web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
-                    if let Some(filters) = &tool.filters {
-                        web_fetch_allowed_domains.extend(filters.allowed_domains.iter().cloned());
-                    }
-                    web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
-                }
-                t if t.starts_with("web_fetch") => {
-                    enable_native_web_fetch = true;
-                    if tool.max_uses.is_some() {
-                        web_fetch_max_uses = tool.max_uses;
-                    }
-                    web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
-                    web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
-                }
-                _ => {}
+    for tool in &req.tools {
+        match tool.tool_type.as_str() {
+            "function" | "custom" => {
+                push_function_or_custom_spec(&mut declared_tools, None, tool, None);
             }
-        }
-
-        // Activate any deferred tools discovered via `tool_search_output` or `additional_tools`
-        // without duplicating definitions already present in `req.tools`.
-        if !dynamic_tools.is_empty() {
-            let mut extra_specs = Vec::new();
-            for dyn_tool in &dynamic_tools {
-                push_dynamic_tool_value(&mut extra_specs, None, dyn_tool, None);
-            }
-            for spec in extra_specs {
-                if !client_tools
-                    .iter()
-                    .any(|existing| existing.name == spec.name)
+            "namespace" => {
+                if let Some(ns_name) = tool
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    && should_activate_tool_namespace(ns_name, &messages)
                 {
-                    client_tools.push(spec);
+                    for sub in &tool.tools {
+                        push_function_or_custom_spec(
+                            &mut declared_tools,
+                            Some(ns_name),
+                            sub,
+                            tool.description.as_deref(),
+                        );
+                    }
                 }
+            }
+            "tool_search" => {
+                let params_json = tool.parameters.as_ref().map_or_else(
+                    || {
+                        "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}"
+                            .to_owned()
+                    },
+                    |raw| raw.get().to_owned(),
+                );
+                declared_tools.push(CanonicalToolSpec {
+                    name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
+                    description: tool.description.clone().or_else(|| {
+                        Some("Search deferred tools and MCP connectors by query.".to_owned())
+                    }),
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: params_json,
+                    },
+                });
+            }
+            "local_shell" => {
+                declared_tools.push(CanonicalToolSpec {
+                    name: INTERNAL_CODEX_LOCAL_SHELL_TOOL.to_owned(),
+                    description: Some(
+                        "Execute a shell command in the Codex workspace. Pass `command` as an argv array of strings and optional `working_directory`."
+                            .to_owned(),
+                    ),
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"working_directory\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}".to_owned(),
+                    },
+                });
+            }
+            "apply_patch" => {
+                declared_tools.push(CanonicalToolSpec {
+                    name: tool
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "apply_patch".to_owned()),
+                    description: tool.description.clone().or_else(|| {
+                        Some(
+                            "Apply a file patch using `*** Begin Patch` ... `*** End Patch` format."
+                                .to_owned(),
+                        )
+                    }),
+                    kind: CanonicalToolKind::Custom {
+                        format_json: tool.format.as_ref().map(|r| r.get().to_owned()),
+                    },
+                });
+            }
+            t if !tool_choice_is_none && t.starts_with("web_search") => {
+                enable_native_web_search = true;
+                // OpenAI Responses API & Codex CLI bundle both web search (`action.type = "search"`)
+                // and URL page opening/fetching (`action.type = "open_page"`) under `{"type": "web_search"}`
+                // whenever `external_web_access` is not explicitly `false`.
+                if tool.external_web_access != Some(false) {
+                    enable_native_web_fetch = true;
+                }
+                if tool.max_uses.is_some() {
+                    web_fetch_max_uses = tool.max_uses;
+                }
+                web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
+                if let Some(filters) = &tool.filters {
+                    web_fetch_allowed_domains.extend(filters.allowed_domains.iter().cloned());
+                }
+                web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
+            }
+            t if !tool_choice_is_none && t.starts_with("web_fetch") => {
+                enable_native_web_fetch = true;
+                if tool.max_uses.is_some() {
+                    web_fetch_max_uses = tool.max_uses;
+                }
+                web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
+                web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+
+    // Activate any deferred tools discovered via `tool_search_output` or `additional_tools`
+    // without duplicating definitions already present in `req.tools`.
+    if !dynamic_tools.is_empty() {
+        let mut extra_specs = Vec::new();
+        for dyn_tool in &dynamic_tools {
+            push_dynamic_tool_value(&mut extra_specs, None, dyn_tool, None);
+        }
+        for spec in extra_specs {
+            if !declared_tools
+                .iter()
+                .any(|existing| existing.name == spec.name)
+            {
+                declared_tools.push(spec);
             }
         }
     }
+
+    let mut client_tools = if tool_choice_is_none {
+        Vec::new()
+    } else {
+        declared_tools.clone()
+    };
 
     let aux_system_hint = (!aux_system_parts.is_empty()).then(|| aux_system_parts.join("\n\n"));
 
@@ -571,6 +594,16 @@ pub fn normalize_responses_request(
             enable_native_web_fetch = false;
         }
     }
+
+    let is_compaction = crate::session_key::is_compaction_summarization_turn(
+        aux_system_hint.as_deref(),
+        &messages,
+        &client_tools,
+    ) || aux_system_hint
+        .as_deref()
+        .is_some_and(is_compaction_instructions_prompt);
+    let detected_harness = crate::harness_prompt::detect_harness_by_tools(&declared_tools);
+    let allow_prompt_distillation = auxiliary_task.is_none() && !is_compaction;
 
     let force_native_web_search = enable_native_web_search
         && req.tool_choice.as_ref().is_some_and(|choice| {
@@ -634,6 +667,9 @@ pub fn normalize_responses_request(
         omit_thinking_text: false,
         include_encrypted_reasoning,
         stream: req.stream.unwrap_or(false),
+        detected_harness,
+        allow_prompt_distillation,
+        developer_slots,
     })
 }
 
@@ -862,17 +898,24 @@ fn normalize_local_shell_action_json(action: &Value) -> String {
     serde_json::to_string(action).unwrap_or_else(|_| "{}".to_owned())
 }
 
-fn push_part(messages: &mut Vec<CanonicalMessage>, role: CanonicalRole, part: CanonicalPart) {
+fn push_part(
+    messages: &mut Vec<CanonicalMessage>,
+    role: CanonicalRole,
+    part: CanonicalPart,
+) -> (usize, usize) {
+    let existing_len = messages.len();
     if let Some(last) = messages.last_mut()
         && last.role == role
     {
+        let part_idx = last.parts.len();
         last.parts.push(part);
-        return;
+        return (existing_len.saturating_sub(1), part_idx);
     }
     messages.push(CanonicalMessage {
         role,
         parts: vec![part],
     });
+    (existing_len, 0)
 }
 
 fn extract_plain_text(content: &ResponseMessageContent) -> String {
@@ -1335,24 +1378,7 @@ pub const fn codex_truncation_limit_bytes(context_window: u64) -> i64 {
     }
 }
 
-const CODEX_AGY_BASE_INSTRUCTIONS: &str = "\
-You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Be precise, safe, and helpful.
-
-# Working Principles
-- Keep going autonomously until the user's request is completely resolved before yielding back. Do not guess when you can inspect the workspace directly.
-- Obey any `AGENTS.md` instructions whose directory scope covers files you touch; deeper `AGENTS.md` files take precedence over parent ones, and direct user/developer instructions take precedence over `AGENTS.md`.
-- Before grouped tool calls or long edits, send a brief 1-sentence preamble so the user can follow progress.
-- When searching text or file paths in the shell, prefer `rg` and `rg --files`.
-- Top-level tool calls execute sequentially over ACP (~1.3s overhead per call) and single tool outputs `> 9.6 KB` spill to disk: when Code Mode (`exec` and `wait`) is active, coalesce multi-file searches, symbol lookups, and ranged reads into a single `exec` JavaScript cell (`await Promise.all([tools.exec_command(...), ...])`), store reusable raw outputs in `store(key, value)` / `load(key)`, slice `text(...)` replies to `<= 8 KB` (~200 lines) to avoid spill round-trips, and call `wait` if `exec` yields a running cell ID.
-- Tiered file edits: batch surgical edits across 1-4 files into a single multi-file `apply_patch` call (`*** Begin Patch` ... `*** End Patch`), or isolate 5+ existing-file patches via `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` inside one `exec` cell; when creating large new files or performing mechanical bulk updates under non-interactive write permissions (never in Plan Mode, read-only sandboxes, or manual `on-request` command approval), you may stream file creation/rewrites plus build/test checks in a single `exec_command` (`python3 - <<'PY'` or `cat <<'EOF' > path`, avoiding `rm -f`), and never commit or create git branches unless asked.
-- Validate changes with targeted builds/tests when appropriate in non-interactive or test-focused runs; do not fix unrelated issues outside the user's scope.
-- When `request_user_input_async` or `request_user_input` is available and a critical requirement cannot be derived from workspace inspection, ask concise questions while continuing independent work.
-- For live web searches or reading HTTP/HTTPS URLs, prefer your built-in `search_web` and server-managed `__gateway_web_fetch` tools rather than running `curl` or `Invoke-WebRequest` in local shell commands (which may be blocked by Codex's network sandbox).
-
-# Response Style
-- Respond concisely and naturally like a direct teammate. Skip heavy section headers for simple greetings, confirmations, or short answers.
-- Wrap commands, paths, env vars, and identifiers in backticks (`...`).
-- Format file references as standalone inline code paths such as `src/lib.rs:42` (never emit `file://` URIs or `【F:...】` citations in Codex CLI output).";
+const CODEX_AGY_BASE_INSTRUCTIONS: &str = crate::harness_prompt::CODEX_DISTILLED_PROMPT;
 
 /// Builds a complete Codex `model_catalog_json` document from the live ACP `AvailableModel` list,
 /// ordering `default_model` first (`priority = 0`) followed by all remaining Antigravity models.
@@ -1799,5 +1825,268 @@ mod tests {
         );
         assert_eq!(efforts_of("gemini-pro-orchestrator-neon"), vec!["high"]);
         assert_eq!(efforts_of("gpt-oss-120b-medium"), vec!["medium"]);
+    }
+
+    #[test]
+    fn distills_codex_and_omp_prompts_by_tools_while_keeping_stateful_and_stateless_hashes_identical()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{WebToolBridgeConfig, hash_conversation_state};
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        let raw_upstream_codex_inst = format!(
+            "You are Codex, based on GPT-5.\n{}",
+            "Upstream Codex CLI boilerplate rule.\n".repeat(300)
+        );
+        let raw_codex_dev = format!(
+            "<skills_instructions>\n## Skills\n### Skill roots\n- `r0` = `/Users/dev/.agents/skills`\n### Available skills\n- skill-creator: {} (file: r0/skill-creator/SKILL.md)\n</skills_instructions>\n<permissions instructions>\nApproval policy is never. Do not pass sandbox_permissions.\n</permissions instructions>\n<collaboration_mode>\n# Collaboration Mode: Default\n{}\n</collaboration_mode>\n<apps_instructions>\nApps prose\n</apps_instructions>",
+            "Verbose skill blurb ".repeat(60),
+            "Verbose collaboration blurb ".repeat(40)
+        );
+        let codex_tools = json!([
+            { "type": "custom", "name": "exec", "description": "Run JS Code Mode" },
+            { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+            { "type": "custom", "name": "apply_patch", "description": "Apply V4A patch" }
+        ]);
+
+        let turn1_req: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": raw_codex_dev },
+                { "role": "user", "content": [
+                    { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nStrict Rust rules\n</INSTRUCTIONS>" },
+                    { "type": "input_text", "text": "<environment_context><cwd>/repo</cwd></environment_context>" },
+                    { "type": "input_text", "text": "hi" }
+                ] }
+            ]
+        }))
+        .expect("valid Turn 1 Codex request");
+
+        let norm1 = normalize_responses_request(&turn1_req).expect("normalized Turn 1");
+        assert!(matches!(
+            norm1.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Upstream Codex CLI boilerplate rule")
+        ));
+        let outbound1 = norm1.render_messages_for_outbound(0, norm1.detected_harness);
+        let joined1: String = norm1
+            .render_messages_for_outbound(0, norm1.detected_harness)
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                CanonicalPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(outbound1.len(), 2);
+        assert!(!joined1.contains("Upstream Codex CLI boilerplate rule"));
+        assert!(!joined1.contains("Verbose skill blurb"));
+        assert!(!joined1.contains("<apps_instructions>"));
+        assert!(joined1.contains("- skill-creator (file: r0/skill-creator/SKILL.md)"));
+        assert!(joined1.contains("Do not pass sandbox_permissions."));
+        assert!(joined1.contains("Strict Rust rules"));
+        assert!(joined1.contains("<cwd>/repo</cwd>"));
+
+        // Simulate Turn 2 with mid-turn collaboration mode switch: stateful delta vs stateless replay.
+        let assistant_1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Hey!".to_owned())],
+        };
+        let mid_dev = "<collaboration_mode>\n# Collaboration Mode: Plan\nEmit <proposed_plan> block.\n</collaboration_mode>";
+
+        let stateful_t2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "previous_response_id": "resp_t1",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": mid_dev },
+                { "role": "user", "content": "Plan the refactor" }
+            ]
+        }))
+        .expect("stateful Turn 2");
+        let norm_stateful_t2 = normalize_responses_request(&stateful_t2).expect("norm stateful t2");
+        let outbound_stateful_t2 = norm_stateful_t2
+            .render_messages_for_outbound(0, norm_stateful_t2.detected_harness)
+            .into_owned();
+        let mut combined = norm1.messages.clone();
+        combined.push(assistant_1);
+        combined.extend(norm_stateful_t2.messages);
+
+        let stateless_t2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_upstream_codex_inst,
+            "tools": codex_tools,
+            "tool_choice": "none",
+            "input": [
+                { "role": "developer", "content": raw_codex_dev },
+                { "role": "user", "content": [
+                    { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nStrict Rust rules\n</INSTRUCTIONS>" },
+                    { "type": "input_text", "text": "<environment_context><cwd>/repo</cwd></environment_context>" },
+                    { "type": "input_text", "text": "hi" }
+                ] },
+                { "role": "assistant", "content": "Hey!" },
+                { "role": "developer", "content": mid_dev },
+                { "role": "user", "content": "Plan the refactor" }
+            ]
+        }))
+        .expect("stateless Turn 2");
+        let norm_stateless_t2 =
+            normalize_responses_request(&stateless_t2).expect("norm stateless t2");
+        let outbound_stateless_delta =
+            norm_stateless_t2.render_messages_for_outbound(3, norm_stateless_t2.detected_harness);
+
+        assert_eq!(combined, norm_stateless_t2.messages);
+        assert_eq!(
+            outbound_stateful_t2.as_slice(),
+            outbound_stateless_delta.as_ref()
+        );
+        assert_eq!(
+            hash_conversation_state(
+                None,
+                &norm_stateless_t2.client_tools,
+                web_cfg,
+                &model,
+                &combined
+            ),
+            hash_conversation_state(
+                None,
+                &norm_stateless_t2.client_tools,
+                web_cfg,
+                &model,
+                &norm_stateless_t2.messages,
+            )
+        );
+
+        // Generic OpenAI Responses SDK caller without Codex/OMP/OpenCode tools keeps instructions verbatim.
+        let generic_req: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": format!("Custom domain prompt.\n{}", "Domain rule.\n".repeat(200)),
+            "tools": [{ "type": "function", "name": "lookup_order", "parameters": { "type": "object" } }],
+            "input": "Check order #42"
+        }))
+        .expect("generic request");
+        let norm_generic = normalize_responses_request(&generic_req).expect("norm generic");
+        let outbound_generic =
+            norm_generic.render_messages_for_outbound(0, norm_generic.detected_harness);
+        assert!(matches!(
+            outbound_generic[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Domain rule.")
+        ));
+    }
+
+    #[test]
+    fn responses_normalization_preserves_hashes_across_tool_mutations_and_literal_assistant_wrappers()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let raw_inst = format!(
+            "You are Codex.\n{}",
+            "Built-in Codex manual line.\n".repeat(200)
+        );
+        let shell_only = json!([{
+            "type": "function",
+            "name": "shell",
+            "parameters": {
+                "type": "object",
+                "properties": { "command": { "type": "array", "items": { "type": "string" } } }
+            }
+        }]);
+        let shell_and_patch = json!([
+            {
+                "type": "function",
+                "name": "shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "array", "items": { "type": "string" } } }
+                }
+            },
+            {
+                "type": "function",
+                "name": "apply_patch",
+                "parameters": { "type": "object", "properties": { "patch": { "type": "string" } } }
+            }
+        ]);
+
+        let turn1: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_inst,
+            "tools": shell_only,
+            "input": [{ "role": "user", "content": "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>" }]
+        }))
+        .expect("turn 1");
+        let norm1 = normalize_responses_request(&turn1).expect("norm 1");
+        assert_eq!(norm1.detected_harness, None);
+
+        let literal_assistant = "<developer_instructions><apps_instructions>assistant literal</apps_instructions></developer_instructions>";
+        let reply1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(literal_assistant.to_owned())],
+        };
+        let t1_hash = hash_conversation_with_reply(
+            None,
+            &norm1.client_tools,
+            web_cfg,
+            &model,
+            &norm1.messages,
+            &reply1,
+        );
+
+        // Turn 2 crosses detection threshold (`[shell]` -> `[shell, apply_patch]`) and replays
+        // both user and assistant literal `<developer_instructions>` blocks.
+        let turn2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_inst,
+            "tools": shell_and_patch,
+            "input": [
+                { "role": "user", "content": "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps prose</apps_instructions>\n<permissions instructions>read-only</permissions instructions>" },
+                { "role": "user", "content": "continue" }
+            ]
+        }))
+        .expect("turn 2");
+        let norm2 = normalize_responses_request(&turn2).expect("norm 2");
+        assert_eq!(
+            norm2.detected_harness,
+            Some(crate::harness_prompt::DetectedHarness::Codex)
+        );
+        let plan2 =
+            compute_routing_plan(None, &norm2.client_tools, web_cfg, &model, &norm2.messages);
+        assert_eq!(plan2.prefix_lookup, Some((t1_hash, 3)));
+
+        // Full outbound rendering distills protocol slots while keeping user & assistant literals untouched.
+        let full_outbound = norm2.render_messages_for_outbound(0, norm2.detected_harness);
+        assert_eq!(
+            full_outbound[1].parts,
+            vec![CanonicalPart::Text(
+                "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>".to_owned()
+            )]
+        );
+        assert_eq!(
+            full_outbound[2].parts,
+            vec![CanonicalPart::Text(literal_assistant.to_owned())]
+        );
+        let delta_outbound = norm2.render_messages_for_outbound(3, norm2.detected_harness);
+        let delta_joined: String = delta_outbound
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                CanonicalPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!delta_joined.contains("drop protocol apps prose"));
+        assert!(delta_joined.contains("read-only"));
     }
 }

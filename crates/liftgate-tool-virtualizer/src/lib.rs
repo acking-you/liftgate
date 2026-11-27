@@ -22,8 +22,8 @@ pub use planner::{
 };
 pub use profile::{
     DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
-    default_apply_patch_v4a_contract, detect_harness, is_omp_input_edit_spec,
-    is_opencode_v4a_patch_spec,
+    default_apply_patch_v4a_contract, detect_harness, detect_harness_by_tools,
+    is_omp_input_edit_spec, is_opencode_v4a_patch_spec,
 };
 pub use profiles::{
     ClaudeCodeToolProfile, CodexToolProfile, GenericToolProfile, OmpToolProfile,
