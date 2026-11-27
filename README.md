@@ -180,7 +180,7 @@ updates back as OpenAI or Anthropic events. See [architecture](docs/architecture
 
 | | |
 | --- | --- |
-| **Use** | [Usage guide](docs/usage.md) · [Codex CLI](docs/usage.md#codex-cli) · [Claude Code](docs/usage.md#claude-code) · [OpenCode](docs/usage.md#opencode) · [Oh My Pi](docs/usage.md#oh-my-pi-omp) · [Dashboard](docs/usage.md#dashboard) · [Flags](docs/usage.md#flags-and-environment) |
+| **Use** | [Usage guide](docs/usage.md) · [Remote gateway](docs/remote.md) · [Codex CLI](docs/usage.md#codex-cli) · [Claude Code](docs/usage.md#claude-code) · [OpenCode](docs/usage.md#opencode) · [Oh My Pi](docs/usage.md#oh-my-pi-omp) · [Dashboard](docs/usage.md#dashboard) · [Flags](docs/usage.md#flags-and-environment) |
 | **Reference** | [API](docs/api.md) · [Architecture](docs/architecture.md) |
 | **Project** | [Changelog](CHANGELOG.md) · [Rust standard](docs/2026-11-09-RUST.md) · [AGENTS.md](AGENTS.md) |
 

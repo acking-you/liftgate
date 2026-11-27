@@ -139,7 +139,7 @@ lg down                  # 优雅停止后台网关服务
 
 | | |
 | --- | --- |
-| **使用** | [使用指南](docs/usage.zh-CN.md) · [Codex CLI](docs/usage.zh-CN.md#codex-cli) · [Claude Code](docs/usage.zh-CN.md#claude-code) · [OpenCode](docs/usage.zh-CN.md#opencode) · [Oh My Pi](docs/usage.zh-CN.md#oh-my-piomp) · [监控面板](docs/usage.zh-CN.md#监控面板) · [参数](docs/usage.zh-CN.md#参数与环境变量) |
+| **使用** | [使用指南](docs/usage.zh-CN.md) · [远端部署](docs/remote.zh-CN.md) · [Codex CLI](docs/usage.zh-CN.md#codex-cli) · [Claude Code](docs/usage.zh-CN.md#claude-code) · [OpenCode](docs/usage.zh-CN.md#opencode) · [Oh My Pi](docs/usage.zh-CN.md#oh-my-piomp) · [监控面板](docs/usage.zh-CN.md#监控面板) · [参数](docs/usage.zh-CN.md#参数与环境变量) |
 | **参考** | [API](docs/api.md) · [架构](docs/architecture.md) |
 | **项目** | [更新日志](CHANGELOG.md) · [Rust 规范](docs/2026-11-09-RUST.md) · [AGENTS.md](AGENTS.md) |
 

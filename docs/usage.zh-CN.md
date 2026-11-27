@@ -2,7 +2,7 @@
 
 [English](usage.md) · 中文
 
-启动 Liftgate，然后把 Codex CLI、Claude Code、OpenCode 或任意 OpenAI / Anthropic 客户端指向它。下文地址均以默认的 `http://127.0.0.1:8787` 为例。
+启动 Liftgate，然后把 Codex CLI、Claude Code、OpenCode 或任意 OpenAI / Anthropic 客户端指向它。下文地址均以默认的 `http://127.0.0.1:8787` 为例；若要在远端服务器运行网关并从本机连接 `cx`、`omp`、`cc` 或 `oc`（支持 `lg remote` 一键接入或纯手动复制配置），详见[远端网关部署与客户端接入指南](remote.zh-CN.md)。
 
 ## 准备工作
 

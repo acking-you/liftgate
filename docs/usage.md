@@ -4,7 +4,9 @@ English · [中文](usage.zh-CN.md)
 
 Run Liftgate, then point Codex CLI, Claude Code, OpenCode or any OpenAI /
 Anthropic client at it. Every address below assumes the default
-`http://127.0.0.1:8787`.
+`http://127.0.0.1:8787`; to run the gateway on another machine and connect local
+`cx`, `omp`, `cc`, or `oc` clients (either via `lg remote` or copy-paste manual
+configs), see the [Remote gateway guide](remote.md).
 
 ## Before you start
 

@@ -9,6 +9,7 @@ must keep. Start with the [usage guide](usage.md); contributor rules are in
 | Page | Covers |
 | --- | --- |
 | [Usage guide](usage.md) · [中文](usage.zh-CN.md) | running the gateway, launchers, Codex CLI and Claude Code setup, dashboard, flags, troubleshooting |
+| [Remote gateway](remote.md) · [中文](remote.zh-CN.md) | running Liftgate on a remote server and connecting local `cx`, `omp`, `cc`, and `oc` via `lg remote` or copy-paste manual configs |
 | [API](api.md) | routes, authentication, OpenAI Responses and Anthropic Messages support, models |
 
 ## Design
@@ -17,6 +18,7 @@ must keep. Start with the [usage guide](usage.md); contributor rules are in
 | --- | --- |
 | [Architecture](architecture.md) | why ACP, the request path, session reuse, model routing, process supervision, workspace layout |
 | [MCP tool virtualization](mcp-tool-virtualization.md) | `agy acp` Eager tool budget adaptation, namespace action hubs, 0-RTT gateway-local `search_client_tools`, preflight self-healing |
+| [`agy acp` 1.5.18 verification & elastic I/O plan](agy-acp-optimization-plan.md) | empirical `agy acp 1.5.18` protocol benchmarks, budget recalibration, and Bash-first / orchestrator-first read-write design |
 
 ## Project
 
