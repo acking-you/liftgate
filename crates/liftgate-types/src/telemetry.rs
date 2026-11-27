@@ -1152,6 +1152,10 @@ pub struct ContextCaptureSummary {
     pub stored_records: usize,
     #[serde(default)]
     pub stored_bytes: u64,
+    /// Completed turns left uncaptured because earlier captures were still being written
+    /// (reset when captures are cleared).
+    #[serde(default)]
+    pub skipped_records: u64,
     #[serde(default)]
     pub capture_dir: Option<String>,
 }

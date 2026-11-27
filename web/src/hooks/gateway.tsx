@@ -151,30 +151,47 @@ export function GatewayProvider({
   const [toolCallsError, setToolCallsError] = useState<string | null>(null);
   /** Revision covered by `toolCallMap`; -1 forces a full fetch. */
   const fetchedToolRevision = useRef(-1);
-  /** Latest revision announced by the snapshot stream. */
-  const wantedToolRevision = useRef(-1);
-  const toolFetchInFlight = useRef(false);
+  /** Client whose fetch is outstanding; a new client never waits on an old client's request. */
+  const toolFetchOwner = useRef<GatewayClient | null>(null);
+  /** Another pass was requested while the owner's fetch was outstanding. */
+  const toolSyncQueued = useRef(false);
+  /** The next pass refetches everything instead of a `?since=` delta. */
+  const toolFullReload = useRef(false);
   const activeClient = useRef(client);
   activeClient.current = client;
 
   const syncToolCalls = useCallback(async (): Promise<void> => {
-    if (toolFetchInFlight.current) return;
-    toolFetchInFlight.current = true;
+    if (toolFetchOwner.current === client) {
+      // The running loop picks this up before it finishes.
+      toolSyncQueued.current = true;
+      return;
+    }
+    toolFetchOwner.current = client;
     try {
-      do {
-        const since = fetchedToolRevision.current < 0 ? undefined : fetchedToolRevision.current;
+      for (;;) {
+        toolSyncQueued.current = false;
+        const full = toolFullReload.current || fetchedToolRevision.current < 0;
+        toolFullReload.current = false;
+        const since = full ? undefined : fetchedToolRevision.current;
         const data = await client.toolCalls(since);
         if (activeClient.current !== client) return;
+        const { revision, oldest_seq } = data.summary;
+        if (since !== undefined && revision < since) {
+          // The gateway restarted and its revisions started over: refetch everything.
+          toolFullReload.current = true;
+          continue;
+        }
         setToolCallMap((prev) => {
           const next = new Map(since === undefined ? [] : prev);
           for (const rec of data.records) next.set(rec.call_id, rec);
           for (const [id, rec] of next) {
-            if (rec.seq < data.summary.oldest_seq) next.delete(id);
+            if (rec.seq < oldest_seq) next.delete(id);
           }
           return next;
         });
-        fetchedToolRevision.current = data.summary.revision;
-      } while (wantedToolRevision.current > fetchedToolRevision.current);
+        fetchedToolRevision.current = revision;
+        if (!toolSyncQueued.current && !toolFullReload.current) break;
+      }
       setToolCallsStatus("ready");
       setToolCallsError(null);
     } catch (err) {
@@ -186,12 +203,12 @@ export function GatewayProvider({
         setToolCallsError(errorMessage(err));
       }
     } finally {
-      toolFetchInFlight.current = false;
+      if (toolFetchOwner.current === client) toolFetchOwner.current = null;
     }
   }, [client]);
 
   const reloadToolCalls = useCallback((): void => {
-    fetchedToolRevision.current = -1;
+    toolFullReload.current = true;
     void syncToolCalls();
   }, [syncToolCalls]);
 
@@ -220,7 +237,8 @@ export function GatewayProvider({
   useEffect(() => {
     fetchedCacheRevision.current = -1;
     fetchedToolRevision.current = -1;
-    wantedToolRevision.current = -1;
+    toolSyncQueued.current = false;
+    toolFullReload.current = false;
     setSnapshot(null);
     setLowCacheRecords([]);
     setToolCallMap(new Map());
@@ -255,7 +273,6 @@ export function GatewayProvider({
       // Revision went backwards: the gateway restarted, so start over.
       fetchedToolRevision.current = -1;
     }
-    wantedToolRevision.current = toolRevision;
     if (toolRevision !== fetchedToolRevision.current) void syncToolCalls();
   }, [hasSnapshot, toolRevision, syncToolCalls]);
 

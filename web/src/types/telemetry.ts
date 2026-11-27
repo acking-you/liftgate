@@ -609,6 +609,8 @@ export interface ContextCaptureSummary {
   max_total_bytes: number;
   stored_records: number;
   stored_bytes: number;
+  /** Turns skipped because earlier captures were still being written; reset by clearing. */
+  skipped_records?: number;
   capture_dir?: string | null;
 }
 

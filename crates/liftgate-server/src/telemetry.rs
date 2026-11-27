@@ -32,12 +32,12 @@ use liftgate_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use uuid::Uuid;
 
 use crate::context_capture::{
-    ContextCaptureConfig, ContextCaptureIoError, ContextCaptureStore, encode_payload,
-    payload_file_name, read_payload,
+    CaptureCommit, CaptureTicket, ContextCaptureConfig, ContextCaptureIoError, ContextCaptureStore,
+    encode_payload, payload_file_name, read_payload,
 };
 use crate::tool_calls::{
     ToolCallLimits, ToolCallOutcome, ToolCallStart, ToolCallStore, ToolCallTaskContext,
@@ -607,6 +607,8 @@ pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
     persist_lock: Mutex<u64>,
     context_persist_lock: Mutex<u64>,
+    /// One permit per full-context capture allowed to wait for, or be in, its disk write.
+    context_write_slots: Arc<Semaphore>,
     settings_path: Option<PathBuf>,
     notify_tx: broadcast::Sender<()>,
     shutdown_tx: watch::Sender<bool>,
@@ -670,6 +672,9 @@ impl TelemetryHub {
         let (notify_tx, _) = broadcast::channel(64);
         let (shutdown_tx, _) = watch::channel(false);
         let settings_path = config.cache.settings_path.clone();
+        let context_write_slots = Arc::new(Semaphore::new(
+            config.context_capture.max_pending_writes.get(),
+        ));
         let cache_store = CacheTelemetryStore::from_config(config.cache);
         Self {
             inner: Mutex::new(TelemetryInner {
@@ -684,6 +689,7 @@ impl TelemetryHub {
             }),
             persist_lock: Mutex::new(0),
             context_persist_lock: Mutex::new(0),
+            context_write_slots,
             settings_path,
             notify_tx,
             shutdown_tx,
@@ -1045,13 +1051,23 @@ impl TelemetryHub {
     }
 
     fn write_context_capture(&self, capture: PendingContextCapture) {
+        // `_slot` is held until this write finishes, bounding payloads waiting on the disk.
         let PendingContextCapture {
-            seq,
+            slot: _slot,
+            ticket,
             mut record,
             payload,
         } = capture;
-        let Some(dir) = self.lock_inner().context_store.dir().map(Path::to_path_buf) else {
-            return;
+        let dir = {
+            let guard = self.lock_inner();
+            if !guard.context_store.accepts(ticket) {
+                // Cleared or switched off since this turn completed.
+                return;
+            }
+            let Some(dir) = guard.context_store.dir().map(Path::to_path_buf) else {
+                return;
+            };
+            dir
         };
         let Some(file_name) = payload_file_name(&record.task_id) else {
             tracing::warn!(task_id = %record.task_id, "skipping full-context capture with unusable task id");
@@ -1065,15 +1081,25 @@ impl TelemetryHub {
             }
         };
         drop(payload);
-        if let Err(err) = write_bytes_atomic_private(&dir.join(file_name), &bytes) {
+        let payload_path = dir.join(file_name);
+        if let Err(err) = write_bytes_atomic_private(&payload_path, &bytes) {
             tracing::warn!(error = ?err, "failed to write full-context capture");
             return;
         }
         record.payload_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let (evicted, prepared) = {
+        let committed = {
             let mut guard = self.lock_inner();
-            let evicted = guard.context_store.commit(seq, record);
-            (evicted, guard.context_store.prepare_index())
+            match guard.context_store.commit(ticket, record) {
+                CaptureCommit::Stored(evicted) => {
+                    Some((evicted, guard.context_store.prepare_index()))
+                }
+                CaptureCommit::Stale => None,
+            }
+        };
+        let Some((evicted, prepared)) = committed else {
+            // Cleared or switched off while the payload was being written: it must not survive.
+            let _ = fs::remove_file(&payload_path);
+            return;
         };
         remove_capture_files(Some(&dir), &evicted);
         self.flush_context_index(prepared);
@@ -1435,8 +1461,10 @@ struct TurnTextCapture {
 
 /// A completed turn's capture, waiting for its payload to be written off the async workers.
 struct PendingContextCapture {
-    /// Position reserved when the turn completed ([`ContextCaptureStore::reserve_seq`]).
-    seq: u64,
+    /// Write slot taken before the payload was materialized; released when the write finishes.
+    slot: OwnedSemaphorePermit,
+    /// Taken when the turn completed ([`ContextCaptureStore::reserve`]).
+    ticket: CaptureTicket,
     record: ContextCaptureRecord,
     payload: FullContextPayload,
 }
@@ -2157,7 +2185,7 @@ impl ActiveTaskGuard {
     ) -> Option<PendingContextCapture> {
         let capture = self.text_capture.as_ref()?;
         let diag = diagnostics?;
-        let (seq, (session_id, resolved_model, prompt_preview, output_preview)) = {
+        let (slot, ticket, (session_id, resolved_model, prompt_preview, output_preview)) = {
             let mut guard = self.hub.lock_inner();
             if !guard.context_store.is_capturing() {
                 return None;
@@ -2169,8 +2197,18 @@ impl ActiveTaskGuard {
                 task.prompt_preview.clone(),
                 task.output_preview.clone(),
             );
+            // Admit before materializing: when the disk falls behind, skip this turn rather than
+            // queue another multi-megabyte payload in memory.
+            let Ok(slot) = Arc::clone(&self.hub.context_write_slots).try_acquire_owned() else {
+                guard.context_store.note_skipped();
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    "skipping full-context capture: earlier captures are still being written"
+                );
+                return None;
+            };
             // Reserved now, in completion order; the blocking writer may finish later.
-            (guard.context_store.reserve_seq(), fields)
+            (slot, guard.context_store.reserve(), fields)
         };
         let (reasoning, output) = {
             let mut buf = match capture.lock() {
@@ -2211,7 +2249,8 @@ impl ActiveTaskGuard {
             assistant_output: (!output.is_empty()).then_some(output),
         };
         Some(PendingContextCapture {
-            seq,
+            slot,
+            ticket,
             record,
             payload,
         })
@@ -3115,6 +3154,92 @@ mod tests {
         assert_eq!(summary.total_cached_read_tokens, 1_450);
         assert_eq!(summary.warm_prompt_tokens, 1_250);
         assert_eq!(summary.warm_cached_read_tokens, 1_050);
+    }
+
+    fn capture_test_diagnostics(messages: &[CanonicalMessage]) -> TurnCompletionDiagnostics<'_> {
+        TurnCompletionDiagnostics {
+            routing_strategy: LowCacheRoutingStrategy::PrefixHash,
+            delta_start_index: 0,
+            session_turn_index: 1,
+            session_idle_ms: None,
+            previous_session_context_tokens: 0,
+            model_switched: false,
+            previous_model: None,
+            previous_response_id: None,
+            prefix_hash_hex: None,
+            base_state_hash_hex: "00",
+            reasoning_effort: None,
+            web_cfg: WebToolBridgeConfig::default(),
+            acp_system_append: None,
+            tools_delta_xml: None,
+            outbound_acp_blocks: &[],
+            messages,
+            client_tools: &[],
+        }
+    }
+
+    #[test]
+    fn full_context_capture_skips_turns_instead_of_queueing_behind_slow_writes() {
+        let dir = std::env::temp_dir().join(format!("liftgate-ctx-backlog-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let hub = Arc::new(TelemetryHub::with_telemetry_config(TelemetryConfig {
+            context_capture: ContextCaptureConfig {
+                enabled: true,
+                dir: Some(dir.clone()),
+                max_pending_writes: std::num::NonZeroUsize::MIN,
+                ..ContextCaptureConfig::default()
+            },
+            ..TelemetryConfig::default()
+        }));
+        let messages = vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("hi".to_owned())],
+        }];
+        let run_turn = |task_id: &str| {
+            let guard = hub.begin_task(
+                task_id.to_owned(),
+                TaskProtocol::OpenaiResponses,
+                false,
+                "gemini-4-carbon-high".to_owned(),
+                None,
+                &messages,
+            );
+            guard.bind_session("sess_capture", false, "gemini-4-carbon-high");
+            guard.complete_with_diagnostics(
+                "end_turn".to_owned(),
+                AcpUsage::default(),
+                Some(capture_test_diagnostics(&messages)),
+            );
+        };
+
+        // An earlier write still holds the only slot: the turn is counted as skipped, not queued.
+        let held = Arc::clone(&hub.context_write_slots)
+            .try_acquire_owned()
+            .expect("free write slot");
+        run_turn("task_backlogged");
+        let summary = hub.context_capture_summary();
+        assert_eq!(summary.skipped_records, 1);
+        assert_eq!(summary.stored_records, 0);
+
+        // With the slot free again the next turn is captured (inline: no runtime in this test)
+        // and its slot is returned once the write finishes.
+        drop(held);
+        run_turn("task_captured");
+        let listed = hub.context_captures();
+        assert_eq!(listed.summary.skipped_records, 1);
+        let ids: Vec<&str> = listed.records.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, ["task_captured"]);
+        assert_eq!(hub.context_write_slots.available_permits(), 1);
+        assert!(
+            hub.context_capture_detail("task_captured")
+                .expect("read capture")
+                .is_some()
+        );
+
+        // Clearing resets the skip counter along with the captures.
+        let cleared = hub.clear_context_captures();
+        assert_eq!((cleared.stored_records, cleared.skipped_records), (0, 0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

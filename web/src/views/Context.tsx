@@ -231,6 +231,11 @@ function ControlCard({
               保存位置 <span className="lg-num text-fg-2">{summary.capture_dir}</span>
             </p>
           )}
+          {(summary.skipped_records ?? 0) > 0 && (
+            <p className="lg-hint m-0 text-warn">
+              磁盘写入跟不上，已跳过 <span className="lg-num">{summary.skipped_records}</span> 轮。
+            </p>
+          )}
         </div>
 
         <form className="flex flex-col gap-3" onSubmit={saveQuota}>

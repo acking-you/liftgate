@@ -4,10 +4,15 @@
 //! resident prefix and delta, reasoning, the `session/prompt` blocks sent to `agy acp`, and the
 //! model output) to `~/.liftgate/context-captures/ctx-<task_id>.json`. An index file keeps the
 //! list cheap to serve, and both a record-count and a disk quota evict the oldest captures.
+//!
+//! Payloads are written off the async workers. Each completed turn first takes a
+//! [`CaptureTicket`]: its sequence keeps the index in turn order however the writers finish, and
+//! its generation lets clearing (or switching capture off) reject writers that are still running.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use liftgate_types::{
@@ -24,8 +29,11 @@ const INDEX_FILE_NAME: &str = "index.json";
 const PAYLOAD_FILE_PREFIX: &str = "ctx-";
 const INDEX_SCHEMA_VERSION: u32 = 1;
 
+/// Default for [`ContextCaptureConfig::max_pending_writes`].
+pub const DEFAULT_MAX_PENDING_CAPTURE_WRITES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+
 /// Startup configuration for [`ContextCaptureStore`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ContextCaptureConfig {
     /// Capture every completed turn (`false` by default).
     pub enabled: bool,
@@ -33,6 +41,40 @@ pub struct ContextCaptureConfig {
     pub max_disk: ContextCaptureDiskMib,
     /// Directory holding payload files and the index (`None` disables capture entirely).
     pub dir: Option<PathBuf>,
+    /// Captures that may wait for, or be in the middle of, their disk write at once. A turn that
+    /// completes while all of them are taken is skipped and counted instead of holding its
+    /// payload in memory.
+    pub max_pending_writes: NonZeroUsize,
+}
+
+impl Default for ContextCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_records: ContextCaptureRecordLimit::default(),
+            max_disk: ContextCaptureDiskMib::default(),
+            dir: None,
+            max_pending_writes: DEFAULT_MAX_PENDING_CAPTURE_WRITES,
+        }
+    }
+}
+
+/// Reservation taken when a turn completes, before its payload is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureTicket {
+    /// Turn-completion order.
+    seq: u64,
+    /// [`ContextCaptureStore`] generation the turn completed in.
+    generation: u64,
+}
+
+/// Outcome of [`ContextCaptureStore::commit`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum CaptureCommit {
+    /// Indexed; carries the older captures evicted to stay within quota.
+    Stored(Vec<ContextCaptureRecord>),
+    /// Captures were cleared, or capture was switched off, after the turn completed.
+    Stale,
 }
 
 /// Failure while writing or reading a capture file.
@@ -98,6 +140,9 @@ pub struct ContextCaptureStore {
     revision: u64,
     persist_seq: u64,
     last_capture_seq: u64,
+    /// Bumped by [`Self::clear`] and by switching capture off; older tickets become stale.
+    generation: u64,
+    skipped_records: u64,
 }
 
 impl ContextCaptureStore {
@@ -148,6 +193,8 @@ impl ContextCaptureStore {
             revision: 1,
             persist_seq: 0,
             last_capture_seq,
+            generation: 0,
+            skipped_records: 0,
         };
         let evicted = store.trim_to_quota();
         store.remove_payload_files(&evicted);
@@ -175,6 +222,7 @@ impl ContextCaptureStore {
             max_total_bytes: self.max_disk.bytes(),
             stored_records: self.records.len(),
             stored_bytes: self.stored_bytes,
+            skipped_records: self.skipped_records,
             capture_dir: self.dir.as_ref().map(|d| d.to_string_lossy().into_owned()),
         }
     }
@@ -213,6 +261,10 @@ impl ContextCaptureStore {
         max_disk: Option<ContextCaptureDiskMib>,
     ) -> Vec<ContextCaptureRecord> {
         if let Some(flag) = enabled {
+            if self.enabled && !flag {
+                // Writers still finishing turns from before the switch must not land after it.
+                self.generation = self.generation.saturating_add(1);
+            }
             self.enabled = flag;
         }
         if let Some(limit) = max_records {
@@ -230,16 +282,36 @@ impl ContextCaptureStore {
         (self.enabled, self.max_records, self.max_disk)
     }
 
-    /// Reserves the position of a completed turn's capture before its payload is written.
-    pub const fn reserve_seq(&mut self) -> u64 {
+    /// Reserves the index position of a completed turn's capture before its payload is written.
+    pub const fn reserve(&mut self) -> CaptureTicket {
         self.last_capture_seq = self.last_capture_seq.saturating_add(1);
-        self.last_capture_seq
+        CaptureTicket {
+            seq: self.last_capture_seq,
+            generation: self.generation,
+        }
+    }
+
+    /// `false` once captures were cleared, or capture was switched off, after `ticket` was taken.
+    #[must_use]
+    pub const fn accepts(&self, ticket: CaptureTicket) -> bool {
+        ticket.generation == self.generation
+    }
+
+    /// Counts a completed turn that was not captured because earlier captures were still being
+    /// written.
+    pub const fn note_skipped(&mut self) {
+        self.skipped_records = self.skipped_records.saturating_add(1);
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Adds a freshly written capture at its reserved position (writers finish out of order),
-    /// replacing an older capture of the same task, and returns records evicted to stay within
-    /// quota.
-    pub fn commit(&mut self, seq: u64, record: ContextCaptureRecord) -> Vec<ContextCaptureRecord> {
+    /// replacing an older capture of the same task. Rejects tickets taken before the latest
+    /// clear or switch-off.
+    pub fn commit(&mut self, ticket: CaptureTicket, record: ContextCaptureRecord) -> CaptureCommit {
+        if !self.accepts(ticket) {
+            return CaptureCommit::Stale;
+        }
+        let seq = ticket.seq;
         if let Some(pos) = self
             .records
             .iter()
@@ -256,12 +328,15 @@ impl ContextCaptureStore {
             .map_or(0, |pos| pos.saturating_add(1));
         self.records.insert(at, StoredCapture { seq, record });
         self.revision = self.revision.saturating_add(1);
-        self.trim_to_quota()
+        CaptureCommit::Stored(self.trim_to_quota())
     }
 
-    /// Drops every record and returns them so their files can be removed.
+    /// Drops every record and returns them so their files can be removed; captures still being
+    /// written are rejected when they try to commit.
     pub fn clear(&mut self) -> Vec<ContextCaptureRecord> {
         self.stored_bytes = 0;
+        self.skipped_records = 0;
+        self.generation = self.generation.saturating_add(1);
         self.revision = self.revision.saturating_add(1);
         self.records.drain(..).map(|c| c.record).collect()
     }
@@ -392,6 +467,28 @@ mod tests {
         }
     }
 
+    /// Commits `record` under a fresh ticket and returns the evicted records.
+    fn store_now(store: &mut ContextCaptureStore, record: ContextCaptureRecord) -> Vec<String> {
+        let ticket = store.reserve();
+        evicted_ids(store.commit(ticket, record))
+    }
+
+    fn evicted_ids(outcome: CaptureCommit) -> Vec<String> {
+        match outcome {
+            CaptureCommit::Stored(evicted) => evicted.into_iter().map(|r| r.task_id).collect(),
+            CaptureCommit::Stale => panic!("ticket unexpectedly stale"),
+        }
+    }
+
+    fn listed_ids(store: &ContextCaptureStore) -> Vec<String> {
+        store
+            .list()
+            .records
+            .into_iter()
+            .map(|r| r.task_id)
+            .collect()
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("liftgate-ctx-{tag}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("create temp dir: {err}"));
@@ -404,24 +501,21 @@ mod tests {
             enabled: true,
             max_records: ContextCaptureRecordLimit::try_new(3).unwrap_or_default(),
             max_disk: ContextCaptureDiskMib::try_new(16).unwrap_or_default(),
-            dir: None,
+            ..ContextCaptureConfig::default()
         });
         for i in 0..4 {
-            let seq = store.reserve_seq();
-            let evicted = store.commit(seq, record(&format!("t{i}"), 1_000));
+            let evicted = store_now(&mut store, record(&format!("t{i}"), 1_000));
             if i < 3 {
                 assert!(evicted.is_empty());
             } else {
-                assert_eq!(evicted.first().map(|r| r.task_id.as_str()), Some("t0"));
+                assert_eq!(evicted, ["t0"]);
             }
         }
         let big = 9 * 1024 * 1024;
-        let seq = store.reserve_seq();
-        let evicted = store.commit(seq, record("t-big-a", big));
+        let evicted = store_now(&mut store, record("t-big-a", big));
         assert!(!evicted.is_empty());
-        let seq = store.reserve_seq();
-        let evicted = store.commit(seq, record("t-big-b", big));
-        assert!(evicted.iter().any(|r| r.task_id == "t-big-a"));
+        let evicted = store_now(&mut store, record("t-big-b", big));
+        assert!(evicted.iter().any(|id| id == "t-big-a"));
         assert!(store.summary().stored_bytes <= 16 * 1024 * 1024);
         assert_eq!(
             store.list().records.first().map(|r| r.task_id.as_str()),
@@ -445,8 +539,7 @@ mod tests {
         for task in ["resp_a", "resp_b"] {
             let name = payload_file_name(task).unwrap_or_default();
             fs::write(dir.join(name), b"{}").unwrap_or_else(|err| panic!("write: {err}"));
-            let seq = store.reserve_seq();
-            let _ = store.commit(seq, record(task, 2));
+            let _ = store_now(&mut store, record(task, 2));
         }
         fs::write(dir.join("ctx-orphan.json"), b"{}").unwrap_or_else(|err| panic!("write: {err}"));
         let (path, _, bytes) = store.prepare_index().unwrap_or_else(|| panic!("index"));
@@ -477,19 +570,13 @@ mod tests {
             dir: None,
             ..ContextCaptureConfig::default()
         });
-        let first = store.reserve_seq();
-        let second = store.reserve_seq();
-        let third = store.reserve_seq();
-        let _ = store.commit(second, record("t2", 1));
-        let _ = store.commit(third, record("t3", 1));
-        let _ = store.commit(first, record("t1", 1));
-        let ids: Vec<String> = store
-            .list()
-            .records
-            .into_iter()
-            .map(|r| r.task_id)
-            .collect();
-        assert_eq!(ids, ["t3", "t2", "t1"]);
+        let first = store.reserve();
+        let second = store.reserve();
+        let third = store.reserve();
+        let _ = evicted_ids(store.commit(second, record("t2", 1)));
+        let _ = evicted_ids(store.commit(third, record("t3", 1)));
+        let _ = evicted_ids(store.commit(first, record("t1", 1)));
+        assert_eq!(listed_ids(&store), ["t3", "t2", "t1"]);
 
         let mut full = ContextCaptureStore::load(ContextCaptureConfig {
             enabled: true,
@@ -497,15 +584,51 @@ mod tests {
             dir: None,
             ..ContextCaptureConfig::default()
         });
-        let older = full.reserve_seq();
-        let newer = full.reserve_seq();
-        let _ = full.commit(newer, record("new", 1));
-        let evicted = full.commit(older, record("old", 1));
-        assert_eq!(evicted.first().map(|r| r.task_id.as_str()), Some("old"));
+        let older = full.reserve();
+        let newer = full.reserve();
+        let _ = evicted_ids(full.commit(newer, record("new", 1)));
+        let evicted = evicted_ids(full.commit(older, record("old", 1)));
+        assert_eq!(evicted, ["old"]);
+        assert_eq!(listed_ids(&full), ["new"]);
+    }
+
+    #[test]
+    fn writers_from_before_a_clear_or_switch_off_are_rejected() {
+        let mut store = ContextCaptureStore::load(ContextCaptureConfig {
+            enabled: true,
+            ..ContextCaptureConfig::default()
+        });
+        let _ = store_now(&mut store, record("kept-until-clear", 1));
+        let in_flight = store.reserve();
+        store.note_skipped();
+        assert_eq!(store.summary().skipped_records, 1);
+
+        let cleared = store.clear();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(store.summary().skipped_records, 0);
+        assert!(!store.accepts(in_flight));
         assert_eq!(
-            full.list().records.first().map(|r| r.task_id.as_str()),
-            Some("new")
+            store.commit(in_flight, record("from-before-clear", 1)),
+            CaptureCommit::Stale
         );
+        assert!(listed_ids(&store).is_empty());
+
+        // Switching capture off invalidates in-flight writers too, even after switching back on.
+        let before_off = store.reserve();
+        let _ = store.update_config(Some(false), None, None);
+        let _ = store.update_config(Some(true), None, None);
+        assert_eq!(
+            store.commit(before_off, record("from-before-off", 1)),
+            CaptureCommit::Stale
+        );
+        // Re-applying the same setting or changing quotas keeps writers valid.
+        let current = store.reserve();
+        let _ = store.update_config(Some(true), None, None);
+        assert_eq!(
+            store.commit(current, record("fresh", 1)),
+            CaptureCommit::Stored(Vec::new())
+        );
+        assert_eq!(listed_ids(&store), ["fresh"]);
     }
 
     #[test]

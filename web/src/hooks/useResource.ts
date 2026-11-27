@@ -85,7 +85,7 @@ export function useResource<T>(load: (() => Promise<T>) | null, key: string): Re
 export function useRevisionResource<T>(
   load: (() => Promise<T>) | null,
   key: string,
-  revision: number,
+  revision: number | string,
 ): Resource<T> {
   const resource = useResource(load, key);
   const seen = useRef(revision);

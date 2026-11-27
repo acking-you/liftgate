@@ -244,6 +244,7 @@ pub async fn run_serve_with_hook(
             max_records: max_context_captures,
             max_disk: max_context_capture_mib,
             dir: Some(context_capture_dir),
+            ..ContextCaptureConfig::default()
         },
     }));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);

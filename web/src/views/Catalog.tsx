@@ -540,10 +540,19 @@ export function CatalogView({ arg, navigate }: ViewProps): React.JSX.Element {
   const selected = sessions.find((s) => s.session_id === selectedId);
   // Gateways that record per-call tool I/O also serve the catalog.
   const supported = snapshot === null ? null : snapshot.tool_call_telemetry !== undefined;
+  // Client tools sync when a turn starts (`turn_count`), but the context sample only lands when
+  // it finishes, so refetch on both.
+  const lastFinished = useMemo(() => {
+    let latest = 0;
+    for (const task of snapshot?.recent_tasks ?? []) {
+      if (task.session_id === selectedId) latest = Math.max(latest, task.finished_at_unix_ms ?? 0);
+    }
+    return latest;
+  }, [snapshot?.recent_tasks, selectedId]);
   const catalog = useRevisionResource(
     supported === true && selectedId !== null ? () => client.toolCatalog(selectedId) : null,
     `${baseUrl}|${client.demo}|catalog|${selectedId ?? ""}`,
-    selected?.turn_count ?? -1,
+    `${selected?.turn_count ?? -1}|${lastFinished}`,
   );
 
   return (

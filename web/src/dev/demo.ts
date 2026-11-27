@@ -1242,6 +1242,7 @@ export function createDemoClient(): GatewayClient {
     max_total_bytes: 512 * 1024 * 1024,
     stored_records: 0,
     stored_bytes: 0,
+    skipped_records: 0,
     capture_dir: "~/.liftgate/context-captures",
   };
   let contextRecords: ContextCaptureRecord[] = tasks
