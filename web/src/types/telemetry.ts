@@ -502,6 +502,8 @@ export interface ToolCallDetail extends ToolCallRecord {
 
 /** Ring-buffer status carried on the snapshot as `tool_call_telemetry`. */
 export interface ToolCallTelemetrySummary {
+  /** Identifies the gateway's buffer; revisions and `seq` start over when it changes. */
+  store_id?: string;
   revision: number;
   oldest_seq: number;
   max_records: number;

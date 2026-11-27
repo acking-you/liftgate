@@ -963,8 +963,12 @@ pub struct ToolCallDetail {
 }
 
 /// Ring-buffer status carried on the snapshot as `tool_call_telemetry`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolCallTelemetrySummary {
+    /// Identifies the buffer (one per gateway process): revisions and `seq` start over when it
+    /// changes, so clients holding older records must refetch everything.
+    #[serde(default)]
+    pub store_id: String,
     /// Bumped on every insert, completion, or eviction.
     #[serde(default)]
     pub revision: u64,

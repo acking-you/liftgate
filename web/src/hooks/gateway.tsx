@@ -151,6 +151,8 @@ export function GatewayProvider({
   const [toolCallsError, setToolCallsError] = useState<string | null>(null);
   /** Revision covered by `toolCallMap`; -1 forces a full fetch. */
   const fetchedToolRevision = useRef(-1);
+  /** Buffer `toolCallMap` came from; `null` before the first fetch. */
+  const fetchedToolStore = useRef<string | undefined | null>(null);
   /** Client whose fetch is outstanding; a new client never waits on an old client's request. */
   const toolFetchOwner = useRef<GatewayClient | null>(null);
   /** Another pass was requested while the owner's fetch was outstanding. */
@@ -175,9 +177,9 @@ export function GatewayProvider({
         const since = full ? undefined : fetchedToolRevision.current;
         const data = await client.toolCalls(since);
         if (activeClient.current !== client) return;
-        const { revision, oldest_seq } = data.summary;
-        if (since !== undefined && revision < since) {
-          // The gateway restarted and its revisions started over: refetch everything.
+        const { revision, oldest_seq, store_id } = data.summary;
+        if (since !== undefined && (store_id !== fetchedToolStore.current || revision < since)) {
+          // A restarted gateway answered: its history starts over, so refetch all of it.
           toolFullReload.current = true;
           continue;
         }
@@ -189,6 +191,7 @@ export function GatewayProvider({
           }
           return next;
         });
+        fetchedToolStore.current = store_id;
         fetchedToolRevision.current = revision;
         if (!toolSyncQueued.current && !toolFullReload.current) break;
       }
@@ -237,6 +240,7 @@ export function GatewayProvider({
   useEffect(() => {
     fetchedCacheRevision.current = -1;
     fetchedToolRevision.current = -1;
+    fetchedToolStore.current = null;
     toolSyncQueued.current = false;
     toolFullReload.current = false;
     setSnapshot(null);
@@ -262,6 +266,7 @@ export function GatewayProvider({
 
   const hasSnapshot = snapshot !== null;
   const toolRevision = snapshot?.tool_call_telemetry?.revision;
+  const toolStore = snapshot?.tool_call_telemetry?.store_id;
   useEffect(() => {
     if (!hasSnapshot) return;
     if (toolRevision === undefined) {
@@ -269,12 +274,14 @@ export function GatewayProvider({
       setToolCallsStatus("unsupported");
       return;
     }
-    if (toolRevision < fetchedToolRevision.current) {
-      // Revision went backwards: the gateway restarted, so start over.
+    const restarted =
+      fetchedToolStore.current !== null && toolStore !== fetchedToolStore.current;
+    if (restarted || toolRevision < fetchedToolRevision.current) {
+      // A new gateway process: revisions and seq started over, so drop the old history.
       fetchedToolRevision.current = -1;
     }
     if (toolRevision !== fetchedToolRevision.current) void syncToolCalls();
-  }, [hasSnapshot, toolRevision, syncToolCalls]);
+  }, [hasSnapshot, toolRevision, toolStore, syncToolCalls]);
 
   const toolCalls = useMemo(
     () => [...toolCallMap.values()].sort((a, b) => a.seq - b.seq),

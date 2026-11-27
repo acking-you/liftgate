@@ -28,6 +28,9 @@ pub const DEFAULT_MAX_TOOL_CALL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const PENDING_TOOL_CALL_TTL_MS: u64 = 30 * 60 * 1000;
 
 const PREVIEW_CHARS: usize = 240;
+/// Cap on each id, name and MIME type kept per call. These come from peers (model-emitted tool
+/// names, client-chosen model ids), so they are bounded like every other retained field.
+const MAX_LABEL_BYTES: usize = 256;
 /// Fixed per-record bookkeeping charged against the total byte budget.
 const RECORD_OVERHEAD_BYTES: usize = 512;
 /// Base64 prefix decoded when probing image dimensions (enough for JPEG SOF markers).
@@ -97,7 +100,7 @@ impl ToolOutputImage {
     pub fn probe(mime_type: &str, base64_data: &str) -> Self {
         let dims = image_dimensions(base64_data);
         Self {
-            mime_type: mime_type.to_owned(),
+            mime_type: capped_label(mime_type),
             base64_bytes: base64_data.len(),
             width: dims.map(|(w, _)| w),
             height: dims.map(|(_, h)| h),
@@ -301,8 +304,52 @@ struct ToolCallEntry {
     retained_bytes: usize,
 }
 
+/// Copy of `value` cut to [`MAX_LABEL_BYTES`] on a char boundary, marked with `…` when cut.
+fn capped_label(value: &str) -> String {
+    if value.len() <= MAX_LABEL_BYTES {
+        return value.to_owned();
+    }
+    let end = value.floor_char_boundary(MAX_LABEL_BYTES.saturating_sub('…'.len_utf8()));
+    let mut out = String::with_capacity(MAX_LABEL_BYTES);
+    out.push_str(value.get(..end).unwrap_or_default());
+    out.push('…');
+    out
+}
+
+/// [`capped_label`] for owned values, reusing the allocation when nothing is cut.
+fn cap_label(value: String) -> String {
+    if value.len() <= MAX_LABEL_BYTES {
+        value
+    } else {
+        capped_label(&value)
+    }
+}
+
+/// Lookup key for a call id: prefix-stripped and bounded exactly like stored keys.
+fn call_key(call_id: &str) -> &str {
+    let key = strip_call_prefix(call_id);
+    key.get(..key.floor_char_boundary(MAX_LABEL_BYTES))
+        .unwrap_or(key)
+}
+
 impl ToolCallEntry {
     fn measure(&mut self) {
+        let record = &self.record;
+        let labels = [
+            self.key.as_str(),
+            record.call_id.as_str(),
+            record.task_id.as_str(),
+            record.session_id.as_deref().unwrap_or_default(),
+            record.model_id.as_str(),
+            record.harness_profile.as_str(),
+            record.orchestrator_mode.as_deref().unwrap_or_default(),
+            record.wire_tool_name.as_str(),
+            record.client_tool_name.as_deref().unwrap_or_default(),
+            record.code_language.as_deref().unwrap_or_default(),
+        ]
+        .iter()
+        .map(|label| label.len())
+        .fold(0_usize, usize::saturating_add);
         let blocks: usize = self
             .output_blocks
             .iter()
@@ -316,14 +363,15 @@ impl ToolCallEntry {
             .saturating_add(self.client_arguments.as_deref().map_or(0, str::len))
             .saturating_add(self.record.input_preview.len())
             .saturating_add(self.record.output_preview.len())
-            .saturating_add(self.record.call_id.len())
-            .saturating_add(self.record.task_id.len())
+            .saturating_add(labels)
             .saturating_add(blocks);
     }
 }
 
 /// Bounded FIFO store of tool calls keyed by their prefix-stripped call id.
 pub struct ToolCallStore {
+    /// Random per buffer, so clients can tell a restarted gateway from a quiet one.
+    store_id: String,
     limits: ToolCallLimits,
     entries: VecDeque<ToolCallEntry>,
     by_key: HashMap<String, u64>,
@@ -339,6 +387,7 @@ impl ToolCallStore {
     #[must_use]
     pub fn new(limits: ToolCallLimits) -> Self {
         Self {
+            store_id: uuid::Uuid::new_v4().simple().to_string(),
             limits,
             entries: VecDeque::new(),
             by_key: HashMap::new(),
@@ -364,6 +413,7 @@ impl ToolCallStore {
     #[must_use]
     pub fn summary(&self) -> ToolCallTelemetrySummary {
         ToolCallTelemetrySummary {
+            store_id: self.store_id.clone(),
             revision: self.revision,
             oldest_seq: self.entries.front().map_or(self.next_seq, |e| e.record.seq),
             max_records: self.limits.max_records,
@@ -393,7 +443,7 @@ impl ToolCallStore {
 
     #[must_use]
     pub fn detail(&self, call_id: &str) -> Option<ToolCallDetail> {
-        let entry = self.entry(strip_call_prefix(call_id))?;
+        let entry = self.entry(call_key(call_id))?;
         Some(ToolCallDetail {
             record: entry.record.clone(),
             wire_arguments: entry.wire_arguments.clone(),
@@ -459,7 +509,7 @@ impl ToolCallStore {
             client_arguments,
             v4a_auto_repaired,
         } = start;
-        let key = strip_call_prefix(&call_id).to_owned();
+        let key = call_key(&call_id).to_owned();
         let input_bytes = client_arguments.as_deref().unwrap_or(&wire_arguments).len();
         let input_preview = preview(client_arguments.as_deref().unwrap_or(&wire_arguments));
         let (wire_stored, wire_cut) = self.clip(&wire_arguments, "tool call arguments");
@@ -476,21 +526,21 @@ impl ToolCallStore {
         let mut entry = ToolCallEntry {
             key: key.clone(),
             record: ToolCallRecord {
-                call_id,
+                call_id: cap_label(call_id),
                 seq,
                 revision,
-                task_id: ctx.task_id.clone(),
-                session_id: ctx.session_id.clone(),
+                task_id: capped_label(&ctx.task_id),
+                session_id: ctx.session_id.as_deref().map(capped_label),
                 turn_index: ctx.turn_index,
                 step_index,
                 harness_profile: ctx.harness_profile.to_owned(),
                 orchestrator_mode: ctx.orchestrator_mode.map(str::to_owned),
-                model_id: ctx.model_id.clone(),
+                model_id: capped_label(&ctx.model_id),
                 route,
-                wire_tool_name,
-                client_tool_name,
+                wire_tool_name: cap_label(wire_tool_name),
+                client_tool_name: client_tool_name.map(cap_label),
                 is_orchestrator,
-                code_language,
+                code_language: code_language.map(cap_label),
                 status: ToolCallStatus::Pending,
                 error_kind: None,
                 v4a_auto_repaired,
@@ -532,7 +582,7 @@ impl ToolCallStore {
     /// Completes the call identified by `call_id` (any `call_` / `toolu_` prefix). Completing an
     /// already finished call replaces its output, so a richer completion can refine a raw one.
     pub fn complete(&mut self, call_id: &str, outcome: ToolCallOutcome, now_ms: u64) -> bool {
-        let key = strip_call_prefix(call_id).to_owned();
+        let key = call_key(call_id).to_owned();
         let max_field = self.limits.max_field_bytes;
         let revision = self.revision.saturating_add(1);
         let Some(entry) = self.entry_mut(&key) else {
@@ -608,13 +658,13 @@ impl ToolCallStore {
     /// `Some(true)` while the call awaits its result, `Some(false)` once finished, `None` if unknown.
     #[must_use]
     pub fn is_pending(&self, call_id: &str) -> Option<bool> {
-        self.entry(strip_call_prefix(call_id))
+        self.entry(call_key(call_id))
             .map(|e| e.record.status == ToolCallStatus::Pending)
     }
 
     /// Flags a finished call whose output the gateway spilled before replying to the model.
     pub fn mark_spilled(&mut self, call_id: &str) -> bool {
-        let key = strip_call_prefix(call_id).to_owned();
+        let key = call_key(call_id).to_owned();
         let revision = self.revision.saturating_add(1);
         let Some(entry) = self.entry_mut(&key) else {
             return false;
@@ -646,7 +696,7 @@ impl ToolCallStore {
     /// Marks still-pending calls as abandoned (their result will never arrive).
     pub fn abandon(&mut self, call_ids: &[String]) {
         for call_id in call_ids {
-            let key = strip_call_prefix(call_id).to_owned();
+            let key = call_key(call_id).to_owned();
             let revision = self.revision.saturating_add(1);
             let Some(entry) = self.entry_mut(&key) else {
                 continue;
@@ -687,8 +737,7 @@ impl ToolCallStore {
         }
         let mut completed = 0usize;
         for observed in trailing_tool_results(messages) {
-            let key = strip_call_prefix(observed.call_id);
-            if self.is_pending(key) != Some(true) {
+            if self.is_pending(observed.call_id) != Some(true) {
                 continue;
             }
             let mut outcome = ToolCallOutcome::from_client(observed.output, observed.is_error);
@@ -1019,6 +1068,63 @@ mod tests {
         }
         assert!(by_bytes.summary().stored_bytes <= 3 * (RECORD_OVERHEAD_BYTES + 4_200));
         assert!(by_bytes.summary().total_evicted >= 3);
+    }
+
+    #[test]
+    fn peer_supplied_labels_are_capped_and_charged_to_the_budget() {
+        let huge = "n".repeat(1024 * 1024);
+        let mut store = ToolCallStore::new(ToolCallLimits {
+            max_records: 100,
+            max_field_bytes: 1_024,
+            max_total_bytes: 64 * 1024,
+        });
+        let mut ctx = ctx();
+        ctx.model_id = format!("model-{huge}");
+        let mut call = start(&format!("call_{huge}"), "{}");
+        call.wire_tool_name = format!("mcp_lg_{huge}");
+        call.client_tool_name = Some(format!("é{huge}"));
+        store.begin(&ctx, 0, call, 1_000);
+        let image = ToolOutputImage::probe(&format!("image/{huge}"), "");
+
+        let listed = store.list(None);
+        let record = listed.records.first().expect("recorded");
+        for label in [
+            record.call_id.as_str(),
+            record.model_id.as_str(),
+            record.wire_tool_name.as_str(),
+            record.client_tool_name.as_deref().unwrap_or_default(),
+            image.mime_type.as_str(),
+        ] {
+            assert!(
+                label.len() <= MAX_LABEL_BYTES,
+                "label kept {} bytes",
+                label.len()
+            );
+            assert!(label.ends_with('…'));
+        }
+        let stored = listed.summary.stored_bytes;
+        assert!(
+            stored > RECORD_OVERHEAD_BYTES + 4 * MAX_LABEL_BYTES - 64,
+            "labels count toward the budget"
+        );
+        assert!(stored < RECORD_OVERHEAD_BYTES + 8 * MAX_LABEL_BYTES);
+
+        // The full id still finds the call, and every stored label stays bounded.
+        assert_eq!(store.is_pending(&format!("call_{huge}")), Some(true));
+        assert!(store.complete(
+            &format!("call_{huge}"),
+            ToolCallOutcome::local("ok".to_owned(), ToolCallStatus::Ok, None),
+            1_200,
+        ));
+        assert_eq!(store.summary().stored_records, 1);
+        assert!(!store.summary().store_id.is_empty());
+        assert_ne!(
+            store.summary().store_id,
+            ToolCallStore::new(ToolCallLimits::default())
+                .summary()
+                .store_id,
+            "each buffer gets its own identity"
+        );
     }
 
     #[test]

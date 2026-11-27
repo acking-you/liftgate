@@ -5506,36 +5506,34 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     &assistant_msg,
                 );
 
-                if telemetry_step_usage.total_prompt_tokens() > 0 {
-                    let pre_reply_slice = cur_full_messages.get(..pre_step_len).unwrap_or(&[]);
-                    let diag = TurnCompletionDiagnostics {
-                        routing_strategy: cur_route_meta.routing_strategy,
-                        delta_start_index: cur_route_meta.delta_start_index,
-                        session_turn_index: cur_route_meta.session_turn_index,
-                        session_idle_ms: cur_route_meta.session_idle_ms,
-                        previous_session_context_tokens: cur_route_meta
-                            .previous_session_context_tokens,
-                        model_switched: cur_route_meta.model_switched,
-                        previous_model: cur_route_meta.previous_model.as_deref(),
-                        previous_response_id: cur_req.previous_response_id.as_deref(),
-                        prefix_hash_hex: cur_route_meta.prefix_hash_hex.as_deref(),
-                        base_state_hash_hex: &cur_route_meta.base_state_hash_hex,
-                        reasoning_effort: cur_req.reasoning_effort,
-                        web_cfg: cur_web_cfg,
-                        acp_system_append: cur_route_meta.acp_system_append.as_deref(),
-                        tools_delta_xml: cur_route_meta.tools_delta_xml.as_deref(),
-                        outbound_acp_blocks: &cur_outbound_blocks,
-                        messages: pre_reply_slice,
-                        client_tools: &cur_req.client_tools,
-                    };
-                    cur_task_guard.complete_with_diagnostics(
-                        "tool_use".to_owned(),
-                        telemetry_step_usage,
-                        cur_req.auxiliary_task.is_none().then_some(diag),
-                    );
-                } else {
-                    cur_task_guard.complete("tool_use".to_owned(), telemetry_step_usage);
-                }
+                // Diagnostics flow even before upstream usage arrives: without prompt tokens no
+                // cache statistics are derived, but the session's context sample and an enabled
+                // full-context capture must not depend on token accounting.
+                let pre_reply_slice = cur_full_messages.get(..pre_step_len).unwrap_or(&[]);
+                let diag = TurnCompletionDiagnostics {
+                    routing_strategy: cur_route_meta.routing_strategy,
+                    delta_start_index: cur_route_meta.delta_start_index,
+                    session_turn_index: cur_route_meta.session_turn_index,
+                    session_idle_ms: cur_route_meta.session_idle_ms,
+                    previous_session_context_tokens: cur_route_meta.previous_session_context_tokens,
+                    model_switched: cur_route_meta.model_switched,
+                    previous_model: cur_route_meta.previous_model.as_deref(),
+                    previous_response_id: cur_req.previous_response_id.as_deref(),
+                    prefix_hash_hex: cur_route_meta.prefix_hash_hex.as_deref(),
+                    base_state_hash_hex: &cur_route_meta.base_state_hash_hex,
+                    reasoning_effort: cur_req.reasoning_effort,
+                    web_cfg: cur_web_cfg,
+                    acp_system_append: cur_route_meta.acp_system_append.as_deref(),
+                    tools_delta_xml: cur_route_meta.tools_delta_xml.as_deref(),
+                    outbound_acp_blocks: &cur_outbound_blocks,
+                    messages: pre_reply_slice,
+                    client_tools: &cur_req.client_tools,
+                };
+                cur_task_guard.complete_with_diagnostics(
+                    "tool_use".to_owned(),
+                    telemetry_step_usage,
+                    cur_req.auxiliary_task.is_none().then_some(diag),
+                );
 
                 cur_full_messages.push(assistant_msg);
                 let message_count = cur_full_messages.len();

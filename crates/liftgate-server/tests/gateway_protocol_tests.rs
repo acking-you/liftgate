@@ -11108,6 +11108,139 @@ async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, V
 }
 
 #[tokio::test]
+async fn zero_usage_mcp_suspension_still_samples_and_captures_context() {
+    // No usage update arrives before the first client tool call suspends the cascade.
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 0,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "ls" }),
+                expect_reply_substrings: vec!["README.md"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 4_000,
+                thoughts: vec![],
+                chunks_template: vec!["Listed.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cached_read_tokens: 3_000,
+                    cached_write_tokens: 0,
+                    thought_tokens: 0,
+                    total_tokens: 4_010,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+    let root = std::env::temp_dir().join(format!(
+        "liftgate-zero-usage-capture-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let capture_dir = root.join("context-captures");
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    state.telemetry = Arc::new(TelemetryHub::with_telemetry_config(
+        liftgate_server::telemetry::TelemetryConfig {
+            context_capture: liftgate_server::context_capture::ContextCaptureConfig {
+                enabled: true,
+                dir: Some(capture_dir.clone()),
+                ..liftgate_server::context_capture::ContextCaptureConfig::default()
+            },
+            ..liftgate_server::telemetry::TelemetryConfig::default()
+        },
+    ));
+    let app = build_router(state.clone());
+    let tools_json = json!([{
+        "type": "function",
+        "name": "Bash",
+        "description": "Execute shell command",
+        "parameters": {
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }
+    }]);
+
+    let (status, r1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "tools": tools_json,
+            "input": "List the files."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let call_id = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .and_then(|fc| fc["call_id"].as_str())
+        .expect("Bash function_call")
+        .to_owned();
+
+    // The suspended turn is captured although its usage is still zero.
+    let mut captured = false;
+    for _ in 0..250 {
+        let (_, listed) = get_json(&app, "/api/telemetry/context-captures").await;
+        if listed["records"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|c| c["task_id"] == r1["id"]))
+        {
+            captured = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(captured, "zero-usage suspension must still be captured");
+
+    // ... and the session's context composition is sampled for the tool catalog.
+    let (_, calls) = get_json(&app, "/api/telemetry/tool-calls").await;
+    let session_id = calls["records"][0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let (status, catalog) = get_json(
+        &app,
+        &format!("/api/telemetry/sessions/{session_id}/tool-catalog"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        catalog["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["key"] == "user_text" && s["bytes"].as_u64().unwrap_or(0) > 0),
+        "context sample recorded: {catalog}"
+    );
+
+    let (status, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "previous_response_id": r1["id"],
+            "tools": tools_json,
+            "input": [{ "type": "function_call_output", "call_id": call_id, "output": "README.md" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
         steps: vec![

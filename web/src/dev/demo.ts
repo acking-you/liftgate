@@ -702,6 +702,7 @@ function allRecords(): ToolCallRecord[] {
 }
 
 const toolSummary: ToolCallTelemetrySummary = {
+  store_id: "demo",
   revision: 1,
   oldest_seq: 1,
   max_records: 2000,
