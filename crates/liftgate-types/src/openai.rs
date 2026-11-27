@@ -423,135 +423,138 @@ pub fn normalize_responses_request(
         return Err(ProtocolError::EmptyInput);
     }
 
-    let mut client_tools = Vec::new();
+    let mut declared_tools = Vec::new();
     let mut enable_native_web_search = false;
     let mut enable_native_web_fetch = false;
     let mut web_fetch_max_uses = None;
     let mut web_fetch_allowed_domains = Vec::new();
     let mut web_fetch_blocked_domains = Vec::new();
-    let tool_choice_is_none = req
-        .tool_choice
-        .as_ref()
-        .and_then(Value::as_str)
-        .is_some_and(|s| s == "none");
+    let tool_choice_is_none = req.tool_choice.as_ref().is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    });
 
-    if !tool_choice_is_none {
-        for tool in &req.tools {
-            match tool.tool_type.as_str() {
-                "function" | "custom" => {
-                    push_function_or_custom_spec(&mut client_tools, None, tool, None);
-                }
-                "namespace" => {
-                    if let Some(ns_name) = tool
-                        .name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        && should_activate_tool_namespace(ns_name, &messages)
-                    {
-                        for sub in &tool.tools {
-                            push_function_or_custom_spec(
-                                &mut client_tools,
-                                Some(ns_name),
-                                sub,
-                                tool.description.as_deref(),
-                            );
-                        }
-                    }
-                }
-                "tool_search" => {
-                    let params_json = tool.parameters.as_ref().map_or_else(
-                        || {
-                            "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}"
-                                .to_owned()
-                        },
-                        |raw| raw.get().to_owned(),
-                    );
-                    client_tools.push(CanonicalToolSpec {
-                        name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
-                        description: tool.description.clone().or_else(|| {
-                            Some("Search deferred tools and MCP connectors by query.".to_owned())
-                        }),
-                        kind: CanonicalToolKind::Function {
-                            parameters_json: params_json,
-                        },
-                    });
-                }
-                "local_shell" => {
-                    client_tools.push(CanonicalToolSpec {
-                        name: INTERNAL_CODEX_LOCAL_SHELL_TOOL.to_owned(),
-                        description: Some(
-                            "Execute a shell command in the Codex workspace. Pass `command` as an argv array of strings and optional `working_directory`."
-                                .to_owned(),
-                        ),
-                        kind: CanonicalToolKind::Function {
-                            parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"working_directory\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}".to_owned(),
-                        },
-                    });
-                }
-                "apply_patch" => {
-                    client_tools.push(CanonicalToolSpec {
-                        name: tool
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| "apply_patch".to_owned()),
-                        description: tool.description.clone().or_else(|| {
-                            Some(
-                                "Apply a file patch using `*** Begin Patch` ... `*** End Patch` format."
-                                    .to_owned(),
-                            )
-                        }),
-                        kind: CanonicalToolKind::Custom {
-                            format_json: tool.format.as_ref().map(|r| r.get().to_owned()),
-                        },
-                    });
-                }
-                t if t.starts_with("web_search") => {
-                    enable_native_web_search = true;
-                    // OpenAI Responses API & Codex CLI bundle both web search (`action.type = "search"`)
-                    // and URL page opening/fetching (`action.type = "open_page"`) under `{"type": "web_search"}`
-                    // whenever `external_web_access` is not explicitly `false`.
-                    if tool.external_web_access != Some(false) {
-                        enable_native_web_fetch = true;
-                    }
-                    if tool.max_uses.is_some() {
-                        web_fetch_max_uses = tool.max_uses;
-                    }
-                    web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
-                    if let Some(filters) = &tool.filters {
-                        web_fetch_allowed_domains.extend(filters.allowed_domains.iter().cloned());
-                    }
-                    web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
-                }
-                t if t.starts_with("web_fetch") => {
-                    enable_native_web_fetch = true;
-                    if tool.max_uses.is_some() {
-                        web_fetch_max_uses = tool.max_uses;
-                    }
-                    web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
-                    web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
-                }
-                _ => {}
+    for tool in &req.tools {
+        match tool.tool_type.as_str() {
+            "function" | "custom" => {
+                push_function_or_custom_spec(&mut declared_tools, None, tool, None);
             }
-        }
-
-        // Activate any deferred tools discovered via `tool_search_output` or `additional_tools`
-        // without duplicating definitions already present in `req.tools`.
-        if !dynamic_tools.is_empty() {
-            let mut extra_specs = Vec::new();
-            for dyn_tool in &dynamic_tools {
-                push_dynamic_tool_value(&mut extra_specs, None, dyn_tool, None);
-            }
-            for spec in extra_specs {
-                if !client_tools
-                    .iter()
-                    .any(|existing| existing.name == spec.name)
+            "namespace" => {
+                if let Some(ns_name) = tool
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    && should_activate_tool_namespace(ns_name, &messages)
                 {
-                    client_tools.push(spec);
+                    for sub in &tool.tools {
+                        push_function_or_custom_spec(
+                            &mut declared_tools,
+                            Some(ns_name),
+                            sub,
+                            tool.description.as_deref(),
+                        );
+                    }
                 }
+            }
+            "tool_search" => {
+                let params_json = tool.parameters.as_ref().map_or_else(
+                    || {
+                        "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}"
+                            .to_owned()
+                    },
+                    |raw| raw.get().to_owned(),
+                );
+                declared_tools.push(CanonicalToolSpec {
+                    name: INTERNAL_CODEX_TOOL_SEARCH_TOOL.to_owned(),
+                    description: tool.description.clone().or_else(|| {
+                        Some("Search deferred tools and MCP connectors by query.".to_owned())
+                    }),
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: params_json,
+                    },
+                });
+            }
+            "local_shell" => {
+                declared_tools.push(CanonicalToolSpec {
+                    name: INTERNAL_CODEX_LOCAL_SHELL_TOOL.to_owned(),
+                    description: Some(
+                        "Execute a shell command in the Codex workspace. Pass `command` as an argv array of strings and optional `working_directory`."
+                            .to_owned(),
+                    ),
+                    kind: CanonicalToolKind::Function {
+                        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"working_directory\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}".to_owned(),
+                    },
+                });
+            }
+            "apply_patch" => {
+                declared_tools.push(CanonicalToolSpec {
+                    name: tool
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "apply_patch".to_owned()),
+                    description: tool.description.clone().or_else(|| {
+                        Some(
+                            "Apply a file patch using `*** Begin Patch` ... `*** End Patch` format."
+                                .to_owned(),
+                        )
+                    }),
+                    kind: CanonicalToolKind::Custom {
+                        format_json: tool.format.as_ref().map(|r| r.get().to_owned()),
+                    },
+                });
+            }
+            t if !tool_choice_is_none && t.starts_with("web_search") => {
+                enable_native_web_search = true;
+                // OpenAI Responses API & Codex CLI bundle both web search (`action.type = "search"`)
+                // and URL page opening/fetching (`action.type = "open_page"`) under `{"type": "web_search"}`
+                // whenever `external_web_access` is not explicitly `false`.
+                if tool.external_web_access != Some(false) {
+                    enable_native_web_fetch = true;
+                }
+                if tool.max_uses.is_some() {
+                    web_fetch_max_uses = tool.max_uses;
+                }
+                web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
+                if let Some(filters) = &tool.filters {
+                    web_fetch_allowed_domains.extend(filters.allowed_domains.iter().cloned());
+                }
+                web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
+            }
+            t if !tool_choice_is_none && t.starts_with("web_fetch") => {
+                enable_native_web_fetch = true;
+                if tool.max_uses.is_some() {
+                    web_fetch_max_uses = tool.max_uses;
+                }
+                web_fetch_allowed_domains.extend(tool.allowed_domains.iter().cloned());
+                web_fetch_blocked_domains.extend(tool.blocked_domains.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+
+    // Activate any deferred tools discovered via `tool_search_output` or `additional_tools`
+    // without duplicating definitions already present in `req.tools`.
+    if !dynamic_tools.is_empty() {
+        let mut extra_specs = Vec::new();
+        for dyn_tool in &dynamic_tools {
+            push_dynamic_tool_value(&mut extra_specs, None, dyn_tool, None);
+        }
+        for spec in extra_specs {
+            if !declared_tools
+                .iter()
+                .any(|existing| existing.name == spec.name)
+            {
+                declared_tools.push(spec);
             }
         }
     }
+
+    let mut client_tools = if tool_choice_is_none {
+        Vec::new()
+    } else {
+        declared_tools.clone()
+    };
 
     let aux_system_hint = (!aux_system_parts.is_empty()).then(|| aux_system_parts.join("\n\n"));
 
@@ -574,13 +577,16 @@ pub fn normalize_responses_request(
         }
     }
 
+    let is_compaction = crate::session_key::is_compaction_summarization_turn(
+        aux_system_hint.as_deref(),
+        &messages,
+        &client_tools,
+    ) || aux_system_hint
+        .as_deref()
+        .is_some_and(is_compaction_instructions_prompt);
     if auxiliary_task.is_none()
-        && !crate::session_key::is_compaction_summarization_turn(
-            aux_system_hint.as_deref(),
-            &messages,
-            &client_tools,
-        )
-        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&client_tools)
+        && !is_compaction
+        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
     {
         crate::harness_prompt::distill_responses_developer_messages(
             harness,
@@ -1887,6 +1893,7 @@ mod tests {
             "model": "gemini-4-carbon-high",
             "instructions": raw_upstream_codex_inst,
             "tools": codex_tools,
+            "tool_choice": "none",
             "input": [
                 { "role": "developer", "content": raw_codex_dev },
                 { "role": "user", "content": [

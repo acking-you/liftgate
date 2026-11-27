@@ -186,6 +186,23 @@ fn is_omp_distinctive_bash_or_todo_spec(spec: &CanonicalToolSpec) -> bool {
     }
 }
 
+/// Runtime context signal tags preserved verbatim when distilling a harness's primary base
+/// prompt (`AGENTS.md`: forwarded to the model intact and normalized only inside
+/// `session_key::strip_unstable_harness_noise` for deterministic prefix hashing).
+const RUNTIME_CONTEXT_SIGNAL_TAGS: &[(&str, &str)] = &[
+    ("<system-reminder>", "</system-reminder>"),
+    ("<total_tokens>", "</total_tokens>"),
+    ("<budget:token_budget>", "</budget:token_budget>"),
+    ("<context_window>", "</context_window>"),
+    ("<context_window_reminder>", "</context_window_reminder>"),
+    ("<rollout_budget>", "</rollout_budget>"),
+    ("<current_time>", "</current_time>"),
+    ("<current_time_reminder>", "</current_time_reminder>"),
+    ("<current_time_unavailable>", "</current_time_unavailable>"),
+    ("<current_date>", "</current_date>"),
+    ("<timestamp>", "</timestamp>"),
+];
+
 /// Distinguishes OpenAI Codex's array-command `shell` tool (`command: string[]` + `workdir`)
 /// from OpenCode v2's string-command `shell` tool (`command: string`).
 #[must_use]
@@ -209,21 +226,47 @@ fn is_codex_array_shell_spec(spec: &CanonicalToolSpec) -> bool {
         == Some("array")
 }
 
+#[must_use]
+fn is_opencode_string_shell_spec(spec: &CanonicalToolSpec) -> bool {
+    if spec.name != "shell" {
+        return false;
+    }
+    let CanonicalToolKind::Function { parameters_json } = &spec.kind else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
+        return false;
+    };
+    let Some(props) = val.get("properties").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    props
+        .get("command")
+        .and_then(|cmd| cmd.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("string")
+}
+
 /// Strictly identifies a known CLI coding harness from characteristic tool signatures alone.
 ///
 /// Returns `None` when `client_tools` is empty or lacks distinctive harness-owned tools, ensuring
 /// generic SDK callers and unknown third-party agents never have their system prompts rewritten.
+/// Generic single-word tool names (`shell`, `execute`, `question`, `skill`, `Bash`, `Agent`)
+/// never establish harness identity on their own without harness-specific metadata or companion
+/// harness tools.
 #[must_use]
 pub fn detect_harness_by_tools(client_tools: &[CanonicalToolSpec]) -> Option<DetectedHarness> {
-    let mut has_codex_identity = false;
+    let mut has_codex_strong_identity = false;
+    let mut codex_companion_count: u32 = 0;
     let mut codex_score: u32 = 0;
 
-    let mut has_claude_identity = false;
-    let mut claude_secondary_count: u32 = 0;
+    let mut has_claude_strong_identity = false;
+    let mut claude_companion_count: u32 = 0;
     let mut claude_score: u32 = 0;
 
-    let mut has_opencode_identity = false;
-    let mut opencode_secondary_count: u32 = 0;
+    let mut has_opencode_strong_identity = false;
+    let mut has_opencode_v2_marker = false;
+    let mut opencode_companion_count: u32 = 0;
     let mut opencode_score: u32 = 0;
 
     let mut has_omp_identity = false;
@@ -238,21 +281,13 @@ pub fn detect_harness_by_tools(client_tools: &[CanonicalToolSpec]) -> Option<Det
                 name,
                 "exec_command"
                     | "write_stdin"
-                    | "shell_command"
                     | "__codex_local_shell"
                     | "__codex_tool_search"
-                    | "view_image"
-                    | "update_plan"
-                    | "request_user_input"
                     | "request_user_input_async"
                     | "send_message_to_user_async"
                     | "send_user_message_async"
                     | "js_repl"
                     | "js_repl_reset"
-                    | "spawn_agent"
-                    | "wait_agent"
-                    | "close_agent"
-                    | "resume_agent"
             )
             || name.starts_with("mcp__codex_apps__")
             || name.starts_with("mcp__codex_tui")
@@ -260,23 +295,35 @@ pub fn detect_harness_by_tools(client_tools: &[CanonicalToolSpec]) -> Option<Det
             || name.starts_with("mcp__cua_repl")
             || name.starts_with("multi_agent_v1.")
             || (name == "apply_patch" && matches!(spec.kind, CanonicalToolKind::Custom { .. }))
-            || is_codex_array_shell_spec(spec)
             || spec
                 .description
                 .as_deref()
                 .is_some_and(|d| d.contains("exec tool declaration:"))
         {
-            has_codex_identity = true;
+            has_codex_strong_identity = true;
             codex_score = codex_score.saturating_add(4);
-        } else if name == "apply_patch" || name.starts_with("clock.") {
+        } else if is_codex_array_shell_spec(spec)
+            || matches!(
+                name,
+                "shell_command"
+                    | "apply_patch"
+                    | "view_image"
+                    | "update_plan"
+                    | "request_user_input"
+                    | "spawn_agent"
+                    | "wait_agent"
+                    | "close_agent"
+                    | "resume_agent"
+            )
+            || name.starts_with("clock.")
+        {
+            codex_companion_count = codex_companion_count.saturating_add(1);
             codex_score = codex_score.saturating_add(2);
         }
 
         if matches!(
             name,
-            "Bash"
-                | "PowerShell"
-                | "MultiEdit"
+            "MultiEdit"
                 | "NotebookEdit"
                 | "TodoWrite"
                 | "TaskCreate"
@@ -292,64 +339,80 @@ pub fn detect_harness_by_tools(client_tools: &[CanonicalToolSpec]) -> Option<Det
                 | "EnterWorktree"
                 | "ExitWorktree"
                 | "AskUserQuestion"
-                | "Skill"
                 | "SlashCommand"
                 | "ToolSearch"
-                | "REPL"
-                | "Agent"
                 | "TeamCreate"
                 | "TeamDelete"
-                | "SendMessage"
                 | "CronCreate"
                 | "ScheduleWakeup"
-                | "Monitor"
                 | "ListMcpResourcesTool"
                 | "ReadMcpResourceTool"
         ) || name.starts_with("mcp__claude_ai_")
             || name.starts_with("mcp__plugin_")
         {
-            has_claude_identity = true;
+            has_claude_strong_identity = true;
             claude_score = claude_score.saturating_add(4);
         } else if matches!(
             name,
-            "Read" | "Edit" | "Write" | "Glob" | "Grep" | "LS" | "LSP" | "WebFetch" | "WebSearch"
+            "Bash"
+                | "PowerShell"
+                | "REPL"
+                | "Agent"
+                | "Skill"
+                | "SendMessage"
+                | "Monitor"
+                | "Read"
+                | "Edit"
+                | "Write"
+                | "Glob"
+                | "Grep"
+                | "LS"
+                | "LSP"
+                | "WebFetch"
+                | "WebSearch"
         ) {
-            claude_secondary_count = claude_secondary_count.saturating_add(1);
-            claude_score = claude_score.saturating_add(2);
+            claude_companion_count = claude_companion_count.saturating_add(1);
+            let weight = if matches!(name, "Bash" | "PowerShell" | "REPL" | "Agent" | "Skill") {
+                4
+            } else {
+                2
+            };
+            claude_score = claude_score.saturating_add(weight);
         }
 
         if matches!(
             name,
-            "execute"
-                | "subagent"
-                | "question"
+            "subagent"
                 | "webfetch"
                 | "websearch"
                 | "todowrite"
                 | "todoread"
                 | "codesearch"
                 | "multiedit"
-                | "batch"
-                | "skill"
-        ) || (name == "shell" && !is_codex_array_shell_spec(spec))
-            || is_opencode_v4a_patch_spec(spec)
+        ) || is_opencode_v4a_patch_spec(spec)
             || is_opencode_execute_orchestrator_tool(spec)
             || name.starts_with("opencode_")
             || name.starts_with("opencode.")
-            || name.starts_with("automation_")
-            || name.starts_with("machine_")
             || spec
                 .description
                 .as_deref()
                 .is_some_and(|d| d.contains("Code Mode runtime") || d.contains("Code Mode catalog"))
         {
-            has_opencode_identity = true;
+            has_opencode_strong_identity = true;
+            opencode_score = opencode_score.saturating_add(4);
+        } else if is_opencode_string_shell_spec(spec)
+            || matches!(name, "execute" | "question" | "skill" | "batch")
+            || name.starts_with("automation_")
+            || name.starts_with("machine_")
+        {
+            has_opencode_v2_marker = true;
+            opencode_companion_count = opencode_companion_count.saturating_add(1);
             opencode_score = opencode_score.saturating_add(4);
         } else if matches!(
             name,
             "bash" | "read" | "edit" | "write" | "glob" | "grep" | "lsp"
         ) {
-            opencode_secondary_count = opencode_secondary_count.saturating_add(1);
+            opencode_companion_count = opencode_companion_count.saturating_add(1);
             opencode_score = opencode_score.saturating_add(2);
         }
 
@@ -411,14 +474,21 @@ pub fn detect_harness_by_tools(client_tools: &[CanonicalToolSpec]) -> Option<Det
     } else {
         0
     };
-    let opencode_effective =
-        if has_opencode_identity || (!has_omp_identity && opencode_secondary_count >= 4) {
-            opencode_score
-        } else {
-            0
-        };
-    let codex_effective = if has_codex_identity { codex_score } else { 0 };
-    let claude_effective = if has_claude_identity || claude_secondary_count >= 2 {
+    let opencode_effective = if has_opencode_strong_identity
+        || (!has_omp_identity
+            && (opencode_companion_count >= 4
+                || (has_opencode_v2_marker && opencode_companion_count >= 3)))
+    {
+        opencode_score
+    } else {
+        0
+    };
+    let codex_effective = if has_codex_strong_identity || codex_companion_count >= 2 {
+        codex_score
+    } else {
+        0
+    };
+    let claude_effective = if has_claude_strong_identity || claude_companion_count >= 2 {
         claude_score
     } else {
         0
@@ -684,15 +754,24 @@ fn is_omp_internal_prelude_item(trimmed: &str) -> bool {
 }
 
 fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
+    let mut outside_containers = transform_tag_blocks(
+        raw,
+        "<claude_background_info>",
+        "</claude_background_info>",
+        |_| None,
+    );
+
     for (open_tag, close_tag) in [
         ("<env>", "</env>"),
         ("<environment_context>", "</environment_context>"),
         ("<project-context>", "</project-context>"),
         ("<INSTRUCTIONS>", "</INSTRUCTIONS>"),
     ] {
-        if let Some(block) = extract_tag_block(raw, open_tag, close_tag) {
+        for block in extract_all_tag_blocks(raw, open_tag, close_tag) {
             sections.push(block.trim().to_owned());
         }
+        outside_containers =
+            transform_tag_blocks(&outside_containers, open_tag, close_tag, |_| None);
     }
 
     if !raw.contains("<project-context>") {
@@ -700,9 +779,11 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
             ("<repo-rules>", "</repo-rules>"),
             ("<user-rules>", "</user-rules>"),
         ] {
-            if let Some(block) = extract_tag_block(raw, open_tag, close_tag) {
+            for block in extract_all_tag_blocks(raw, open_tag, close_tag) {
                 sections.push(block.trim().to_owned());
             }
+            outside_containers =
+                transform_tag_blocks(&outside_containers, open_tag, close_tag, |_| None);
         }
     }
 
@@ -712,10 +793,29 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
     {
         sections.push(compacted);
     }
+    outside_containers = transform_tag_blocks(
+        &outside_containers,
+        "<skills_instructions>",
+        "</skills_instructions>",
+        |_| None,
+    );
     if let Some(xml_skills_inner) = extract_tag_inner(raw, "<skills>", "</skills>")
         && let Some(compacted) = compact_xml_skills_block(xml_skills_inner)
     {
         sections.push(compacted);
+    }
+    outside_containers =
+        transform_tag_blocks(&outside_containers, "<skills>", "</skills>", |_| None);
+
+    for &(open_tag, close_tag) in RUNTIME_CONTEXT_SIGNAL_TAGS {
+        for block in extract_all_tag_blocks(&outside_containers, open_tag, close_tag) {
+            let trimmed_block = block.trim();
+            if !trimmed_block.is_empty() {
+                sections.push(trimmed_block.to_owned());
+            }
+        }
+        outside_containers =
+            transform_tag_blocks(&outside_containers, open_tag, close_tag, |_| None);
     }
 
     if let Some(inst_from) = extract_instructions_from_tail(raw) {
@@ -947,15 +1047,34 @@ fn extract_bounded_git_status(raw: &str) -> Option<String> {
     }
 }
 
-fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
-    let start = text.find(open_tag)?;
-    let after_open = start.checked_add(open_tag.len())?;
-    let tail = text.get(after_open..)?;
-    let rel_end = tail.find(close_tag)?;
-    let end = after_open
-        .checked_add(rel_end)?
-        .checked_add(close_tag.len())?;
-    text.get(start..end)
+fn extract_all_tag_blocks<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
+    if !text.contains(open_tag) {
+        return Vec::new();
+    }
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(open_tag) {
+        let Some(after_open_idx) = start.checked_add(open_tag.len()) else {
+            break;
+        };
+        let Some(tail) = rest.get(after_open_idx..) else {
+            break;
+        };
+        let Some(rel_end) = tail.find(close_tag) else {
+            break;
+        };
+        let Some(end) = after_open_idx
+            .checked_add(rel_end)
+            .and_then(|i| i.checked_add(close_tag.len()))
+        else {
+            break;
+        };
+        if let Some(block) = rest.get(start..end) {
+            blocks.push(block);
+        }
+        rest = rest.get(end..).unwrap_or("");
+    }
+    blocks
 }
 
 fn extract_tag_inner<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
@@ -1053,32 +1172,69 @@ mod tests {
             Some(DetectedHarness::ClaudeCode)
         );
 
-        // Codex array `shell` vs OpenCode string `shell`.
-        let codex_shell = vec![fn_spec(
-            "shell",
-            "Run command",
-            json!({"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}),
-        )];
+        // Generic single-word tool names (`shell`, `execute`, `Bash`, `Agent`) NEVER match alone.
+        for lone in [
+            fn_spec("shell", "Run command", json!({"type": "object"})),
+            fn_spec(
+                "shell",
+                "Run command",
+                json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            ),
+            fn_spec(
+                "shell",
+                "Run command",
+                json!({"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}),
+            ),
+            fn_spec("execute", "Execute query", json!({"type": "object"})),
+            fn_spec("Bash", "Run bash", json!({"type": "object"})),
+            fn_spec("Agent", "Delegate", json!({"type": "object"})),
+        ] {
+            assert_eq!(
+                detect_harness_by_tools(std::slice::from_ref(&lone)),
+                None,
+                "lone generic tool `{}` must not trigger harness prompt rewriting",
+                lone.name
+            );
+        }
+
+        // Companion tuples disambiguate Codex array `shell` + `apply_patch` vs OpenCode string `shell` + `read` + `grep`.
+        let codex_shell_pair = vec![
+            fn_spec(
+                "shell",
+                "Run command",
+                json!({"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}),
+            ),
+            fn_spec(
+                "apply_patch",
+                "Patch file",
+                json!({"type": "object", "properties": {"patch": {"type": "string"}}}),
+            ),
+        ];
         assert_eq!(
-            detect_harness_by_tools(&codex_shell),
+            detect_harness_by_tools(&codex_shell_pair),
             Some(DetectedHarness::Codex)
         );
-        let opencode_shell = vec![fn_spec(
-            "shell",
-            "Run command",
-            json!({"type": "object", "properties": {"command": {"type": "string"}}}),
-        )];
+        let opencode_shell_tuple = vec![
+            fn_spec(
+                "shell",
+                "Run command",
+                json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            ),
+            fn_spec("read", "Read file", json!({"type": "object"})),
+            fn_spec("grep", "Search text", json!({"type": "object"})),
+        ];
         assert_eq!(
-            detect_harness_by_tools(&opencode_shell),
+            detect_harness_by_tools(&opencode_shell_tuple),
             Some(DetectedHarness::OpenCode)
         );
     }
 
     #[test]
     fn distills_version_changed_builtin_prompts_while_preserving_env_and_custom_rules() {
-        // Simulate a hypothetical future Claude Code v99 whose prose changed completely.
+        // Simulate a hypothetical future Claude Code v99 whose prose changed completely
+        // and embeds live runtime context tags (`<current_time_reminder>`, `<budget:token_budget>`, `<timestamp>`).
         let raw_v99_block = format!(
-            "Welcome to NextGen CLI v99.\n{}\n<env>\nWorking directory: /workspace/demo\nPlatform: darwin\n</env>\ngitStatus: On branch main\n<claude_background_info>Model marketing</claude_background_info>",
+            "Welcome to NextGen CLI v99.\n{}\n<current_time_reminder>2026-11-28T02:05:00+08:00</current_time_reminder>\n<budget:token_budget>200000</budget:token_budget>\n<context_window>500000</context_window>\n<rollout_budget>100</rollout_budget>\n<timestamp>1795802700</timestamp>\n<env>\nWorking directory: /workspace/demo\nPlatform: darwin\n</env>\ngitStatus: On branch main\n<claude_background_info>Model marketing</claude_background_info>",
             "Verbose built-in tool manual paragraph.\n".repeat(120)
         );
         let segments = vec![
@@ -1092,10 +1248,19 @@ mod tests {
         assert!(!distilled.contains("Verbose built-in tool manual paragraph"));
         assert!(!distilled.contains("Model marketing"));
         assert!(distilled.contains(CLAUDE_CODE_DISTILLED_PROMPT));
+        assert!(
+            distilled.contains(
+                "<current_time_reminder>2026-11-28T02:05:00+08:00</current_time_reminder>"
+            )
+        );
+        assert!(distilled.contains("<budget:token_budget>200000</budget:token_budget>"));
+        assert!(distilled.contains("<context_window>500000</context_window>"));
+        assert!(distilled.contains("<rollout_budget>100</rollout_budget>"));
+        assert!(distilled.contains("<timestamp>1795802700</timestamp>"));
         assert!(distilled.contains("<env>\nWorking directory: /workspace/demo"));
         assert!(distilled.contains("gitStatus: On branch main"));
         assert!(distilled.contains("Always respond in Simplified Chinese."));
-        assert!(distilled.len() < 1_200);
+        assert!(distilled.len() < 1_500);
 
         // Idempotence check.
         assert_eq!(

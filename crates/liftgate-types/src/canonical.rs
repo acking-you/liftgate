@@ -212,8 +212,24 @@ impl NormalizedTurnRequest {
     /// never carries caller system prompts.
     pub fn materialize_system_instructions(&mut self) {
         if let Some(sys) = self.system_instructions.take() {
+            let effective_sys: std::borrow::Cow<'_, str> = if self.auxiliary_task.is_none()
+                && !crate::session_key::is_compaction_instructions_prompt(&sys)
+                && !crate::session_key::is_compaction_summarization_turn(
+                    Some(&sys),
+                    &self.messages,
+                    &self.client_tools,
+                )
+                && let Some(harness) =
+                    crate::harness_prompt::detect_harness_by_tools(&self.client_tools)
+            {
+                std::borrow::Cow::Owned(crate::harness_prompt::distill_harness_base_prompt(
+                    harness, &sys,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(&sys)
+            };
             crate::session_key::materialize_system_prompt_into_messages(
-                Some(&sys),
+                Some(&effective_sys),
                 self.previous_response_id.is_some(),
                 &self.client_tools,
                 &mut self.messages,

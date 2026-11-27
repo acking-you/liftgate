@@ -425,48 +425,56 @@ pub fn normalize_anthropic_request(
         .and_then(Value::as_str);
     let tool_choice_is_none = choice_type == Some("none");
 
-    let mut client_tools = Vec::new();
+    let mut declared_tools = Vec::new();
     let mut enable_native_web_search = false;
     let mut enable_native_web_fetch = false;
     let mut web_fetch_max_uses = None;
     let mut web_fetch_allowed_domains = Vec::new();
     let mut web_fetch_blocked_domains = Vec::new();
 
-    if !tool_choice_is_none {
-        for tool in req.tools {
-            if let Some(tt) = &tool.tool_type {
-                if tt.starts_with("web_search") {
+    for tool in req.tools {
+        if let Some(tt) = &tool.tool_type {
+            if tt.starts_with("web_search") {
+                if !tool_choice_is_none {
                     enable_native_web_search = true;
-                    continue;
                 }
-                if tt.starts_with("web_fetch") {
+                continue;
+            }
+            if tt.starts_with("web_fetch") {
+                if !tool_choice_is_none {
                     enable_native_web_fetch = true;
                     if tool.max_uses.is_some() {
                         web_fetch_max_uses = tool.max_uses;
                     }
                     web_fetch_allowed_domains.extend(tool.allowed_domains);
                     web_fetch_blocked_domains.extend(tool.blocked_domains);
-                    continue;
                 }
-                if tt.starts_with("code_execution") && tool.input_schema.is_none() {
-                    continue;
-                }
+                continue;
             }
-            if !tool.name.trim().is_empty() {
-                let schema_json = tool.input_schema.as_ref().map_or_else(
-                    || "{\"type\":\"object\"}".to_owned(),
-                    |r| r.get().to_owned(),
-                );
-                client_tools.push(CanonicalToolSpec {
-                    name: tool.name,
-                    description: tool.description,
-                    kind: CanonicalToolKind::Function {
-                        parameters_json: schema_json,
-                    },
-                });
+            if tt.starts_with("code_execution") && tool.input_schema.is_none() {
+                continue;
             }
         }
+        if !tool.name.trim().is_empty() {
+            let schema_json = tool.input_schema.as_ref().map_or_else(
+                || "{\"type\":\"object\"}".to_owned(),
+                |r| r.get().to_owned(),
+            );
+            declared_tools.push(CanonicalToolSpec {
+                name: tool.name,
+                description: tool.description,
+                kind: CanonicalToolKind::Function {
+                    parameters_json: schema_json,
+                },
+            });
+        }
     }
+
+    let client_tools = if tool_choice_is_none {
+        Vec::new()
+    } else {
+        declared_tools.clone()
+    };
 
     let auxiliary_task = detect_auxiliary_task(
         aux_system.as_deref(),
@@ -476,13 +484,16 @@ pub fn normalize_anthropic_request(
         enable_native_web_fetch,
     );
 
+    let is_compaction = crate::session_key::is_compaction_summarization_turn(
+        aux_system.as_deref(),
+        &conv_messages,
+        &client_tools,
+    ) || aux_system
+        .as_deref()
+        .is_some_and(crate::session_key::is_compaction_instructions_prompt);
     let effective_system = if auxiliary_task.is_none()
-        && !crate::session_key::is_compaction_summarization_turn(
-            aux_system.as_deref(),
-            &conv_messages,
-            &client_tools,
-        )
-        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&client_tools)
+        && !is_compaction
+        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
     {
         crate::harness_prompt::distill_responses_developer_messages(
             harness,
@@ -1086,6 +1097,64 @@ mod tests {
             &norm_act.messages,
         );
         assert_eq!(plan.prefix_lookup.map(|(h, _)| h), Some(t1_hash));
+
+        // Disabling tool execution (`tool_choice: {"type": "none"}`) on a continuation turn while
+        // declaring the same harness tools preserves the exact distilled prefix hash!
+        let req_tool_choice_none: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": raw_cc_system,
+            "tool_choice": { "type": "none" },
+            "tools": [
+                { "name": "Bash", "input_schema": { "type": "object" } },
+                { "name": "Read", "input_schema": { "type": "object" } }
+            ],
+            "messages": [
+                { "role": "user", "content": "<system-reminder>\n# claudeMd\nObey docs/2026-11-09-RUST.md\n</system-reminder>\nhi" },
+                { "role": "assistant", "content": "Ready." },
+                { "role": "user", "content": "Summarize without calling tools" }
+            ]
+        }))
+        .expect("valid tool_choice=none continuation");
+        let norm_none = normalize_anthropic_request(req_tool_choice_none)
+            .expect("normalized tool_choice=none turn");
+        assert!(norm_none.client_tools.is_empty());
+        let plan_none = compute_routing_plan(
+            None,
+            &norm_none.client_tools,
+            web_cfg,
+            &model,
+            &norm_none.messages,
+        );
+        assert_eq!(plan_none.prefix_lookup.map(|(h, _)| h), Some(t1_hash));
+
+        // Auxiliary Auto Mode classifier request with Claude Code tools attached (`Bash`, `Read`)
+        // and a >2 KB classifier system prompt MUST keep its classifier system prompt intact!
+        let classifier_sys = format!(
+            "You are a security classifier for Claude Code Auto Mode. Return <block>yes</block> or <block>no</block>.\n{}",
+            "CLASSIFIER_POLICY_RULE_LINE\n".repeat(100)
+        );
+        let req_aux_cls: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 256,
+            "system": classifier_sys,
+            "tools": [
+                { "name": "Bash", "input_schema": { "type": "object" } },
+                { "name": "Read", "input_schema": { "type": "object" } }
+            ],
+            "messages": [{ "role": "user", "content": "<transcript>\nAssistant wants to run cargo test\n</transcript>" }]
+        }))
+        .expect("valid Auto Mode classifier request");
+        let norm_aux_cls =
+            normalize_anthropic_request(req_aux_cls).expect("normalized Auto Mode classifier");
+        assert_eq!(
+            norm_aux_cls.auxiliary_task,
+            Some(crate::canonical::AuxiliaryTaskKind::AutoModeClassifier)
+        );
+        assert!(matches!(
+            norm_aux_cls.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("CLASSIFIER_POLICY_RULE_LINE")
+        ));
 
         // 2. OpenCode multi-block system prompt preserves `<env>` and `Instructions from: AGENTS.md`.
         let req_oc: AnthropicMessagesRequest = serde_json::from_value(json!({
