@@ -14,6 +14,7 @@ import type {
   ToolCallDetail,
   ToolCallsResponse,
   UsageResponse,
+  UsageSeriesResponse,
   UsageSummary,
 } from "@/types/telemetry";
 
@@ -79,13 +80,22 @@ export interface GatewayClient {
   updateContextCapture(update: ContextCaptureConfigUpdate): Promise<ContextCaptureSummary>;
   clearContextCaptures(): Promise<ContextCaptureSummary>;
 
-  usage(): Promise<UsageResponse>;
+  /** Everything recorded, or only the usage within `range`. */
+  usage(range?: UsageRange): Promise<UsageResponse>;
+  /** Usage per interval between consecutive `bounds` (ascending unix ms, e.g. local midnights). */
+  usageSeries(bounds: readonly number[]): Promise<UsageSeriesResponse>;
   resetUsage(): Promise<UsageSummary>;
   pricing(): Promise<PricingResponse>;
   /** `null` restores the default price of `key`. */
   setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse>;
 
   probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string>;
+}
+
+/** A half-open time range `[from, to)` in unix ms. */
+export interface UsageRange {
+  from: number;
+  to: number;
 }
 
 const RECONNECT_DELAY_MS = 2000;
@@ -261,8 +271,16 @@ export class HttpGatewayClient implements GatewayClient {
     return this.request("/api/telemetry/context-captures/clear", { method: "POST" });
   }
 
-  usage(): Promise<UsageResponse> {
-    return this.request("/api/telemetry/usage");
+  usage(range?: UsageRange): Promise<UsageResponse> {
+    return this.request(
+      range
+        ? `/api/telemetry/usage?from=${Math.floor(range.from)}&to=${Math.floor(range.to)}`
+        : "/api/telemetry/usage",
+    );
+  }
+
+  usageSeries(bounds: readonly number[]): Promise<UsageSeriesResponse> {
+    return this.request(`/api/telemetry/usage/series?bounds=${bounds.map((b) => Math.floor(b)).join(",")}`);
   }
 
   resetUsage(): Promise<UsageSummary> {

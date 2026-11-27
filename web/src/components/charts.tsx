@@ -199,6 +199,128 @@ export function RankedBars({
   );
 }
 
+/* ---------- Day bars: one bar per local day ---------- */
+
+export interface DayBar {
+  key: string;
+  value: number;
+  /** Accessible name: the day and its value. */
+  label: string;
+  /** No recorded detail covers this day. */
+  unknown?: boolean;
+  /** Outside the selected period. */
+  muted?: boolean;
+  /** The day is the selected period. */
+  pressed?: boolean;
+}
+
+export interface DayTick {
+  index: number;
+  label: string;
+}
+
+const DAY_BARS_HEIGHT = 140;
+const DAY_TIP_WIDTH = 196;
+
+function dayTickStyle(index: number, count: number): React.CSSProperties {
+  if (index <= 0) return { left: 0 };
+  if (index >= count - 1) return { right: 0 };
+  return { left: `${((index + 0.5) / count) * 100}%`, transform: "translateX(-50%)" };
+}
+
+export function DayBars({
+  bars,
+  max,
+  maxLabel,
+  ticks,
+  ariaLabel,
+  onSelect,
+  renderTip,
+}: {
+  bars: DayBar[];
+  /** Value at the top gridline; taller values are clipped to it. */
+  max: number;
+  maxLabel: string;
+  ticks: DayTick[];
+  ariaLabel: string;
+  onSelect: (index: number) => void;
+  renderTip: (index: number) => React.ReactNode;
+}): React.JSX.Element {
+  const [ref, width] = useElementWidth<HTMLDivElement>();
+  const [hover, setHover] = useState<number | null>(null);
+  const buttons = useRef<(HTMLButtonElement | null)[]>([]);
+  const count = bars.length;
+  const pressed = bars.findIndex((bar) => bar.pressed);
+  // Roving focus: one tab stop for the whole chart, arrows move between days.
+  const [focusIndex, setFocusIndex] = useState<number | null>(null);
+  const tabIndex = Math.min(focusIndex ?? (pressed >= 0 ? pressed : count - 1), count - 1);
+
+  const tipLeft = (i: number): number => {
+    const x = count > 0 ? ((i + 0.5) / count) * width : 0;
+    const left = x < width / 2 ? x + 12 : x - 12 - DAY_TIP_WIDTH;
+    return Math.min(Math.max(left, 0), Math.max(0, width - DAY_TIP_WIDTH));
+  };
+  const onKeyDown = (ev: React.KeyboardEvent, i: number): void => {
+    const step = { ArrowLeft: -1, ArrowRight: 1, Home: -count, End: count }[ev.key];
+    if (step === undefined) return;
+    ev.preventDefault();
+    buttons.current[Math.min(count - 1, Math.max(0, i + step))]?.focus();
+  };
+
+  return (
+    <div ref={ref} className="relative" onMouseLeave={() => setHover(null)}>
+      <div className="lg-days" style={{ height: DAY_BARS_HEIGHT }} role="group" aria-label={ariaLabel}>
+        <span className="lg-days-max" aria-hidden="true">
+          {maxLabel}
+        </span>
+        {bars.map((bar, i) => {
+          const pct = max > 0 ? Math.min(100, (bar.value / max) * 100) : 0;
+          return (
+            <button
+              key={bar.key}
+              ref={(el) => {
+                buttons.current[i] = el;
+              }}
+              type="button"
+              className="lg-day"
+              tabIndex={i === tabIndex ? 0 : -1}
+              data-muted={bar.muted ? "true" : undefined}
+              data-unknown={bar.unknown ? "true" : undefined}
+              aria-label={bar.label}
+              aria-pressed={bar.pressed ?? false}
+              onMouseEnter={() => setHover(i)}
+              onFocus={() => {
+                setHover(i);
+                setFocusIndex(i);
+              }}
+              onBlur={() => setHover(null)}
+              onKeyDown={(ev) => onKeyDown(ev, i)}
+              onClick={() => onSelect(i)}
+            >
+              <span
+                className="lg-day-bar"
+                style={bar.unknown ? undefined : { height: bar.value > 0 ? `max(2px, ${pct}%)` : 0 }}
+              />
+            </button>
+          );
+        })}
+      </div>
+      <div className="lg-days-axis" aria-hidden="true">
+        {ticks.map((tick) => (
+          <span key={tick.index} style={dayTickStyle(tick.index, count)}>
+            {tick.label}
+          </span>
+        ))}
+      </div>
+      {hover !== null && hover < count && width > 0 && (
+        <div className="lg-chart-tip" style={{ left: tipLeft(hover), top: 6, width: DAY_TIP_WIDTH }}>
+          {renderTip(hover)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------- Sparkline ---------- */
 
 export function Sparkline({

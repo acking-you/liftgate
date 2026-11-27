@@ -679,7 +679,12 @@ export interface UsageTokens {
 
 export interface UsageSummary {
   revision: number;
+  /** Start of the covered range: when recording started (or was reset), or the requested `from`. */
   since_unix_ms: number;
+  /** End of the requested range; absent for the all-time totals. */
+  until_unix_ms?: number;
+  /** Where bucketed history starts; earlier usage only counts toward the all-time totals. */
+  history_from_unix_ms?: number;
   calls: number;
   tokens: UsageTokens;
   /** Cost of priced usage. */
@@ -688,6 +693,30 @@ export interface UsageSummary {
   cache_savings_usd?: number;
   /** Calls on models without a price, left out of `cost_usd`. */
   unpriced_calls: number;
+}
+
+/** Usage within one interval of `GET /api/telemetry/usage/series`. */
+export interface UsageInterval {
+  start_unix_ms: number;
+  end_unix_ms: number;
+  calls: number;
+  auxiliary_calls: number;
+  tokens: UsageTokens;
+  /** Cost of priced usage in the interval. */
+  cost_usd: number;
+  cache_savings_usd: number;
+  /** Calls on models without a price, left out of `cost_usd`. */
+  unpriced_calls: number;
+}
+
+/** One interval per consecutive pair of requested bounds, e.g. the viewer's local midnights. */
+export interface UsageSeriesResponse {
+  revision: number;
+  /** Width of the usage buckets the intervals are cut from. */
+  bucket_ms: number;
+  /** Where bucketed history starts; intervals before it read as zero. */
+  history_from_unix_ms: number;
+  intervals: UsageInterval[];
 }
 
 export interface ModelUsage {

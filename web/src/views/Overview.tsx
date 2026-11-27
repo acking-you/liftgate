@@ -27,6 +27,9 @@ import {
   Usd,
 } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
+import { useRevisionResource } from "@/hooks/useResource";
+import { useToday } from "@/hooks/useToday";
+import { addDays } from "@/lib/days";
 import {
   formatBpsPct,
   formatBytes,
@@ -145,7 +148,7 @@ function InFlight({ task }: { task: TaskSnapshot }): React.JSX.Element {
 }
 
 export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
-  const { snapshot, lowCacheRecords, toolCalls } = useGateway();
+  const { client, baseUrl, snapshot, lowCacheRecords, toolCalls } = useGateway();
   const { m } = useI18n();
   const t = m.overview;
   const [protocol, setProtocol] = useState<"all" | TaskProtocol>("all");
@@ -157,6 +160,13 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const cacheSummary = snapshot?.cache_telemetry;
   const toolSummary = snapshot?.tool_call_telemetry;
   const usage = snapshot?.usage;
+  const today = useToday();
+  const todayUsage = useRevisionResource(
+    usage ? () => client.usage({ from: today, to: addDays(today, 1) }) : null,
+    `${baseUrl}|${client.demo}|usage-today|${today}`,
+    usage?.revision ?? -1,
+  );
+  const todaySummary = todayUsage.data?.summary;
   const activeTasks = snapshot?.active_tasks ?? [];
   const recentTasks = useMemo(() => snapshot?.recent_tasks ?? [], [snapshot?.recent_tasks]);
   const thresholdBps = cacheSummary?.low_cache_threshold_bps ?? 5000;
@@ -230,20 +240,15 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
         />
         {usage ? (
           <Stat
-            label={t.stats.cost}
+            label={t.stats.costToday}
             icon={<CircleDollarSign />}
-            value={formatUsd(usage.cost_usd)}
-            onClick={() => navigate("usage")}
+            value={todaySummary ? formatUsd(todaySummary.cost_usd) : "—"}
+            onClick={() => navigate("usage", "today")}
             foot={
-              usage.unpriced_calls > 0 ? (
-                <span className="text-warn">{t.stats.unpricedFoot(formatNumber(usage.unpriced_calls))}</span>
+              todaySummary && todaySummary.unpriced_calls > 0 ? (
+                <span className="text-warn">{t.stats.unpricedFoot(formatNumber(todaySummary.unpriced_calls))}</span>
               ) : (
-                <span>
-                  {t.stats.costFoot(
-                    formatCompact(usage.tokens.input + usage.tokens.cached_input + usage.tokens.cache_write + usage.tokens.output),
-                    formatNumber(usage.calls),
-                  )}
-                </span>
+                <span>{t.stats.costTotalFoot(formatUsd(usage.cost_usd), formatNumber(usage.calls))}</span>
               )
             }
           />
