@@ -124,7 +124,7 @@ lg down                  # 优雅停止后台网关服务
 - **实测校准的上下文窗口**：Codex、Claude Code、OpenCode 与 Oh My Pi 在上游 `agy acp` 强制内部压缩线（Gemini `524,288` token）前按 `500k / 425k` 稳妥触发客户端 `/compact`，纯单轮请求配合热会话复用，零后台重放副作用（[上下文策略](docs/usage.zh-CN.md#上下文窗口与单轮预算)）。
 - **实时模型目录**：`/v1/models` 与 Codex 模型目录列出账号下全部可用模型，`/model` 菜单直接显示 Antigravity 模型（[接入 Codex](docs/usage.zh-CN.md#codex-cli)）。
 - **拒绝静默降级与 Flash 快车道**：上游 `429` 限流立即返回，绝不暗中偷换模型；标题、摘要与 Auto Mode 分类走独立的 Flash 会话，不打扰主会话（[模型路由](docs/architecture.md#model-routing)）。
-- **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板，也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
+- **Web 与终端双监控面板**：既可在浏览器 `http://127.0.0.1:8787/` 打开内嵌 React 面板（中英文双语，按模型统计用量与美元费用），也可直接在终端运行 `lg top` 全屏实时查看对话流、驱逐空闲会话、热切换模型与追踪日志（[监控面板](docs/usage.zh-CN.md#监控面板)）。
 
 ## 工作原理
 

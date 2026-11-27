@@ -596,7 +596,11 @@ session's tool catalog (how client tools were virtualized onto `lg`, client vs.
 wire definitions, and context composition), opt-in full-context captures, the
 session pool (idle or MCP-suspended sessions can be closed by hand, and the
 Hybrid MCP Tool Bridge and `>=300k` vision offload can be toggled live), the
-model catalog and the last lines of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
+model catalog and the last lines of `agy` stderr. A usage view prices every request
+from its model's API price (defaults follow each provider's published standard
+price and can be overridden per model) and totals tokens and cost per model. The
+dashboard follows the system language (Chinese or English) and can be switched
+from the top bar. With `--api-key`, `liftgate ui` passes the key automatically
 (or enter it in the dashboard's connection settings). Serve an extra dedicated
 UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir>`.
 

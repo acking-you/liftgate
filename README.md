@@ -161,7 +161,8 @@ well. Full command reference and SDK examples:
   Flash model without touching your main session ([model routing](docs/architecture.md#model-routing)).
 - **Web & terminal dashboards** — inspect live turns, evict pooled sessions,
   switch models and tail `agy` logs either in the browser
-  (`http://127.0.0.1:8787/`) or right inside your terminal with `lg top`
+  (`http://127.0.0.1:8787/`, in Chinese or English, with per-model usage and
+  USD cost) or right inside your terminal with `lg top`
   ([dashboard](docs/usage.md#dashboard)).
 
 ## How it works

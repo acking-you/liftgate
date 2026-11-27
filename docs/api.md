@@ -23,6 +23,8 @@ without the `/v1` prefix.
 | `GET /api/telemetry/tool-calls[?since=<revision>]`, `GET /api/telemetry/tool-calls/{call_id}` | per-call tool I/O from a bounded in-memory ring buffer (route, status, timing, sizes, wire vs. forwarded arguments, output blocks); `since` returns only records changed after that revision |
 | `GET /api/telemetry/sessions/{id}/tool-catalog` | how a pooled MCP session's client tools were virtualized: tier per tool, client vs. wire definitions, wire tools, bridge rules, and the latest context composition |
 | `GET /api/telemetry/context-captures`, `GET /api/telemetry/context-captures/{task_id}` | opt-in full-context captures (index, newest first) and one captured turn |
+| `GET /api/telemetry/usage`, `POST /api/telemetry/usage/reset` | per-model token usage (uncached input, cached input, cache write, output) and its USD cost since the last reset, costliest first; reset starts counting again |
+| `GET /api/telemetry/pricing`, `POST /api/telemetry/pricing` | per-1M-token prices of every model family (shipped defaults, scheduled changes, custom prices, and the catalog models each covers); post `{"key", "price": {"input", "cached_input", "cache_write", "output"}}` to set a custom price or `"price": null` to restore the default |
 | `POST /api/telemetry/context-capture`, `POST /api/telemetry/context-captures/clear` | toggle full-context capture and set its quota (`{"enabled", "max_records", "max_total_mib"}`), or delete every capture |
 | `POST /api/admin/shutdown` | graceful shutdown for managed background daemons (requires `x-liftgate-shutdown-token`) |
 
