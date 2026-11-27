@@ -243,7 +243,8 @@ impl SpillStore {
         let mut line_no = skipped_lines;
 
         if let Some(needle) = clean_query {
-            let needle_lower = needle.to_ascii_lowercase();
+            let needle_unicode_lower = (!needle.is_ascii()).then(|| needle.to_lowercase());
+            let mut chunk_lower_buf = String::new();
             let mut total_matches = 0usize;
             while remaining_scan_bytes > 0
                 && read_next_spill_line(
@@ -266,9 +267,12 @@ impl SpillStore {
                     0
                 };
                 let haystack = line.get(search_start..).unwrap_or_default();
-                let Some(rel_pos) =
-                    find_case_insensitive_byte_offset(haystack, needle, &needle_lower)
-                else {
+                let Some(rel_pos) = find_case_insensitive_byte_offset(
+                    haystack,
+                    needle,
+                    needle_unicode_lower.as_deref(),
+                    &mut chunk_lower_buf,
+                ) else {
                     continue;
                 };
                 total_matches = total_matches.saturating_add(1);
@@ -453,35 +457,77 @@ fn floor_utf8_boundary(s: &str, index: usize) -> usize {
 }
 
 /// Finds the first case-insensitive match of `needle` inside `haystack`, returning the exact
-/// UTF-8 byte offset within `haystack` (including non-ASCII Unicode case folding where lowercasing
-/// a character may change its UTF-8 byte width).
+/// UTF-8 byte offset within `haystack` in `O(1)` auxiliary memory (`0` heap allocations for ASCII
+/// needles; bounded `64 KiB` chunked scan with scalar offset translation for Unicode needles).
 fn find_case_insensitive_byte_offset(
     haystack: &str,
     needle: &str,
-    needle_ascii_lower: &str,
+    needle_unicode_lower: Option<&str>,
+    chunk_lower_buf: &mut String,
 ) -> Option<usize> {
-    if needle.is_ascii() {
-        return haystack.to_ascii_lowercase().find(needle_ascii_lower);
+    if needle.is_empty() {
+        return Some(0);
     }
-    let needle_lower = needle.to_lowercase();
+    if needle.is_ascii() {
+        let nb = needle.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(nb.len())
+            .position(|w| w.eq_ignore_ascii_case(nb));
+    }
+    let needle_lower = needle_unicode_lower?;
     if needle_lower.is_empty() {
         return Some(0);
     }
-    let mut lowered = String::with_capacity(haystack.len());
-    let mut lower_to_orig: Vec<(usize, usize)> = Vec::new();
-    for (orig_idx, ch) in haystack.char_indices() {
-        lower_to_orig.push((lowered.len(), orig_idx));
-        for lc in ch.to_lowercase() {
-            lowered.push(lc);
+    let overlap = needle_lower.len().saturating_mul(4).saturating_add(16);
+    let chunk_bytes = (64 * 1024).max(overlap.saturating_mul(4));
+    let mut chunk_start = 0usize;
+    while chunk_start < haystack.len() {
+        let chunk_end = if chunk_start.saturating_add(chunk_bytes) >= haystack.len() {
+            haystack.len()
+        } else {
+            let candidate = floor_utf8_boundary(haystack, chunk_start + chunk_bytes);
+            if candidate > chunk_start {
+                candidate
+            } else {
+                haystack.len()
+            }
+        };
+        let chunk = haystack.get(chunk_start..chunk_end)?;
+        chunk_lower_buf.clear();
+        chunk_lower_buf.reserve(chunk.len().saturating_sub(chunk_lower_buf.capacity()));
+        for ch in chunk.chars() {
+            for lc in ch.to_lowercase() {
+                chunk_lower_buf.push(lc);
+            }
+        }
+        if let Some(target_lower_byte) = chunk_lower_buf.find(needle_lower) {
+            let mut cur_lower = 0usize;
+            let mut prev_orig = 0usize;
+            for (rel_orig, ch) in chunk.char_indices() {
+                if cur_lower == target_lower_byte {
+                    return Some(chunk_start + rel_orig);
+                }
+                if cur_lower > target_lower_byte {
+                    return Some(chunk_start + prev_orig);
+                }
+                prev_orig = rel_orig;
+                cur_lower = cur_lower.saturating_add(ch.to_lowercase().map(char::len_utf8).sum());
+            }
+            return Some(chunk_start + prev_orig);
+        }
+        if chunk_end >= haystack.len() {
+            break;
+        }
+        let next_start = floor_utf8_boundary(haystack, chunk_end.saturating_sub(overlap));
+        if next_start <= chunk_start {
+            let step = chunk.chars().next().map_or(1, char::len_utf8);
+            chunk_start = chunk_start.saturating_add(step);
+        } else {
+            chunk_start = next_start;
         }
     }
-    let lower_pos = lowered.find(&needle_lower)?;
-    match lower_to_orig.binary_search_by_key(&lower_pos, |&(lp, _)| lp) {
-        Ok(i) => lower_to_orig.get(i).map(|&(_, orig)| orig),
-        Err(ins) => lower_to_orig
-            .get(ins.saturating_sub(1))
-            .map(|&(_, orig)| orig),
-    }
+    None
 }
 
 fn decode_line_lossless_or_lossy(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -898,7 +944,7 @@ mod tests {
         // must also center the snippet around the actual match offset rather than byte 0!
         let unicode_overlong = format!(
             r#"{{"pad":"{}","greeting":"ПРИВЕТ_МИР_77","tail":"{}"}}"#,
-            "a".repeat(14_500),
+            "a".repeat(150_000),
             "b".repeat(4_000)
         );
         let unicode_path = store
