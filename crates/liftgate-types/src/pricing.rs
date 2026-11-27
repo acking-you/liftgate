@@ -64,6 +64,13 @@ impl ModelPrice {
         Ok(())
     }
 
+    /// What serving `tokens.cached_input` from the cache saved versus billing it as uncached
+    /// input, in USD.
+    #[must_use]
+    pub fn cache_savings_usd(&self, tokens: &UsageTokens) -> f64 {
+        tokens_f64(tokens.cached_input) * (self.input - self.cached_input).max(0.0) / 1_000_000.0
+    }
+
     /// Cost of `tokens` in USD.
     #[must_use]
     pub fn cost_usd(&self, tokens: &UsageTokens) -> f64 {
@@ -417,6 +424,9 @@ pub struct UsageSummary {
     /// Cost of priced usage.
     #[serde(default)]
     pub cost_usd: f64,
+    /// What cache hits saved versus uncached input, priced per price period like `cost_usd`.
+    #[serde(default)]
+    pub cache_savings_usd: f64,
     /// Calls on models without a price, left out of `cost_usd`.
     #[serde(default)]
     pub unpriced_calls: u64,
@@ -511,6 +521,12 @@ mod tests {
         let cost = sonnet.cost_usd(&tokens);
         assert!((cost - (2.00 + 0.40 + 0.25 + 2.00)).abs() < 1e-9, "{cost}");
         assert_eq!(ModelPrice::default().cost_usd(&tokens), 0.0);
+        // 4M cached tokens at $2.00 instead of $0.10.
+        assert!((sonnet.cache_savings_usd(&tokens) - 7.60).abs() < 1e-9);
+        assert_eq!(
+            price(0.09, 0.09, 0.09, 0.36).cache_savings_usd(&tokens),
+            0.0
+        );
     }
 
     #[test]

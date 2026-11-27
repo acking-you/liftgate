@@ -1419,8 +1419,17 @@ export function createDemoClient(): GatewayClient {
       calls: 0,
       tokens: { input: 0, cached_input: 0, cache_write: 0, output: 0, thought: 0 },
       cost_usd: 0,
+      cache_savings_usd: 0,
       unpriced_calls: 0,
     };
+    for (const task of done) {
+      const t = tokensOf(task);
+      const price = priceOf(task.resolved_model);
+      if (t && price) {
+        summary.cache_savings_usd =
+          (summary.cache_savings_usd ?? 0) + (t.cached_input * Math.max(0, price.input - price.cached_input)) / 1e6;
+      }
+    }
     for (const row of models) {
       summary.calls += row.calls;
       summary.tokens = {

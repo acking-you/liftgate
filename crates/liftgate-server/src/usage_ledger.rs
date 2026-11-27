@@ -238,11 +238,14 @@ impl UsageLedger {
     #[must_use]
     pub fn report(&self, prices: &PriceBook) -> UsageResponse {
         let mut by_model: BTreeMap<&str, ModelUsage> = BTreeMap::new();
+        let mut cache_savings_usd = 0.0;
         for row in &self.rows {
             let key = pricing_key(&row.model_id);
-            let cost = prices
-                .price_for(key, row.period_start_unix_ms)
-                .map(|price| price.cost_usd(&row.tokens));
+            let price = prices.price_for(key, row.period_start_unix_ms);
+            let cost = price.map(|price| price.cost_usd(&row.tokens));
+            if let Some(price) = price {
+                cache_savings_usd += price.cache_savings_usd(&row.tokens);
+            }
             let entry = by_model
                 .entry(row.model_id.as_str())
                 .or_insert_with(|| ModelUsage {
@@ -273,6 +276,7 @@ impl UsageLedger {
         let mut summary = UsageSummary {
             revision: self.revision.saturating_add(prices.revision()),
             since_unix_ms: self.since_unix_ms,
+            cache_savings_usd,
             ..UsageSummary::default()
         };
         for model in &models {
@@ -561,6 +565,10 @@ mod tests {
         assert_eq!(low.auxiliary_calls, 1);
         assert_eq!(report.summary.calls, 4);
         assert_eq!(report.summary.unpriced_calls, 1);
+        assert_eq!(
+            report.summary.cache_savings_usd, 0.0,
+            "nothing was cached yet"
+        );
         assert!((report.summary.cost_usd - 60.0).abs() < 1e-9);
         assert_eq!(
             report.models.first().map(|m| m.model_id.as_str()),
@@ -598,6 +606,39 @@ mod tests {
         ledger.reset(5_000);
         assert!(ledger.rows().is_empty());
         assert_eq!(ledger.since_unix_ms(), 5_000);
+    }
+
+    #[test]
+    fn cache_savings_follow_the_price_of_each_period() {
+        // 1M cached Carbon tokens on each side of the Dec 1 change: $1.90 then $3.80 saved.
+        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        ledger.record(
+            "gemini-4-carbon-high",
+            false,
+            tokens(0, 1_000_000, 0),
+            DEC_1_2026 - 10,
+        );
+        ledger.record(
+            "gemini-4-carbon-high",
+            false,
+            tokens(0, 1_000_000, 0),
+            DEC_1_2026 + 10,
+        );
+        let mut prices = PriceBook::load(None);
+        let saved = ledger.report(&prices).summary.cache_savings_usd;
+        assert!((saved - (1.90 + 3.80)).abs() < 1e-9, "{saved}");
+        // A custom price applies to all history, savings included.
+        let _ = prices.set(
+            "gemini-4-carbon",
+            Some(ModelPrice {
+                input: 1.0,
+                cached_input: 0.5,
+                cache_write: 1.0,
+                output: 1.0,
+            }),
+        );
+        let saved = ledger.report(&prices).summary.cache_savings_usd;
+        assert!((saved - 1.0).abs() < 1e-9, "{saved}");
     }
 
     #[test]

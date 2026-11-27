@@ -480,15 +480,8 @@ export function UsageView(_props: ViewProps): React.JSX.Element {
 
   const report = usage.data;
   const totals = report?.summary ?? summary;
-  const saved = useMemo(() => {
-    if (!report) return null;
-    let sum = 0;
-    for (const row of report.models) {
-      const price = effectivePrice(byKey.get(row.pricing_key));
-      if (price) sum += (row.tokens.cached_input * Math.max(0, price.input - price.cached_input)) / 1e6;
-    }
-    return sum;
-  }, [report, byKey]);
+  // Priced per price period on the gateway, like cost, so scheduled changes never re-price it.
+  const saved = totals?.cache_savings_usd ?? null;
 
   if (supported === false) {
     return (

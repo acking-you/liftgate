@@ -684,6 +684,8 @@ export interface UsageSummary {
   tokens: UsageTokens;
   /** Cost of priced usage. */
   cost_usd: number;
+  /** What cache hits saved versus uncached input, priced per price period. */
+  cache_savings_usd?: number;
   /** Calls on models without a price, left out of `cost_usd`. */
   unpriced_calls: number;
 }
