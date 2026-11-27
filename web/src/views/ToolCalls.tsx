@@ -20,6 +20,7 @@ import {
   Card,
   EmptyState,
   HarnessBadge,
+  Latency,
   Loading,
   Note,
   Pager,
@@ -39,11 +40,11 @@ import {
   shortId,
 } from "@/lib/format";
 import { harnessMeta } from "@/lib/harness";
+import { useI18n } from "@/lib/i18n";
+import { TOOL_SCALE, latencyTone } from "@/lib/latency";
 import {
   EMPTY_FILTER,
   type HarnessStats,
-  ROUTE_LABEL,
-  TOOL_KIND_LABEL,
   type ToolCallFilter,
   type ToolKind,
   aggregateByHarness,
@@ -54,6 +55,8 @@ import {
   isFailure,
   isFilterActive,
   recordKind,
+  routeLabel,
+  toolKindLabel,
 } from "@/lib/toolcalls";
 import type { ToolCallRecord, ToolCallTelemetrySummary } from "@/types/telemetry";
 import type { ViewProps } from "@/views/types";
@@ -95,11 +98,13 @@ function HarnessBoard({
   active: string;
   onToggle: (harness: string) => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.tools.board;
   // Every card measures against the same maxima, so bar lengths compare across cards.
   const maxOut = Math.max(1, ...stats.map((s) => s.avgOutputBytes));
   const maxP50 = Math.max(1, ...stats.map((s) => s.p50DurationMs ?? 0));
   return (
-    <div className="lg-board" role="group" aria-label="按 Harness 对比，点击筛选">
+    <div className="lg-board" role="group" aria-label={t.aria}>
       {stats.map((s) => {
         const meta = harnessMeta(s.harness);
         return (
@@ -112,13 +117,13 @@ function HarnessBoard({
           >
             <span className="flex items-center justify-between gap-2">
               <HarnessBadge id={s.harness} className="text-[13px] font-semibold text-fg" />
-              <span className="lg-num text-[11.5px] text-fg-3">{formatNumber(s.calls)} 次</span>
+              <span className="lg-num text-[11.5px] text-fg-3">{t.calls(formatNumber(s.calls))}</span>
             </span>
             <span className="flex items-baseline gap-2">
               <span className={`lg-hcard-hero ${s.failures > 0 ? "text-err" : ""}`}>
                 {formatPct(s.failureRate, 1)}
               </span>
-              <span className="text-[12px] text-fg-3">失败率</span>
+              <span className="text-[12px] text-fg-3">{t.failureRate}</span>
             </span>
             <MiniBar
               label="CodeMode"
@@ -127,13 +132,13 @@ function HarnessBoard({
               color={meta.color}
             />
             <MiniBar
-              label="平均输出"
+              label={t.avgOutput}
               ratio={s.avgOutputBytes / maxOut}
               display={formatBytes(s.avgOutputBytes)}
               color={meta.color}
             />
             <MiniBar
-              label="P50 耗时"
+              label={t.p50}
               ratio={(s.p50DurationMs ?? 0) / maxP50}
               display={formatDurationMs(s.p50DurationMs)}
               color={meta.color}
@@ -164,9 +169,12 @@ function CallRow({
   onSelect: (rec: ToolCallRecord) => void;
   onHover: (id: string | null) => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.tools.row;
   const failed = isFailure(rec);
   const pending = rec.status === "pending";
   const name = displayToolName(rec);
+  const durTone = rec.duration_ms != null ? latencyTone(rec.duration_ms, TOOL_SCALE) : undefined;
   const unwrapped = rec.route === "namespace_hub" || rec.route === "generic_dispatcher";
   const preview = failed && rec.output_preview ? rec.output_preview : rec.input_preview;
   // Square-root keeps short calls visible beside a multi-second outlier.
@@ -179,6 +187,7 @@ function CallRow({
       aria-selected={selected}
       className="lg-call"
       data-failed={failed}
+      data-status={rec.status}
       data-hot={hot}
       data-fresh={fresh ? "true" : undefined}
       onClick={() => onSelect(rec)}
@@ -190,25 +199,25 @@ function CallRow({
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="lg-call-name">{name}</span>
           {unwrapped && (
-            <span className="lg-num lg-clip min-w-0 text-[11px] text-fg-4" title={`经 ${rec.wire_tool_name} 解包`}>
+            <span className="lg-num lg-clip min-w-0 text-[11px] text-fg-4" title={t.unwrappedFrom(rec.wire_tool_name)}>
               ← {rec.wire_tool_name}
             </span>
           )}
           {rec.route !== "client_roundtrip" && !unwrapped && (
-            <span className="lg-call-route">{ROUTE_LABEL[rec.route]}</span>
+            <span className="lg-call-route">{routeLabel(rec.route)}</span>
           )}
           {rec.v4a_auto_repaired && (
-            <span className="lg-call-flag" title="V4A 补丁已由网关自动修复">
+            <span className="lg-call-flag" title={t.v4a}>
               <Sparkles />
             </span>
           )}
           {rec.output_spilled && (
-            <span className="lg-call-flag" title="输出超过内联上限，已 Spill">
+            <span className="lg-call-flag" title={t.spilled}>
               <Scissors />
             </span>
           )}
           {rec.output_sanitized && (
-            <span className="lg-call-flag" title="终端控制符已清洗">
+            <span className="lg-call-flag" title={t.sanitized}>
               <Wrench />
             </span>
           )}
@@ -224,14 +233,14 @@ function CallRow({
           {formatBytes(rec.output_bytes)}
         </span>
       </div>
-      <div className="lg-call-dur">
+      <div className="lg-call-dur" data-tone={failed ? "err" : durTone}>
         {pending ? (
           <span className="inline-flex items-center gap-1 text-accent">
             <LoaderCircle className="lg-spin h-3 w-3" />
-            进行中
+            {t.running}
           </span>
         ) : (
-          <span>{formatDurationMs(rec.duration_ms)}</span>
+          <Latency ms={rec.duration_ms} kind="tool" />
         )}
         <span className="lg-durbar" aria-hidden="true">
           <span style={{ width: `${durRatio * 100}%` }} />
@@ -261,6 +270,7 @@ function groupByTurn(records: ToolCallRecord[]): CallGroup[] {
 
 function LegacyToolNames(): React.JSX.Element | null {
   const { snapshot } = useGateway();
+  const { m } = useI18n();
   const rows = useMemo(() => {
     const names: string[] = [];
     for (const task of snapshot?.recent_tasks ?? []) names.push(...task.client_tool_calls);
@@ -269,8 +279,8 @@ function LegacyToolNames(): React.JSX.Element | null {
   if (rows.length === 0) return null;
   return (
     <Card
-      title="最近请求里出现过的工具"
-      sub="最近 100 条请求里各工具的调用次数。"
+      title={m.tools.legacy.title}
+      sub={m.tools.legacy.sub}
     >
       <RankedBars
         rows={rows.map(([name, count]) => ({
@@ -282,7 +292,7 @@ function LegacyToolNames(): React.JSX.Element | null {
             </span>
           ),
           value: count,
-          display: `${count} 次`,
+          display: m.tools.legacy.times(count),
           hint: name,
         }))}
         labelWidth={220}
@@ -295,6 +305,8 @@ function LegacyToolNames(): React.JSX.Element | null {
 /** Turns whose saved low-cache payload already holds real tool round-trips. */
 function ReplayableTurns({ onOpen }: { onOpen: (taskId: string) => void }): React.JSX.Element | null {
   const { lowCacheRecords } = useGateway();
+  const { m } = useI18n();
+  const t = m.tools.replay;
   const turns = useMemo(
     () =>
       lowCacheRecords
@@ -311,17 +323,17 @@ function ReplayableTurns({ onOpen }: { onOpen: (taskId: string) => void }): Reac
   return (
     <Card
       flush
-      title="现在就能回放的工具往返"
-      sub="这些低命中轮次保存了完整载荷，点开按时间线回放其中的工具调用。"
+      title={t.title}
+      sub={t.sub}
     >
       <div className="lg-table-wrap">
         <table className="lg-table">
           <thead>
             <tr>
-              <th>时间</th>
-              <th className="hide-sm">模型 · 会话</th>
-              <th className="num">工具调用</th>
-              <th className="num hide-sm">调用 / 输出体积</th>
+              <th>{t.time}</th>
+              <th className="hide-sm">{t.modelSession}</th>
+              <th className="num">{t.calls}</th>
+              <th className="num hide-sm">{t.sizes}</th>
               <th>Prompt</th>
             </tr>
           </thead>
@@ -343,7 +355,7 @@ function ReplayableTurns({ onOpen }: { onOpen: (taskId: string) => void }): Reac
                   <span className="lg-num text-[12px] text-fg">{rec.resolved_model}</span>
                   <span className="lg-num ml-2 text-[11.5px] text-fg-4">{shortId(rec.session_id)}</span>
                 </td>
-                <td className="num">{rec.request_metrics?.tool_call_part_count ?? 0} 次</td>
+                <td className="num">{t.times(rec.request_metrics?.tool_call_part_count ?? 0)}</td>
                 <td className="num hide-sm whitespace-nowrap">
                   {formatBytes(rec.request_metrics?.tool_call_bytes ?? 0)}
                   <span className="text-fg-4"> / </span>
@@ -364,12 +376,17 @@ function ReplayableTurns({ onOpen }: { onOpen: (taskId: string) => void }): Reac
 }
 
 function BufferStatus({ summary }: { summary: ToolCallTelemetrySummary }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.tools.buffer;
   return (
     <span
-      title={`有界环形缓冲：${formatBytes(summary.stored_bytes)} / ${formatBytes(summary.max_total_bytes)}，已淘汰 ${formatNumber(summary.total_evicted)} 条`}
+      title={t.hint(
+        formatBytes(summary.stored_bytes),
+        formatBytes(summary.max_total_bytes),
+        formatNumber(summary.total_evicted),
+      )}
     >
-      {" "}
-      · 缓冲上限 {formatNumber(summary.max_records)}
+      {t.cap(formatNumber(summary.max_records))}
     </span>
   );
 }
@@ -378,6 +395,8 @@ function BufferStatus({ summary }: { summary: ToolCallTelemetrySummary }): React
 
 export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
   const { snapshot, toolCalls, toolCallsStatus, toolCallsError, reloadToolCalls } = useGateway();
+  const { m } = useI18n();
+  const t = m.tools.view;
   const summary = snapshot?.tool_call_telemetry;
   const wide = useMediaQuery("(min-width: 1180px)");
 
@@ -438,13 +457,13 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
       if (rec.session_id) harnessOf.set(rec.session_id, rec.harness_profile);
     }
     return [
-      { value: "all", label: "全部会话" },
+      { value: "all", label: t.allSessions },
       ...countBy(records, (r) => r.session_id).map(([id, count]) => ({
         value: id,
         label: `${harnessMeta(harnessOf.get(id)).label} · ${shortId(id)} (${count})`,
       })),
     ];
-  }, [records]);
+  }, [records, t.allSessions]);
   // The URL argument is either a call to open or a search to run.
   const appliedArg = useRef<string | null>(null);
   useEffect(() => {
@@ -539,7 +558,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
     return (
       <>
         <Card>
-          <Unsupported feature="逐次工具调用记录" endpoint="GET /api/telemetry/tool-calls" />
+          <Unsupported feature={t.unsupported} endpoint="GET /api/telemetry/tool-calls" />
         </Card>
         <ReplayableTurns onOpen={(taskId) => navigate("cache", taskId)} />
         <LegacyToolNames />
@@ -549,16 +568,16 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
   if (toolCallsStatus === "loading") {
     return (
       <Card>
-        <Loading label="读取工具调用记录…" />
+        <Loading label={t.loading} />
       </Card>
     );
   }
   if (toolCallsStatus === "error" && records.length === 0) {
     return (
       <Note tone="err" icon={<CircleAlert />}>
-        读取工具调用记录失败：{toolCallsError}
+        {t.loadFailed(toolCallsError ?? "")}
         <Button size="sm" className="ml-2" onClick={reloadToolCalls}>
-          重试
+          {t.retry}
         </Button>
       </Note>
     );
@@ -568,8 +587,8 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
       <Card>
         <EmptyState
           icon={<Wrench />}
-          title="还没有工具调用"
-          hint="用 lg cx、lg cc、lg oc 或 lg omp 发起一次会用到工具的对话，每一次调用的输入与输出都会出现在这里。"
+          title={t.empty}
+          hint={t.emptyHint}
         />
       </Card>
     );
@@ -599,16 +618,16 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
       />
 
       <Card
-        title="I/O 天际线"
-        sub={metric === "bytes" ? "一柱一次调用：向上是输出体积，向下是输入体积。" : "一柱一次调用的耗时。"}
+        title={t.skyline}
+        sub={metric === "bytes" ? t.skylineBytes : t.skylineDuration}
         actions={
           <Segmented<SkylineMetric>
-            ariaLabel="天际线指标"
+            ariaLabel={t.skylineMetric}
             value={metric}
             onChange={setMetric}
             options={[
-              { value: "bytes", label: "体积" },
-              { value: "duration", label: "耗时" },
+              { value: "bytes", label: t.bytes },
+              { value: "duration", label: t.duration },
             ]}
           />
         }
@@ -623,18 +642,18 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
             onHover={setHoverId}
           />
         ) : (
-          <p className="lg-hint m-0">没有符合当前筛选条件的调用。</p>
+          <p className="lg-hint m-0">{t.noMatch}</p>
         )}
       </Card>
 
       <div className="lg-split" data-wide={wide}>
         <Card
           flush
-          title="调用流"
+          title={t.stream}
           sub={
             <>
               {active ? `${formatNumber(filtered.length)} / ` : ""}
-              {formatNumber(records.length)} 次
+              {t.count(formatNumber(records.length))}
               {summary && <BufferStatus summary={summary} />}
             </>
           }
@@ -643,11 +662,11 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
               <Button
                 size="sm"
                 aria-pressed={follow}
-                title="有新调用到达时自动选中它"
+                title={t.followHint}
                 onClick={() => setFollow((v) => !v)}
               >
                 <Radio />
-                跟随最新
+                {t.follow}
               </Button>
             </>
           }
@@ -656,11 +675,11 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
             <SearchInput
               value={filter.query}
               onChange={(query) => patchFilter({ query })}
-              placeholder="搜索工具、参数或输出"
+              placeholder={t.search}
               className="min-w-[220px] flex-[2]"
             />
             <Select
-              ariaLabel="按会话筛选"
+              ariaLabel={t.sessionFilter}
               className="min-w-[150px] flex-1"
               value={filter.session}
               onChange={(session) => patchFilter({ session })}
@@ -669,11 +688,11 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
             {active && (
               <Button size="sm" variant="ghost" onClick={() => patchFilter(EMPTY_FILTER)}>
                 <FilterX />
-                清除筛选
+                {t.clear}
               </Button>
             )}
           </div>
-          <div className="lg-toolbar lg-chiprow" role="group" aria-label="按工具类型筛选">
+          <div className="lg-toolbar lg-chiprow" role="group" aria-label={t.kindFilter}>
             {KIND_ORDER.filter((kind) => (kindCounts.get(kind) ?? 0) > 0 || filter.kind === kind).map(
               (kind) => (
                 <button
@@ -684,7 +703,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
                   onClick={() => patchFilter({ kind: filter.kind === kind ? "all" : kind })}
                 >
                   <ToolGlyph kind={kind} size="sm" />
-                  {TOOL_KIND_LABEL[kind]}
+                  {toolKindLabel(kind)}
                   <span className="lg-seg-count">{kindCounts.get(kind) ?? 0}</span>
                 </button>
               ),
@@ -697,7 +716,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
               onClick={() => patchFilter({ errorsOnly: !filter.errorsOnly })}
             >
               <CircleAlert />
-              只看失败
+              {t.errorsOnly}
               <span className="lg-seg-count">{failureCount}</span>
             </button>
           </div>
@@ -705,10 +724,10 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
           {pageRecords.length === 0 ? (
             <EmptyState
               icon={<FilterX />}
-              title="没有符合条件的调用"
+              title={t.noMatchTitle}
               action={
                 <Button size="sm" onClick={() => patchFilter(EMPTY_FILTER)}>
-                  清除筛选
+                  {t.clear}
                 </Button>
               }
             />
@@ -717,7 +736,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
               className="lg-stream"
               role="listbox"
               tabIndex={0}
-              aria-label="工具调用流"
+              aria-label={t.streamAria}
               aria-activedescendant={selected ? `call-${selected.call_id}` : undefined}
               onKeyDown={(ev) => {
                 if (ev.key === "ArrowDown") move(1);
@@ -737,7 +756,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
                     <span className="lg-num" title={group.head.session_id ?? undefined}>
                       {shortId(group.head.session_id)}
                     </span>
-                    <span className="lg-num flex-1">轮 {group.head.turn_index}</span>
+                    <span className="lg-num flex-1">{t.turn(group.head.turn_index)}</span>
                     <span className="lg-num flex-none">{formatSmartTime(group.head.started_at_unix_ms)}</span>
                   </li>
                   {group.records.map((rec) => (
@@ -760,7 +779,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
         </Card>
 
         {wide && (
-          <aside className="lg-dock" aria-label="调用检视器">
+          <aside className="lg-dock" aria-label={t.dockAria}>
             {selected && inspector ? (
               <>
                 <div className="lg-dock-head">
@@ -771,8 +790,8 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
             ) : (
               <EmptyState
                 icon={<MousePointerClick />}
-                title="选择一次调用"
-                hint="在左侧的调用流或上方的天际线里点一下，这里会展开它的路由、输入与输出。"
+                title={t.pick}
+                hint={t.pickHint}
               />
             )}
           </aside>
@@ -783,7 +802,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
         <Sheet
           open={sheetOpen && selected !== null}
           onOpenChange={setSheetOpen}
-          title={selected ? <InspectorTitle record={selected} /> : "工具调用"}
+          title={selected ? <InspectorTitle record={selected} /> : t.sheetTitle}
         >
           {inspector}
         </Sheet>

@@ -1,3 +1,4 @@
+import { msg } from "@/lib/i18n";
 import type { TaskSnapshot } from "@/types/telemetry";
 
 export function formatDurationMs(ms: number | null | undefined): string {
@@ -109,10 +110,32 @@ export function byteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
-/** Size change as a signed percentage: `−73%`, `+12%`, or `不变` when it rounds to nothing. */
+/** Size change as a signed percentage: `−73%`, `+12%`, or "unchanged" when it rounds to nothing. */
 export function formatSizeChange(before: number, after: number): string {
   if (before <= 0) return "—";
   const delta = (after - before) / before;
-  if (Math.abs(delta) < 0.005) return "不变";
+  if (Math.abs(delta) < 0.005) return msg().common.sizeUnchanged;
   return `${delta < 0 ? "−" : "+"}${Math.abs(delta * 100).toFixed(0)}%`;
+}
+
+/**
+ * US dollars with precision that follows the amount: cents for dollars, more digits for the
+ * fractions of a cent a single cached request costs.
+ */
+export function formatUsd(usd: number | null | undefined): string {
+  if (typeof usd !== "number" || !Number.isFinite(usd)) return "—";
+  if (usd === 0) return "$0.00";
+  const abs = Math.abs(usd);
+  const sign = usd < 0 ? "−" : "";
+  if (abs < 0.0001) return `${sign}<$0.0001`;
+  if (abs < 0.01) return `${sign}$${abs.toFixed(4)}`;
+  if (abs < 1) return `${sign}$${abs.toFixed(3)}`;
+  return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** A per-1M-token price: at least two decimals, up to four, trailing zeros trimmed. */
+export function formatPrice(usd: number | null | undefined): string {
+  if (typeof usd !== "number" || !Number.isFinite(usd)) return "—";
+  const fixed = usd.toFixed(4).replace(/0{1,2}$/, "");
+  return `$${fixed}`;
 }

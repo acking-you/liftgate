@@ -8,6 +8,7 @@ import {
   taskHitBps,
   taskPromptTokens,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { TaskSnapshot } from "@/types/telemetry";
 
@@ -53,6 +54,7 @@ export function SegmentedBar({
   ariaLabel: string;
   legend?: boolean;
 }): React.JSX.Element {
+  const { m } = useI18n();
   const [ref, width] = useElementWidth<HTMLDivElement>();
   const [active, setActive] = useState<string | null>(null);
   const total = parts.reduce((sum, p) => sum + Math.max(0, p.value), 0);
@@ -69,7 +71,10 @@ export function SegmentedBar({
           className="lg-segbar"
           data-size={size}
           role="img"
-          aria-label={`${ariaLabel}：${shown.map((p) => `${p.label} ${format(p.value)}（${share(p)}）`).join("，")}`}
+          aria-label={m.common.segmentAria(
+            ariaLabel,
+            shown.map((p) => m.common.segmentPart(p.label, format(p.value), share(p))),
+          )}
         >
           {total === 0 && <div className="flex-1 bg-sunken" />}
           {shown.map((p) => {
@@ -240,6 +245,8 @@ interface TrendPoint {
 
 const TREND_HEIGHT = 196;
 const TREND_PAD = { top: 14, right: 46, bottom: 24, left: 42 };
+/** Room right of the plot for the threshold label, which is wider in English. */
+const TREND_PAD_RIGHT = { zh: 46, en: 66 } as const;
 
 export const CacheTrendChart = React.memo(function CacheTrendChart({
   tasks,
@@ -250,6 +257,8 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
   thresholdBps: number;
   onSelect?: (task: TaskSnapshot) => void;
 }): React.JSX.Element {
+  const { m, locale } = useI18n();
+  const padRight = TREND_PAD_RIGHT[locale];
   const [ref, width] = useElementWidth<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
 
@@ -265,7 +274,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
     return out.reverse();
   }, [tasks]);
 
-  const plotW = Math.max(0, width - TREND_PAD.left - TREND_PAD.right);
+  const plotW = Math.max(0, width - TREND_PAD.left - padRight);
   const plotH = TREND_HEIGHT - TREND_PAD.top - TREND_PAD.bottom;
   const xAt = (i: number): number =>
     TREND_PAD.left + (points.length <= 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
@@ -286,7 +295,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
   if (points.length === 0) {
     return (
       <div ref={ref} className="grid place-items-center text-[12.5px] text-fg-3" style={{ height: TREND_HEIGHT }}>
-        完成至少一轮请求后，这里会画出逐轮缓存命中率。
+        {m.common.trend.empty}
       </div>
     );
   }
@@ -304,7 +313,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
           width={width}
           height={TREND_HEIGHT}
           role="img"
-          aria-label={`最近 ${points.length} 轮请求的缓存命中率，最新一轮 ${formatBpsPct(last?.hitBps)}，其中 ${lowCount} 轮低于阈值`}
+          aria-label={m.common.trend.aria(points.length, formatBpsPct(last?.hitBps), lowCount)}
           className={onSelect ? "cursor-pointer" : undefined}
           onMouseMove={handleMove}
           onMouseLeave={() => setHover(null)}
@@ -316,7 +325,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
             <g key={bps}>
               <line
                 x1={TREND_PAD.left}
-                x2={width - TREND_PAD.right}
+                x2={width - padRight}
                 y1={yAt(bps)}
                 y2={yAt(bps)}
                 stroke={bps === 0 ? "var(--lg-axis)" : "var(--lg-grid)"}
@@ -338,7 +347,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
           {thresholdBps !== 5000 && thresholdBps > 0 && thresholdBps < 10000 && (
             <line
               x1={TREND_PAD.left}
-              x2={width - TREND_PAD.right}
+              x2={width - padRight}
               y1={thresholdY}
               y2={thresholdY}
               stroke="var(--lg-fg-4)"
@@ -346,8 +355,8 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
               strokeDasharray="3 4"
             />
           )}
-          <text x={width - TREND_PAD.right + 6} y={thresholdY + 4} fontSize="11" fill="var(--lg-fg-3)">
-            阈值
+          <text x={width - padRight + 6} y={thresholdY + 4} fontSize="11" fill="var(--lg-fg-3)">
+            {m.common.trend.threshold}
           </text>
 
           <path d={area} fill="var(--lg-s1)" opacity="0.1" />
@@ -421,7 +430,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
             {formatClock(points[0]?.task.started_at_unix_ms ?? 0)}
           </text>
           <text
-            x={width - TREND_PAD.right}
+            x={width - padRight}
             y={TREND_HEIGHT - 6}
             textAnchor="end"
             fontSize="11"
@@ -440,7 +449,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
           </div>
           <div className="lg-num mt-1 truncate text-fg-2">{hovered.task.resolved_model}</div>
           <div className="lg-num mt-0.5 text-fg-3">
-            缓存读 {formatCompact(hovered.task.usage?.cachedReadTokens ?? 0)} /{" "}
+            {m.common.trend.cacheRead} {formatCompact(hovered.task.usage?.cachedReadTokens ?? 0)} /{" "}
             {formatCompact(taskPromptTokens(hovered.task))} · TTFT {formatDurationMs(hovered.task.ttft_ms)}
           </div>
         </div>
@@ -449,7 +458,7 @@ export const CacheTrendChart = React.memo(function CacheTrendChart({
       {lowCount > 0 && (
         <div className="mt-1 flex items-center gap-1.5 text-[12px] text-fg-3">
           <span className="lg-dot" data-tone="err" />
-          低于阈值的轮次（{lowCount}）
+          {m.common.trend.lowTurns(lowCount)}
         </div>
       )}
     </div>

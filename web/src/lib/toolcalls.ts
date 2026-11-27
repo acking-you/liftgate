@@ -1,5 +1,6 @@
 import { percentile } from "@/lib/format";
 import { sortHarnessIds } from "@/lib/harness";
+import { msg } from "@/lib/i18n";
 import {
   type CodeLanguage,
   guessScriptLanguage,
@@ -9,26 +10,13 @@ import type { ToolCallRecord, ToolCallRoute } from "@/types/telemetry";
 
 export type ToolKind = "orchestrator" | "patch" | "shell" | "file" | "search" | "web" | "other";
 
-export const TOOL_KIND_LABEL: Record<ToolKind, string> = {
-  orchestrator: "CodeMode",
-  patch: "补丁",
-  shell: "Shell",
-  file: "文件",
-  search: "检索",
-  web: "Web",
-  other: "其他",
-};
+export function toolKindLabel(kind: ToolKind): string {
+  return msg().tools.kind[kind];
+}
 
-export const ROUTE_LABEL: Record<ToolCallRoute, string> = {
-  client_roundtrip: "客户端往返",
-  namespace_hub: "Hub 解包",
-  generic_dispatcher: "分发器解包",
-  zero_rtt_search: "0-RTT 检索",
-  zero_rtt_spill_read: "0-RTT 分片读",
-  zero_rtt_preflight: "0-RTT 预检",
-  gateway_managed: "网关托管",
-  unknown: "未知路由",
-};
+export function routeLabel(route: ToolCallRoute): string {
+  return msg().tools.route[route];
+}
 
 export type RouteGroup = "client" | "unwrapped" | "local";
 
@@ -108,6 +96,32 @@ export function recordKind(rec: ToolCallRecord): ToolKind {
 
 export function isFailure(rec: ToolCallRecord): boolean {
   return rec.status === "error" || rec.status === "preflight_rejected";
+}
+
+/** How a turn's tool calls ended, for the at-a-glance pills beside each request. */
+export interface ToolOutcomeCounts {
+  total: number;
+  /** Errors, script exceptions, and calls whose result never came back. */
+  failed: number;
+  /** Rejected by gateway preflight or aimed at a disabled tool. */
+  rejected: number;
+  /** Still waiting for the client's result. */
+  waiting: number;
+}
+
+export function toolOutcomesByTask(
+  records: readonly ToolCallRecord[],
+): ReadonlyMap<string, ToolOutcomeCounts> {
+  const out = new Map<string, ToolOutcomeCounts>();
+  for (const rec of records) {
+    const counts = out.get(rec.task_id) ?? { total: 0, failed: 0, rejected: 0, waiting: 0 };
+    counts.total += 1;
+    if (rec.status === "error" || rec.status === "abandoned") counts.failed += 1;
+    else if (rec.status === "preflight_rejected") counts.rejected += 1;
+    else if (rec.status === "pending") counts.waiting += 1;
+    out.set(rec.task_id, counts);
+  }
+  return out;
 }
 
 /* ---------- input rendering ---------- */
@@ -589,19 +603,17 @@ export function patchFiles(parsed: ParsedPatch): PatchFile[] {
 }
 
 export function errorKindLabel(kind: string | null | undefined): string {
+  const labels = msg().tools.errorKind;
   switch (kind) {
     case "tool_error":
-      return "工具返回了错误";
     case "script_exception":
-      return "脚本运行时异常";
     case "preflight_rejected":
-      return "网关预检拒绝";
     case "disabled_tool":
-      return "调用了未启用的工具";
+      return labels[kind];
     case "unknown":
     case null:
     case undefined:
-      return "调用失败";
+      return labels.failed;
     default:
       return kind;
   }

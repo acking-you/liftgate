@@ -1,4 +1,5 @@
 import type { SegmentPart } from "@/components/charts";
+import { msg } from "@/lib/i18n";
 import type {
   CapturedFullMessage,
   ContextSegment,
@@ -6,19 +7,9 @@ import type {
   LowCacheRequestMetrics,
 } from "@/types/telemetry";
 
-export const SEGMENT_LABEL: Record<ContextSegmentKey, string> = {
-  wire_tools: "Wire 工具定义",
-  bridge_rules: "桥接规则提示词",
-  orchestrator_contract: "编排器契约",
-  client_tools_update: "增量工具同步",
-  developer_instructions: "开发者指令",
-  user_text: "用户文本",
-  assistant_text: "助手文本",
-  reasoning: "思考",
-  tool_calls: "工具调用",
-  tool_results: "工具输出",
-  images: "图像",
-};
+export function segmentLabel(key: ContextSegmentKey): string {
+  return msg().catalog.segment[key];
+}
 
 export interface NamedBytes {
   key: string;
@@ -43,12 +34,12 @@ const GROUP_OF: Record<ContextSegmentKey, GroupId> = {
 };
 
 /** Fixed group order and colours: identity never moves when a group is empty. */
-const GROUPS: ReadonlyArray<{ id: GroupId; label: string; color: string; ink?: "dark" }> = [
-  { id: "tooling", label: "工具定义与契约", color: "var(--lg-s1)" },
-  { id: "instructions", label: "开发者指令", color: "var(--lg-s2)" },
-  { id: "dialogue", label: "对话文本", color: "var(--lg-s3)" },
-  { id: "roundtrip", label: "工具往返", color: "var(--lg-s4)", ink: "dark" },
-  { id: "images", label: "图像", color: "var(--lg-s5)" },
+const GROUPS: ReadonlyArray<{ id: GroupId; color: string; ink?: "dark" }> = [
+  { id: "tooling", color: "var(--lg-s1)" },
+  { id: "instructions", color: "var(--lg-s2)" },
+  { id: "dialogue", color: "var(--lg-s3)" },
+  { id: "roundtrip", color: "var(--lg-s4)", ink: "dark" },
+  { id: "images", color: "var(--lg-s5)" },
 ];
 
 export function groupSegments(
@@ -59,9 +50,10 @@ export function groupSegments(
     const group = GROUP_OF[seg.key];
     totals.set(group, (totals.get(group) ?? 0) + seg.bytes);
   }
+  const labels = msg().catalog.group;
   return GROUPS.map((g) => ({
     key: g.id,
-    label: g.label,
+    label: labels[g.id],
     value: totals.get(g.id) ?? 0,
     color: g.color,
     ink: g.ink,
@@ -71,7 +63,7 @@ export function groupSegments(
 export function rankSegments(segments: ReadonlyArray<ContextSegment>): NamedBytes[] {
   return segments
     .filter((s) => s.bytes > 0)
-    .map((s) => ({ key: s.key, label: SEGMENT_LABEL[s.key], bytes: s.bytes }))
+    .map((s) => ({ key: s.key, label: segmentLabel(s.key), bytes: s.bytes }))
     .sort((a, b) => b.bytes - a.bytes);
 }
 
@@ -97,14 +89,9 @@ export function segmentsFromMetrics(m: LowCacheRequestMetrics): ContextSegment[]
 
 export type PartKindId = "text" | "instructions" | "reasoning" | "tool_call" | "tool_result" | "image";
 
-export const PART_KIND_LABEL: Record<PartKindId, string> = {
-  text: "文本",
-  instructions: "开发者指令",
-  reasoning: "思考",
-  tool_call: "工具调用",
-  tool_result: "工具输出",
-  image: "图像",
-};
+export function partKindLabel(kind: PartKindId): string {
+  return msg().catalog.part[kind];
+}
 
 const PART_KIND_STYLE: Record<PartKindId, { color: string; ink?: "dark" }> = {
   text: { color: "var(--lg-s3)" },
@@ -147,7 +134,7 @@ export function messagePartComposition(messages: CapturedFullMessage[]): Segment
   }
   return PART_KIND_ORDER.map((kind) => ({
     key: kind,
-    label: PART_KIND_LABEL[kind],
+    label: partKindLabel(kind),
     value: totals.get(kind) ?? 0,
     ...PART_KIND_STYLE[kind],
   }));

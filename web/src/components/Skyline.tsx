@@ -2,6 +2,7 @@ import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatClock, formatDurationMs } from "@/lib/format";
 import { harnessMeta } from "@/lib/harness";
+import { useI18n } from "@/lib/i18n";
 import { displayToolName, isFailure, recordKind } from "@/lib/toolcalls";
 import type { ToolCallRecord } from "@/types/telemetry";
 
@@ -44,6 +45,8 @@ export function Skyline({
   onSelect: (rec: ToolCallRecord) => void;
   onHover: (id: string | null) => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const sk = m.common.skyline;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(0);
   const [localHover, setLocalHover] = useState<number | null>(null);
@@ -111,19 +114,19 @@ export function Skyline({
   const failures = records.filter(isFailure).length;
   const summary =
     metric === "bytes"
-      ? `最近 ${records.length} 次工具调用的输入与输出体积，最大输出 ${formatBytes(scale.maxOut)}，${failures} 次失败`
-      : `最近 ${records.length} 次工具调用的耗时，最长 ${formatDurationMs(scale.maxDur)}，${failures} 次失败`;
+      ? sk.bytesAria(records.length, formatBytes(scale.maxOut), failures)
+      : sk.durationAria(records.length, formatDurationMs(scale.maxDur), failures);
 
   return (
     <div className="relative min-w-0">
       <div className="lg-skyline-axis" aria-hidden="true">
         {metric === "bytes" ? (
           <>
-            <span>↑ 输出 · 峰值 {formatBytes(scale.maxOut)}</span>
-            <span>↓ 输入 · 峰值 {formatBytes(scale.maxIn)}</span>
+            <span>{sk.outPeak(formatBytes(scale.maxOut))}</span>
+            <span>{sk.inPeak(formatBytes(scale.maxIn))}</span>
           </>
         ) : (
-          <span>↑ 耗时 · 峰值 {formatDurationMs(scale.maxDur)}</span>
+          <span>{sk.durPeak(formatDurationMs(scale.maxDur))}</span>
         )}
       </div>
       <div ref={wrapRef} className="min-w-0">
@@ -225,15 +228,15 @@ export function Skyline({
               className="lg-swatch"
               style={{ background: harnessMeta(hovered.harness_profile).color }}
             />
-            {harnessMeta(hovered.harness_profile).label} · 轮 {hovered.turn_index} · 步 {hovered.step_index}
+            {harnessMeta(hovered.harness_profile).label} · {sk.turnStep(hovered.turn_index, hovered.step_index)}
           </div>
           <div className="lg-num mt-1 text-fg-2">
-            入 {formatBytes(hovered.input_bytes)} → 出 {formatBytes(hovered.output_bytes)} ·{" "}
-            {hovered.status === "pending" ? "进行中" : formatDurationMs(hovered.duration_ms)}
+            {sk.io(formatBytes(hovered.input_bytes), formatBytes(hovered.output_bytes))} ·{" "}
+            {hovered.status === "pending" ? sk.running : formatDurationMs(hovered.duration_ms)}
           </div>
           {isFailure(hovered) && (
             <div className="mt-1 text-err">
-              {hovered.status === "preflight_rejected" ? "网关预检拒绝" : "调用失败"}
+              {hovered.status === "preflight_rejected" ? sk.preflightRejected : sk.failed}
               {hovered.error_kind ? ` · ${hovered.error_kind}` : ""}
             </div>
           )}
@@ -243,15 +246,15 @@ export function Skyline({
       <ul className="m-0 mt-2 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-[12px] text-fg-3">
         <li className="flex items-center gap-1.5">
           <span className="lg-swatch" style={{ background: "var(--lg-fg)" }} aria-hidden="true" />
-          CodeMode 编排器
+          {sk.legendOrchestrator}
         </li>
         <li className="flex items-center gap-1.5">
           <span className="lg-swatch" style={{ background: "var(--lg-s-neutral)" }} aria-hidden="true" />
-          其他调用
+          {sk.legendOther}
         </li>
         <li className="flex items-center gap-1.5">
           <span className="lg-swatch" style={{ background: "var(--lg-err)" }} aria-hidden="true" />
-          失败 {failures > 0 ? `(${failures})` : ""}
+          {sk.legendFailed} {failures > 0 ? `(${failures})` : ""}
         </li>
       </ul>
     </div>

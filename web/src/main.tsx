@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { GatewayProvider } from "./hooks/gateway";
 import type { GatewayClient } from "./lib/api";
+import { I18nProvider } from "./lib/i18n";
 import "./index.css";
 
 const rootEl = document.getElementById("root");
@@ -14,9 +15,11 @@ const root = createRoot(rootEl);
 function render(demoClient?: GatewayClient): void {
   root.render(
     <StrictMode>
-      <GatewayProvider demoClient={demoClient}>
-        <App />
-      </GatewayProvider>
+      <I18nProvider>
+        <GatewayProvider demoClient={demoClient}>
+          <App />
+        </GatewayProvider>
+      </I18nProvider>
     </StrictMode>,
   );
 }

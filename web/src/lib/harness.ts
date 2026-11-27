@@ -1,3 +1,5 @@
+import { msg } from "@/lib/i18n";
+
 /**
  * Harness identity. Colour follows the harness, never its rank, so a filter that
  * hides one harness leaves the others painted exactly as before.
@@ -26,7 +28,7 @@ export const HARNESS_ORDER: readonly string[] = [
 ];
 
 export function harnessMeta(id: string | null | undefined): HarnessMeta {
-  if (!id) return { id: "unknown", label: "未识别", color: "var(--lg-s-neutral)" };
+  if (!id) return { id: "unknown", label: msg().common.harnessUnknown, color: "var(--lg-s-neutral)" };
   return KNOWN[id] ?? { id, label: id, color: "var(--lg-s-neutral)" };
 }
 
@@ -47,7 +49,7 @@ export function orchestratorModeLabel(mode: string | null | undefined): string {
     case "codex_exec":
       return "exec";
     case "claude_bash_first":
-      return "Bash 聚合";
+      return msg().common.modeBashFirst;
     case "opencode_execute_full":
       return "execute · Full";
     case "opencode_execute":
@@ -57,7 +59,7 @@ export function orchestratorModeLabel(mode: string | null | undefined): string {
     case "direct":
     case null:
     case undefined:
-      return "直调";
+      return msg().common.modeDirect;
     default:
       return mode;
   }

@@ -26,6 +26,7 @@ import { useRevisionResource } from "@/hooks/useResource";
 import { groupSegments, rankSegments } from "@/lib/context";
 import { byteLength, formatBytes, formatNumber, formatPct, formatSizeChange, shortId } from "@/lib/format";
 import { orchestratorModeLabel } from "@/lib/harness";
+import { useI18n } from "@/lib/i18n";
 import { WIRE_BUDGET_BYTES } from "@/lib/stats";
 import { classifyTool, prettyJson } from "@/lib/toolcalls";
 import type {
@@ -46,27 +47,14 @@ const TIER_ORDER: readonly CatalogToolTier[] = [
   "search_index_only",
 ];
 
-const TIER: Record<CatalogToolTier, { label: string; tone: Tone; hint: string }> = {
-  orchestrator: { label: "Tier-0 编排器", tone: "accent", hint: "CodeMode 编排器，脚本里再调其他工具" },
-  direct: { label: "Tier-1 直通", tone: "ok", hint: "一对一原样挂载" },
-  folded_into_orchestrator: {
-    label: "折叠进编排器",
-    tone: "neutral",
-    hint: "不单独挂载，说明内联在编排器契约里",
-  },
-  namespace_hub_action: { label: "Tier-2 Hub 动作", tone: "warn", hint: "折叠在 mcp_lg_ns__* 命名空间 Hub 后面" },
-  slack_backfill: { label: "Slack 回填", tone: "ok", hint: "预算有余量时回填成直通工具" },
-  search_index_only: { label: "仅检索索引", tone: "neutral", hint: "只能通过 0-RTT 检索发现" },
-  unknown: { label: "未知", tone: "neutral", hint: "当前版本无法识别的分层" },
-};
-
-const WIRE_ROLE: Record<CatalogWireTool["role"], string> = {
-  orchestrator: "编排器",
-  direct: "直通",
-  namespace_hub: "Hub",
-  slack_backfill: "回填",
-  gateway: "网关内置",
-  unknown: "未知",
+const TIER_TONE: Record<CatalogToolTier, Tone> = {
+  orchestrator: "accent",
+  direct: "ok",
+  folded_into_orchestrator: "neutral",
+  namespace_hub_action: "warn",
+  slack_backfill: "ok",
+  search_index_only: "neutral",
+  unknown: "neutral",
 };
 
 type SheetTarget = { kind: "client"; entry: CatalogToolEntry } | { kind: "wire"; tool: CatalogWireTool };
@@ -87,12 +75,14 @@ function CompareSheet({
   catalog: SessionToolCatalog;
   onClose: () => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const c = m.catalog.compare;
   let title: React.ReactNode = null;
   let body: React.ReactNode = null;
 
   if (target?.kind === "client") {
     const entry = target.entry;
-    const tier = TIER[entry.tier];
+    const tier = { ...m.catalog.tier[entry.tier], tone: TIER_TONE[entry.tier] };
     const mounted = entry.wire_description != null || entry.wire_schema != null;
     title = (
       <>
@@ -104,31 +94,31 @@ function CompareSheet({
     body = (
       <>
         <div className="grid grid-cols-3 gap-4">
-          <Figure label="客户端声明" value={formatBytes(entry.client_bytes)} sub={entry.client_kind} />
+          <Figure label={c.clientDeclared} value={formatBytes(entry.client_bytes)} sub={entry.client_kind} />
           <Figure
-            label="挂到 lg 之后"
+            label={c.onLg}
             value={formatBytes(entry.wire_bytes)}
-            sub={entry.wire_name ? `由 ${entry.wire_name} 提供` : "不占 Wire 体积"}
+            sub={entry.wire_name ? c.providedBy(entry.wire_name) : c.noWire}
           />
           <Figure
-            label="体积变化"
+            label={c.sizeChange}
             value={formatSizeChange(entry.client_bytes, entry.wire_bytes)}
             sub={tier.hint}
           />
         </div>
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <section className="flex min-w-0 flex-col gap-2">
-            <h3 className="lg-section-title m-0">客户端原始声明</h3>
+            <h3 className="lg-section-title m-0">{c.clientOriginal}</h3>
             {entry.client_description ? (
               <ProseBlock text={entry.client_description} title="Description" maxHeight={300} />
             ) : (
-              <p className="lg-hint m-0">没有 Description。</p>
+              <p className="lg-hint m-0">{c.noDescription}</p>
             )}
             {entry.client_schema &&
               schemaBlock(entry.client_schema, entry.client_kind === "custom" ? "Custom Grammar" : "JSON Schema")}
           </section>
           <section className="flex min-w-0 flex-col gap-2">
-            <h3 className="lg-section-title m-0">模型实际看到的</h3>
+            <h3 className="lg-section-title m-0">{c.modelSees}</h3>
             {mounted ? (
               <>
                 {entry.wire_description && (
@@ -139,17 +129,17 @@ function CompareSheet({
             ) : (
               <Note>
                 {entry.tier === "search_index_only"
-                  ? "这个工具没有挂载到 lg。模型需要先用 mcp_lg_search_client_tools 检索到它，再经分发器调用。"
+                  ? c.searchOnly
                   : entry.tier === "folded_into_orchestrator"
-                    ? `这个工具没有单独挂载，它的说明内联在编排器契约里${entry.wire_name ? `，由 ${entry.wire_name} 在脚本中调用` : ""}。`
-                    : `这个工具折叠在 ${entry.wire_name ?? "命名空间 Hub"} 后面，模型通过 Hub 的 action 参数选择它。`}
+                    ? c.folded(entry.wire_name ?? null)
+                    : c.behindHub(entry.wire_name ?? null)}
               </Note>
             )}
             {entry.ts_signature && (
               <CodeBlock
                 code={entry.ts_signature}
                 language="js"
-                title="检索索引里的 TypeScript 签名"
+                title={c.tsSignature}
                 maxHeight={220}
               />
             )}
@@ -163,19 +153,23 @@ function CompareSheet({
       <>
         <ToolGlyph kind={classifyTool(tool.wire_name, tool.role === "orchestrator")} />
         <span className="lg-num">{tool.wire_name}</span>
-        <Tag>{WIRE_ROLE[tool.role]}</Tag>
+        <Tag>{m.catalog.role[tool.role]}</Tag>
       </>
     );
     body = (
       <>
         <div className="grid grid-cols-3 gap-4">
-          <Figure label="Wire 体积" value={formatBytes(tool.bytes)} sub={`预算的 ${formatPct(tool.bytes / catalog.wire_budget_bytes)}`} />
+          <Figure
+            label={c.wireSize}
+            value={formatBytes(tool.bytes)}
+            sub={c.ofBudget(formatPct(tool.bytes / catalog.wire_budget_bytes))}
+          />
           <Figure label="Description" value={formatBytes(byteLength(tool.description ?? ""))} />
-          <Figure label="折叠的客户端工具" value={tool.folded_actions.length} />
+          <Figure label={c.foldedTools} value={tool.folded_actions.length} />
         </div>
         {tool.folded_actions.length > 0 && (
           <section>
-            <h3 className="lg-section-title">折叠在它后面的工具</h3>
+            <h3 className="lg-section-title">{c.foldedBehind}</h3>
             <div className="flex flex-wrap gap-1.5">
               {tool.folded_actions.map((name) => (
                 <Tag key={name}>{name}</Tag>
@@ -197,7 +191,7 @@ function CompareSheet({
         if (!open) onClose();
       }}
       title={title}
-      description={target?.kind === "client" ? "同一个工具：客户端怎么声明，Liftgate 怎么交给模型。" : "挂载在 lg MCP 服务器上的工具定义。"}
+      description={target?.kind === "client" ? c.clientDescription : c.wireDescription}
     >
       {body}
     </Sheet>
@@ -205,6 +199,8 @@ function CompareSheet({
 }
 
 function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.Element {
+  const { m } = useI18n();
+  const d = m.catalog.detail;
   const [tier, setTier] = useState<CatalogToolTier | "all">("all");
   const [wireFilter, setWireFilter] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -245,10 +241,10 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
     <>
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
         <Card
-          title="上下文构成"
-          sub={`最近一轮共 ${formatBytes(contextTotal)}，约 ${formatNumber(contextTokens)} tokens`}
+          title={d.context}
+          sub={d.contextSub(formatBytes(contextTotal), formatNumber(contextTokens))}
         >
-          <SegmentedBar parts={groupSegments(catalog.segments)} format={formatBytes} ariaLabel="上下文按类别的体积构成" />
+          <SegmentedBar parts={groupSegments(catalog.segments)} format={formatBytes} ariaLabel={d.contextAria} />
           {ranked.length > 0 && (
             <div className="mt-4">
               <RankedBars
@@ -265,18 +261,22 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
           )}
         </Card>
 
-        <Card title="虚拟化收益" sub={`检索索引 ${catalog.search_index_entries} 项`}>
+        <Card title={d.savings} sub={d.searchEntries(catalog.search_index_entries)}>
           <div className="flex flex-col gap-4">
             <div className="flex items-center gap-3">
-              <Figure label="客户端声明" value={formatBytes(catalog.client_tools_bytes)} sub={`${catalog.tools.length} 个工具`} />
+              <Figure
+                label={d.clientDeclared}
+                value={formatBytes(catalog.client_tools_bytes)}
+                sub={d.tools(catalog.tools.length)}
+              />
               <ArrowRight className="h-4 w-4 flex-none text-fg-4" />
               <Figure
-                label="挂载后"
+                label={d.mounted}
                 value={formatBytes(clientWireBytes)}
-                sub={`${catalog.wire_tools.length - gatewayWire.length} 个工具`}
+                sub={d.tools(catalog.wire_tools.length - gatewayWire.length)}
               />
               <div className="ml-auto text-right">
-                <div className="text-[12px] text-fg-3">体积变化</div>
+                <div className="text-[12px] text-fg-3">{d.sizeChange}</div>
                 <div className="lg-num text-[22px] font-semibold leading-tight text-fg">
                   {formatSizeChange(catalog.client_tools_bytes, clientWireBytes)}
                 </div>
@@ -284,12 +284,12 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
             </div>
             {gatewayWire.length > 0 && (
               <p className="lg-hint m-0">
-                另挂载 {gatewayWire.length} 个网关内置工具 · {formatBytes(gatewayBytes)}
+                {d.gatewayExtra(gatewayWire.length, formatBytes(gatewayBytes))}
               </p>
             )}
             <div>
               <div className="mb-1.5 flex items-baseline justify-between text-[12px] text-fg-3">
-                <span>Wire 预算占用</span>
+                <span>{d.wireBudget}</span>
                 <span className="lg-num">
                   {formatBytes(wireTotal)} / {formatBytes(catalog.wire_budget_bytes)}
                 </span>
@@ -297,7 +297,7 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
               <Meter
                 ratio={wireTotal / catalog.wire_budget_bytes}
                 tone={wireTotal / catalog.wire_budget_bytes > 0.9 ? "warn" : undefined}
-                label="Wire 工具体积占预算比例"
+                label={d.wireRatio}
               />
             </div>
           </div>
@@ -306,12 +306,12 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
 
       <Card
         flush
-        title="三层虚拟化映射"
-        sub="左：模型看到的 Wire 工具，点击筛出它背后的工具。右：客户端声明的工具，点击对照两份定义。"
+        title={d.map}
+        sub={d.mapSub}
       >
-        <div className="lg-toolbar lg-chiprow" role="group" aria-label="按分层筛选">
+        <div className="lg-toolbar lg-chiprow" role="group" aria-label={d.tierFilter}>
           <button type="button" className="lg-chip lg-chip-plain" aria-pressed={tier === "all"} onClick={() => setTier("all")}>
-            全部
+            {d.all}
             <span className="lg-seg-count">{catalog.tools.length}</span>
           </button>
           {TIER_ORDER.filter((id) => (tierCounts.get(id) ?? 0) > 0).map((id) => (
@@ -320,20 +320,20 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
               type="button"
               className="lg-chip lg-chip-plain"
               aria-pressed={tier === id}
-              title={TIER[id].hint}
+              title={m.catalog.tier[id].hint}
               onClick={() => setTier((cur) => (cur === id ? "all" : id))}
             >
-              {TIER[id].label}
+              {m.catalog.tier[id].label}
               <span className="lg-seg-count">{tierCounts.get(id)}</span>
             </button>
           ))}
-          <SearchInput value={query} onChange={setQuery} placeholder="按工具名筛选" className="ml-auto w-full sm:w-56" />
+          <SearchInput value={query} onChange={setQuery} placeholder={d.filterByName} className="ml-auto w-full sm:w-56" />
         </div>
 
         <div className="lg-map">
-          <section className="lg-map-col" aria-label="Wire 工具">
+          <section className="lg-map-col" aria-label={d.wireTools}>
             <h3 className="lg-map-title">
-              Wire 工具 · {catalog.wire_tools.length}
+              {d.wireTools} · {catalog.wire_tools.length}
               <span className="lg-num font-normal text-fg-4">{formatBytes(wireTotal)}</span>
             </h3>
             <ul className="m-0 list-none p-0">
@@ -351,8 +351,8 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
                         <span className="flex items-center gap-1.5">
                           <span className="lg-num lg-clip text-[12.5px] font-medium text-fg">{tool.wire_name}</span>
                           <span className="flex-none text-[11px] text-fg-4">
-                            {WIRE_ROLE[tool.role]}
-                            {tool.folded_actions.length > 0 ? ` · 折叠 ${tool.folded_actions.length}` : ""}
+                            {m.catalog.role[tool.role]}
+                            {tool.folded_actions.length > 0 ? d.folded(tool.folded_actions.length) : ""}
                           </span>
                         </span>
                         <span className="lg-minibar-track mt-1.5">
@@ -372,8 +372,8 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
                       size="sm"
                       variant="ghost"
                       icon
-                      aria-label={`查看 ${tool.wire_name} 的定义`}
-                      title="查看定义"
+                      aria-label={d.viewDefinitionOf(tool.wire_name)}
+                      title={d.viewDefinition}
                       onClick={() => setTarget({ kind: "wire", tool })}
                     >
                       <FileSearch />
@@ -384,17 +384,17 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
             </ul>
           </section>
 
-          <section className="lg-map-col" aria-label="客户端工具">
+          <section className="lg-map-col" aria-label={d.clientTools}>
             <h3 className="lg-map-title">
-              客户端工具 · {shownTools.length}
+              {d.clientTools} · {shownTools.length}
               {wireFilter !== null && (
                 <button type="button" className="lg-link text-[11.5px]" onClick={() => setWireFilter(null)}>
-                  取消按 {wireFilter} 筛选
+                  {d.clearWireFilter(wireFilter)}
                 </button>
               )}
             </h3>
             {shownTools.length === 0 ? (
-              <p className="lg-hint m-0 px-4 py-6 text-center">没有符合条件的工具。</p>
+              <p className="lg-hint m-0 px-4 py-6 text-center">{d.noTools}</p>
             ) : (
               <ul className="m-0 list-none p-0">
                 {shownTools.map((tool) => (
@@ -403,7 +403,7 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
                       <button type="button" className="lg-map-main" onClick={() => setTarget({ kind: "client", entry: tool })}>
                         <ToolGlyph kind={classifyTool(tool.client_name, tool.tier === "orchestrator")} size="sm" />
                         <span className="lg-num lg-clip min-w-0 flex-1 text-[12.5px] text-fg">{tool.client_name}</span>
-                        <Pill tone={TIER[tool.tier].tone}>{TIER[tool.tier].label}</Pill>
+                        <Pill tone={TIER_TONE[tool.tier]}>{m.catalog.tier[tool.tier].label}</Pill>
                         <span className="lg-num w-[132px] flex-none text-right text-[11.5px] text-fg-3 max-sm:hidden">
                           {formatBytes(tool.client_bytes)}
                           <span className="text-fg-4"> → </span>
@@ -420,13 +420,13 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
       </Card>
 
       {(catalog.bridge_rules_prompt || catalog.orchestrator_contract_prompt) && (
-        <Card title="桥接提示词" sub="新建会话时追加到系统提示词。">
+        <Card title={d.bridge} sub={d.bridgeSub}>
           <div className="flex flex-col gap-2">
             {catalog.orchestrator_contract_prompt && (
               <Disclosure
                 head={
                   <>
-                    <span className="flex-none font-medium text-fg-2">编排器契约</span>
+                    <span className="flex-none font-medium text-fg-2">{d.contract}</span>
                     <span className="lg-num lg-clip min-w-0 text-[11.5px] text-fg-4">McpOrchestratorContract</span>
                   </>
                 }
@@ -439,7 +439,7 @@ function CatalogDetail({ catalog }: { catalog: SessionToolCatalog }): React.JSX.
               <Disclosure
                 head={
                   <>
-                    <span className="flex-none font-medium text-fg-2">桥接规则</span>
+                    <span className="flex-none font-medium text-fg-2">{d.rules}</span>
                     <span className="lg-num lg-clip min-w-0 text-[11.5px] text-fg-4">&lt;api_gateway_bridge_rules&gt;</span>
                   </>
                 }
@@ -466,18 +466,20 @@ function SessionPicker({
   selectedId: string | null;
   onSelect: (id: string) => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const p = m.catalog.picker;
   return (
     <div className="lg-table-wrap">
       <table className="lg-table">
         <thead>
           <tr>
             <th>Harness</th>
-            <th className="hide-sm">会话</th>
-            <th className="hide-sm">模型</th>
-            <th className="hide-sm">编排方式</th>
-            <th className="num hide-sm">声明 → Eager</th>
+            <th className="hide-sm">{p.session}</th>
+            <th className="hide-sm">{p.model}</th>
+            <th className="hide-sm">{p.mode}</th>
+            <th className="num hide-sm">{p.eager}</th>
             <th className="num hide-sm">Hub</th>
-            <th>Wire 体积</th>
+            <th>{p.wireSize}</th>
           </tr>
         </thead>
         <tbody>
@@ -506,7 +508,7 @@ function SessionPicker({
                 <td className="hide-sm">
                   <span className="inline-flex gap-1.5">
                     <Tag>{orchestratorModeLabel(mcp.orchestrator_mode)}</Tag>
-                    {mcp.is_passthrough && <Tag>1:1 直通</Tag>}
+                    {mcp.is_passthrough && <Tag>{p.passthrough}</Tag>}
                   </span>
                 </td>
                 <td className="num hide-sm">
@@ -515,7 +517,7 @@ function SessionPicker({
                 <td className="num hide-sm">{mcp.virtualized_hubs}</td>
                 <td>
                   <div className="flex min-w-[120px] items-center gap-2 sm:w-[190px]">
-                    <Meter ratio={ratio} tone={ratio > 0.9 ? "warn" : undefined} label="Wire 工具体积占预算比例" />
+                    <Meter ratio={ratio} tone={ratio > 0.9 ? "warn" : undefined} label={m.catalog.detail.wireRatio} />
                     <span className="lg-num w-[64px] flex-none text-right text-[11.5px] text-fg-2">
                       {formatBytes(mcp.wire_bytes)}
                     </span>
@@ -532,6 +534,8 @@ function SessionPicker({
 
 export function CatalogView({ arg, navigate }: ViewProps): React.JSX.Element {
   const { client, snapshot, baseUrl } = useGateway();
+  const { m } = useI18n();
+  const v = m.catalog.view;
   const sessions = useMemo(
     () => (snapshot?.session_pool.sessions ?? []).filter((s) => s.mcp != null),
     [snapshot?.session_pool.sessions],
@@ -557,12 +561,12 @@ export function CatalogView({ arg, navigate }: ViewProps): React.JSX.Element {
 
   return (
     <>
-      <Card flush title="选择会话" sub="并排比较各 Harness 的工具虚拟化结果。">
+      <Card flush title={v.pick} sub={v.pickSub}>
         {sessions.length === 0 ? (
           <EmptyState
             icon={<Library />}
-            title="会话池里没有带工具的会话"
-            hint="发起一次声明了工具的对话后，这里会列出它的虚拟化规划。"
+            title={v.noSessions}
+            hint={v.noSessionsHint}
           />
         ) : (
           <SessionPicker sessions={sessions} selectedId={selectedId} onSelect={(id) => navigate("catalog", id)} />
@@ -571,27 +575,22 @@ export function CatalogView({ arg, navigate }: ViewProps): React.JSX.Element {
 
       {supported === false ? (
         <Card>
-          <Unsupported feature="会话工具目录" endpoint="GET /api/telemetry/sessions/{id}/tool-catalog" />
+          <Unsupported feature={v.unsupported} endpoint="GET /api/telemetry/sessions/{id}/tool-catalog" />
         </Card>
       ) : selectedId === null || supported === null ? null : catalog.status === "loading" ? (
         <Card>
-          <Loading label="读取工具目录…" />
+          <Loading label={v.loading} />
         </Card>
       ) : catalog.status === "unsupported" ? (
         <Card>
           <EmptyState
             icon={<Library />}
-            title="这个会话已不在会话池里"
-            hint={
-              <>
-                会话 <span className="lg-num">{shortId(selectedId, 13)}</span>{" "}
-                被回收后，它的工具目录也一起释放了。
-              </>
-            }
+            title={v.gone}
+            hint={v.goneHint(<span className="lg-num">{shortId(selectedId, 13)}</span>)}
             action={
               sessions[0] ? (
                 <Button size="sm" onClick={() => navigate("catalog", sessions[0]?.session_id)}>
-                  查看当前会话
+                  {v.current}
                 </Button>
               ) : undefined
             }
@@ -599,9 +598,9 @@ export function CatalogView({ arg, navigate }: ViewProps): React.JSX.Element {
         </Card>
       ) : catalog.status === "error" || catalog.data === null ? (
         <Note tone="err" icon={<CircleAlert />}>
-          读取工具目录失败：{catalog.error ?? "未知错误"}
+          {v.failed(catalog.error ?? v.unknownError)}
           <Button size="sm" className="ml-2" onClick={catalog.reload}>
-            重试
+            {v.retry}
           </Button>
         </Note>
       ) : (

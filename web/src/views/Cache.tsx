@@ -26,6 +26,7 @@ import {
   formatSmartTime,
   shortId,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { cacheStats } from "@/lib/stats";
 import type { CacheTelemetrySummary, LowCacheHitReason, LowCacheHitRecord } from "@/types/telemetry";
 import type { ViewProps } from "@/views/types";
@@ -45,6 +46,8 @@ function ConfigCard({
   onBanner: (banner: Banner) => void;
 }): React.JSX.Element {
   const { client, refresh, reloadLowCache } = useGateway();
+  const { m } = useI18n();
+  const t = m.cache.config;
   const [maxRecords, setMaxRecords] = useState("1000");
   const [thresholdPct, setThresholdPct] = useState("50");
   const [dirty, setDirty] = useState(false);
@@ -65,11 +68,11 @@ function ConfigCard({
     const max = Number.parseInt(maxRecords.trim(), 10);
     const pct = Number.parseInt(thresholdPct.trim(), 10);
     if (!Number.isFinite(max) || max < 0 || max > 50_000) {
-      onBanner({ tone: "err", text: "保留条数需在 0 到 50,000 之间；设为 0 表示不记录。" });
+      onBanner({ tone: "err", text: t.recordsRange });
       return;
     }
     if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
-      onBanner({ tone: "err", text: "阈值需在 0% 到 100% 之间。" });
+      onBanner({ tone: "err", text: t.thresholdRange });
       return;
     }
     setSaving(true);
@@ -81,11 +84,11 @@ function ConfigCard({
       setDirty(false);
       onBanner({
         tone: "ok",
-        text: `已保存：最多保留 ${formatNumber(next.max_low_cache_records)} 条，命中率低于 ${Math.round(next.low_cache_threshold_bps / 100)}% 的轮次会被记录。`,
+        text: t.saved(formatNumber(next.max_low_cache_records), Math.round(next.low_cache_threshold_bps / 100)),
       });
       await Promise.all([refresh(), reloadLowCache()]);
     } catch (err) {
-      onBanner({ tone: "err", text: `保存失败：${errorMessage(err)}` });
+      onBanner({ tone: "err", text: t.saveFailed(errorMessage(err)) });
     } finally {
       setSaving(false);
     }
@@ -94,10 +97,10 @@ function ConfigCard({
   const toggleCapture = async (next: boolean): Promise<void> => {
     try {
       await client.updateCacheConfig({ capture_request_details: next });
-      onBanner({ tone: "ok", text: `低命中轮次的完整请求内容保存已${next ? "开启" : "关闭"}。` });
+      onBanner({ tone: "ok", text: t.captureToggled(next) });
       await refresh();
     } catch (err) {
-      onBanner({ tone: "err", text: `切换失败：${errorMessage(err)}` });
+      onBanner({ tone: "err", text: t.toggleFailed(errorMessage(err)) });
     }
   };
 
@@ -106,19 +109,19 @@ function ConfigCard({
       await client.clearLowCacheHits(resetTotals);
       onBanner({
         tone: "ok",
-        text: resetTotals ? "已清空低命中记录并重置累计统计。" : "已清空低命中记录，累计统计保留。",
+        text: resetTotals ? t.clearedReset : t.cleared,
       });
       await Promise.all([refresh(), reloadLowCache()]);
     } catch (err) {
-      onBanner({ tone: "err", text: `清理失败：${errorMessage(err)}` });
+      onBanner({ tone: "err", text: t.clearFailed(errorMessage(err)) });
     }
   };
 
   return (
-    <Card title="记录策略">
+    <Card title={t.title}>
       <form className="flex flex-col gap-4" onSubmit={(ev) => void save(ev)}>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="最多保留条数" htmlFor="cache-max-records">
+          <Field label={t.maxRecords} htmlFor="cache-max-records">
             <input
               id="cache-max-records"
               className="lg-input lg-num"
@@ -132,7 +135,7 @@ function ConfigCard({
               }}
             />
           </Field>
-          <Field label="低命中阈值 %" htmlFor="cache-threshold">
+          <Field label={t.threshold} htmlFor="cache-threshold">
             <input
               id="cache-threshold"
               className="lg-input lg-num"
@@ -148,26 +151,26 @@ function ConfigCard({
           </Field>
         </div>
         <SwitchRow
-          title="保存完整请求内容"
-          hint="低命中时落盘实际发往 ACP 的 Prompt、消息与工具 Schema。"
+          title={t.capture}
+          hint={t.captureHint}
           checked={capture}
           onChange={(next) => void toggleCapture(next)}
         />
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3">
           <Button type="submit" variant="primary" disabled={saving || !dirty}>
-            {saving ? "保存中…" : "保存"}
+            {saving ? t.saving : t.save}
           </Button>
           <span className="flex flex-wrap items-center gap-1.5">
             <ConfirmButton
-              label="清空记录"
-              confirmLabel="确认清空记录"
+              label={t.clear}
+              confirmLabel={t.clearConfirm}
               icon={<Trash2 />}
               disabled={(summary?.stored_low_cache_count ?? 0) === 0}
               onConfirm={() => void clear(false)}
             />
             <ConfirmButton
-              label="重置累计统计"
-              confirmLabel="确认清空并重置"
+              label={t.reset}
+              confirmLabel={t.resetConfirm}
               onConfirm={() => void clear(true)}
             />
           </span>
@@ -179,6 +182,8 @@ function ConfigCard({
 
 export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
   const { snapshot, lowCacheRecords } = useGateway();
+  const { m } = useI18n();
+  const t = m.cache.view;
   const summary = snapshot?.cache_telemetry;
   const stats = useMemo(() => cacheStats(summary, snapshot?.metrics), [summary, snapshot?.metrics]);
   const thresholdBps = summary?.low_cache_threshold_bps ?? 5000;
@@ -233,13 +238,11 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <Card
-          title="累计命中"
-          sub="缓存读 ÷ 全部输入，跨重启累计。"
+          title={t.total}
+          sub={t.totalSub}
           actions={
             (summary?.auxiliary_turns ?? 0) > 0 ? (
-              <Tag title="标题生成等一次性后台请求，不进入命中率分母">
-                已隔离辅助请求 {formatNumber(summary?.auxiliary_turns ?? 0)} 轮
-              </Tag>
+              <Tag title={t.auxiliaryHint}>{t.auxiliary(formatNumber(summary?.auxiliary_turns ?? 0))}</Tag>
             ) : undefined
           }
         >
@@ -247,33 +250,36 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
             <div>
               <div className="lg-hero">{formatBpsPct(stats.hitBps, 1)}</div>
               <div className="mt-2 text-[12px] text-fg-3">
-                全部 {formatNumber(stats.evaluatedTurns)} 轮
+                {t.allTurns(formatNumber(stats.evaluatedTurns))}
               </div>
             </div>
             <div className="min-w-[180px] flex-1">
               <div className="flex items-baseline justify-between gap-3 text-[12px] text-fg-3">
-                <span>热会话续接（排除首轮冷启动）</span>
+                <span>{t.warm}</span>
                 <span className="lg-num text-[15px] font-semibold text-fg">
                   {formatBpsPct(stats.warmHitBps, 1)}
                 </span>
               </div>
               <div className="mt-1.5">
-                <Meter ratio={(stats.warmHitBps ?? 0) / 10000} label="热会话续接命中率" />
+                <Meter ratio={(stats.warmHitBps ?? 0) / 10000} label={t.warmMeter} />
               </div>
               <div className="mt-1.5 text-[12px] text-fg-3">
-                {formatNumber(stats.warmTurns)} 轮复用 · 累计 {formatNumber(summary?.total_low_cache_turns ?? lowCacheRecords.length)} 轮低于阈值
+                {t.warmFoot(
+                  formatNumber(stats.warmTurns),
+                  formatNumber(summary?.total_low_cache_turns ?? lowCacheRecords.length),
+                )}
               </div>
             </div>
           </div>
           <div className="mt-5">
-            <h3 className="lg-section-title">输入 Token 去向 · 共 {formatNumber(stats.promptTokens)}</h3>
+            <h3 className="lg-section-title">{t.inputMix(formatNumber(stats.promptTokens))}</h3>
             <SegmentedBar
-              ariaLabel="累计输入 Token 构成"
+              ariaLabel={t.inputMixAria}
               format={formatNumber}
               parts={[
-                { key: "read", label: "缓存读", value: stats.cachedRead, color: "var(--lg-s1)" },
-                { key: "write", label: "缓存写", value: stats.cachedWrite, color: "var(--lg-s4)", ink: "dark" },
-                { key: "input", label: "未命中输入", value: stats.uncachedInput, color: "var(--lg-s-neutral)" },
+                { key: "read", label: t.cacheRead, value: stats.cachedRead, color: "var(--lg-s1)" },
+                { key: "write", label: t.cacheWrite, value: stats.cachedWrite, color: "var(--lg-s4)", ink: "dark" },
+                { key: "input", label: t.uncached, value: stats.uncachedInput, color: "var(--lg-s-neutral)" },
               ]}
             />
           </div>
@@ -284,11 +290,10 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
 
       <Card
         flush
-        title="低命中记录"
+        title={t.records}
         sub={
           <>
-            保留 {formatNumber(summary?.stored_low_cache_count ?? lowCacheRecords.length)} /{" "}
-            {formatNumber(maxRecords)} 条
+            {t.kept(formatNumber(summary?.stored_low_cache_count ?? lowCacheRecords.length), formatNumber(maxRecords))}
             {summary?.persisted_path && (
               <>
                 <span className="lg-num max-md:hidden" title={summary.persisted_path}>
@@ -302,17 +307,17 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
       >
         <div className="lg-toolbar">
           <Segmented<"all" | LowCacheHitReason>
-            ariaLabel="按原因筛选"
+            ariaLabel={t.reasonFilter}
             value={reason}
             onChange={(next) => {
               setReason(next);
               setPage(1);
             }}
             options={[
-              { value: "all", label: "全部", count: lowCacheRecords.length },
-              { value: "warm_cache_miss", label: "热会话掉缓存", count: counts.warm_cache_miss },
-              { value: "warm_partial_hit", label: "部分命中", count: counts.warm_partial_hit },
-              { value: "cold_session_start", label: "冷启动", count: counts.cold_session_start },
+              { value: "all", label: t.all, count: lowCacheRecords.length },
+              { value: "warm_cache_miss", label: m.cache.reason.warm_cache_miss, count: counts.warm_cache_miss },
+              { value: "warm_partial_hit", label: t.partial, count: counts.warm_partial_hit },
+              { value: "cold_session_start", label: m.cache.reason.cold_session_start, count: counts.cold_session_start },
             ]}
           />
           <SearchInput
@@ -321,37 +326,33 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
               setQuery(next);
               setPage(1);
             }}
-            placeholder="搜索模型、会话或 Prompt"
+            placeholder={t.search}
             className="w-full sm:w-64"
           />
         </div>
         {shown.length === 0 ? (
           <EmptyState
             icon={<Gauge />}
-            title={lowCacheRecords.length === 0 ? "没有低命中记录" : "没有符合条件的记录"}
-            hint={
-              lowCacheRecords.length === 0
-                ? `任何一轮的缓存命中率低于 ${Math.round(thresholdBps / 100)}% 时，会被记录在这里并附上归因。`
-                : "换一个原因分类，或清空搜索词。"
-            }
+            title={lowCacheRecords.length === 0 ? t.none : t.noMatch}
+            hint={lowCacheRecords.length === 0 ? t.noneHint(Math.round(thresholdBps / 100)) : t.noMatchHint}
           />
         ) : (
           <div className="lg-table-wrap">
             <table className="lg-table">
               <thead>
                 <tr>
-                  <th>时间</th>
-                  <th>归因</th>
-                  <th>命中率</th>
-                  <th className="hide-sm">模型 · 会话</th>
-                  <th className="num hide-sm">缓存读 / 总输入</th>
-                  <th className="num hide-sm">耗时</th>
+                  <th>{t.col.time}</th>
+                  <th>{t.col.reason}</th>
+                  <th>{t.col.hitRate}</th>
+                  <th className="hide-sm">{t.col.modelSession}</th>
+                  <th className="num hide-sm">{t.col.readOfTotal}</th>
+                  <th className="num hide-sm">{t.col.elapsed}</th>
                   <th className="hide-sm">Prompt</th>
                 </tr>
               </thead>
               <tbody>
                 {shown.map((rec) => {
-                  const m = rec.request_metrics;
+                  const metrics = rec.request_metrics;
                   return (
                     <tr
                       key={`${rec.task_id}-${rec.recorded_at_unix_ms}`}
@@ -377,7 +378,7 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
                             <Meter
                               ratio={rec.cache_hit_rate_bps / 10000}
                               tone={rec.cache_hit_rate_bps === 0 ? "err" : "warn"}
-                              label="单轮缓存命中率"
+                              label={t.turnHitRate}
                             />
                           </span>
                         </div>
@@ -386,9 +387,9 @@ export function CacheView({ arg, navigate }: ViewProps): React.JSX.Element {
                         <div className="lg-num text-[12px] text-fg">{rec.resolved_model}</div>
                         <div className="lg-num whitespace-nowrap text-[11.5px] text-fg-4">
                           {rec.session_id
-                            ? `${rec.session_reused ? "复用" : "新建"} ${shortId(rec.session_id)}`
+                            ? `${rec.session_reused ? t.reused : t.created} ${shortId(rec.session_id)}`
                             : rec.task_id}
-                          {m?.session_idle_ms != null && ` · 空闲 ${formatDurationMs(m.session_idle_ms)}`}
+                          {metrics?.session_idle_ms != null && t.idle(formatDurationMs(metrics.session_idle_ms))}
                         </div>
                       </td>
                       <td className="num hide-sm whitespace-nowrap">

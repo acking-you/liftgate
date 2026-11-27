@@ -878,6 +878,57 @@
     animation: lg-pulse 1.6s ease-in-out infinite;
   }
 
+  /* Latency: a traffic-light dot ahead of the figure; the figure itself only turns amber or
+     red once it is slow, so a column of healthy values stays quiet. */
+  .lg-lat {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+
+  .lg-lat::before {
+    content: "";
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--lg-fg-4);
+  }
+
+  .lg-lat[data-tone="ok"]::before {
+    background: var(--lg-ok);
+  }
+
+  .lg-lat[data-tone="neutral"]::before {
+    background: var(--lg-accent);
+    opacity: 0.6;
+  }
+
+  .lg-lat[data-tone="warn"] {
+    color: var(--lg-warn-fg);
+  }
+
+  .lg-lat[data-tone="warn"]::before {
+    background: var(--lg-warn);
+  }
+
+  .lg-lat[data-tone="err"] {
+    color: var(--lg-err-fg);
+    font-weight: 600;
+  }
+
+  .lg-lat[data-tone="err"]::before {
+    background: var(--lg-err);
+    box-shadow: 0 0 0 3px var(--lg-err-soft);
+  }
+
+  .lg-locale span {
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+  }
+
   .lg-swatch {
     flex: none;
     display: inline-block;
@@ -946,6 +997,15 @@
   .lg-table td.num {
     font-family: var(--font-mono);
     font-size: 12px;
+  }
+
+  /* Rows that need attention carry a coloured stripe on their leading edge. */
+  .lg-table tbody tr[data-tone="err"] > td:first-child {
+    box-shadow: inset 3px 0 0 var(--lg-err);
+  }
+
+  .lg-table tbody tr[data-tone="warn"] > td:first-child {
+    box-shadow: inset 3px 0 0 var(--lg-warn);
   }
 
   .lg-table tbody tr[data-clickable="true"] {
@@ -1867,7 +1927,7 @@
   .lg-call {
     position: relative;
     display: grid;
-    grid-template-columns: 26px minmax(0, 1fr) auto 76px;
+    grid-template-columns: 26px minmax(0, 1fr) auto 84px;
     align-items: center;
     gap: 10px;
     padding: 8px 16px;
@@ -1988,6 +2048,33 @@
 
   .lg-call[data-failed="true"] .lg-durbar > span {
     background: var(--lg-err);
+  }
+
+  /* How a call ended, as a stripe on its leading edge (selection draws over it). */
+  .lg-call[data-status="error"],
+  .lg-call[data-status="abandoned"] {
+    box-shadow: inset 3px 0 0 var(--lg-err);
+  }
+
+  .lg-call[data-status="preflight_rejected"] {
+    box-shadow: inset 3px 0 0 var(--lg-warn);
+  }
+
+  .lg-call[data-status="pending"] {
+    box-shadow: inset 3px 0 0 var(--lg-accent);
+  }
+
+  .lg-call-dur[data-tone="warn"] .lg-durbar > span {
+    background: var(--lg-warn);
+  }
+
+  .lg-call-dur[data-tone="err"] .lg-durbar > span {
+    background: var(--lg-err);
+  }
+
+  .lg-call-dur[data-tone="ok"] .lg-durbar > span {
+    background: var(--lg-ok);
+    opacity: 0.7;
   }
 
   @media (max-width: 640px) {

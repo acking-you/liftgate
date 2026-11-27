@@ -29,6 +29,10 @@ import type {
   LowCacheHitRecord,
   LowCacheHitsResponse,
   LowCachePayloadDetailResponse,
+  ModelPrice,
+  ModelPricingEntry,
+  ModelUsage,
+  PricingResponse,
   SessionSummary,
   SessionToolCatalog,
   TaskProtocol,
@@ -41,6 +45,9 @@ import type {
   ToolCallsResponse,
   ToolCallTelemetrySummary,
   ToolOutputBlock,
+  UsageResponse,
+  UsageSummary,
+  UsageTokens,
 } from "@/types/telemetry";
 
 /* ---------- deterministic randomness ---------- */
@@ -583,7 +590,7 @@ interface DemoSession {
 
 const SESSIONS: DemoSession[] = [
   { id: uuid(), harness: "codex", mode: "codex_exec", model: "gemini-4-carbon-high", passthrough: false, declared: 128, eager: 14, hubs: 4, wire: 21_300, turns: 13, prompt: "给网关加上逐次工具调用的 I/O 记录，并在 Web 面板里可视化" },
-  { id: uuid(), harness: "claude-code", mode: "claude_bash_first", model: "claude-opus-5", passthrough: false, declared: 46, eager: 31, hubs: 2, wire: 28_900, turns: 9, prompt: "排查会话池在 mcp-cont 续接后的缓存命中率抖动" },
+  { id: uuid(), harness: "claude-code", mode: "claude_bash_first", model: "claude-opus-5-5-high", passthrough: false, declared: 46, eager: 31, hubs: 2, wire: 28_900, turns: 9, prompt: "排查会话池在 mcp-cont 续接后的缓存命中率抖动" },
   { id: uuid(), harness: "opencode", mode: "opencode_execute_full", model: "gemini-4-carbon-high", passthrough: false, declared: 38, eager: 12, hubs: 1, wire: 26_100, turns: 8, prompt: "把 OpenCode 的 execute 契约与 Codex 对齐，减少脚本运行时报错" },
   { id: uuid(), harness: "omp", mode: "omp_eval", model: "gemini-4-neon-high", passthrough: false, declared: 52, eager: 10, hubs: 0, wire: 32_400, turns: 9, prompt: "修复 omp eval 里 edit 工具的参数校验失败" },
   { id: uuid(), harness: "generic", mode: "direct", model: "gemini-4-hydrogen-low", passthrough: true, declared: 6, eager: 6, hubs: 0, wire: 4_100, turns: 3, prompt: "总结一下这个仓库的目录结构" },
@@ -1074,14 +1081,55 @@ const MODELS: AvailableModel[] = [
   ["gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"],
   ["gemini-4-neon-high", "Gemini 4 Neon (High)"],
   ["gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"],
-  ["gemini-3.8-flash", "Gemini 3.8 Flash"],
-  ["claude-opus-5", "Claude Opus 5"],
-  ["claude-sonnet-5", "Claude Sonnet 5"],
-  ["gpt-oss-140b", "GPT-OSS 140B"],
+  ["gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"],
+  ["claude-opus-5-5-high", "Claude Opus 5.5 (High)"],
+  ["claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"],
+  ["gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"],
+  ["gemini-5-quark-preview", "Gemini 5 Quark (Preview)"],
 ].map(([modelId, name]) => ({ modelId: modelId ?? "", name: name ?? "" }));
+
+/** A dev-only copy of the gateway's default price list (the real one lives in Rust). */
+const DEMO_FAMILIES: ReadonlyArray<{
+  key: string;
+  label: string;
+  price: ModelPrice;
+  upcoming?: { from: number; price: ModelPrice };
+}> = [
+  { key: "gemini-4-neon", label: "Gemini 4 Neon", price: { input: 3, cached_input: 0.15, cache_write: 3, output: 15 } },
+  {
+    key: "gemini-4-carbon",
+    label: "Gemini 4 Carbon",
+    price: { input: 2, cached_input: 0.1, cache_write: 2, output: 10 },
+    upcoming: { from: 1_796_112_000_000, price: { input: 4, cached_input: 0.2, cache_write: 4, output: 20 } },
+  },
+  {
+    key: "gemini-4-argon",
+    label: "Gemini 4 Argon",
+    price: { input: 2, cached_input: 0.1, cache_write: 2, output: 10 },
+    upcoming: { from: 1_796_112_000_000, price: { input: 4, cached_input: 0.2, cache_write: 4, output: 20 } },
+  },
+  { key: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen", price: { input: 1.5, cached_input: 0.075, cache_write: 1.5, output: 7.5 } },
+  {
+    key: "gemini-3.8-flash",
+    label: "Gemini 3.8 Flash",
+    price: { input: 0.75, cached_input: 0.075, cache_write: 0.75, output: 3.75 },
+    upcoming: { from: 1_798_790_400_000, price: { input: 1.5, cached_input: 0.15, cache_write: 1.5, output: 7.5 } },
+  },
+  { key: "claude-opus-5-5", label: "Claude Opus 5.5", price: { input: 4, cached_input: 0.2, cache_write: 5, output: 20 } },
+  { key: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", price: { input: 2, cached_input: 0.1, cache_write: 2.5, output: 10 } },
+  { key: "gpt-oss-120b", label: "GPT-OSS 120B", price: { input: 0.09, cached_input: 0.09, cache_write: 0.09, output: 0.36 } },
+];
+
+function demoPricingKey(modelId: string): string {
+  return modelId.replace(/-(minimal|low|medium|high|xhigh|max)$/, "");
+}
 
 export function createDemoClient(): GatewayClient {
   let tasks = buildTasks();
+  const customPrices = new Map<string, ModelPrice>();
+  let priceRevision = 1;
+  let usageResets = 0;
+  let usageSince = 0;
   let visionOffload = false;
   let mcpBridge = true;
   let closed = new Set<string>();
@@ -1307,6 +1355,119 @@ export function createDemoClient(): GatewayClient {
       };
     });
 
+  const priceOf = (modelId: string): ModelPrice | null => {
+    const key = demoPricingKey(modelId);
+    const family = DEMO_FAMILIES.find((f) => f.key === key);
+    const fallback = family?.upcoming && Date.now() >= family.upcoming.from ? family.upcoming.price : family?.price;
+    return customPrices.get(key) ?? fallback ?? null;
+  };
+  const tokensOf = (task: TaskSnapshot): UsageTokens | null =>
+    task.usage
+      ? {
+          input: task.usage.inputTokens,
+          cached_input: task.usage.cachedReadTokens,
+          cache_write: task.usage.cachedWriteTokens,
+          output: task.usage.outputTokens,
+          thought: Math.min(task.usage.thoughtTokens, task.usage.outputTokens),
+        }
+      : null;
+  const costOf = (price: ModelPrice, t: UsageTokens): number =>
+    (t.input * price.input + t.cached_input * price.cached_input + t.cache_write * price.cache_write + t.output * price.output) /
+    1e6;
+  const taskCost = (task: TaskSnapshot): number | null => {
+    const t = tokensOf(task);
+    const price = priceOf(task.resolved_model);
+    return t && price ? costOf(price, t) : null;
+  };
+
+  const usageReport = (): UsageResponse => {
+    const done = tasks.filter(
+      (t) => t.phase === "completed" && t.usage !== null && (t.finished_at_unix_ms ?? 0) >= usageSince,
+    );
+    const rows = new Map<string, ModelUsage>();
+    for (const task of done) {
+      const t = tokensOf(task);
+      if (!t) continue;
+      const row = rows.get(task.resolved_model) ?? {
+        model_id: task.resolved_model,
+        pricing_key: demoPricingKey(task.resolved_model),
+        calls: 0,
+        auxiliary_calls: 0,
+        tokens: { input: 0, cached_input: 0, cache_write: 0, output: 0, thought: 0 },
+        cost_usd: 0,
+        first_used_at_unix_ms: task.finished_at_unix_ms ?? 0,
+        last_used_at_unix_ms: 0,
+      };
+      row.calls += 1;
+      row.tokens = {
+        input: row.tokens.input + t.input,
+        cached_input: row.tokens.cached_input + t.cached_input,
+        cache_write: row.tokens.cache_write + t.cache_write,
+        output: row.tokens.output + t.output,
+        thought: row.tokens.thought + t.thought,
+      };
+      const cost = taskCost(task);
+      row.cost_usd = row.cost_usd !== null && cost !== null ? row.cost_usd + cost : null;
+      row.first_used_at_unix_ms = Math.min(row.first_used_at_unix_ms, task.finished_at_unix_ms ?? 0);
+      row.last_used_at_unix_ms = Math.max(row.last_used_at_unix_ms, task.finished_at_unix_ms ?? 0);
+      rows.set(task.resolved_model, row);
+    }
+    const models = [...rows.values()].sort((a, b) => (b.cost_usd ?? -1) - (a.cost_usd ?? -1));
+    const summary: UsageSummary = {
+      revision: done.length + priceRevision + usageResets,
+      since_unix_ms: usageSince > 0 ? usageSince : Math.min(...done.map((t) => t.started_at_unix_ms), Date.now()),
+      calls: 0,
+      tokens: { input: 0, cached_input: 0, cache_write: 0, output: 0, thought: 0 },
+      cost_usd: 0,
+      unpriced_calls: 0,
+    };
+    for (const row of models) {
+      summary.calls += row.calls;
+      summary.tokens = {
+        input: summary.tokens.input + row.tokens.input,
+        cached_input: summary.tokens.cached_input + row.tokens.cached_input,
+        cache_write: summary.tokens.cache_write + row.tokens.cache_write,
+        output: summary.tokens.output + row.tokens.output,
+        thought: summary.tokens.thought + row.tokens.thought,
+      };
+      if (row.cost_usd === null) summary.unpriced_calls += row.calls;
+      else summary.cost_usd += row.cost_usd;
+    }
+    return { summary, models };
+  };
+
+  const pricingReport = (): PricingResponse => {
+    const now = Date.now();
+    const entries: ModelPricingEntry[] = DEMO_FAMILIES.map((f) => ({
+      key: f.key,
+      label: f.label,
+      model_ids: MODELS.map((model) => model.modelId).filter((id) => demoPricingKey(id) === f.key),
+      default_price: f.upcoming && now >= f.upcoming.from ? f.upcoming.price : f.price,
+      upcoming_defaults:
+        f.upcoming && now < f.upcoming.from ? [{ effective_from_unix_ms: f.upcoming.from, price: f.upcoming.price }] : [],
+      custom_price: customPrices.get(f.key) ?? null,
+      source_url: f.key.startsWith("gemini")
+        ? "https://ai.google.dev/gemini-api/docs/pricing"
+        : f.key.startsWith("claude")
+          ? "https://docs.anthropic.com/en/docs/about-claude/pricing"
+          : "https://cloud.google.com/model-garden/partner-models/pricing",
+    }));
+    for (const model of MODELS) {
+      const key = demoPricingKey(model.modelId);
+      if (entries.some((e) => e.key === key)) continue;
+      entries.push({
+        key,
+        label: null,
+        model_ids: [model.modelId],
+        default_price: null,
+        upcoming_defaults: [],
+        custom_price: customPrices.get(key) ?? null,
+        source_url: null,
+      });
+    }
+    return { revision: priceRevision, currency: "USD", defaults_as_of: "2026-11-27", entries };
+  };
+
   const snapshot = (): GatewayTelemetrySnapshot => {
     const all = [...details.values()];
     const active = tasks.filter((t) => t.phase !== "completed");
@@ -1390,8 +1551,9 @@ export function createDemoClient(): GatewayClient {
       },
       tool_call_telemetry: { ...toolSummary },
       context_capture: { ...contextSummary },
+      usage: usageReport().summary,
       active_tasks: active,
-      recent_tasks: done.slice(0, 100),
+      recent_tasks: done.slice(0, 100).map((task) => ({ ...task, cost_usd: taskCost(task) })),
       available_models: MODELS,
     };
   };
@@ -1534,6 +1696,27 @@ export function createDemoClient(): GatewayClient {
       contextRecords = [];
       refreshContextSummary();
       return wait({ ...contextSummary });
+    },
+
+    usage(): Promise<UsageResponse> {
+      return wait(usageReport());
+    },
+
+    resetUsage(): Promise<UsageSummary> {
+      usageSince = Date.now();
+      usageResets += 1;
+      return wait(usageReport().summary);
+    },
+
+    pricing(): Promise<PricingResponse> {
+      return wait(pricingReport());
+    },
+
+    setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse> {
+      if (price) customPrices.set(key, price);
+      else customPrices.delete(key);
+      priceRevision += 1;
+      return wait(pricingReport());
     },
 
     probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string> {

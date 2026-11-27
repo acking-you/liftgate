@@ -12,28 +12,32 @@ import { useGateway } from "@/hooks/gateway";
 import { useResource } from "@/hooks/useResource";
 import { groupSegments, rankSegments, segmentsFromMetrics } from "@/lib/context";
 import { formatBpsPct, formatBytes, formatDateTime, formatDurationMs, formatNumber } from "@/lib/format";
-import { REASON_LABEL, REASON_TONE, causeLabel, explainLowCache, routingLabel } from "@/lib/lowcache";
+import { useI18n } from "@/lib/i18n";
+import { REASON_TONE, causeLabel, explainLowCache, reasonLabel, routingLabel } from "@/lib/lowcache";
 import type { LowCacheHitRecord, LowCacheRequestMetrics } from "@/types/telemetry";
 
 type TabId = "why" | "request" | "messages" | "tools";
 
 export function ReasonPills({ record }: { record: LowCacheHitRecord }): React.JSX.Element {
+  useI18n();
   const cause = causeLabel(record.diagnostic_cause);
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
-      <Pill tone={REASON_TONE[record.reason]}>{REASON_LABEL[record.reason]}</Pill>
+      <Pill tone={REASON_TONE[record.reason]}>{reasonLabel(record.reason)}</Pill>
       {cause !== null && <Tag>{cause}</Tag>}
     </span>
   );
 }
 
 function Composition({ metrics }: { metrics: LowCacheRequestMetrics }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.cache.sheet;
   const segments = segmentsFromMetrics(metrics);
   const ranked = rankSegments(segments);
   return (
     <section>
-      <h3 className="lg-section-title">会话内容构成 · {formatBytes(metrics.total_conversation_bytes)}</h3>
-      <SegmentedBar parts={groupSegments(segments)} format={formatBytes} ariaLabel="会话内容按类别的体积构成" />
+      <h3 className="lg-section-title">{t.composition(formatBytes(metrics.total_conversation_bytes))}</h3>
+      <SegmentedBar parts={groupSegments(segments)} format={formatBytes} ariaLabel={t.compositionAria} />
       {ranked.length > 0 && (
         <div className="mt-3">
           <RankedBars
@@ -49,31 +53,32 @@ function Composition({ metrics }: { metrics: LowCacheRequestMetrics }): React.JS
         </div>
       )}
       <p className="lg-hint m-0 mt-2">
-        另有客户端工具声明 {metrics.client_tool_count} 个 · {formatBytes(metrics.client_tools_schema_bytes)}
-        （不直接发往上游，经虚拟化后挂载）。
+        {t.clientTools(metrics.client_tool_count, formatBytes(metrics.client_tools_schema_bytes))}
       </p>
     </section>
   );
 }
 
 function Why({ record }: { record: LowCacheHitRecord }): React.JSX.Element {
+  const { m: messages } = useI18n();
+  const t = messages.cache.sheet;
   const m = record.request_metrics;
   return (
     <>
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <Figure
-          label="缓存读 / 总输入"
+          label={t.readOfTotal}
           value={`${formatNumber(record.cached_read_tokens)} / ${formatNumber(record.total_prompt_tokens)}`}
           sub="tokens"
         />
-        <Figure label="未命中输入" value={formatNumber(record.input_uncached_tokens)} sub="tokens" />
+        <Figure label={t.uncached} value={formatNumber(record.input_uncached_tokens)} sub="tokens" />
         <Figure
-          label="输出 / 思考"
+          label={t.outputThought}
           value={`${formatNumber(record.output_tokens)} / ${formatNumber(m?.thought_tokens ?? 0)}`}
           sub="tokens"
         />
         <Figure
-          label="耗时"
+          label={t.elapsed}
           value={formatDurationMs(record.elapsed_ms)}
           sub={`TTFT ${formatDurationMs(record.ttft_ms)}`}
         />
@@ -82,43 +87,42 @@ function Why({ record }: { record: LowCacheHitRecord }): React.JSX.Element {
       {m ? (
         <>
           <section>
-            <h3 className="lg-section-title">路由与连续性</h3>
+            <h3 className="lg-section-title">{t.routing}</h3>
             <KV
               items={[
-                ["路由方式", routingLabel(m.routing_strategy)],
-                ["会话轮次", `第 ${m.session_turn_index} 轮 · ${record.session_reused ? "热复用" : "冷启动"}`],
+                [t.routingMode, routingLabel(m.routing_strategy)],
+                [t.sessionTurn, t.turnOf(m.session_turn_index, record.session_reused)],
+                [t.idleBefore, m.session_idle_ms != null ? formatDurationMs(m.session_idle_ms) : t.newSession],
+                [t.previousContext, `${formatNumber(m.previous_session_context_tokens)} tokens`],
                 [
-                  "检出前空闲",
-                  m.session_idle_ms != null ? formatDurationMs(m.session_idle_ms) : "—（新建会话）",
-                ],
-                ["上轮上下文", `${formatNumber(m.previous_session_context_tokens)} tokens`],
-                [
-                  "模型切换",
-                  m.model_switched ? `是 · ${m.previous_model ?? "?"} → ${record.resolved_model}` : "否",
+                  t.modelSwitch,
+                  m.model_switched ? t.yes(`${m.previous_model ?? "?"} → ${record.resolved_model}`) : t.no,
                 ],
                 [
-                  "热轮工具变更",
-                  m.tools_updated_on_warm_turn ? `是 · ${formatBytes(m.tools_delta_xml_bytes)}` : "否",
+                  t.warmToolChange,
+                  m.tools_updated_on_warm_turn ? t.yes(formatBytes(m.tools_delta_xml_bytes)) : t.no,
                 ],
                 [
-                  "本轮增量",
-                  `${m.delta_message_count} / ${m.total_message_count} 条 · ${formatBytes(m.delta_messages_bytes)}`,
+                  t.delta,
+                  t.deltaValue(m.delta_message_count, m.total_message_count, formatBytes(m.delta_messages_bytes)),
                 ],
                 [
-                  "实际发送",
-                  `${formatBytes(m.outbound_acp_prompt_bytes)} · ${m.outbound_acp_text_blocks} 文本块${
-                    m.outbound_acp_image_blocks > 0 ? ` · ${m.outbound_acp_image_blocks} 图像块` : ""
-                  }`,
+                  t.sent,
+                  t.sentValue(
+                    formatBytes(m.outbound_acp_prompt_bytes),
+                    m.outbound_acp_text_blocks,
+                    m.outbound_acp_image_blocks,
+                  ),
                 ],
-                ["会话", record.session_id ?? "—"],
+                [t.session, record.session_id ?? "—"],
                 ...(m.reasoning_effort
-                  ? ([["推理强度", m.reasoning_effort]] as Array<readonly [string, React.ReactNode]>)
+                  ? ([[t.effort, m.reasoning_effort]] as Array<readonly [string, React.ReactNode]>)
                   : []),
               ]}
             />
           </section>
           <Composition metrics={m} />
-          <Disclosure head={<span className="font-medium text-fg-2">会话指纹</span>}>
+          <Disclosure head={<span className="font-medium text-fg-2">{t.fingerprint}</span>}>
             <KV
               items={[
                 ...(m.previous_response_id
@@ -127,9 +131,9 @@ function Why({ record }: { record: LowCacheHitRecord }): React.JSX.Element {
                     >)
                   : []),
                 ...(m.prefix_hash_hex
-                  ? ([["前缀哈希", m.prefix_hash_hex]] as Array<readonly [string, React.ReactNode]>)
+                  ? ([[t.prefixHash, m.prefix_hash_hex]] as Array<readonly [string, React.ReactNode]>)
                   : []),
-                ["本轮状态哈希", m.base_state_hash_hex],
+                [t.stateHash, m.base_state_hash_hex],
               ]}
             />
           </Disclosure>
@@ -137,12 +141,12 @@ function Why({ record }: { record: LowCacheHitRecord }): React.JSX.Element {
       ) : (
         <KV
           items={[
-            ["模型", record.resolved_model],
-            ["会话", `${record.session_id ?? "—"} · ${record.session_reused ? "复用" : "新建"}`],
+            [t.model, record.resolved_model],
+            [t.session, t.sessionValue(record.session_id ?? "—", record.session_reused)],
           ]}
         />
       )}
-      {record.prompt_preview && <ProseBlock text={record.prompt_preview} title="末条用户输入摘要" maxHeight={200} />}
+      {record.prompt_preview && <ProseBlock text={record.prompt_preview} title={t.lastPrompt} maxHeight={200} />}
     </>
   );
 }
@@ -158,6 +162,8 @@ export function LowCacheSheet({
   onClose: () => void;
 }): React.JSX.Element {
   const { client } = useGateway();
+  const { m } = useI18n();
+  const t = m.cache.sheet;
   const [tab, setTab] = useState<TabId>(replayTools ? "messages" : "why");
   const taskId = record?.task_id ?? null;
   const detail = useResource(
@@ -209,23 +215,23 @@ export function LowCacheSheet({
           <div className="flex items-end justify-between gap-3">
             <div className="min-w-0 flex-1">
               <Tabs<TabId>
-                ariaLabel="低命中记录详情"
+                ariaLabel={t.tabsAria}
                 value={tab}
                 onChange={setTab}
                 tabs={[
-                  { value: "why", label: "归因与构成" },
-                  { value: "request", label: "发往 ACP 的请求" },
-                  { value: "messages", label: "消息", count: messageCount },
-                  { value: "tools", label: "工具声明", count: toolCount },
+                  { value: "why", label: t.tabWhy },
+                  { value: "request", label: t.tabRequest },
+                  { value: "messages", label: t.tabMessages, count: messageCount },
+                  { value: "tools", label: t.tabTools, count: toolCount },
                 ]}
               />
             </div>
-            <CopyButton value={() => JSON.stringify(detail.data ?? record, null, 2)} label="复制 JSON" />
+            <CopyButton value={() => JSON.stringify(detail.data ?? record, null, 2)} label={t.copyJson} />
           </div>
 
           {tab === "why" && <Why record={record} />}
 
-          {tab !== "why" && detail.status === "loading" && <Loading label="读取保存的请求载荷…" />}
+          {tab !== "why" && detail.status === "loading" && <Loading label={t.loading} />}
 
           {tab === "request" && detail.status !== "loading" && (
             <>
@@ -239,12 +245,12 @@ export function LowCacheSheet({
               {(payload?.assistant_output_preview || capture?.output_preview) && (
                 <ProseBlock
                   text={payload?.assistant_output_preview || capture?.output_preview || ""}
-                  title="模型输出摘要"
+                  title={t.outputPreview}
                   maxHeight={240}
                 />
               )}
               {payload?.payload_truncated && (
-                <p className="lg-hint m-0">载荷超过保存上限，已被截断。</p>
+                <p className="lg-hint m-0">{t.truncated}</p>
               )}
             </>
           )}
@@ -259,7 +265,7 @@ export function LowCacheSheet({
               />
             ) : capture && capture.message_digests.length > 0 ? (
               <div className="flex flex-col gap-3">
-                <p className="lg-hint m-0">完整消息未保存，以下是每条消息的摘录。</p>
+                <p className="lg-hint m-0">{t.digestsOnly}</p>
                 {capture.message_digests.map((msg) => (
                   <article className="lg-msg" key={msg.index}>
                     <header className="lg-msg-head">
@@ -267,7 +273,7 @@ export function LowCacheSheet({
                         #{msg.index} {msg.role}
                       </span>
                       <Pill tone={msg.in_delta ? "accent" : "neutral"}>
-                        {msg.in_delta ? "本轮增量" : "驻留前缀"}
+                        {msg.in_delta ? t.inDelta : t.resident}
                       </Pill>
                       <span className="lg-num text-[11.5px]">
                         {msg.part_kinds.join(" · ")} · {formatBytes(msg.total_bytes)}
@@ -278,15 +284,15 @@ export function LowCacheSheet({
                 ))}
               </div>
             ) : (
-              <p className="lg-hint m-0">这条记录没有保存消息序列。</p>
+              <p className="lg-hint m-0">{t.noMessages}</p>
             ))}
 
           {tab === "tools" && detail.status !== "loading" && (
             <>
               {capture && (
                 <div className="flex flex-wrap gap-1.5">
-                  <Tag>原生联网搜索 {capture.enable_native_web_search ? "开" : "关"}</Tag>
-                  <Tag>原生网页抓取 {capture.enable_native_web_fetch ? "开" : "关"}</Tag>
+                  <Tag>{t.webSearch(capture.enable_native_web_search)}</Tag>
+                  <Tag>{t.webFetch(capture.enable_native_web_fetch)}</Tag>
                 </div>
               )}
               <ClientToolsView

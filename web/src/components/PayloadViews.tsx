@@ -5,6 +5,7 @@ import { CodeBlock, ProseBlock } from "@/components/CodeBlock";
 import { RankedBars } from "@/components/charts";
 import { Disclosure, SearchInput, Tag } from "@/components/ui";
 import { formatBytes } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { prettyJson } from "@/lib/toolcalls";
 import type { CapturedAcpPromptBlock, CapturedToolSpec } from "@/types/telemetry";
 
@@ -24,17 +25,19 @@ export function AcpRequestView({
   promptExcerpt?: string | null;
   excerptOnly?: boolean;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.context.payload;
   const hasPrompt = (promptBlocks?.length ?? 0) > 0 || Boolean(promptExcerpt);
   return (
     <div className="flex min-w-0 flex-col gap-3">
       {excerptOnly && (
-        <p className="lg-hint m-0">完整载荷文件已不在磁盘上，以下是随记录保存的截断摘录。</p>
+        <p className="lg-hint m-0">{t.excerptOnly}</p>
       )}
       {systemAppend && (
         <Disclosure
           head={
             <>
-              <span className="flex-none font-medium text-fg-2">新会话桥接指令</span>
+              <span className="flex-none font-medium text-fg-2">{t.bridge}</span>
               <span className="lg-num lg-clip min-w-0 text-[11.5px] text-fg-4">
                 _meta.antigravity.systemPrompt.append
               </span>
@@ -49,7 +52,7 @@ export function AcpRequestView({
         <Disclosure
           head={
             <>
-              <span className="flex-none font-medium text-fg-2">增量工具同步</span>
+              <span className="flex-none font-medium text-fg-2">{t.toolsDelta}</span>
               <span className="lg-num lg-clip min-w-0 text-[11.5px] text-fg-4">&lt;client_tools_update&gt;</span>
             </>
           }
@@ -66,7 +69,7 @@ export function AcpRequestView({
                 key={idx}
                 code={block.text}
                 language="xml"
-                title={`session/prompt · 文本块 ${idx + 1}`}
+                title={t.textBlock(idx + 1)}
                 wrap
                 maxHeight={520}
               />
@@ -74,16 +77,14 @@ export function AcpRequestView({
               <div key={idx} className="flex items-center gap-2 rounded-lg border border-line p-3 text-[12.5px] text-fg-3">
                 <ImageIcon className="h-4 w-4" />
                 <span className="lg-num">
-                  session/prompt · 图像块 {idx + 1} · {block.mime_type} · base64 {formatBytes(block.base64_bytes)}
+                  {t.imageBlock(idx + 1, block.mime_type, formatBytes(block.base64_bytes))}
                 </span>
               </div>
             ),
           )
-        : promptExcerpt && <ProseBlock text={promptExcerpt} title="session/prompt 摘录" />}
+        : promptExcerpt && <ProseBlock text={promptExcerpt} title={t.excerpt} />}
       {!systemAppend && !toolsDelta && !hasPrompt && (
-        <p className="lg-hint m-0">
-          这条记录产生时没有保存请求内容。开启「保存完整请求内容」后，之后的轮次会带上实际发往 agy acp 的载荷。
-        </p>
+        <p className="lg-hint m-0">{t.notSaved}</p>
       )}
     </div>
   );
@@ -98,6 +99,8 @@ export function ClientToolsView({
   /** Names only, when the full payload is unavailable. */
   fallbackNames?: string[];
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.context.payload;
   const [query, setQuery] = useState("");
   const sorted = useMemo(() => [...tools].sort((a, b) => b.schema_bytes - a.schema_bytes), [tools]);
   const total = useMemo(() => tools.reduce((sum, t) => sum + t.schema_bytes, 0), [tools]);
@@ -108,7 +111,7 @@ export function ClientToolsView({
     if (fallbackNames && fallbackNames.length > 0) {
       return (
         <div className="flex flex-col gap-2">
-          <p className="lg-hint m-0">完整 Schema 未保存，仅有工具名（{fallbackNames.length} 个）。</p>
+          <p className="lg-hint m-0">{t.namesOnly(fallbackNames.length)}</p>
           <div className="flex flex-wrap gap-1.5">
             {fallbackNames.map((name) => (
               <Tag key={name}>{name}</Tag>
@@ -117,18 +120,17 @@ export function ClientToolsView({
         </div>
       );
     }
-    return <p className="lg-hint m-0">这一轮没有声明客户端工具。</p>;
+    return <p className="lg-hint m-0">{t.noTools}</p>;
   }
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="lg-hint m-0">
-          {tools.length} 个工具，声明合计 <span className="lg-num text-fg-2">{formatBytes(total)}</span>
-          。体积最大的排在最前。
+          {t.toolsSummary(tools.length, <span className="lg-num text-fg-2">{formatBytes(total)}</span>)}
         </p>
         {tools.length > 10 && (
-          <SearchInput value={query} onChange={setQuery} placeholder="按工具名筛选" className="w-52" />
+          <SearchInput value={query} onChange={setQuery} placeholder={t.filter} className="w-52" />
         )}
       </div>
       {q === "" && sorted.length > 3 && (

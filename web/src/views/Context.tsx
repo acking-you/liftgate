@@ -26,6 +26,7 @@ import { useGateway } from "@/hooks/gateway";
 import { useResource, useRevisionResource } from "@/hooks/useResource";
 import { errorMessage } from "@/lib/api";
 import { formatBytes, formatDateTime, formatNumber, formatSmartTime, shortId } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import type { ContextCaptureRecord, ContextCaptureSummary } from "@/types/telemetry";
 
 const MB = 1024 * 1024;
@@ -47,6 +48,8 @@ function ContextSheet({
   onClose: () => void;
 }): React.JSX.Element {
   const { client } = useGateway();
+  const { m } = useI18n();
+  const t = m.context.sheet;
   const [tab, setTab] = useState<TabId>("timeline");
   const taskId = record?.task_id ?? null;
   const detail = useResource(
@@ -76,8 +79,12 @@ function ContextSheet({
       description={
         record && (
           <span className="lg-num">
-            {record.resolved_model} · 会话 {shortId(record.session_id)} 第 {record.session_turn_index} 轮 ·{" "}
-            {formatDateTime(record.recorded_at_unix_ms)}
+            {t.description(
+              record.resolved_model,
+              shortId(record.session_id),
+              record.session_turn_index,
+              formatDateTime(record.recorded_at_unix_ms),
+            )}
           </span>
         )
       }
@@ -86,48 +93,46 @@ function ContextSheet({
         <>
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
             <Figure
-              label="缓存命中率"
+              label={t.hitRate}
               value={<HitRate bps={record.cache_hit_rate_bps} thresholdBps={thresholdBps} digits={2} />}
             />
             <Figure
-              label="输入 / 输出"
+              label={t.io}
               value={`${formatNumber(record.total_prompt_tokens)} / ${formatNumber(record.output_tokens)}`}
               sub="tokens"
             />
             <Figure
-              label="消息"
-              value={`${record.message_count} 条`}
-              sub={`其中本轮增量 ${record.delta_message_count} 条`}
+              label={t.messages}
+              value={t.messageCount(record.message_count)}
+              sub={t.deltaCount(record.delta_message_count)}
             />
-            <Figure label="载荷" value={formatBytes(record.payload_bytes)} />
+            <Figure label={t.payload} value={formatBytes(record.payload_bytes)} />
           </div>
 
           <div className="flex items-end justify-between gap-3">
             <div className="min-w-0 flex-1">
               <Tabs<TabId>
-                ariaLabel="完整上下文"
+                ariaLabel={t.tabsAria}
                 value={tab}
                 onChange={setTab}
                 tabs={[
-                  { value: "timeline", label: "时间线", count: payload?.messages.length ?? record.message_count },
-                  { value: "request", label: "发往 ACP 的请求" },
-                  { value: "output", label: "模型输出" },
-                  { value: "tools", label: "工具声明", count: payload?.client_tools.length },
+                  { value: "timeline", label: t.tabTimeline, count: payload?.messages.length ?? record.message_count },
+                  { value: "request", label: t.tabRequest },
+                  { value: "output", label: t.tabOutput },
+                  { value: "tools", label: t.tabTools, count: payload?.client_tools.length },
                 ]}
               />
             </div>
-            {payload && <CopyButton value={() => JSON.stringify(detail.data, null, 2)} label="复制 JSON" />}
+            {payload && <CopyButton value={() => JSON.stringify(detail.data, null, 2)} label={t.copyJson} />}
           </div>
 
-          {detail.status === "loading" && <Loading label="读取完整上下文…" />}
+          {detail.status === "loading" && <Loading label={t.loading} />}
           {detail.status === "error" && (
             <Note tone="err" icon={<CircleAlert />}>
-              读取失败：{detail.error}
+              {t.readFailed(detail.error ?? "")}
             </Note>
           )}
-          {detail.status === "unsupported" && (
-            <Note icon={<CircleAlert />}>这份载荷已被配额回收，只剩下列表里的摘要。</Note>
-          )}
+          {detail.status === "unsupported" && <Note icon={<CircleAlert />}>{t.reclaimed}</Note>}
 
           {payload && tab === "timeline" && <MessageTimeline key={record.task_id} messages={payload.messages} />}
           {payload && tab === "request" && (
@@ -142,7 +147,7 @@ function ContextSheet({
               {payload.assistant_reasoning && (
                 <ProseBlock
                   text={payload.assistant_reasoning}
-                  title={payload.assistant_reasoning_truncated ? "思考 · 超出上限的部分未保存" : "思考"}
+                  title={payload.assistant_reasoning_truncated ? t.reasoningCut : t.reasoning}
                   maxHeight={360}
                 />
               )}
@@ -150,17 +155,17 @@ function ContextSheet({
                 text={payload.assistant_output ?? payload.assistant_output_preview}
                 title={
                   payload.assistant_output == null
-                    ? "输出摘要"
+                    ? t.outputPreview
                     : payload.assistant_output_truncated
-                      ? "输出 · 超出上限的部分未保存"
-                      : "输出"
+                      ? t.outputCut
+                      : t.output
                 }
                 maxHeight={520}
               />
             </div>
           )}
           {payload && tab === "tools" && <ClientToolsView tools={payload.client_tools} />}
-          {payload?.payload_truncated && <p className="lg-hint m-0">载荷超过保存上限，已被截断。</p>}
+          {payload?.payload_truncated && <p className="lg-hint m-0">{t.truncated}</p>}
         </>
       )}
     </Sheet>
@@ -177,6 +182,8 @@ function ControlCard({
   onChanged: () => void;
 }): React.JSX.Element {
   const { client, refresh } = useGateway();
+  const { m } = useI18n();
+  const t = m.context.control;
   const [maxRecords, setMaxRecords] = useState(String(summary.max_records));
   const [maxMb, setMaxMb] = useState(String(Math.round(summary.max_total_bytes / MB)));
   const [dirty, setDirty] = useState(false);
@@ -196,7 +203,7 @@ function ControlCard({
       await refresh();
       onChanged();
     } catch (err) {
-      onBanner({ tone: "err", text: `操作失败：${errorMessage(err)}` });
+      onBanner({ tone: "err", text: t.failed(errorMessage(err)) });
     } finally {
       setBusy(false);
     }
@@ -207,43 +214,43 @@ function ControlCard({
     const records = Number.parseInt(maxRecords.trim(), 10);
     const mb = Number.parseInt(maxMb.trim(), 10);
     if (!Number.isFinite(records) || records < 1 || records > 10_000) {
-      onBanner({ tone: "err", text: "保留条数需在 1 到 10,000 之间。" });
+      onBanner({ tone: "err", text: t.recordsRange });
       return;
     }
     if (!Number.isFinite(mb) || mb < 16 || mb > 65_536) {
-      onBanner({ tone: "err", text: "磁盘上限需在 16 到 65,536 MB 之间。" });
+      onBanner({ tone: "err", text: t.diskRange });
       return;
     }
     void apply(
       () => client.updateContextCapture({ max_records: records, max_total_mib: mb }),
-      `配额已更新：最多 ${formatNumber(records)} 条、${formatNumber(mb)} MB，超出后回收最旧的载荷。`,
+      t.quotaSaved(formatNumber(records), formatNumber(mb)),
     ).then(() => setDirty(false));
   };
 
   return (
-    <Card title="完整上下文捕获">
+    <Card title={t.title}>
       <div className="grid grid-cols-1 gap-x-10 gap-y-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <div className="flex flex-col gap-4">
           <SwitchRow
-            title={summary.enabled ? "正在捕获每一轮" : "未在捕获"}
-            hint="开启后每一轮都落盘完整消息历史、思考、发往 ACP 的 Prompt 与输出。长上下文一轮可达数 MB，排查问题时再打开。"
+            title={summary.enabled ? t.on : t.off}
+            hint={t.hint}
             checked={summary.enabled}
             disabled={busy}
             onChange={(next) =>
               void apply(
                 () => client.updateContextCapture({ enabled: next }),
-                next ? "已开启，之后的每一轮都会保存完整上下文。" : "已关闭，不再保存新的上下文；已有的载荷保留。",
+                next ? t.enabled : t.disabled,
               )
             }
           />
           {summary.capture_dir && (
             <p className="lg-hint m-0">
-              保存位置 <span className="lg-num text-fg-2">{summary.capture_dir}</span>
+              {t.location} <span className="lg-num text-fg-2">{summary.capture_dir}</span>
             </p>
           )}
           {(summary.skipped_records ?? 0) > 0 && (
             <p className="lg-hint m-0 text-warn">
-              磁盘写入跟不上，已跳过 <span className="lg-num">{summary.skipped_records}</span> 轮。
+              {t.skipped(<span className="lg-num">{summary.skipped_records}</span>)}
             </p>
           )}
         </div>
@@ -252,16 +259,19 @@ function ControlCard({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <div className="mb-1.5 flex items-baseline justify-between text-[12px] text-fg-3">
-                <span>条数</span>
+                <span>{t.records}</span>
                 <span className="lg-num">
                   {formatNumber(summary.stored_records)} / {formatNumber(summary.max_records)}
                 </span>
               </div>
-              <Meter ratio={summary.max_records > 0 ? summary.stored_records / summary.max_records : 0} label="已用条数配额" />
+              <Meter
+                ratio={summary.max_records > 0 ? summary.stored_records / summary.max_records : 0}
+                label={t.recordsQuota}
+              />
             </div>
             <div>
               <div className="mb-1.5 flex items-baseline justify-between text-[12px] text-fg-3">
-                <span>磁盘</span>
+                <span>{t.disk}</span>
                 <span className="lg-num">
                   {formatBytes(summary.stored_bytes)} / {formatBytes(summary.max_total_bytes)}
                 </span>
@@ -269,10 +279,10 @@ function ControlCard({
               <Meter
                 ratio={summary.max_total_bytes > 0 ? summary.stored_bytes / summary.max_total_bytes : 0}
                 tone={summary.stored_bytes / Math.max(1, summary.max_total_bytes) > 0.9 ? "warn" : undefined}
-                label="已用磁盘配额"
+                label={t.diskQuota}
               />
             </div>
-            <Field label="最多保留条数" htmlFor="ctx-max-records">
+            <Field label={t.maxRecords} htmlFor="ctx-max-records">
               <input
                 id="ctx-max-records"
                 className="lg-input lg-num"
@@ -285,7 +295,7 @@ function ControlCard({
                 }}
               />
             </Field>
-            <Field label="磁盘上限 MB" htmlFor="ctx-max-mb">
+            <Field label={t.maxMb} htmlFor="ctx-max-mb">
               <input
                 id="ctx-max-mb"
                 className="lg-input lg-num"
@@ -301,14 +311,14 @@ function ControlCard({
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <Button type="submit" variant="primary" disabled={busy || !dirty}>
-              保存配额
+              {t.saveQuota}
             </Button>
             <ConfirmButton
-              label="清空已保存的上下文"
-              confirmLabel={`确认删除 ${formatNumber(summary.stored_records)} 份载荷`}
+              label={t.clear}
+              confirmLabel={t.clearConfirm(formatNumber(summary.stored_records))}
               icon={<Trash2 />}
               disabled={busy || summary.stored_records === 0}
-              onConfirm={() => void apply(() => client.clearContextCaptures(), "已清空全部保存的上下文载荷。")}
+              onConfirm={() => void apply(() => client.clearContextCaptures(), t.cleared)}
             />
           </div>
         </form>
@@ -319,6 +329,8 @@ function ControlCard({
 
 export function ContextView(): React.JSX.Element {
   const { client, snapshot, baseUrl } = useGateway();
+  const { m } = useI18n();
+  const t = m.context.view;
   const live = snapshot?.context_capture;
   const advertised = snapshot === null ? null : live !== undefined;
   const captures = useRevisionResource(
@@ -335,16 +347,15 @@ export function ContextView(): React.JSX.Element {
   if (advertised === null) {
     return (
       <Card>
-        <Loading label="等待网关上报状态…" />
+        <Loading label={t.waiting} />
       </Card>
     );
   }
   if (advertised === false || (captures.status === "unsupported" && !live)) {
     return (
       <Card>
-        <Unsupported feature="完整上下文捕获" endpoint="GET /api/telemetry/context-captures">
-          {" "}
-          低命中轮次的完整载荷可在「缓存」页查看。
+        <Unsupported feature={t.unsupported} endpoint="GET /api/telemetry/context-captures">
+          {t.unsupportedHint}
         </Unsupported>
       </Card>
     );
@@ -362,46 +373,42 @@ export function ContextView(): React.JSX.Element {
         <ControlCard summary={summary} onBanner={setBanner} onChanged={captures.reload} />
       ) : (
         <Card>
-          <Loading label="读取捕获状态…" />
+          <Loading label={t.loadingState} />
         </Card>
       )}
 
       <Card
         flush
-        title={`已保存的上下文 · ${records.length}`}
-        sub="一行一轮，点开查看时间线。"
+        title={t.saved(records.length)}
+        sub={t.savedSub}
       >
         {captures.status === "loading" ? (
           <Loading />
         ) : captures.status === "error" && captures.data === null ? (
           <div className="px-4 pb-4">
             <Note tone="err" icon={<CircleAlert />}>
-              读取失败：{captures.error}
+              {t.readFailed(captures.error ?? "")}
             </Note>
           </div>
         ) : records.length === 0 ? (
           <EmptyState
             icon={<ScrollText />}
-            title={summary?.enabled ? "还没有捕获到任何一轮" : "捕获处于关闭状态"}
-            hint={
-              summary?.enabled
-                ? "下一轮请求完成后，它的完整上下文会出现在这里。"
-                : "打开上面的开关后，之后每一轮请求的完整上下文都会保存下来。"
-            }
+            title={summary?.enabled ? t.noneYet : t.off}
+            hint={summary?.enabled ? t.noneYetHint : t.offHint}
           />
         ) : (
           <div className="lg-table-wrap">
             <table className="lg-table">
               <thead>
                 <tr>
-                  <th>时间</th>
-                  <th>Harness · 会话</th>
-                  <th className="hide-sm">模型</th>
-                  <th className="num hide-sm">轮次</th>
-                  <th className="num">命中率</th>
-                  <th className="num hide-sm">输入 / 输出</th>
-                  <th className="num hide-sm">消息（增量）</th>
-                  <th className="num">载荷</th>
+                  <th>{t.col.time}</th>
+                  <th>{t.col.harness}</th>
+                  <th className="hide-sm">{t.col.model}</th>
+                  <th className="num hide-sm">{t.col.turn}</th>
+                  <th className="num">{t.col.hitRate}</th>
+                  <th className="num hide-sm">{t.col.io}</th>
+                  <th className="num hide-sm">{t.col.messages}</th>
+                  <th className="num">{t.col.payload}</th>
                   <th className="hide-sm">Prompt</th>
                 </tr>
               </thead>
@@ -437,7 +444,7 @@ export function ContextView(): React.JSX.Element {
                     </td>
                     <td className="num hide-sm whitespace-nowrap">
                       {rec.message_count}
-                      <span className="text-fg-4">（{rec.delta_message_count}）</span>
+                      <span className="text-fg-4">{t.delta(rec.delta_message_count)}</span>
                     </td>
                     <td className="num whitespace-nowrap">{formatBytes(rec.payload_bytes)}</td>
                     <td className="hide-sm max-w-[260px]">

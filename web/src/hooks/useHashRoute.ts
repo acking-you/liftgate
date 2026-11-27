@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export const VIEW_IDS = [
   "overview",
+  "usage",
   "tools",
   "catalog",
   "context",

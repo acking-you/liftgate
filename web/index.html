@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Liftgate 控制台</title>
+    <title>Liftgate</title>
     <meta
       name="description"
-      content="Liftgate 网关实时观测控制台：请求与缓存命中、工具调用 I/O、工具目录与上下文分布、ACP 会话池。"
+      content="Liftgate gateway console: requests, cache hits, usage and cost, tool call I/O, tool catalogs, and the ACP session pool."
     />
     <meta name="theme-color" content="#f5f6f8" />
     <link
@@ -39,6 +39,17 @@
       }
     </style>
     <script>
+      (function () {
+        // Language: a stored choice, else the system language (same rule as src/lib/i18n.tsx).
+        try {
+          var lang = localStorage.getItem("lg_locale");
+          if (lang !== "zh" && lang !== "en") {
+            var preferred = (navigator.languages && navigator.languages[0]) || navigator.language || "en";
+            lang = /^zh\b/i.test(preferred) ? "zh" : "en";
+          }
+          document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+        } catch (_) {}
+      })();
       (function () {
         var stored = null;
         try {

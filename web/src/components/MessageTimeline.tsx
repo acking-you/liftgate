@@ -6,13 +6,14 @@ import { SegmentedBar } from "@/components/charts";
 import { ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
 import { Button, Disclosure, Pill, Segmented } from "@/components/ui";
 import {
-  PART_KIND_LABEL,
+  partKindLabel,
   messagePartComposition,
   partBytes,
   partKindColor,
   partKindOf,
 } from "@/lib/context";
 import { formatBytes } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { classifyTool, outputReportsFailure } from "@/lib/toolcalls";
 import type { CapturedFullMessage, CapturedFullPart } from "@/types/telemetry";
 
@@ -46,6 +47,8 @@ function PartView({
   /** call_id → tool name, so a result can say which call it answers. */
   toolNames: ReadonlyMap<string, string>;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.context.timeline;
   const kind = partKindOf(part);
   const toolName =
     part.kind === "tool_call"
@@ -63,9 +66,9 @@ function PartView({
       ) : (
         <span className="lg-swatch" style={{ background: partKindColor(kind) }} aria-hidden="true" />
       )}
-      <span className="flex-none font-medium text-fg-2">{PART_KIND_LABEL[kind]}</span>
+      <span className="flex-none font-medium text-fg-2">{partKindLabel(kind)}</span>
       {toolName !== null && <span className="lg-num flex-none text-fg">{toolName}</span>}
-      {failed && <Pill tone="err">报错</Pill>}
+      {failed && <Pill tone="err">{t.error}</Pill>}
       <span className="lg-clip lg-num min-w-0 flex-1 text-[11.5px] text-fg-4">{excerptOf(part)}</span>
     </>
   );
@@ -76,19 +79,19 @@ function PartView({
       body = (
         <ProseBlock
           text={part.text}
-          title={part.is_developer_instructions ? "<developer_instructions>" : "文本"}
+          title={part.is_developer_instructions ? "<developer_instructions>" : t.text}
         />
       );
       break;
     case "reasoning":
-      body = <ProseBlock text={part.text} title="思考内容" />;
+      body = <ProseBlock text={part.text} title={t.reasoning} />;
       break;
     case "tool_call":
       body = (
         <ToolInputView
           toolName={part.name}
           raw={part.arguments}
-          label={part.is_custom ? "自由格式参数" : "参数"}
+          label={part.is_custom ? t.customArgs : t.args}
           maxHeight={360}
         />
       );
@@ -146,7 +149,9 @@ export function MessageTimeline({
   /** Scope to open on; defaults to this turn's delta for long histories. */
   initialScope?: TimelineScope;
 }): React.JSX.Element {
-  const deltaCount = useMemo(() => messages.filter((m) => m.in_delta).length, [messages]);
+  const { m } = useI18n();
+  const t = m.context.timeline;
+  const deltaCount = useMemo(() => messages.filter((msg) => msg.in_delta).length, [messages]);
   const [scope, setScope] = useState<Scope>(
     initialScope ?? (deltaCount > 0 && messages.length > PAGE ? "delta" : "all"),
   );
@@ -162,13 +167,14 @@ export function MessageTimeline({
     return names;
   }, [messages]);
 
-  const composition = useMemo(() => messagePartComposition(messages), [messages]);
+  // Labels come from the catalog, so a language switch recomputes the composition too.
+  const composition = useMemo(() => messagePartComposition(messages), [messages, m]);
 
   const scoped = useMemo(() => {
-    if (scope === "delta") return messages.filter((m) => m.in_delta);
+    if (scope === "delta") return messages.filter((entry) => entry.in_delta);
     if (scope === "tools") {
-      return messages.filter((m) =>
-        m.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
+      return messages.filter((entry) =>
+        entry.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
       );
     }
     return messages;
@@ -177,13 +183,13 @@ export function MessageTimeline({
   // The newest messages matter most, so paging reveals older ones upward.
   const hidden = Math.max(0, scoped.length - limit);
   const shown = hidden > 0 ? scoped.slice(hidden) : scoped;
-  const firstDeltaIndex = shown.find((m) => m.in_delta)?.index;
-  const toolMessages = messages.filter((m) =>
-    m.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
+  const firstDeltaIndex = shown.find((entry) => entry.in_delta)?.index;
+  const toolMessages = messages.filter((entry) =>
+    entry.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
   ).length;
 
   if (messages.length === 0) {
-    return <p className="lg-hint m-0">这一轮没有保存消息序列。</p>;
+    return <p className="lg-hint m-0">{t.empty}</p>;
   }
 
   return (
@@ -191,36 +197,36 @@ export function MessageTimeline({
       <SegmentedBar
         parts={composition}
         format={formatBytes}
-        ariaLabel="消息内容按类型的体积构成"
+        ariaLabel={t.compositionAria}
       />
       <div className="flex flex-wrap items-center justify-between gap-2">
         <Segmented<Scope>
-          ariaLabel="消息范围"
+          ariaLabel={t.scope}
           value={scope}
           onChange={(next) => {
             setScope(next);
             setLimit(PAGE);
           }}
           options={[
-            { value: "all", label: "全部消息", count: messages.length },
-            { value: "delta", label: "本轮增量", count: deltaCount },
-            { value: "tools", label: "工具往返", count: toolMessages },
+            { value: "all", label: t.all, count: messages.length },
+            { value: "delta", label: t.delta, count: deltaCount },
+            { value: "tools", label: t.tools, count: toolMessages },
           ]}
         />
         {hidden > 0 && (
           <Button size="sm" onClick={() => setLimit((n) => n + PAGE * 2)}>
-            显示更早的 {Math.min(hidden, PAGE * 2)} 条（还有 {hidden} 条）
+            {t.showEarlier(Math.min(hidden, PAGE * 2), hidden)}
           </Button>
         )}
       </div>
 
-      {shown.length === 0 && <p className="lg-hint m-0">当前范围内没有消息。</p>}
+      {shown.length === 0 && <p className="lg-hint m-0">{t.noneInScope}</p>}
 
       {shown.map((msg) => (
         <React.Fragment key={msg.index}>
           {scope === "all" && msg.index === firstDeltaIndex && (
             <div className="lg-rule" role="separator">
-              以下 {deltaCount} 条是本轮实际发往上游的增量
+              {t.deltaRule(deltaCount)}
             </div>
           )}
           <article className="lg-msg" data-delta={msg.in_delta}>
@@ -229,10 +235,10 @@ export function MessageTimeline({
                 #{msg.index} {ROLE_LABEL[msg.role] ?? msg.role}
               </span>
               <Pill tone={msg.in_delta ? "accent" : "neutral"}>
-                {msg.in_delta ? "本轮增量" : "驻留前缀"}
+                {msg.in_delta ? t.inDelta : t.resident}
               </Pill>
               <span className="lg-num text-[11.5px]">
-                {msg.parts.length} 块 · {formatBytes(msg.total_bytes)}
+                {t.parts(msg.parts.length, formatBytes(msg.total_bytes))}
               </span>
             </header>
             {msg.parts.map((part, idx) => (

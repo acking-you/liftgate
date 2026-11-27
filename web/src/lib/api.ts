@@ -7,10 +7,14 @@ import type {
   GatewayTelemetrySnapshot,
   LowCacheHitsResponse,
   LowCachePayloadDetailResponse,
+  ModelPrice,
+  PricingResponse,
   SessionToolCatalog,
   TaskProtocol,
   ToolCallDetail,
   ToolCallsResponse,
+  UsageResponse,
+  UsageSummary,
 } from "@/types/telemetry";
 
 export type StreamConnectionState = "connecting" | "live" | "reconnecting";
@@ -74,6 +78,12 @@ export interface GatewayClient {
   contextCaptureDetail(taskId: string): Promise<ContextCaptureDetailResponse>;
   updateContextCapture(update: ContextCaptureConfigUpdate): Promise<ContextCaptureSummary>;
   clearContextCaptures(): Promise<ContextCaptureSummary>;
+
+  usage(): Promise<UsageResponse>;
+  resetUsage(): Promise<UsageSummary>;
+  pricing(): Promise<PricingResponse>;
+  /** `null` restores the default price of `key`. */
+  setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse>;
 
   probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string>;
 }
@@ -249,6 +259,22 @@ export class HttpGatewayClient implements GatewayClient {
 
   clearContextCaptures(): Promise<ContextCaptureSummary> {
     return this.request("/api/telemetry/context-captures/clear", { method: "POST" });
+  }
+
+  usage(): Promise<UsageResponse> {
+    return this.request("/api/telemetry/usage");
+  }
+
+  resetUsage(): Promise<UsageSummary> {
+    return this.request("/api/telemetry/usage/reset", { method: "POST" });
+  }
+
+  pricing(): Promise<PricingResponse> {
+    return this.request("/api/telemetry/pricing");
+  }
+
+  setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse> {
+    return this.request("/api/telemetry/pricing", { method: "POST", body: { key, price } });
   }
 
   async probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string> {
