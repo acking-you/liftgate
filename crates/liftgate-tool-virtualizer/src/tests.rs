@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::NoopSpillSink,
+    telemetry::{CatalogToolTier, CatalogWireRole},
 };
 use serde_json::{Value, json};
 
@@ -127,6 +128,7 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             client_name: "sql_lark".to_owned(),
             arguments: "SELECT 1;".to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -167,9 +169,15 @@ fn codex_profile_virtualizes_128_tools_preserving_eager_exec_and_dehydrating_ts_
             &json!({"patch": "```diff\n*** Update File: src/lib.rs\n@@\n-a\n+b\n\n ctx\n*** Update File: src/lib.rs\n@@\n-c\n+d\n```"}),
             &tools,
         ) {
-            VirtualizedCallDecision::ForwardToClient { client_name, arguments, is_custom } => {
+            VirtualizedCallDecision::ForwardToClient {
+                client_name,
+                arguments,
+                is_custom,
+                patch_repaired,
+            } => {
                 assert_eq!(client_name, "apply_patch");
                 assert!(is_custom);
+                assert!(patch_repaired, "fenced, split patch is reported as repaired");
                 assert_eq!(
                     arguments,
                     "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n \n ctx\n@@\n-c\n+d\n*** End Patch"
@@ -362,6 +370,7 @@ fn claude_code_profile_groups_pascal_families_dedupes_plugins_and_backfills_stan
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "TaskCreate");
             assert!(!is_custom);
@@ -537,8 +546,25 @@ fn zero_tool_session_with_gateway_web_fetch_hot_syncs_dynamic_tools_without_recr
                 client_name: "apply_patch".to_owned(),
                 arguments: "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch".to_owned(),
                 is_custom: true,
-            }
+                patch_repaired: false,
+            },
+            "a valid patch behind the dispatcher envelope is not a repair"
         );
+    match rebuilt.resolve_call(
+        CALL_CLIENT_TOOL_MCP_NAME,
+        &json!({ "name": "apply_patch", "arguments": { "patch": "```diff\n*** Update File: a.rs\n@@\n-x\n+y\n```" } }),
+        &hot_tools,
+    ) {
+        VirtualizedCallDecision::ForwardToClient {
+            arguments,
+            patch_repaired,
+            ..
+        } => {
+            assert!(patch_repaired, "a fenced patch behind the dispatcher is repaired");
+            assert!(arguments.starts_with("*** Begin Patch"), "got: {arguments}");
+        }
+        other => panic!("expected the repaired patch to be forwarded, got {other:?}"),
+    }
 }
 
 #[test]
@@ -701,6 +727,7 @@ fn opencode_profile_virtualizes_namespaces_mcps_backfills_and_heals_patchtext() 
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "patch");
             assert!(!is_custom);
@@ -738,6 +765,7 @@ fn opencode_profile_virtualizes_namespaces_mcps_backfills_and_heals_patchtext() 
             client_name: "playwright_browser_op_04".to_owned(),
             arguments: "{\"selector\":\"#login\"}".to_owned(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 }
@@ -792,6 +820,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json.clone(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -806,6 +835,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json.clone(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -831,6 +861,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: unified_diff.to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -860,6 +891,7 @@ fn generic_and_non_opencode_patch_tools_forward_unified_diffs_verbatim() {
             client_name: "patch".to_owned(),
             arguments: expected_json,
             is_custom: false,
+            patch_repaired: false,
         }
     );
 }
@@ -1125,6 +1157,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "edit".to_owned(),
             arguments: json!({ "input": hashline_payload }).to_string(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
 
@@ -1151,6 +1184,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "edit".to_owned(),
             arguments: hashline_payload.to_owned(),
             is_custom: true,
+            patch_repaired: false,
         }
     );
 
@@ -1181,6 +1215,7 @@ fn omp_large_toolset_virtualizes_mcp_and_memory_while_preserving_hashline_edit()
             client_name: "mcp__google_drive_file_op_03".to_owned(),
             arguments: json!({ "fileId": "doc-77" }).to_string(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
     assert_eq!(
@@ -1524,6 +1559,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name,
             arguments,
             is_custom,
+            ..
         } => {
             assert_eq!(client_name, "edit");
             assert!(!is_custom);
@@ -1626,6 +1662,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name,
             arguments,
             is_custom: false,
+            ..
         } => {
             assert_eq!(client_name, "edit");
             let parsed: Value = serde_json::from_str(&arguments).unwrap();
@@ -1662,6 +1699,7 @@ fn omp_eval_typed_signatures_intent_backfill_direct_preflight_and_spill_reader()
             client_name: "emit_event".to_owned(),
             arguments: r#"{"payload":null,"meta":null}"#.to_owned(),
             is_custom: false,
+            patch_repaired: false,
         }
     );
     assert!(matches!(
@@ -1787,4 +1825,169 @@ fn calibrated_budget_enables_30_tool_direct_passthrough_and_codex_claude_contrac
         &mut spill,
     );
     assert_eq!(claude_repl_cat.orchestrator_contract(), None);
+}
+
+#[test]
+fn describe_explains_tier_wire_tool_and_byte_attribution_for_every_client_tool() {
+    let ts_footer = "\n\nexec tool declaration:\n```ts\ndeclare const tools: { gh(args: { id: number }): Promise<unknown>; };\n```";
+    let mut tools = vec![
+        CanonicalToolSpec {
+            name: "exec".to_owned(),
+            description: Some(
+                "Run JavaScript in Code Mode. globalThis.tools exposes nested tools.".to_owned(),
+            ),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+        fn_tool(
+            "exec_command",
+            "Run a shell command in PTY.",
+            json!({"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}),
+        ),
+        CanonicalToolSpec {
+            name: "apply_patch".to_owned(),
+            description: Some("Freeform patch grammar.".to_owned()),
+            kind: CanonicalToolKind::Custom { format_json: None },
+        },
+    ];
+    for i in 0..50 {
+        tools.push(fn_tool(
+            &format!("mcp__codex_apps__github._action_{i:02}"),
+            &format!("GitHub connector action #{i}.{ts_footer}"),
+            json!({"type": "object", "properties": {"pr_number": {"type": "integer"}}, "required": ["pr_number"]}),
+        ));
+    }
+
+    let cat = partition_tools_for_mcp(&tools, &mut NoopSpillSink);
+    assert!(!cat.is_passthrough, "53 tools must virtualize");
+    let described = cat.routing_table.describe(&cat);
+
+    assert_eq!(described.tools.len(), tools.len());
+    assert_eq!(described.search_index_entries, tools.len());
+    assert_eq!(described.wire_tools.len(), cat.wire_tools.len());
+    let by_name = |name: &str| {
+        described
+            .tools
+            .iter()
+            .find(|t| t.client_name == name)
+            .unwrap_or_else(|| panic!("missing `{name}`"))
+    };
+
+    let exec = by_name("exec");
+    assert_eq!(exec.tier, CatalogToolTier::Orchestrator);
+    assert_eq!(exec.wire_name.as_deref(), Some("exec"));
+    assert_eq!(exec.client_kind, "custom");
+    assert!(exec.wire_bytes > 0 && exec.wire_description.is_some());
+
+    let shell = by_name("exec_command");
+    assert_eq!(shell.tier, CatalogToolTier::Direct);
+    assert!(
+        shell
+            .wire_schema
+            .as_deref()
+            .is_some_and(|s| s.contains("cmd"))
+    );
+
+    let action = by_name("mcp__codex_apps__github._action_07");
+    assert_eq!(action.tier, CatalogToolTier::NamespaceHubAction);
+    assert_eq!(action.wire_name.as_deref(), Some("ns__github"));
+    assert!(action.wire_description.is_none());
+    assert!(
+        action
+            .ts_signature
+            .as_deref()
+            .is_some_and(|ts| ts.contains("declare const tools")),
+        "Codex TypeScript declarations stay in the 0-RTT search index"
+    );
+    assert!(action.client_bytes > action.wire_bytes);
+
+    let hub = described
+        .wire_tools
+        .iter()
+        .find(|w| w.wire_name == "ns__github")
+        .expect("github hub");
+    assert_eq!(hub.role, CatalogWireRole::NamespaceHub);
+    assert_eq!(hub.folded_actions.len(), 50);
+    let per_action: usize = described
+        .tools
+        .iter()
+        .filter(|t| t.wire_name.as_deref() == Some("ns__github"))
+        .map(|t| t.wire_bytes)
+        .sum();
+    assert!(per_action <= hub.bytes && per_action + 50 >= hub.bytes);
+
+    for gateway in [SEARCH_CLIENT_TOOLS_MCP_NAME, CALL_CLIENT_TOOL_MCP_NAME] {
+        let wire = described
+            .wire_tools
+            .iter()
+            .find(|w| w.wire_name == gateway)
+            .expect("gateway tool mounted");
+        assert_eq!(wire.role, CatalogWireRole::Gateway);
+    }
+    let wire_total: usize = described.wire_tools.iter().map(|w| w.bytes).sum();
+    assert_eq!(wire_total, cat.wire_tool_bytes);
+    assert!(described.client_tools_bytes > wire_total);
+}
+
+#[test]
+fn describe_attributes_omp_folded_tools_to_the_eval_orchestrator() {
+    let mut tools = vec![
+        fn_tool(
+            "eval",
+            "Run persistent Python (`py`) or JavaScript (`js`) cells; top-level state persists.\n<prelude>\nawait tool.read({ path: 'src/lib.rs' });\n</prelude>",
+            json!({
+                "type": "object",
+                "properties": {
+                    "language": { "type": "string", "enum": ["py", "js"] },
+                    "code": { "type": "string" }
+                },
+                "required": ["language", "code"]
+            }),
+        ),
+        fn_tool(
+            "wait",
+            "Wait for background jobs",
+            json!({ "type": "object", "properties": { "jobs": { "type": "array" } } }),
+        ),
+    ];
+    for name in ["read", "bash", "grep", "glob", "write", "task"] {
+        tools.push(fn_tool(
+            name,
+            &format!("OMP built-in {name} tool"),
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        ));
+    }
+    let cat = partition_tools_for_mcp_session(
+        ProtocolHint::OpenAiResponses,
+        &tools,
+        false,
+        &mut NoopSpillSink,
+    );
+    let described = cat.routing_table.describe(&cat);
+
+    let read = described
+        .tools
+        .iter()
+        .find(|t| t.client_name == "read")
+        .expect("read");
+    assert_eq!(read.tier, CatalogToolTier::FoldedIntoOrchestrator);
+    assert_eq!(read.wire_name.as_deref(), Some("eval"));
+    assert_eq!(read.wire_bytes, 0);
+
+    let eval = described
+        .wire_tools
+        .iter()
+        .find(|w| w.wire_name == "eval")
+        .expect("eval mounted");
+    assert_eq!(eval.role, CatalogWireRole::Orchestrator);
+    assert!(eval.folded_actions.iter().any(|a| a == "read"));
+    assert!(eval.folded_actions.iter().any(|a| a == "bash"));
+    let wait = described
+        .wire_tools
+        .iter()
+        .find(|w| w.wire_name == "wait")
+        .expect("wait mounted");
+    assert!(
+        wait.folded_actions.is_empty(),
+        "the wait barrier is not the script orchestrator"
+    );
 }

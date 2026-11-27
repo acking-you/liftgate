@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use liftgate_server::{
     acp_client::{LiveAcpClient, LiveAcpConfig},
+    context_capture::ContextCaptureConfig,
     job::install_panic_cleanup_hook as install_server_panic_hook,
     platform::{canonicalize_clean, prepare_isolated_session_cwd, wait_for_shutdown_signal},
     routes::{AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router, serve_router},
     session_pool::SessionPool,
-    telemetry::{CacheTelemetryConfig, TelemetryHub},
+    telemetry::{CacheTelemetryConfig, TelemetryConfig, TelemetryHub},
+    tool_calls::ToolCallLimits,
     turn_runner::GatewayRuntimeConfig,
 };
 use liftgate_types::config::{AcpModeId, GatewayLimits, ModelId};
@@ -19,9 +21,11 @@ use crate::cli::{ServeArgs, normalize_optional_api_key};
 use crate::error::CliError;
 use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
-    resolve_effective_agy_proxy, resolve_effective_low_cache_capture_payload,
-    resolve_effective_low_cache_threshold_bps, resolve_effective_max_low_cache_records,
-    resolve_effective_mcp_tool_bridge, resolve_effective_vision_offload,
+    resolve_effective_agy_proxy, resolve_effective_capture_full_context,
+    resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
+    resolve_effective_max_context_capture_mib, resolve_effective_max_context_captures,
+    resolve_effective_max_low_cache_records, resolve_effective_mcp_tool_bridge,
+    resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -151,6 +155,16 @@ pub async fn run_serve_with_hook(
         args.no_low_cache_capture_payload,
         &settings,
     );
+    let capture_full_context = resolve_effective_capture_full_context(
+        args.capture_full_context,
+        args.no_capture_full_context,
+        &settings,
+    );
+    let max_context_captures =
+        resolve_effective_max_context_captures(args.max_context_captures, &settings)?;
+    let max_context_capture_mib =
+        resolve_effective_max_context_capture_mib(args.max_context_capture_mib, &settings)?;
+    let context_capture_dir = state_paths.ensure_context_capture_dir()?;
     let binary_path =
         resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
@@ -196,6 +210,9 @@ pub async fn run_serve_with_hook(
         max_low_cache_records = max_low_cache_records.get(),
         low_cache_threshold_bps = low_cache_threshold_bps.get(),
         low_cache_capture_payload = capture_low_cache_payload,
+        capture_full_context,
+        max_context_captures = max_context_captures.get(),
+        max_context_capture_mib = max_context_capture_mib.get(),
         "starting liftgate"
     );
 
@@ -213,12 +230,22 @@ pub async fn run_serve_with_hook(
     );
 
     let pool = Arc::new(SessionPool::new(limits));
-    let telemetry = Arc::new(TelemetryHub::with_config(CacheTelemetryConfig {
-        persist_path: Some(state_paths.cache_telemetry_file()),
-        settings_path: Some(state_paths.settings_file()),
-        max_low_cache_records,
-        low_cache_threshold_bps,
-        capture_request_details: capture_low_cache_payload,
+    let telemetry = Arc::new(TelemetryHub::with_telemetry_config(TelemetryConfig {
+        cache: CacheTelemetryConfig {
+            persist_path: Some(state_paths.cache_telemetry_file()),
+            settings_path: Some(state_paths.settings_file()),
+            max_low_cache_records,
+            low_cache_threshold_bps,
+            capture_request_details: capture_low_cache_payload,
+        },
+        tool_calls: ToolCallLimits::default(),
+        context_capture: ContextCaptureConfig {
+            enabled: capture_full_context,
+            max_records: max_context_captures,
+            max_disk: max_context_capture_mib,
+            dir: Some(context_capture_dir),
+            ..ContextCaptureConfig::default()
+        },
     }));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();

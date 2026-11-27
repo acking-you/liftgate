@@ -382,7 +382,7 @@ OpenAI Responses 客户端指向 `http://127.0.0.1:8787/v1`，Anthropic Messages
 
 ## 监控面板
 
-Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含工具调用与 Token 明细）、会话池（可手动释放空闲或 MCP 挂起会话，并在线热切换 MCP 原生工具桥接与 `>=300k` 视觉卸载）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
+Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release 二进制已在编译期内置完整面板，也可直接执行 `liftgate ui` 打开）：展示进行中与最近完成的任务（含 Token 与缓存命中率）、每一次工具调用的完整输入输出（CodeMode 脚本高亮、补丁以 Diff 展示，网关本地 0-RTT 应答与预检拒绝也会记录）、各会话的工具目录（客户端工具如何虚拟化挂载到 `lg`、客户端与 Wire 定义对照、上下文构成）、可选的完整上下文捕获、会话池（可手动释放空闲或 MCP 挂起会话，并在线热切换 MCP 原生工具桥接与 `>=300k` 视觉卸载）、实时模型目录以及 `agy` 最近的 stderr 日志。启用了 `--api-key` 时，`liftgate ui` 会自动携带密钥完成连接；也可通过 `--ui-listen <地址>` 额外监听独立前端端口，或用 `--ui-dir <目录>` 覆盖静态资源目录。
 
 ## 参数与环境变量
 
@@ -399,6 +399,9 @@ Liftgate 直接在 `http://127.0.0.1:8787/` 提供实时监控面板（Release �
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000`（`0..=50000`；原子持久化至 `~/.liftgate/cache-telemetry.json`，可在 Web 面板实时调整） |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50`（`0..=100%`；低于该命中率阈值的请求自动持久化归档） |
 | `--low-cache-capture-payload` / `--no-low-cache-capture-payload` | `AGY_LOW_CACHE_CAPTURE_PAYLOAD` | `true`（低命中时在 `~/.liftgate/low-cache-payloads/` 落盘完整请求内容与消息明细，可在 Web 面板实时开关） |
+| `--capture-full-context` / `--no-capture-full-context` | `AGY_CAPTURE_FULL_CONTEXT` | `false`（或读取 `~/.liftgate/settings.json` 中的 `capture_full_context`；开启后每一轮的完整上下文——消息历史、思考、发往 ACP 的 Prompt 与输出——落盘到 `~/.liftgate/context-captures/`，可在 Web 面板实时开关） |
+| `--max-context-captures` | `AGY_MAX_CONTEXT_CAPTURES` | `200`（`1..=10000`；超出后先删除最旧的捕获） |
+| `--max-context-capture-mib` | `AGY_MAX_CONTEXT_CAPTURE_MIB` | `512`（`16..=65536` MiB，完整上下文捕获的磁盘上限） |
 | `--default-model`（请求未知或通用模型名时使用） | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode`（`auto`、`accept-edits`、`default`、`plan`） | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | 系统临时目录下的独立空目录 |

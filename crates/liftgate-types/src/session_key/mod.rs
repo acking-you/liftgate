@@ -36,6 +36,7 @@ pub use system_append::{
     build_mcp_virtualized_tools_delta_xml_with_spill, build_session_system_append,
     build_session_system_append_for_mcp_with_spill_sink, build_session_system_append_with_sink,
     build_session_system_append_with_spill, build_session_system_append_with_spill_sink,
+    orchestrator_contract_rules,
 };
 
 pub type ConversationHash = [u8; 32];

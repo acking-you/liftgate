@@ -795,7 +795,504 @@ pub struct GatewayTelemetrySnapshot {
     pub elastic_io: ElasticIoTelemetry,
     #[serde(default)]
     pub cache_telemetry: CacheTelemetrySummary,
+    #[serde(default)]
+    pub tool_call_telemetry: ToolCallTelemetrySummary,
+    #[serde(default)]
+    pub context_capture: ContextCaptureSummary,
     pub active_tasks: Vec<TaskSnapshot>,
     pub recent_tasks: Vec<TaskSnapshot>,
     pub available_models: Vec<AvailableModel>,
+}
+
+// ============================================================================
+// Per-call tool I/O telemetry (`/api/telemetry/tool-calls`)
+// ============================================================================
+
+/// How a tool call travelled through the gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallRoute {
+    /// Suspended or XML round-trip executed by the caller harness (`exec`, `Bash`, `apply_patch`, ...).
+    ClientRoundtrip,
+    /// `mcp_lg_ns__*` namespace hub unwrapped to the original client tool.
+    NamespaceHub,
+    /// `mcp_lg_call_client_tool` generic dispatcher unwrapped to the original client tool.
+    GenericDispatcher,
+    /// Gateway-local `mcp_lg_search_client_tools` answered without a round-trip.
+    ZeroRttSearch,
+    /// Gateway-local `mcp_lg_read_context_spill` paging.
+    ZeroRttSpillRead,
+    /// Gateway-local preflight rejection (missing fields, V4A syntax, unknown or disabled tool).
+    ZeroRttPreflight,
+    /// Gateway-hosted tool such as `mcp_lg_gateway_web_fetch`.
+    GatewayManaged,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lifecycle state of a recorded tool call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    /// Emitted to the caller; the result has not come back yet.
+    Pending,
+    Ok,
+    Error,
+    /// Answered locally by gateway preflight without reaching the caller.
+    PreflightRejected,
+    /// The result never came back (session evicted, turn cancelled, or result never sent).
+    Abandoned,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Coarse classification of a failed tool call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallErrorKind {
+    /// The caller marked the result as an error.
+    ToolError,
+    /// A CodeMode script (`exec` / `execute` / `eval` / `REPL`) failed at runtime.
+    ScriptException,
+    /// Gateway preflight rejected the arguments (schema, V4A syntax, unknown action).
+    PreflightRejected,
+    /// The model invoked a tool that is not active for the turn.
+    DisabledTool,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lightweight row served by `GET /api/telemetry/tool-calls`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-call flags (orchestrator, V4A repair, sanitization, spill) shown as separate badges"
+)]
+pub struct ToolCallRecord {
+    /// Call id as emitted to the caller (`call_*`), or a gateway-local `lg_*` id.
+    pub call_id: String,
+    /// Insertion order inside the ring buffer; records with `seq < summary.oldest_seq` were evicted.
+    pub seq: u64,
+    /// Buffer revision at which this record last changed (used for incremental `?since=` polling).
+    pub revision: u64,
+    pub task_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Session turn (one per HTTP request against the session) that emitted the call.
+    #[serde(default)]
+    pub turn_index: u64,
+    /// 0-based order of the call inside its turn.
+    #[serde(default)]
+    pub step_index: u32,
+    /// Detected harness profile (`codex`, `claude-code`, `opencode`, `omp`, `generic`).
+    pub harness_profile: String,
+    #[serde(default)]
+    pub orchestrator_mode: Option<String>,
+    pub model_id: String,
+    pub route: ToolCallRoute,
+    /// Tool name the model invoked (`mcp_lg_*` for MCP calls, the client name for XML calls).
+    pub wire_tool_name: String,
+    /// Client tool that executed the call (`None` for gateway-local calls).
+    #[serde(default)]
+    pub client_tool_name: Option<String>,
+    /// `true` for CodeMode orchestrators (`exec`, `execute`, `eval`, `REPL`).
+    #[serde(default)]
+    pub is_orchestrator: bool,
+    /// Script language when it is known (`js`, `py`).
+    #[serde(default)]
+    pub code_language: Option<String>,
+    pub status: ToolCallStatus,
+    #[serde(default)]
+    pub error_kind: Option<ToolCallErrorKind>,
+    /// The gateway rewrote a malformed V4A patch before forwarding it.
+    #[serde(default)]
+    pub v4a_auto_repaired: bool,
+    /// Terminal control sequences or billing noise were scrubbed from the output.
+    #[serde(default)]
+    pub output_sanitized: bool,
+    /// The output exceeded the inline budget; the model saw a head/tail excerpt plus a spill file.
+    #[serde(default)]
+    pub output_spilled: bool,
+    pub started_at_unix_ms: u64,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub input_tokens_est: u64,
+    pub output_tokens_est: u64,
+    pub input_preview: String,
+    pub output_preview: String,
+}
+
+/// Output block of a recorded tool call.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolOutputBlock {
+    Text {
+        bytes: usize,
+        text: String,
+    },
+    Image {
+        mime_type: String,
+        base64_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
+}
+
+/// Full record served by `GET /api/telemetry/tool-calls/{call_id}`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolCallDetail {
+    #[serde(flatten)]
+    pub record: ToolCallRecord,
+    /// Arguments exactly as the model emitted them on the wire tool.
+    pub wire_arguments: String,
+    /// Arguments forwarded to the client tool after unwrapping or repair (`None` when unchanged).
+    #[serde(default)]
+    pub client_arguments: Option<String>,
+    #[serde(default)]
+    pub output_blocks: Vec<ToolOutputBlock>,
+    /// The per-field byte cap clipped the stored input.
+    #[serde(default)]
+    pub input_truncated: bool,
+    /// The per-field byte cap clipped the stored output.
+    #[serde(default)]
+    pub output_truncated: bool,
+}
+
+/// Ring-buffer status carried on the snapshot as `tool_call_telemetry`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolCallTelemetrySummary {
+    /// Identifies the buffer (one per gateway process): revisions and `seq` start over when it
+    /// changes, so clients holding older records must refetch everything.
+    #[serde(default)]
+    pub store_id: String,
+    /// Bumped on every insert, completion, or eviction.
+    #[serde(default)]
+    pub revision: u64,
+    /// `seq` of the oldest retained record (equal to the next `seq` when empty).
+    #[serde(default)]
+    pub oldest_seq: u64,
+    #[serde(default)]
+    pub max_records: usize,
+    /// Per-field cap applied to stored arguments and output text.
+    #[serde(default)]
+    pub max_field_bytes: usize,
+    #[serde(default)]
+    pub max_total_bytes: usize,
+    #[serde(default)]
+    pub stored_records: usize,
+    #[serde(default)]
+    pub stored_bytes: usize,
+    #[serde(default)]
+    pub total_recorded: u64,
+    #[serde(default)]
+    pub total_evicted: u64,
+}
+
+/// Response served by `GET /api/telemetry/tool-calls[?since=<revision>]`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolCallsResponse {
+    pub summary: ToolCallTelemetrySummary,
+    /// Records changed after `since` (all retained records when `since` is absent), oldest first.
+    pub records: Vec<ToolCallRecord>,
+}
+
+// ============================================================================
+// Session tool catalog (`/api/telemetry/sessions/{session_id}/tool-catalog`)
+// ============================================================================
+
+/// Where a declared client tool ended up after 3-tier virtualization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogToolTier {
+    /// Tier-0 CodeMode orchestrator mounted on `lg`.
+    Orchestrator,
+    /// Tier-1 one-to-one direct tool.
+    Direct,
+    /// Folded into the orchestrator contract (e.g. Oh My Pi `<eval_session_tools>`).
+    FoldedIntoOrchestrator,
+    /// Tier-2 action folded behind an `mcp_lg_ns__*` hub.
+    NamespaceHubAction,
+    /// Promoted back to a direct tool by slack-slot backfill.
+    SlackBackfill,
+    /// Reachable only through the 0-RTT search index and `mcp_lg_call_client_tool`.
+    SearchIndexOnly,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Role of a tool mounted on the `lg` loopback MCP server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogWireRole {
+    Orchestrator,
+    Direct,
+    NamespaceHub,
+    SlackBackfill,
+    /// Gateway-provided tool (`search_client_tools`, `call_client_tool`, `gateway_web_fetch`, `read_context_spill`).
+    Gateway,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One client tool as declared by the caller and as mounted for the model.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CatalogToolEntry {
+    pub client_name: String,
+    pub tier: CatalogToolTier,
+    /// Wire tool (`mcp_lg_*` without prefix) that serves this client tool.
+    #[serde(default)]
+    pub wire_name: Option<String>,
+    /// `function` or `custom`.
+    pub client_kind: String,
+    #[serde(default)]
+    pub client_description: Option<String>,
+    /// JSON Schema or custom grammar exactly as the client declared it.
+    #[serde(default)]
+    pub client_schema: Option<String>,
+    pub client_bytes: usize,
+    /// Description mounted on `lg` (`None` when the tool is not mounted directly).
+    #[serde(default)]
+    pub wire_description: Option<String>,
+    #[serde(default)]
+    pub wire_schema: Option<String>,
+    /// Wire bytes attributable to this tool (hub bytes are split across its actions).
+    pub wire_bytes: usize,
+    /// TypeScript declaration indexed for 0-RTT search (Codex `code_mode_host` declarations).
+    #[serde(default)]
+    pub ts_signature: Option<String>,
+}
+
+/// One tool mounted on the `lg` loopback MCP server.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CatalogWireTool {
+    /// MCP-local name (the model sees `mcp_lg_<wire_name>`).
+    pub wire_name: String,
+    pub role: CatalogWireRole,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: String,
+    pub bytes: usize,
+    /// Client tools folded behind this wire tool (hub actions or orchestrator-folded tools).
+    #[serde(default)]
+    pub folded_actions: Vec<String>,
+}
+
+/// Category of context bytes shown in the session composition bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSegmentKey {
+    WireTools,
+    BridgeRules,
+    OrchestratorContract,
+    ClientToolsUpdate,
+    DeveloperInstructions,
+    UserText,
+    AssistantText,
+    Reasoning,
+    ToolCalls,
+    ToolResults,
+    Images,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Bytes and estimated tokens of one context category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ContextSegment {
+    pub key: ContextSegmentKey,
+    pub bytes: usize,
+    pub tokens_est: u64,
+}
+
+/// Response served by `GET /api/telemetry/sessions/{session_id}/tool-catalog`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionToolCatalog {
+    pub session_id: String,
+    pub harness_profile: String,
+    #[serde(default)]
+    pub orchestrator_mode: Option<String>,
+    pub is_passthrough: bool,
+    pub model_id: String,
+    /// When the context composition was sampled (`0` before the first completed turn).
+    #[serde(default)]
+    pub captured_at_unix_ms: u64,
+    pub wire_budget_bytes: usize,
+    pub eager_tool_budget: usize,
+    /// Bytes of the tool list as the client declared it (never sent upstream verbatim).
+    pub client_tools_bytes: usize,
+    /// Context composition of the session's latest completed turn.
+    pub segments: Vec<ContextSegment>,
+    pub wire_tools: Vec<CatalogWireTool>,
+    pub tools: Vec<CatalogToolEntry>,
+    /// `<api_gateway_bridge_rules>` sent in `_meta.antigravity.systemPrompt.append` at `session/new`.
+    #[serde(default)]
+    pub bridge_rules_prompt: Option<String>,
+    /// The CodeMode orchestrator contract embedded in the bridge rules.
+    #[serde(default)]
+    pub orchestrator_contract_prompt: Option<String>,
+    pub search_index_entries: usize,
+}
+
+// ============================================================================
+// Opt-in full-context capture (`/api/telemetry/context-captures`)
+// ============================================================================
+
+/// Full-context capture status carried on the snapshot as `context_capture`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ContextCaptureSummary {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_records: usize,
+    #[serde(default)]
+    pub max_total_bytes: u64,
+    #[serde(default)]
+    pub stored_records: usize,
+    #[serde(default)]
+    pub stored_bytes: u64,
+    /// Completed turns left uncaptured because earlier captures were still being written
+    /// (reset when captures are cleared).
+    #[serde(default)]
+    pub skipped_records: u64,
+    #[serde(default)]
+    pub capture_dir: Option<String>,
+}
+
+/// Index row describing one captured turn.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ContextCaptureRecord {
+    pub task_id: String,
+    pub recorded_at_unix_ms: u64,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub harness_profile: Option<String>,
+    pub resolved_model: String,
+    #[serde(default)]
+    pub session_turn_index: u64,
+    #[serde(default)]
+    pub cache_hit_rate_bps: Option<u16>,
+    #[serde(default)]
+    pub total_prompt_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
+    pub delta_message_count: usize,
+    /// Serialized payload size on disk.
+    #[serde(default)]
+    pub payload_bytes: u64,
+    #[serde(default)]
+    pub prompt_preview: String,
+}
+
+/// Response served by `GET /api/telemetry/context-captures` (newest first).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ContextCapturesResponse {
+    pub summary: ContextCaptureSummary,
+    pub records: Vec<ContextCaptureRecord>,
+}
+
+/// On-disk payload of one captured turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FullContextPayload {
+    #[serde(flatten)]
+    pub request: LowCacheFullRequestPayload,
+    /// Reasoning the model produced during this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_reasoning: Option<String>,
+    /// Complete text output of this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_output: Option<String>,
+    /// Reasoning beyond the per-field capture cap was dropped.
+    #[serde(default)]
+    pub assistant_reasoning_truncated: bool,
+    /// Output beyond the per-field capture cap was dropped.
+    #[serde(default)]
+    pub assistant_output_truncated: bool,
+}
+
+/// Response served by `GET /api/telemetry/context-captures/{task_id}`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContextCaptureDetailResponse {
+    pub record: ContextCaptureRecord,
+    pub payload: FullContextPayload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_detail_flattens_the_record_and_tolerates_unknown_enum_values() {
+        let detail = ToolCallDetail {
+            record: ToolCallRecord {
+                call_id: "call_abc".to_owned(),
+                seq: 3,
+                revision: 9,
+                task_id: "resp_1".to_owned(),
+                session_id: Some("sess".to_owned()),
+                turn_index: 2,
+                step_index: 0,
+                harness_profile: "codex".to_owned(),
+                orchestrator_mode: Some("codex_exec".to_owned()),
+                model_id: "gemini-4-carbon-high".to_owned(),
+                route: ToolCallRoute::ClientRoundtrip,
+                wire_tool_name: "mcp_lg_exec".to_owned(),
+                client_tool_name: Some("exec".to_owned()),
+                is_orchestrator: true,
+                code_language: Some("js".to_owned()),
+                status: ToolCallStatus::Ok,
+                error_kind: None,
+                v4a_auto_repaired: false,
+                output_sanitized: false,
+                output_spilled: false,
+                started_at_unix_ms: 1,
+                duration_ms: Some(5),
+                input_bytes: 10,
+                output_bytes: 20,
+                input_tokens_est: 3,
+                output_tokens_est: 5,
+                input_preview: "text(1)".to_owned(),
+                output_preview: "1".to_owned(),
+            },
+            wire_arguments: "text(1)".to_owned(),
+            client_arguments: None,
+            output_blocks: vec![ToolOutputBlock::Image {
+                mime_type: "image/png".to_owned(),
+                base64_bytes: 128,
+                width: Some(2),
+                height: None,
+            }],
+            input_truncated: false,
+            output_truncated: false,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["call_id"], "call_abc");
+        assert_eq!(json["route"], "client_roundtrip");
+        assert_eq!(json["output_blocks"][0]["type"], "image");
+        assert!(json["output_blocks"][0].get("height").is_none());
+        let round: ToolCallDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(round, detail);
+
+        let route: ToolCallRoute = serde_json::from_str("\"teleport\"").unwrap();
+        assert_eq!(route, ToolCallRoute::Unknown);
+        let status: ToolCallStatus = serde_json::from_str("\"exploded\"").unwrap();
+        assert_eq!(status, ToolCallStatus::Unknown);
+    }
+
+    #[test]
+    fn snapshot_without_new_sections_still_decodes() {
+        let summary: ToolCallTelemetrySummary = serde_json::from_str("{}").unwrap();
+        assert_eq!(summary.stored_records, 0);
+        let capture: ContextCaptureSummary = serde_json::from_str("{}").unwrap();
+        assert!(!capture.enabled);
+    }
 }

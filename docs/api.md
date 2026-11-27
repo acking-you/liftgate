@@ -20,6 +20,10 @@ without the `/v1` prefix.
 | `POST /api/telemetry/vision-offload` | live toggle for optional `>=300k` ephemeral vision sub-session offload (`false` by default) |
 | `POST /api/telemetry/mcp-tool-bridge` | live toggle for the hybrid loopback MCP tool bridge |
 | `POST /api/telemetry/sessions/{id}/close` | close an idle or MCP-suspended pooled session |
+| `GET /api/telemetry/tool-calls[?since=<revision>]`, `GET /api/telemetry/tool-calls/{call_id}` | per-call tool I/O from a bounded in-memory ring buffer (route, status, timing, sizes, wire vs. forwarded arguments, output blocks); `since` returns only records changed after that revision |
+| `GET /api/telemetry/sessions/{id}/tool-catalog` | how a pooled MCP session's client tools were virtualized: tier per tool, client vs. wire definitions, wire tools, bridge rules, and the latest context composition |
+| `GET /api/telemetry/context-captures`, `GET /api/telemetry/context-captures/{task_id}` | opt-in full-context captures (index, newest first) and one captured turn |
+| `POST /api/telemetry/context-capture`, `POST /api/telemetry/context-captures/clear` | toggle full-context capture and set its quota (`{"enabled", "max_records", "max_total_mib"}`), or delete every capture |
 | `POST /api/admin/shutdown` | graceful shutdown for managed background daemons (requires `x-liftgate-shutdown-token`) |
 
 ## Authentication

@@ -389,7 +389,275 @@ export interface GatewayTelemetrySnapshot {
   metrics: GatewayMetricsSummary;
   cache_telemetry?: CacheTelemetrySummary;
   elastic_io?: ElasticIoTelemetry;
+  /** Present once the gateway records per-call tool I/O (issue #21). */
+  tool_call_telemetry?: ToolCallTelemetrySummary;
+  /** Present once the gateway supports opt-in full-context capture (issue #21). */
+  context_capture?: ContextCaptureSummary;
   active_tasks: TaskSnapshot[];
   recent_tasks: TaskSnapshot[];
   available_models: AvailableModel[];
+}
+
+/* ===========================================================================
+   Per-call tool I/O, session tool catalog & opt-in full-context capture.
+   Mirrors `liftgate_types::telemetry`. A gateway that predates these features
+   omits `tool_call_telemetry` / `context_capture` on the snapshot; views check
+   for those before calling the endpoints below.
+   =========================================================================== */
+
+/** How a tool call travelled through the gateway. */
+export type ToolCallRoute =
+  /** Suspended or XML round-trip executed by the harness (`exec`, `Bash`, `apply_patch`, …). */
+  | "client_roundtrip"
+  /** `mcp_lg_ns__*` namespace hub unwrapped to the original client tool. */
+  | "namespace_hub"
+  /** `mcp_lg_call_client_tool` generic dispatcher unwrapped to a client tool. */
+  | "generic_dispatcher"
+  /** Gateway-local `mcp_lg_search_client_tools` answered without a round-trip. */
+  | "zero_rtt_search"
+  /** Gateway-local `mcp_lg_read_context_spill` paging. */
+  | "zero_rtt_spill_read"
+  /** Gateway-local preflight rejection (missing fields, V4A syntax, unknown or disabled tool). */
+  | "zero_rtt_preflight"
+  /** Gateway-hosted tool such as `mcp_lg_gateway_web_fetch`. */
+  | "gateway_managed"
+  | "unknown";
+
+export type ToolCallStatus =
+  | "pending"
+  | "ok"
+  | "error"
+  | "preflight_rejected"
+  /** The result never came back (session evicted, turn cancelled, result never sent). */
+  | "abandoned"
+  | "unknown";
+
+export type ToolCallErrorKind =
+  | "tool_error"
+  | "script_exception"
+  | "preflight_rejected"
+  | "disabled_tool"
+  | "unknown";
+
+/** Row returned by `GET /api/telemetry/tool-calls`. */
+export interface ToolCallRecord {
+  call_id: string;
+  /** Insertion order; records with `seq < summary.oldest_seq` were evicted. */
+  seq: number;
+  /** Buffer revision at which this record last changed (for `?since=` polling). */
+  revision: number;
+  task_id: string;
+  session_id: string | null;
+  /** Session turn (one per HTTP request against the session). */
+  turn_index: number;
+  /** 0-based order of the call inside its turn. */
+  step_index: number;
+  harness_profile: string;
+  orchestrator_mode?: string | null;
+  model_id: string;
+  route: ToolCallRoute;
+  /** Tool name the model invoked (`mcp_lg_*` for MCP calls, the client name for XML calls). */
+  wire_tool_name: string;
+  /** Client tool that executed the call (null for gateway-local calls). */
+  client_tool_name?: string | null;
+  /** True for CodeMode orchestrators (`exec` / `execute` / `eval` / `REPL`). */
+  is_orchestrator: boolean;
+  code_language?: string | null;
+  status: ToolCallStatus;
+  error_kind?: ToolCallErrorKind | null;
+  v4a_auto_repaired?: boolean;
+  output_sanitized?: boolean;
+  output_spilled?: boolean;
+  started_at_unix_ms: number;
+  duration_ms: number | null;
+  input_bytes: number;
+  output_bytes: number;
+  input_tokens_est: number;
+  output_tokens_est: number;
+  input_preview: string;
+  output_preview: string;
+}
+
+export type ToolOutputBlock =
+  | { type: "text"; bytes: number; text: string }
+  | {
+      type: "image";
+      mime_type: string;
+      base64_bytes: number;
+      width?: number | null;
+      height?: number | null;
+    };
+
+/** Full record returned by `GET /api/telemetry/tool-calls/{call_id}`. */
+export interface ToolCallDetail extends ToolCallRecord {
+  /** Arguments exactly as the model emitted them on the wire tool. */
+  wire_arguments: string;
+  /** Arguments forwarded to the client after unwrapping or repair (null when unchanged). */
+  client_arguments?: string | null;
+  output_blocks: ToolOutputBlock[];
+  /** True when the per-field byte cap clipped the stored input or output. */
+  input_truncated?: boolean;
+  output_truncated?: boolean;
+}
+
+/** Ring-buffer status carried on the snapshot as `tool_call_telemetry`. */
+export interface ToolCallTelemetrySummary {
+  /** Identifies the gateway's buffer; revisions and `seq` start over when it changes. */
+  store_id?: string;
+  revision: number;
+  oldest_seq: number;
+  max_records: number;
+  max_field_bytes: number;
+  max_total_bytes: number;
+  stored_records: number;
+  stored_bytes: number;
+  total_recorded: number;
+  total_evicted: number;
+}
+
+export interface ToolCallsResponse {
+  summary: ToolCallTelemetrySummary;
+  /** Records changed after `since` (all retained records without it), oldest first. */
+  records: ToolCallRecord[];
+}
+
+/** Where a declared client tool ended up after 3-tier virtualization. */
+export type CatalogToolTier =
+  | "orchestrator"
+  | "direct"
+  | "folded_into_orchestrator"
+  | "namespace_hub_action"
+  | "slack_backfill"
+  | "search_index_only"
+  | "unknown";
+
+export interface CatalogToolEntry {
+  client_name: string;
+  tier: CatalogToolTier;
+  /** Wire tool that serves this client tool (hub name for folded actions). */
+  wire_name?: string | null;
+  client_kind: string;
+  client_description?: string | null;
+  /** JSON Schema or custom grammar exactly as the client declared it. */
+  client_schema?: string | null;
+  client_bytes: number;
+  /** Description / schema mounted on `lg` for this tool (null when it is not mounted directly). */
+  wire_description?: string | null;
+  wire_schema?: string | null;
+  /** Wire bytes attributable to this tool (hub bytes are split across its actions). */
+  wire_bytes: number;
+  /** TypeScript declaration indexed for 0-RTT search (Codex `code_mode_host`). */
+  ts_signature?: string | null;
+}
+
+export interface CatalogWireTool {
+  wire_name: string;
+  role: "orchestrator" | "direct" | "namespace_hub" | "slack_backfill" | "gateway" | "unknown";
+  description?: string | null;
+  input_schema: string;
+  bytes: number;
+  /** Client tools folded behind this wire tool. */
+  folded_actions: string[];
+}
+
+export type ContextSegmentKey =
+  | "wire_tools"
+  | "bridge_rules"
+  | "orchestrator_contract"
+  | "client_tools_update"
+  | "developer_instructions"
+  | "user_text"
+  | "assistant_text"
+  | "reasoning"
+  | "tool_calls"
+  | "tool_results"
+  | "images";
+
+export interface ContextSegment {
+  key: ContextSegmentKey;
+  bytes: number;
+  tokens_est: number;
+}
+
+/** `GET /api/telemetry/sessions/{session_id}/tool-catalog`. */
+export interface SessionToolCatalog {
+  session_id: string;
+  harness_profile: string;
+  orchestrator_mode?: string | null;
+  is_passthrough: boolean;
+  model_id: string;
+  /** When the context composition was sampled (0 before the first completed turn). */
+  captured_at_unix_ms: number;
+  wire_budget_bytes: number;
+  eager_tool_budget: number;
+  /** Bytes of the tool list as the client declared it (never sent upstream verbatim). */
+  client_tools_bytes: number;
+  /** Context composition of the session's latest completed turn. */
+  segments: ContextSegment[];
+  wire_tools: CatalogWireTool[];
+  tools: CatalogToolEntry[];
+  /** `<api_gateway_bridge_rules>` sent in `_meta.antigravity.systemPrompt.append`. */
+  bridge_rules_prompt?: string | null;
+  /** The CodeMode orchestrator contract embedded in the bridge rules. */
+  orchestrator_contract_prompt?: string | null;
+  search_index_entries: number;
+}
+
+/** Full-context capture status carried on the snapshot as `context_capture`. */
+export interface ContextCaptureSummary {
+  revision: number;
+  enabled: boolean;
+  max_records: number;
+  max_total_bytes: number;
+  stored_records: number;
+  stored_bytes: number;
+  /** Turns skipped because earlier captures were still being written; reset by clearing. */
+  skipped_records?: number;
+  capture_dir?: string | null;
+}
+
+export interface ContextCaptureRecord {
+  task_id: string;
+  recorded_at_unix_ms: number;
+  session_id: string | null;
+  harness_profile?: string | null;
+  resolved_model: string;
+  session_turn_index: number;
+  cache_hit_rate_bps?: number | null;
+  total_prompt_tokens: number;
+  output_tokens: number;
+  message_count: number;
+  delta_message_count: number;
+  payload_bytes: number;
+  prompt_preview: string;
+}
+
+export interface ContextCapturesResponse {
+  summary: ContextCaptureSummary;
+  records: ContextCaptureRecord[];
+}
+
+export interface FullContextPayload extends LowCacheFullRequestPayload {
+  /** Reasoning the model produced during this turn. */
+  assistant_reasoning?: string | null;
+  /** Complete text output of this turn. */
+  assistant_output?: string | null;
+  /** Reasoning beyond the per-field capture cap was dropped. */
+  assistant_reasoning_truncated?: boolean;
+  /** Output beyond the per-field capture cap was dropped. */
+  assistant_output_truncated?: boolean;
+}
+
+/** `GET /api/telemetry/context-captures/{task_id}`. */
+export interface ContextCaptureDetailResponse {
+  record: ContextCaptureRecord;
+  payload: FullContextPayload;
+}
+
+/** Body of `POST /api/telemetry/context-capture`. */
+export interface ContextCaptureConfigUpdate {
+  enabled?: boolean;
+  max_records?: number;
+  /** Disk quota in MiB (16..=65536). */
+  max_total_mib?: number;
 }

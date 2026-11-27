@@ -23,10 +23,12 @@ use liftgate_types::{
         build_session_system_append_for_mcp_with_spill_sink,
         build_session_system_append_with_spill_sink, compute_routing_plan,
         format_conversation_hash_hex, hash_conversation_state, hash_conversation_with_reply,
-        hash_dialogue_state, hash_dialogue_with_reply, scrub_terminal_control_noise,
-        strip_billing_noise, truncate_head_tail_lines_with_spill,
+        hash_dialogue_state, hash_dialogue_with_reply, is_code_mode_orchestrator_tool,
+        scrub_terminal_control_noise, strip_billing_noise, truncate_head_tail_lines_with_spill,
     },
-    telemetry::{LowCacheRoutingStrategy, TaskProtocol},
+    telemetry::{
+        LowCacheRoutingStrategy, TaskProtocol, ToolCallErrorKind, ToolCallRoute, ToolCallStatus,
+    },
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -42,8 +44,9 @@ use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
     mcp_bridge::{
-        ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LocalReplyKind, LoopbackMcpServer,
-        McpContentItem, McpSessionHandle, McpToolCallReply, ProtocolHint, ResolvedMcpIncoming,
+        ACP_MCP_TOOL_PREFIX, CALL_CLIENT_TOOL_MCP_NAME, IncomingMcpToolCall, LocalReplyKind,
+        LoopbackMcpServer, McpContentItem, McpSessionHandle, McpToolCallReply,
+        NAMESPACE_HUB_MCP_PREFIX, ProtocolHint, ResolvedMcpIncoming, detect_harness,
         strip_call_prefix,
     },
     session_pool::{
@@ -52,7 +55,13 @@ use crate::{
         SessionPool, SuspendedCheckoutGuard, SuspendedMcpTurn,
     },
     spill_store::SpillStore,
-    telemetry::{ActiveTaskGuard, TelemetryHub, TurnCompletionDiagnostics, unix_timestamp_ms},
+    telemetry::{
+        ActiveTaskGuard, GENERIC_HARNESS_PROFILE, TelemetryHub, TurnCompletionDiagnostics,
+        unix_timestamp_ms,
+    },
+    tool_calls::{
+        ToolCallOutcome, ToolCallStart, patch_was_repaired, script_language, trailing_tool_results,
+    },
     web_fetch::{WebFetchError, WebFetchOutcome},
 };
 
@@ -819,7 +828,9 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 &nonce,
                 &mut spill_store,
             );
-            mcp_session_handle = Some(mcp_srv.register_session(catalog));
+            let handle = mcp_srv.register_session(catalog);
+            handle.record_bridge_rules(&out.0);
+            mcp_session_handle = Some(handle);
             out
         } else {
             build_session_system_append_with_spill_sink(
@@ -977,6 +988,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         lease.session_id().as_str(),
         session_reused,
         active_model.as_str(),
+    );
+    let (harness_profile, orchestrator_mode) =
+        tool_attribution(lease.mcp_handle(), protocol, &req.client_tools);
+    task_guard.set_tool_context(
+        harness_profile,
+        orchestrator_mode,
+        route_meta.session_turn_index,
     );
 
     let turn_cancel = CancellationToken::new();
@@ -1994,6 +2012,7 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     let mut continuation_xml = String::new();
 
                     for (fetch_call_id, raw_url) in queued_fetches {
+                        let fetch_started_ms = unix_timestamp_ms();
                         if !send_cancel_safe(
                             &events_tx,
                             TurnEvent::WebFetchStart {
@@ -2037,7 +2056,14 @@ async fn run_turn_pipeline<B: AcpBackend>(
                             }
                         };
 
-                        format_web_fetch_continuation(&mut continuation_xml, &outcome);
+                        format_and_record_xml_web_fetch(
+                            &task_guard,
+                            &fetch_call_id,
+                            &raw_url,
+                            &outcome,
+                            fetch_started_ms,
+                            &mut continuation_xml,
+                        );
 
                         if !send_cancel_safe(
                             &events_tx,
@@ -2439,7 +2465,7 @@ async fn forward_acp_update(
                 }
                 let thought_chars = content.text.chars().count();
                 state.step_thought_chars = state.step_thought_chars.saturating_add(thought_chars);
-                task_guard.record_thought(thought_chars);
+                task_guard.record_thought(&content.text);
                 if req.include_thinking && !req.omit_thinking_text {
                     return send_cancel_safe(
                         events_tx,
@@ -2930,12 +2956,29 @@ async fn emit_parsed_items_inner(
                     };
                     (format!("call_{}", generate_short_nonce()), is_custom)
                 };
+                let wire_arguments = arguments.clone();
                 let arguments = normalize_emitted_tool_arguments(
                     arguments,
                     is_custom,
                     is_raw_input,
                     matched_spec,
                 );
+                let is_orchestrator = matched_spec.is_some_and(is_code_mode_orchestrator_tool);
+                task_guard.begin_tool_call(ToolCallStart {
+                    call_id: call_id.clone(),
+                    route: ToolCallRoute::ClientRoundtrip,
+                    wire_tool_name: name.clone(),
+                    client_tool_name: Some(name.clone()),
+                    is_orchestrator,
+                    code_language: if is_orchestrator {
+                        script_language(is_custom, &arguments)
+                    } else {
+                        None
+                    },
+                    v4a_auto_repaired: patch_was_repaired(&name, &wire_arguments, &arguments),
+                    client_arguments: (wire_arguments != arguments).then(|| arguments.clone()),
+                    wire_arguments,
+                });
                 state.assistant_parts.push(CanonicalPart::ToolCall {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -3873,6 +3916,14 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
         true,
         resolved_model.as_str(),
     );
+    if let Some(handle) = step_lease.mcp_handle() {
+        let catalog = handle.catalog();
+        task_guard.set_tool_context(
+            catalog.profile_id,
+            catalog.orchestrator_contract().map(|c| c.mode_id()),
+            step_lease.turn_count(),
+        );
+    }
 
     let route_meta = TurnRoutingMetadata {
         routing_strategy: LowCacheRoutingStrategy::McpSuspendedContinuation,
@@ -3943,6 +3994,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             &delta_for_reply,
             tools_delta.as_deref(),
             &mut spill_store,
+            task_guard.hub(),
         );
         task_guard
             .record_mcp_tool_results(built_replies.total_results, built_replies.spilled_results);
@@ -4104,7 +4156,14 @@ fn build_mcp_tool_replies(
     delta_messages: &[CanonicalMessage],
     tools_delta_xml: Option<&str>,
     spill_store: &mut Option<SpillStore>,
+    telemetry: &TelemetryHub,
 ) -> BuiltMcpToolReplies {
+    let mut result_images: HashMap<String, Vec<crate::tool_calls::ToolOutputImage>> =
+        trailing_tool_results(delta_messages)
+            .into_iter()
+            .filter(|r| !r.images.is_empty())
+            .map(|r| (strip_call_prefix(r.call_id).to_owned(), r.images))
+            .collect();
     let pending_set: HashSet<&str> = pending_calls
         .iter()
         .map(|p| p.nonce_suffix.as_str())
@@ -4168,6 +4227,15 @@ fn build_mcp_tool_replies(
             .unwrap_or_else(|| (String::new(), false));
         let (sanitized, did_spill) =
             sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        telemetry.finish_client_tool_call(
+            &pending.call_id,
+            &raw_out,
+            is_error,
+            did_spill,
+            result_images
+                .remove(&pending.nonce_suffix)
+                .unwrap_or_default(),
+        );
         total_results = total_results.saturating_add(1);
         if did_spill {
             spilled_results = spilled_results.saturating_add(1);
@@ -4306,6 +4374,163 @@ fn compute_final_mcp_step_usage(
     }
 }
 
+/// Harness profile and orchestration mode that a turn's tool calls are attributed to.
+fn tool_attribution(
+    mcp_handle: Option<&Arc<McpSessionHandle>>,
+    protocol: TaskProtocol,
+    client_tools: &[liftgate_types::canonical::CanonicalToolSpec],
+) -> (&'static str, Option<&'static str>) {
+    if let Some(handle) = mcp_handle {
+        let catalog = handle.catalog();
+        return (
+            catalog.profile_id,
+            catalog.orchestrator_contract().map(|c| c.mode_id()),
+        );
+    }
+    if client_tools.is_empty() {
+        return (GENERIC_HARNESS_PROFILE, None);
+    }
+    let hint = match protocol {
+        TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
+        TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
+    };
+    (detect_harness(hint, client_tools).id(), None)
+}
+
+/// Route of a call forwarded to the client, judged by the wire tool the model invoked.
+fn client_tool_route(wire_mcp_name: &str) -> ToolCallRoute {
+    if wire_mcp_name.starts_with(NAMESPACE_HUB_MCP_PREFIX) {
+        ToolCallRoute::NamespaceHub
+    } else if wire_mcp_name == CALL_CLIENT_TOOL_MCP_NAME {
+        ToolCallRoute::GenericDispatcher
+    } else {
+        ToolCallRoute::ClientRoundtrip
+    }
+}
+
+/// Start of a call answered inside the gateway.
+fn local_tool_start(
+    route: ToolCallRoute,
+    wire_mcp_name: &str,
+    wire_arguments: String,
+) -> ToolCallStart {
+    ToolCallStart {
+        call_id: format!("lg_{}", generate_short_nonce()),
+        route,
+        wire_tool_name: format!("{ACP_MCP_TOOL_PREFIX}{wire_mcp_name}"),
+        client_tool_name: None,
+        is_orchestrator: false,
+        code_language: None,
+        wire_arguments,
+        client_arguments: None,
+        v4a_auto_repaired: false,
+    }
+}
+
+fn mcp_reply_text(reply: &McpToolCallReply) -> String {
+    let mut text = String::new();
+    for item in &reply.content {
+        if let McpContentItem::Text { text: chunk } = item {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(chunk);
+        }
+    }
+    text
+}
+
+/// Records a 0-RTT search, spill read, preflight rejection, or disabled-tool reply.
+fn record_local_mcp_reply(
+    task_guard: &ActiveTaskGuard,
+    wire_mcp_name: &str,
+    wire_arguments: String,
+    reply: &McpToolCallReply,
+    kind: LocalReplyKind,
+    started_ms: u64,
+) {
+    let (route, status, error_kind) = match kind {
+        LocalReplyKind::Search | LocalReplyKind::SpillRead if reply.is_error => (
+            if matches!(kind, LocalReplyKind::Search) {
+                ToolCallRoute::ZeroRttSearch
+            } else {
+                ToolCallRoute::ZeroRttSpillRead
+            },
+            ToolCallStatus::Error,
+            Some(ToolCallErrorKind::ToolError),
+        ),
+        LocalReplyKind::Search => (ToolCallRoute::ZeroRttSearch, ToolCallStatus::Ok, None),
+        LocalReplyKind::SpillRead => (ToolCallRoute::ZeroRttSpillRead, ToolCallStatus::Ok, None),
+        LocalReplyKind::PreflightError => (
+            ToolCallRoute::ZeroRttPreflight,
+            ToolCallStatus::PreflightRejected,
+            Some(ToolCallErrorKind::PreflightRejected),
+        ),
+        LocalReplyKind::DisabledTool => (
+            ToolCallRoute::ZeroRttPreflight,
+            ToolCallStatus::PreflightRejected,
+            Some(ToolCallErrorKind::DisabledTool),
+        ),
+    };
+    task_guard.record_local_tool_call(
+        local_tool_start(route, wire_mcp_name, wire_arguments),
+        ToolCallOutcome::local(mcp_reply_text(reply), status, error_kind),
+        started_ms,
+    );
+}
+
+/// Records a server-side web fetch as a gateway-managed tool call.
+fn record_gateway_web_fetch(
+    task_guard: &ActiveTaskGuard,
+    start: ToolCallStart,
+    formatted: &str,
+    is_error: bool,
+    started_ms: u64,
+) {
+    let (status, error_kind) = if is_error {
+        (ToolCallStatus::Error, Some(ToolCallErrorKind::ToolError))
+    } else {
+        (ToolCallStatus::Ok, None)
+    };
+    task_guard.record_local_tool_call(
+        start,
+        ToolCallOutcome::local(formatted.to_owned(), status, error_kind),
+        started_ms,
+    );
+}
+
+/// Appends an XML-path web fetch to the continuation prompt and records it.
+fn format_and_record_xml_web_fetch(
+    task_guard: &ActiveTaskGuard,
+    call_id: &str,
+    url: &str,
+    outcome: &WebFetchOutcome,
+    started_ms: u64,
+    continuation: &mut String,
+) {
+    let before = continuation.len();
+    format_web_fetch_continuation(continuation, outcome);
+    let formatted = continuation.get(before..).unwrap_or_default().trim();
+    let start = ToolCallStart {
+        call_id: call_id.to_owned(),
+        route: ToolCallRoute::GatewayManaged,
+        wire_tool_name: INTERNAL_GATEWAY_WEB_FETCH_TOOL.to_owned(),
+        client_tool_name: None,
+        is_orchestrator: false,
+        code_language: None,
+        wire_arguments: serde_json::json!({ "url": url }).to_string(),
+        client_arguments: None,
+        v4a_auto_repaired: false,
+    };
+    record_gateway_web_fetch(
+        task_guard,
+        start,
+        formatted,
+        matches!(outcome, WebFetchOutcome::Error { .. }),
+        started_ms,
+    );
+}
+
 const MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS: u8 = 3;
 const MAX_CONSECUTIVE_PREFLIGHT_MCP_REJECTIONS: u8 = 4;
 
@@ -4314,6 +4539,13 @@ struct ForwardedMcpCall {
     arguments: String,
     is_custom: bool,
     reply_tx: oneshot::Sender<McpToolCallReply>,
+    /// MCP-local tool name the model invoked (`exec`, `ns__github`, `call_client_tool`, ...).
+    wire_mcp_name: String,
+    /// Arguments exactly as the model sent them to the wire tool.
+    wire_arguments: String,
+    /// The virtualizer's V4A auto-repair rewrote the patch (judged on the unwrapped call, so hub
+    /// and dispatcher envelopes never look like repairs).
+    patch_repaired: bool,
 }
 
 fn record_forwarded_mcp_call(
@@ -4321,6 +4553,7 @@ fn record_forwarded_mcp_call(
     task_guard: &ActiveTaskGuard,
     state: &mut TurnStreamState,
     is_first_in_prompt_turn: bool,
+    active_tools: &[liftgate_types::canonical::CanonicalToolSpec],
 ) -> (
     PendingMcpCallInfo,
     oneshot::Sender<McpToolCallReply>,
@@ -4332,10 +4565,33 @@ fn record_forwarded_mcp_call(
         arguments,
         is_custom,
         reply_tx,
+        wire_mcp_name,
+        wire_arguments,
+        patch_repaired,
     } = forwarded;
     let arg_chars = arguments.chars().count();
     let nonce_suffix = generate_short_nonce();
     let call_id = format!("call_{nonce_suffix}");
+
+    let is_orchestrator = active_tools
+        .iter()
+        .find(|t| t.name == client_name)
+        .is_some_and(is_code_mode_orchestrator_tool);
+    task_guard.begin_tool_call(ToolCallStart {
+        call_id: call_id.clone(),
+        route: client_tool_route(&wire_mcp_name),
+        wire_tool_name: format!("{ACP_MCP_TOOL_PREFIX}{wire_mcp_name}"),
+        client_tool_name: Some(client_name.clone()),
+        is_orchestrator,
+        code_language: if is_orchestrator {
+            script_language(is_custom, &arguments)
+        } else {
+            None
+        },
+        v4a_auto_repaired: patch_repaired,
+        client_arguments: (wire_arguments != arguments).then(|| arguments.clone()),
+        wire_arguments,
+    });
 
     task_guard.record_mcp_forwarded_tool(&client_name, &arguments, is_first_in_prompt_turn);
     task_guard.record_tool_delta(arg_chars);
@@ -4866,51 +5122,65 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     mcp_handle.sync_client_tools(&cur_req.client_tools);
                     let mut exceeded_rejection_reason: Option<&'static str> = None;
                     for incoming in pending_mcp_incoming.drain(..) {
+                        let wire_mcp_name = incoming.mcp_name.clone();
+                        let wire_arguments = incoming.arguments.to_string();
+                        let started_ms = unix_timestamp_ms();
                         match mcp_handle.resolve_incoming_call(incoming, &cur_req.client_tools) {
                             ResolvedMcpIncoming::ImmediateLocalReply {
                                 reply_tx,
                                 reply,
                                 kind,
-                            } => match kind {
-                                LocalReplyKind::Search => {
-                                    disabled_mcp_rejections = 0;
-                                    preflight_mcp_rejections = 0;
-                                    cur_task_guard.record_zero_rtt_search();
-                                    let _ = reply_tx.send(reply);
-                                }
-                                LocalReplyKind::SpillRead => {
-                                    disabled_mcp_rejections = 0;
-                                    preflight_mcp_rejections = 0;
-                                    cur_task_guard.record_zero_rtt_spill_read();
-                                    let _ = reply_tx.send(reply);
-                                }
-                                LocalReplyKind::PreflightError => {
-                                    preflight_mcp_rejections =
-                                        preflight_mcp_rejections.saturating_add(1);
-                                    if preflight_mcp_rejections
-                                        > MAX_CONSECUTIVE_PREFLIGHT_MCP_REJECTIONS
-                                    {
-                                        exceeded_rejection_reason = Some(
-                                            "\"model repeatedly failed virtualized MCP tool preflight\"",
-                                        );
-                                    } else {
-                                        cur_task_guard.record_zero_rtt_preflight_heal();
+                            } => {
+                                record_local_mcp_reply(
+                                    &cur_task_guard,
+                                    &wire_mcp_name,
+                                    wire_arguments,
+                                    &reply,
+                                    kind,
+                                    started_ms,
+                                );
+                                match kind {
+                                    LocalReplyKind::Search => {
+                                        disabled_mcp_rejections = 0;
+                                        preflight_mcp_rejections = 0;
+                                        cur_task_guard.record_zero_rtt_search();
                                         let _ = reply_tx.send(reply);
                                     }
-                                }
-                                LocalReplyKind::DisabledTool => {
-                                    disabled_mcp_rejections =
-                                        disabled_mcp_rejections.saturating_add(1);
-                                    if disabled_mcp_rejections
-                                        > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS
-                                    {
-                                        exceeded_rejection_reason =
-                                            Some("\"model repeatedly invoked disabled MCP tool\"");
-                                    } else {
+                                    LocalReplyKind::SpillRead => {
+                                        disabled_mcp_rejections = 0;
+                                        preflight_mcp_rejections = 0;
+                                        cur_task_guard.record_zero_rtt_spill_read();
                                         let _ = reply_tx.send(reply);
                                     }
+                                    LocalReplyKind::PreflightError => {
+                                        preflight_mcp_rejections =
+                                            preflight_mcp_rejections.saturating_add(1);
+                                        if preflight_mcp_rejections
+                                            > MAX_CONSECUTIVE_PREFLIGHT_MCP_REJECTIONS
+                                        {
+                                            exceeded_rejection_reason = Some(
+                                                "\"model repeatedly failed virtualized MCP tool preflight\"",
+                                            );
+                                        } else {
+                                            cur_task_guard.record_zero_rtt_preflight_heal();
+                                            let _ = reply_tx.send(reply);
+                                        }
+                                    }
+                                    LocalReplyKind::DisabledTool => {
+                                        disabled_mcp_rejections =
+                                            disabled_mcp_rejections.saturating_add(1);
+                                        if disabled_mcp_rejections
+                                            > MAX_CONSECUTIVE_DISABLED_MCP_REJECTIONS
+                                        {
+                                            exceeded_rejection_reason = Some(
+                                                "\"model repeatedly invoked disabled MCP tool\"",
+                                            );
+                                        } else {
+                                            let _ = reply_tx.send(reply);
+                                        }
+                                    }
                                 }
-                            },
+                            }
                             ResolvedMcpIncoming::ReadContextSpill {
                                 path,
                                 start_line,
@@ -4941,6 +5211,23 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                         true,
                                     ),
                                 };
+                                cur_task_guard.record_local_tool_call(
+                                    local_tool_start(
+                                        ToolCallRoute::ZeroRttSpillRead,
+                                        &wire_mcp_name,
+                                        wire_arguments,
+                                    ),
+                                    ToolCallOutcome::local(
+                                        text.clone(),
+                                        if is_error {
+                                            ToolCallStatus::Error
+                                        } else {
+                                            ToolCallStatus::Ok
+                                        },
+                                        is_error.then_some(ToolCallErrorKind::ToolError),
+                                    ),
+                                    started_ms,
+                                );
                                 let _ = reply_tx.send(McpToolCallReply {
                                     content: vec![McpContentItem::Text { text }],
                                     is_error,
@@ -4950,6 +5237,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 client_name,
                                 arguments,
                                 is_custom,
+                                patch_repaired,
                                 reply_tx,
                             } => {
                                 disabled_mcp_rejections = 0;
@@ -4959,10 +5247,26 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     arguments,
                                     is_custom,
                                     reply_tx,
+                                    wire_mcp_name,
+                                    wire_arguments,
+                                    patch_repaired,
                                 });
                             }
                             ResolvedMcpIncoming::GatewayWebFetch { url, reply_tx } => {
                                 if !cur_req.enable_native_web_fetch {
+                                    cur_task_guard.record_local_tool_call(
+                                        local_tool_start(
+                                            ToolCallRoute::ZeroRttPreflight,
+                                            &wire_mcp_name,
+                                            wire_arguments,
+                                        ),
+                                        ToolCallOutcome::local(
+                                            "Tool `gateway_web_fetch` is disabled for this turn; do not call it.".to_owned(),
+                                            ToolCallStatus::PreflightRejected,
+                                            Some(ToolCallErrorKind::DisabledTool),
+                                        ),
+                                        started_ms,
+                                    );
                                     disabled_mcp_rejections =
                                         disabled_mcp_rejections.saturating_add(1);
                                     if disabled_mcp_rejections
@@ -5034,6 +5338,17 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 let mut formatted = String::new();
                                 format_web_fetch_continuation(&mut formatted, &outcome);
                                 let is_err = matches!(outcome, WebFetchOutcome::Error { .. });
+                                record_gateway_web_fetch(
+                                    &cur_task_guard,
+                                    local_tool_start(
+                                        ToolCallRoute::GatewayManaged,
+                                        &wire_mcp_name,
+                                        wire_arguments,
+                                    ),
+                                    formatted.trim(),
+                                    is_err,
+                                    started_ms,
+                                );
                                 if !send_cancel_safe(
                                     &cur_events_tx,
                                     TurnEvent::WebFetchComplete {
@@ -5110,6 +5425,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         &cur_task_guard,
                         &mut state,
                         is_first_in_prompt,
+                        &cur_req.client_tools,
                     );
                     step_tool_arg_chars = step_tool_arg_chars.saturating_add(arg_chars);
                     parked_replies.push((info.nonce_suffix.clone(), reply_tx));
@@ -5196,36 +5512,34 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     &assistant_msg,
                 );
 
-                if telemetry_step_usage.total_prompt_tokens() > 0 {
-                    let pre_reply_slice = cur_full_messages.get(..pre_step_len).unwrap_or(&[]);
-                    let diag = TurnCompletionDiagnostics {
-                        routing_strategy: cur_route_meta.routing_strategy,
-                        delta_start_index: cur_route_meta.delta_start_index,
-                        session_turn_index: cur_route_meta.session_turn_index,
-                        session_idle_ms: cur_route_meta.session_idle_ms,
-                        previous_session_context_tokens: cur_route_meta
-                            .previous_session_context_tokens,
-                        model_switched: cur_route_meta.model_switched,
-                        previous_model: cur_route_meta.previous_model.as_deref(),
-                        previous_response_id: cur_req.previous_response_id.as_deref(),
-                        prefix_hash_hex: cur_route_meta.prefix_hash_hex.as_deref(),
-                        base_state_hash_hex: &cur_route_meta.base_state_hash_hex,
-                        reasoning_effort: cur_req.reasoning_effort,
-                        web_cfg: cur_web_cfg,
-                        acp_system_append: cur_route_meta.acp_system_append.as_deref(),
-                        tools_delta_xml: cur_route_meta.tools_delta_xml.as_deref(),
-                        outbound_acp_blocks: &cur_outbound_blocks,
-                        messages: pre_reply_slice,
-                        client_tools: &cur_req.client_tools,
-                    };
-                    cur_task_guard.complete_with_diagnostics(
-                        "tool_use".to_owned(),
-                        telemetry_step_usage,
-                        cur_req.auxiliary_task.is_none().then_some(diag),
-                    );
-                } else {
-                    cur_task_guard.complete("tool_use".to_owned(), telemetry_step_usage);
-                }
+                // Diagnostics flow even before upstream usage arrives: without prompt tokens no
+                // cache statistics are derived, but the session's context sample and an enabled
+                // full-context capture must not depend on token accounting.
+                let pre_reply_slice = cur_full_messages.get(..pre_step_len).unwrap_or(&[]);
+                let diag = TurnCompletionDiagnostics {
+                    routing_strategy: cur_route_meta.routing_strategy,
+                    delta_start_index: cur_route_meta.delta_start_index,
+                    session_turn_index: cur_route_meta.session_turn_index,
+                    session_idle_ms: cur_route_meta.session_idle_ms,
+                    previous_session_context_tokens: cur_route_meta.previous_session_context_tokens,
+                    model_switched: cur_route_meta.model_switched,
+                    previous_model: cur_route_meta.previous_model.as_deref(),
+                    previous_response_id: cur_req.previous_response_id.as_deref(),
+                    prefix_hash_hex: cur_route_meta.prefix_hash_hex.as_deref(),
+                    base_state_hash_hex: &cur_route_meta.base_state_hash_hex,
+                    reasoning_effort: cur_req.reasoning_effort,
+                    web_cfg: cur_web_cfg,
+                    acp_system_append: cur_route_meta.acp_system_append.as_deref(),
+                    tools_delta_xml: cur_route_meta.tools_delta_xml.as_deref(),
+                    outbound_acp_blocks: &cur_outbound_blocks,
+                    messages: pre_reply_slice,
+                    client_tools: &cur_req.client_tools,
+                };
+                cur_task_guard.complete_with_diagnostics(
+                    "tool_use".to_owned(),
+                    telemetry_step_usage,
+                    cur_req.auxiliary_task.is_none().then_some(diag),
+                );
 
                 cur_full_messages.push(assistant_msg);
                 let message_count = cur_full_messages.len();
@@ -5407,6 +5721,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         let fetch_deadline = Instant::now() + Duration::from_secs(cur_timeout_secs);
 
                         for (fetch_call_id, raw_url) in queued_fetches {
+                            let fetch_started_ms = unix_timestamp_ms();
                             if !send_cancel_safe(
                                 &cur_events_tx,
                                 TurnEvent::WebFetchStart {
@@ -5454,7 +5769,14 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 }
                             };
 
-                            format_web_fetch_continuation(&mut continuation_xml, &outcome);
+                            format_and_record_xml_web_fetch(
+                                &cur_task_guard,
+                                &fetch_call_id,
+                                &raw_url,
+                                &outcome,
+                                fetch_started_ms,
+                                &mut continuation_xml,
+                            );
                             if !send_cancel_safe(
                                 &cur_events_tx,
                                 TurnEvent::WebFetchComplete {

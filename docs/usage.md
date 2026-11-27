@@ -589,10 +589,14 @@ Messages client at `http://127.0.0.1:8787` ([API](api.md)).
 
 Liftgate serves the observability dashboard directly at `http://127.0.0.1:8787/`
 (embedded inside release binaries at compile time, or opened via `liftgate ui`):
-in-flight and recent turns with their tool calls and token counts, the session
-pool (idle or MCP-suspended sessions can be closed by hand, and the Hybrid MCP
-Tool Bridge and `>=300k` vision offload can be toggled live), the model catalog
-and the last lines of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
+in-flight and recent turns with their token counts and cache hit rates, every
+tool call with its full input and output (CodeMode scripts highlighted, patches
+as diffs, gateway-local 0-RTT replies and preflight rejections included), each
+session's tool catalog (how client tools were virtualized onto `lg`, client vs.
+wire definitions, and context composition), opt-in full-context captures, the
+session pool (idle or MCP-suspended sessions can be closed by hand, and the
+Hybrid MCP Tool Bridge and `>=300k` vision offload can be toggled live), the
+model catalog and the last lines of `agy` stderr. With `--api-key`, `liftgate ui` passes the key automatically
 (or enter it in the dashboard's connection settings). Serve an extra dedicated
 UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir>`.
 
@@ -611,6 +615,9 @@ UI port with `--ui-listen <addr>` or override assets on disk with `--ui-dir <dir
 | `--max-low-cache-records` | `AGY_MAX_LOW_CACHE_RECORDS` | `1000` (`0..=50000`; persisted in `~/.liftgate/cache-telemetry.json`, live-configurable in Web UI) |
 | `--low-cache-threshold-pct` | `AGY_LOW_CACHE_THRESHOLD_PCT` | `50` (`0..=100%`; turns below threshold are persisted as low-cache-hit records) |
 | `--low-cache-capture-payload` / `--no-low-cache-capture-payload` | `AGY_LOW_CACHE_CAPTURE_PAYLOAD` | `true` (persists full low-cache request payloads under `~/.liftgate/low-cache-payloads/`, live-toggleable in Web UI) |
+| `--capture-full-context` / `--no-capture-full-context` | `AGY_CAPTURE_FULL_CONTEXT` | `false` (or `capture_full_context` in `~/.liftgate/settings.json`; writes every turn's full context — message history, reasoning, ACP prompt, output — to `~/.liftgate/context-captures/`, live-toggleable in the Web UI) |
+| `--max-context-captures` | `AGY_MAX_CONTEXT_CAPTURES` | `200` (`1..=10000`; oldest captures are deleted first) |
+| `--max-context-capture-mib` | `AGY_MAX_CONTEXT_CAPTURE_MIB` | `512` (`16..=65536` MiB disk quota for full-context captures) |
 | `--default-model` (used for unknown or generic model names) | `AGY_DEFAULT_MODEL` | `gemini-4-carbon-high` |
 | `--acp-mode` (`auto`, `accept-edits`, `default`, `plan`) | `AGY_ACP_MODE` | `auto` |
 | `--acp-cwd` | `AGY_ACP_CWD` | an isolated empty directory under the system temp dir |

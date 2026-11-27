@@ -1,0 +1,247 @@
+import * as React from "react";
+import { useMemo, useState } from "react";
+import { Image as ImageIcon } from "lucide-react";
+import { ProseBlock } from "@/components/CodeBlock";
+import { SegmentedBar } from "@/components/charts";
+import { ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
+import { Button, Disclosure, Pill, Segmented } from "@/components/ui";
+import {
+  PART_KIND_LABEL,
+  messagePartComposition,
+  partBytes,
+  partKindColor,
+  partKindOf,
+} from "@/lib/context";
+import { formatBytes } from "@/lib/format";
+import { classifyTool, outputReportsFailure } from "@/lib/toolcalls";
+import type { CapturedFullMessage, CapturedFullPart } from "@/types/telemetry";
+
+/** Messages mounted per step; long histories grow on demand. */
+const PAGE = 40;
+
+export type TimelineScope = "all" | "delta" | "tools";
+type Scope = TimelineScope;
+
+function excerptOf(part: CapturedFullPart): string {
+  switch (part.kind) {
+    case "text":
+    case "reasoning":
+      return part.text.slice(0, 120).replace(/\s+/g, " ");
+    case "tool_call":
+      return part.arguments.slice(0, 120).replace(/\s+/g, " ");
+    case "tool_result":
+      return part.output.slice(0, 120).replace(/\s+/g, " ");
+    case "image":
+      return part.media_type;
+  }
+}
+
+function PartView({
+  part,
+  open,
+  toolNames,
+}: {
+  part: CapturedFullPart;
+  open: boolean;
+  /** call_id → tool name, so a result can say which call it answers. */
+  toolNames: ReadonlyMap<string, string>;
+}): React.JSX.Element {
+  const kind = partKindOf(part);
+  const toolName =
+    part.kind === "tool_call"
+      ? part.name
+      : part.kind === "tool_result"
+        ? (toolNames.get(part.call_id) ?? null)
+        : null;
+  // Harnesses often report a failed script inside the text while leaving the flag unset.
+  const failed = part.kind === "tool_result" && (part.is_error || outputReportsFailure(part.output));
+
+  const head = (
+    <>
+      {toolName !== null ? (
+        <ToolGlyph kind={classifyTool(toolName)} failed={failed} size="sm" />
+      ) : (
+        <span className="lg-swatch" style={{ background: partKindColor(kind) }} aria-hidden="true" />
+      )}
+      <span className="flex-none font-medium text-fg-2">{PART_KIND_LABEL[kind]}</span>
+      {toolName !== null && <span className="lg-num flex-none text-fg">{toolName}</span>}
+      {failed && <Pill tone="err">报错</Pill>}
+      <span className="lg-clip lg-num min-w-0 flex-1 text-[11.5px] text-fg-4">{excerptOf(part)}</span>
+    </>
+  );
+
+  let body: React.ReactNode;
+  switch (part.kind) {
+    case "text":
+      body = (
+        <ProseBlock
+          text={part.text}
+          title={part.is_developer_instructions ? "<developer_instructions>" : "文本"}
+        />
+      );
+      break;
+    case "reasoning":
+      body = <ProseBlock text={part.text} title="思考内容" />;
+      break;
+    case "tool_call":
+      body = (
+        <ToolInputView
+          toolName={part.name}
+          raw={part.arguments}
+          label={part.is_custom ? "自由格式参数" : "参数"}
+          maxHeight={360}
+        />
+      );
+      break;
+    case "tool_result":
+      body = (
+        <ToolOutputView
+          blocks={[{ type: "text", bytes: part.bytes, text: part.output }]}
+          failed={failed}
+          maxHeight={360}
+        />
+      );
+      break;
+    case "image":
+      body = (
+        <div className="flex items-center gap-2 text-[12.5px] text-fg-3">
+          <ImageIcon className="h-4 w-4" />
+          <span className="lg-num">
+            {part.media_type} · base64 {formatBytes(part.base64_bytes)}
+          </span>
+        </div>
+      );
+      break;
+  }
+
+  return (
+    <Disclosure
+      head={head}
+      meta={formatBytes(partBytes(part))}
+      tone={failed ? "err" : undefined}
+      defaultOpen={open}
+    >
+      {body}
+    </Disclosure>
+  );
+}
+
+const ROLE_LABEL: Record<string, string> = {
+  user: "user",
+  assistant: "assistant",
+  system: "system",
+  developer: "developer",
+  tool: "tool",
+};
+
+/**
+ * The conversation exactly as the gateway held it for one turn: resident
+ * prefix first, then a rule, then what this turn actually sent upstream.
+ */
+export function MessageTimeline({
+  messages,
+  initialScope,
+}: {
+  messages: CapturedFullMessage[];
+  /** Scope to open on; defaults to this turn's delta for long histories. */
+  initialScope?: TimelineScope;
+}): React.JSX.Element {
+  const deltaCount = useMemo(() => messages.filter((m) => m.in_delta).length, [messages]);
+  const [scope, setScope] = useState<Scope>(
+    initialScope ?? (deltaCount > 0 && messages.length > PAGE ? "delta" : "all"),
+  );
+  const [limit, setLimit] = useState(PAGE);
+
+  const toolNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const msg of messages) {
+      for (const part of msg.parts) {
+        if (part.kind === "tool_call") names.set(part.call_id, part.name);
+      }
+    }
+    return names;
+  }, [messages]);
+
+  const composition = useMemo(() => messagePartComposition(messages), [messages]);
+
+  const scoped = useMemo(() => {
+    if (scope === "delta") return messages.filter((m) => m.in_delta);
+    if (scope === "tools") {
+      return messages.filter((m) =>
+        m.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
+      );
+    }
+    return messages;
+  }, [messages, scope]);
+
+  // The newest messages matter most, so paging reveals older ones upward.
+  const hidden = Math.max(0, scoped.length - limit);
+  const shown = hidden > 0 ? scoped.slice(hidden) : scoped;
+  const firstDeltaIndex = shown.find((m) => m.in_delta)?.index;
+  const toolMessages = messages.filter((m) =>
+    m.parts.some((p) => p.kind === "tool_call" || p.kind === "tool_result"),
+  ).length;
+
+  if (messages.length === 0) {
+    return <p className="lg-hint m-0">这一轮没有保存消息序列。</p>;
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col gap-3">
+      <SegmentedBar
+        parts={composition}
+        format={formatBytes}
+        ariaLabel="消息内容按类型的体积构成"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Segmented<Scope>
+          ariaLabel="消息范围"
+          value={scope}
+          onChange={(next) => {
+            setScope(next);
+            setLimit(PAGE);
+          }}
+          options={[
+            { value: "all", label: "全部消息", count: messages.length },
+            { value: "delta", label: "本轮增量", count: deltaCount },
+            { value: "tools", label: "工具往返", count: toolMessages },
+          ]}
+        />
+        {hidden > 0 && (
+          <Button size="sm" onClick={() => setLimit((n) => n + PAGE * 2)}>
+            显示更早的 {Math.min(hidden, PAGE * 2)} 条（还有 {hidden} 条）
+          </Button>
+        )}
+      </div>
+
+      {shown.length === 0 && <p className="lg-hint m-0">当前范围内没有消息。</p>}
+
+      {shown.map((msg) => (
+        <React.Fragment key={msg.index}>
+          {scope === "all" && msg.index === firstDeltaIndex && (
+            <div className="lg-rule" role="separator">
+              以下 {deltaCount} 条是本轮实际发往上游的增量
+            </div>
+          )}
+          <article className="lg-msg" data-delta={msg.in_delta}>
+            <header className="lg-msg-head">
+              <span className="lg-role">
+                #{msg.index} {ROLE_LABEL[msg.role] ?? msg.role}
+              </span>
+              <Pill tone={msg.in_delta ? "accent" : "neutral"}>
+                {msg.in_delta ? "本轮增量" : "驻留前缀"}
+              </Pill>
+              <span className="lg-num text-[11.5px]">
+                {msg.parts.length} 块 · {formatBytes(msg.total_bytes)}
+              </span>
+            </header>
+            {msg.parts.map((part, idx) => (
+              // Parts are an ordered, immutable list inside a captured message.
+              <PartView key={idx} part={part} open={msg.in_delta && msg.parts.length <= 6} toolNames={toolNames} />
+            ))}
+          </article>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}

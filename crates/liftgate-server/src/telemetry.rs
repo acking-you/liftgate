@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_types::{
@@ -12,20 +15,33 @@ use liftgate_types::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
         CanonicalToolSpec, ReasoningEffort,
     },
-    config::{CacheHitThresholdBps, LowCacheRecordLimit},
+    config::{
+        CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit, LowCacheRecordLimit,
+    },
     session_key::{WebToolBridgeConfig, truncate_head_tail_lines},
     telemetry::{
         CacheTelemetrySummary, CapturedAcpPromptBlock, CapturedFullMessage, CapturedFullPart,
-        CapturedMessageSummary, CapturedToolSpec, ElasticIoTelemetry, GatewayMetricsSummary,
+        CapturedMessageSummary, CapturedToolSpec, ContextCaptureDetailResponse,
+        ContextCaptureRecord, ContextCaptureSummary, ContextCapturesResponse, ContextSegment,
+        ContextSegmentKey, ElasticIoTelemetry, FullContextPayload, GatewayMetricsSummary,
         LowCacheDiagnosticCause, LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord,
         LowCacheHitsResponse, LowCachePayloadDetailResponse, LowCacheRequestCapture,
         LowCacheRequestMetrics, LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
+        ToolCallDetail, ToolCallTelemetrySummary, ToolCallsResponse,
     },
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use uuid::Uuid;
+
+use crate::context_capture::{
+    CaptureCommit, CaptureTicket, ContextCaptureConfig, ContextCaptureIoError, ContextCaptureStore,
+    encode_payload, payload_file_name, read_payload,
+};
+use crate::tool_calls::{
+    ToolCallLimits, ToolCallOutcome, ToolCallStart, ToolCallStore, ToolCallTaskContext,
+};
 
 const MAX_RECENT_TASKS: usize = 100;
 const MAX_PROMPT_PREVIEW_CHARS: usize = 180;
@@ -36,8 +52,33 @@ const MAX_INLINE_TOOLS_DELTA_BYTES: usize = 8 * 1024;
 const MAX_INLINE_OUTBOUND_PROMPT_BYTES: usize = 24 * 1024;
 const MAX_INLINE_MESSAGE_DIGESTS: usize = 24;
 const MAX_INLINE_MESSAGE_EXCERPT_CHARS: usize = 600;
-const MAX_FULL_PART_BYTES: usize = 256 * 1024;
-const MAX_FULL_PAYLOAD_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+/// Bounds applied while materializing a request payload for disk.
+#[derive(Clone, Copy, Debug)]
+struct PayloadBudget {
+    per_part: usize,
+    total: usize,
+}
+
+const LOW_CACHE_PAYLOAD_BUDGET: PayloadBudget = PayloadBudget {
+    per_part: 256 * 1024,
+    total: 2 * 1024 * 1024,
+};
+const CONTEXT_CAPTURE_PAYLOAD_BUDGET: PayloadBudget = PayloadBudget {
+    per_part: 1024 * 1024,
+    total: 16 * 1024 * 1024,
+};
+/// Reasoning / output text retained per turn for full-context capture.
+const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 1024 * 1024;
+/// Sessions whose latest context composition is kept for the tool catalog view.
+const MAX_SESSION_CONTEXT_SAMPLES: usize = 256;
+/// Rough token cost charged per image when estimating context composition.
+const IMAGE_TOKENS_ESTIMATE: u64 = 1_000;
+
+const _: () = assert!(
+    LOW_CACHE_PAYLOAD_BUDGET.per_part <= LOW_CACHE_PAYLOAD_BUDGET.total
+        && CONTEXT_CAPTURE_PAYLOAD_BUDGET.per_part <= CONTEXT_CAPTURE_PAYLOAD_BUDGET.total,
+    "a single payload part must fit inside its payload budget"
+);
 
 const fn default_persisted_schema_version() -> u32 {
     PERSISTED_CACHE_SCHEMA_VERSION
@@ -74,6 +115,26 @@ impl Default for CacheTelemetryConfig {
     }
 }
 
+/// Complete [`TelemetryHub`] configuration.
+#[derive(Clone, Debug, Default)]
+pub struct TelemetryConfig {
+    pub cache: CacheTelemetryConfig,
+    /// Bounds of the per-call tool I/O ring buffer (enabled by default).
+    pub tool_calls: ToolCallLimits,
+    /// Opt-in full-context capture (disabled by default).
+    pub context_capture: ContextCaptureConfig,
+}
+
+/// Latest context composition observed for a session, used by the tool catalog view.
+#[derive(Clone, Debug)]
+pub struct SessionContextSample {
+    pub model_id: String,
+    pub captured_at_unix_ms: u64,
+    /// Message-derived segments plus `<client_tools_update>`; wire-tool and bridge-prompt
+    /// segments are added from the live MCP handle when the catalog is built.
+    pub segments: Vec<ContextSegment>,
+}
+
 /// Borrowed zero-copy turn context passed to [`ActiveTaskGuard::complete_with_diagnostics`]
 /// so full request metrics and payloads are materialized ONLY when a turn actually falls
 /// below the low-cache-hit threshold.
@@ -95,6 +156,12 @@ pub struct TurnCompletionDiagnostics<'a> {
     pub outbound_acp_blocks: &'a [AcpPromptBlock],
     pub messages: &'a [CanonicalMessage],
     pub client_tools: &'a [CanonicalToolSpec],
+}
+
+impl TurnCompletionDiagnostics<'_> {
+    fn clamped_delta_start(&self) -> usize {
+        self.delta_start_index.min(self.messages.len())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -407,36 +474,41 @@ fn persist_cache_file_atomic(
 /// while preserving all existing settings keys, and synchronizes any active sibling `daemon.json`
 /// owned by the current process (`pid == std::process::id()`).
 pub fn sync_settings_json_bool_field(settings_path: &Path, key: &str, value: bool) {
+    sync_settings_json_fields(settings_path, &[(key, serde_json::Value::from(value))]);
+}
+
+/// Atomically sets `fields` inside `settings.json` (creating the file if absent) while preserving
+/// all other keys, and mirrors them into a sibling `daemon.json` owned by this process.
+pub fn sync_settings_json_fields(settings_path: &Path, fields: &[(&str, serde_json::Value)]) {
     let mut map: serde_json::Map<String, serde_json::Value> = match fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => serde_json::Map::new(),
         Err(err) => {
             tracing::warn!(
                 path = %settings_path.display(),
-                key,
                 error = ?err,
-                "failed to read settings.json while syncing runtime boolean toggle"
+                "failed to read settings.json while syncing runtime settings"
             );
             return;
         }
     };
-    map.insert(key.to_owned(), serde_json::Value::from(value));
+    for (key, value) in fields {
+        map.insert((*key).to_owned(), value.clone());
+    }
     match serde_json::to_vec_pretty(&map) {
         Ok(mut json) => {
             json.push(b'\n');
             if let Err(err) = write_bytes_atomic_private(settings_path, &json) {
                 tracing::warn!(
                     path = %settings_path.display(),
-                    key,
                     error = ?err,
-                    "failed to persist updated runtime boolean toggle to settings.json"
+                    "failed to persist updated runtime settings to settings.json"
                 );
             }
         }
         Err(err) => {
             tracing::warn!(
                 path = %settings_path.display(),
-                key,
                 error = ?err,
                 "failed to serialize updated settings.json"
             );
@@ -451,18 +523,30 @@ pub fn sync_settings_json_bool_field(settings_path: &Path, key: &str, value: boo
             && daemon_map.get("pid").and_then(serde_json::Value::as_u64)
                 == Some(u64::from(std::process::id()))
         {
-            daemon_map.insert(key.to_owned(), serde_json::Value::from(value));
+            for (key, value) in fields {
+                daemon_map.insert((*key).to_owned(), value.clone());
+            }
             if let Ok(mut daemon_json) = serde_json::to_vec_pretty(&daemon_map) {
                 daemon_json.push(b'\n');
                 if let Err(err) = write_bytes_atomic_private(&daemon_path, &daemon_json) {
                     tracing::warn!(
                         path = %daemon_path.display(),
-                        key,
                         error = ?err,
-                        "failed to persist updated runtime boolean toggle to daemon.json"
+                        "failed to persist updated runtime settings to daemon.json"
                     );
                 }
             }
+        }
+    }
+}
+
+fn remove_capture_files(dir: Option<&Path>, records: &[ContextCaptureRecord]) {
+    let Some(dir) = dir else {
+        return;
+    };
+    for record in records {
+        if let Some(name) = payload_file_name(&record.task_id) {
+            let _ = fs::remove_file(dir.join(name));
         }
     }
 }
@@ -522,6 +606,10 @@ fn sync_settings_json_cache_fields(
 pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
     persist_lock: Mutex<u64>,
+    context_persist_lock: Mutex<u64>,
+    /// One permit per full-context capture allowed to wait for, or be in, its disk write.
+    context_write_slots: Arc<Semaphore>,
+    settings_path: Option<PathBuf>,
     notify_tx: broadcast::Sender<()>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -536,8 +624,27 @@ struct TelemetryInner {
     metrics: GatewayMetricsSummary,
     elastic_io: ElasticIoTelemetry,
     cache_store: CacheTelemetryStore,
+    tool_calls: ToolCallStore,
+    context_store: ContextCaptureStore,
+    session_contexts: HashMap<String, SessionContextSample>,
     active_tasks: BTreeMap<String, TaskSnapshot>,
     recent_tasks: VecDeque<TaskSnapshot>,
+}
+
+impl TelemetryInner {
+    fn store_session_sample(&mut self, session_id: &str, sample: SessionContextSample) {
+        if !self.session_contexts.contains_key(session_id)
+            && self.session_contexts.len() >= MAX_SESSION_CONTEXT_SAMPLES
+            && let Some(oldest) = self
+                .session_contexts
+                .iter()
+                .min_by_key(|(_, s)| s.captured_at_unix_ms)
+                .map(|(k, _)| k.clone())
+        {
+            let _ = self.session_contexts.remove(&oldest);
+        }
+        self.session_contexts.insert(session_id.to_owned(), sample);
+    }
 }
 
 impl Default for TelemetryHub {
@@ -554,20 +661,45 @@ impl TelemetryHub {
 
     #[must_use]
     pub fn with_config(config: CacheTelemetryConfig) -> Self {
+        Self::with_telemetry_config(TelemetryConfig {
+            cache: config,
+            ..TelemetryConfig::default()
+        })
+    }
+
+    #[must_use]
+    pub fn with_telemetry_config(config: TelemetryConfig) -> Self {
         let (notify_tx, _) = broadcast::channel(64);
         let (shutdown_tx, _) = watch::channel(false);
-        let cache_store = CacheTelemetryStore::from_config(config);
+        let settings_path = config.cache.settings_path.clone();
+        let context_write_slots = Arc::new(Semaphore::new(
+            config.context_capture.max_pending_writes.get(),
+        ));
+        let cache_store = CacheTelemetryStore::from_config(config.cache);
         Self {
             inner: Mutex::new(TelemetryInner {
                 metrics: GatewayMetricsSummary::default(),
                 elastic_io: ElasticIoTelemetry::default(),
                 cache_store,
+                tool_calls: ToolCallStore::new(config.tool_calls),
+                context_store: ContextCaptureStore::load(config.context_capture),
+                session_contexts: HashMap::new(),
                 active_tasks: BTreeMap::new(),
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
             }),
             persist_lock: Mutex::new(0),
+            context_persist_lock: Mutex::new(0),
+            context_write_slots,
+            settings_path,
             notify_tx,
             shutdown_tx,
+        }
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, TelemetryInner> {
+        match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         }
     }
 
@@ -634,6 +766,7 @@ impl TelemetryHub {
     ) -> ActiveTaskGuard {
         let now_ms = unix_timestamp_ms();
         let prompt_preview = extract_last_user_preview(messages);
+        let requested_model_for_ctx = requested_model.clone();
 
         let snapshot = TaskSnapshot {
             task_id: task_id.clone(),
@@ -665,23 +798,35 @@ impl TelemetryHub {
             cache_hit_rate_bps: None,
         };
 
-        {
-            let mut guard = match self.inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+        let capturing = {
+            let mut guard = self.lock_inner();
             guard.metrics.total_requests += 1;
             match protocol {
                 TaskProtocol::OpenaiResponses => guard.metrics.openai_requests += 1,
                 TaskProtocol::AnthropicMessages => guard.metrics.anthropic_requests += 1,
             }
+            if guard.tool_calls.pending_count() > 0 {
+                guard.tool_calls.sweep_stale(now_ms);
+                let _ = guard.tool_calls.complete_from_messages(messages, now_ms);
+            }
             guard.active_tasks.insert(task_id.clone(), snapshot);
             guard.metrics.active_requests = guard.active_tasks.len();
-        }
+            auxiliary_task.is_none() && guard.context_store.is_capturing()
+        };
         self.notify_change();
 
         ActiveTaskGuard {
             hub: Arc::clone(self),
+            tool_ctx: Mutex::new(ToolCallTaskContext {
+                task_id: task_id.clone(),
+                session_id: None,
+                model_id: requested_model_for_ctx,
+                harness_profile: GENERIC_HARNESS_PROFILE,
+                orchestrator_mode: None,
+                turn_index: 0,
+            }),
+            next_tool_step: AtomicU32::new(0),
+            text_capture: capturing.then(|| Mutex::new(TurnTextCapture::default())),
             task_id,
             armed: true,
         }
@@ -725,6 +870,240 @@ impl TelemetryHub {
             guard.elastic_io.context_spills_created.saturating_add(1);
         guard.elastic_io.context_spills_bytes =
             guard.elastic_io.context_spills_bytes.saturating_add(bytes);
+    }
+
+    // ---- per-call tool I/O -------------------------------------------------------------
+
+    /// Ring-buffer status; also resolves calls that stayed pending past their TTL.
+    #[must_use]
+    pub fn tool_call_summary(&self) -> ToolCallTelemetrySummary {
+        let mut guard = self.lock_inner();
+        guard.tool_calls.sweep_stale(unix_timestamp_ms());
+        guard.tool_calls.summary()
+    }
+
+    /// Tool calls changed after `since` (all retained calls when `None`), oldest first.
+    #[must_use]
+    pub fn tool_calls(&self, since: Option<u64>) -> ToolCallsResponse {
+        self.lock_inner().tool_calls.list(since)
+    }
+
+    #[must_use]
+    pub fn tool_call_detail(&self, call_id: &str) -> Option<ToolCallDetail> {
+        self.lock_inner().tool_calls.detail(call_id)
+    }
+
+    /// Completes a client round-trip with the result the caller returned. When the request scan
+    /// already completed it, only the spill flag (known once the gateway shaped the reply) is added.
+    pub fn finish_client_tool_call(
+        &self,
+        call_id: &str,
+        raw_output: &str,
+        is_error: bool,
+        spilled: bool,
+        images: Vec<crate::tool_calls::ToolOutputImage>,
+    ) {
+        let state = self.lock_inner().tool_calls.is_pending(call_id);
+        let changed = match state {
+            None => false,
+            Some(true) => {
+                let mut outcome = ToolCallOutcome::from_client(raw_output, is_error);
+                outcome.spilled = spilled;
+                outcome.images = images;
+                self.lock_inner()
+                    .tool_calls
+                    .complete(call_id, outcome, unix_timestamp_ms())
+            }
+            Some(false) => spilled && self.lock_inner().tool_calls.mark_spilled(call_id),
+        };
+        if changed {
+            self.notify_change();
+        }
+    }
+
+    // ---- session context composition ---------------------------------------------------
+
+    /// Latest context composition recorded for `session_id`.
+    #[must_use]
+    pub fn session_context_sample(&self, session_id: &str) -> Option<SessionContextSample> {
+        self.lock_inner().session_contexts.get(session_id).cloned()
+    }
+
+    // ---- full-context capture ----------------------------------------------------------
+
+    #[must_use]
+    pub fn context_capture_summary(&self) -> ContextCaptureSummary {
+        self.lock_inner().context_store.summary()
+    }
+
+    /// Captured turns, newest first.
+    #[must_use]
+    pub fn context_captures(&self) -> ContextCapturesResponse {
+        self.lock_inner().context_store.list()
+    }
+
+    /// Loads the payload of a captured turn; `Ok(None)` when the turn is not captured.
+    pub fn context_capture_detail(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ContextCaptureDetailResponse>, ContextCaptureIoError> {
+        let located = self.lock_inner().context_store.locate(task_id);
+        match located {
+            Some((record, path)) => read_payload(record, &path).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Updates capture settings at runtime, enforcing a smaller quota immediately and syncing
+    /// `settings.json` (and this process' `daemon.json`).
+    pub fn update_context_capture(
+        &self,
+        enabled: Option<bool>,
+        max_records: Option<ContextCaptureRecordLimit>,
+        max_disk: Option<ContextCaptureDiskMib>,
+    ) -> ContextCaptureSummary {
+        let (summary, evicted, prepared, dir, settings) = {
+            let mut guard = self.lock_inner();
+            let evicted = guard
+                .context_store
+                .update_config(enabled, max_records, max_disk);
+            let prepared = if evicted.is_empty() {
+                None
+            } else {
+                guard.context_store.prepare_index()
+            };
+            (
+                guard.context_store.summary(),
+                evicted,
+                prepared,
+                guard.context_store.dir().map(Path::to_path_buf),
+                guard.context_store.settings(),
+            )
+        };
+        remove_capture_files(dir.as_deref(), &evicted);
+        self.flush_context_index(prepared);
+        if let Some(path) = self.settings_path.as_deref() {
+            let (flag, limit, quota) = settings;
+            sync_settings_json_fields(
+                path,
+                &[
+                    ("capture_full_context", serde_json::Value::from(flag)),
+                    ("max_context_captures", serde_json::Value::from(limit.get())),
+                    (
+                        "max_context_capture_mib",
+                        serde_json::Value::from(quota.get()),
+                    ),
+                ],
+            );
+        }
+        self.notify_change();
+        summary
+    }
+
+    /// Deletes every captured payload.
+    pub fn clear_context_captures(&self) -> ContextCaptureSummary {
+        let (summary, cleared, prepared, dir) = {
+            let mut guard = self.lock_inner();
+            let cleared = guard.context_store.clear();
+            let prepared = guard.context_store.prepare_index();
+            (
+                guard.context_store.summary(),
+                cleared,
+                prepared,
+                guard.context_store.dir().map(Path::to_path_buf),
+            )
+        };
+        remove_capture_files(dir.as_deref(), &cleared);
+        self.flush_context_index(prepared);
+        self.notify_change();
+        summary
+    }
+
+    fn flush_context_index(&self, prepared: Option<(PathBuf, u64, Vec<u8>)>) {
+        let Some((path, seq, bytes)) = prepared else {
+            return;
+        };
+        let mut written_seq = match self.context_persist_lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if seq <= *written_seq {
+            return;
+        }
+        match write_bytes_atomic_private(&path, &bytes) {
+            Ok(()) => *written_seq = seq,
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = ?err,
+                "failed to persist full-context capture index"
+            ),
+        }
+    }
+
+    /// Writes a capture off the async workers when a runtime is available.
+    fn persist_context_capture(self: &Arc<Self>, capture: PendingContextCapture) {
+        let hub = Arc::clone(self);
+        let job = move || hub.write_context_capture(capture);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => drop(handle.spawn_blocking(job)),
+            Err(_) => job(),
+        }
+    }
+
+    fn write_context_capture(&self, capture: PendingContextCapture) {
+        // `_slot` is held until this write finishes, bounding payloads waiting on the disk.
+        let PendingContextCapture {
+            slot: _slot,
+            ticket,
+            mut record,
+            payload,
+        } = capture;
+        let dir = {
+            let guard = self.lock_inner();
+            if !guard.context_store.accepts(ticket) {
+                // Cleared or switched off since this turn completed.
+                return;
+            }
+            let Some(dir) = guard.context_store.dir().map(Path::to_path_buf) else {
+                return;
+            };
+            dir
+        };
+        let Some(file_name) = payload_file_name(&record.task_id) else {
+            tracing::warn!(task_id = %record.task_id, "skipping full-context capture with unusable task id");
+            return;
+        };
+        let bytes = match encode_payload(&record.task_id, &payload) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to encode full-context capture");
+                return;
+            }
+        };
+        drop(payload);
+        let payload_path = dir.join(file_name);
+        if let Err(err) = write_bytes_atomic_private(&payload_path, &bytes) {
+            tracing::warn!(error = ?err, "failed to write full-context capture");
+            return;
+        }
+        record.payload_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let committed = {
+            let mut guard = self.lock_inner();
+            match guard.context_store.commit(ticket, record) {
+                CaptureCommit::Stored(evicted) => {
+                    Some((evicted, guard.context_store.prepare_index()))
+                }
+                CaptureCommit::Stale => None,
+            }
+        };
+        let Some((evicted, prepared)) = committed else {
+            // Cleared or switched off while the payload was being written: it must not survive.
+            let _ = fs::remove_file(&payload_path);
+            return;
+        };
+        remove_capture_files(Some(&dir), &evicted);
+        self.flush_context_index(prepared);
+        self.notify_change();
     }
 
     /// Returns `(metrics, cache_telemetry, active_tasks, recent_tasks)` with live `elapsed_ms`.
@@ -1070,11 +1449,49 @@ fn extract_v4a_patch_file_count(tool_name: &str, arguments: &str) -> Option<usiz
     }
 }
 
+/// Harness profile reported until a turn identifies its harness.
+pub const GENERIC_HARNESS_PROFILE: &str = "generic";
+
+/// Reasoning and output text accumulated for full-context capture.
+#[derive(Debug, Default)]
+struct TurnTextCapture {
+    reasoning: String,
+    output: String,
+    reasoning_truncated: bool,
+    output_truncated: bool,
+}
+
+/// A completed turn's capture, waiting for its payload to be written off the async workers.
+struct PendingContextCapture {
+    /// Write slot taken before the payload was materialized; released when the write finishes.
+    slot: OwnedSemaphorePermit,
+    /// Taken when the turn completed ([`ContextCaptureStore::reserve`]).
+    ticket: CaptureTicket,
+    record: ContextCaptureRecord,
+    payload: FullContextPayload,
+}
+
+/// Appends as much of `delta` as fits in `cap` bytes; `true` when anything was dropped.
+fn push_bounded(buf: &mut String, delta: &str, cap: usize) -> bool {
+    let room = cap.saturating_sub(buf.len());
+    if delta.len() <= room {
+        buf.push_str(delta);
+        return false;
+    }
+    if let Some(prefix) = delta.get(..delta.floor_char_boundary(room)) {
+        buf.push_str(prefix);
+    }
+    true
+}
+
 /// RAII tracker for an in-flight gateway turn.
 pub struct ActiveTaskGuard {
     hub: Arc<TelemetryHub>,
     task_id: String,
     armed: bool,
+    tool_ctx: Mutex<ToolCallTaskContext>,
+    next_tool_step: AtomicU32,
+    text_capture: Option<Mutex<TurnTextCapture>>,
 }
 
 impl ActiveTaskGuard {
@@ -1083,7 +1500,24 @@ impl ActiveTaskGuard {
         &self.hub
     }
 
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    fn lock_tool_ctx(&self) -> std::sync::MutexGuard<'_, ToolCallTaskContext> {
+        match self.tool_ctx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
     pub fn bind_session(&self, session_id: &str, reused: bool, resolved_model: &str) {
+        {
+            let mut ctx = self.lock_tool_ctx();
+            ctx.session_id = Some(session_id.to_owned());
+            resolved_model.clone_into(&mut ctx.model_id);
+        }
         {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
@@ -1096,6 +1530,82 @@ impl ActiveTaskGuard {
             }
         }
         self.hub.notify_change();
+    }
+
+    /// Attributes this turn's tool calls to a harness profile, orchestration mode, and the
+    /// session turn index.
+    pub fn set_tool_context(
+        &self,
+        harness_profile: &'static str,
+        orchestrator_mode: Option<&'static str>,
+        turn_index: u64,
+    ) {
+        let mut ctx = self.lock_tool_ctx();
+        ctx.harness_profile = harness_profile;
+        ctx.orchestrator_mode = orchestrator_mode;
+        ctx.turn_index = turn_index;
+    }
+
+    /// Harness profile attributed to this turn.
+    #[must_use]
+    pub fn harness_profile(&self) -> &'static str {
+        self.lock_tool_ctx().harness_profile
+    }
+
+    fn next_tool_context(&self) -> (ToolCallTaskContext, u32) {
+        let step = self.next_tool_step.fetch_add(1, Ordering::Relaxed);
+        (self.lock_tool_ctx().clone(), step)
+    }
+
+    /// Records a call emitted to the caller; it stays pending until its result arrives.
+    pub fn begin_tool_call(&self, start: ToolCallStart) {
+        let (ctx, step) = self.next_tool_context();
+        let now_ms = unix_timestamp_ms();
+        self.hub
+            .lock_inner()
+            .tool_calls
+            .begin(&ctx, step, start, now_ms);
+        self.hub.notify_change();
+    }
+
+    /// Records a call answered inside the gateway (0-RTT replies, preflight, web fetch).
+    pub fn record_local_tool_call(
+        &self,
+        start: ToolCallStart,
+        outcome: ToolCallOutcome,
+        started_ms: u64,
+    ) {
+        let (ctx, step) = self.next_tool_context();
+        let now_ms = unix_timestamp_ms();
+        self.hub
+            .lock_inner()
+            .tool_calls
+            .record_local(&ctx, step, start, outcome, started_ms, now_ms);
+        self.hub.notify_change();
+    }
+
+    fn capture_text(&self, delta: &str, reasoning: bool) {
+        let Some(capture) = self.text_capture.as_ref() else {
+            return;
+        };
+        let mut buf = match capture.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let TurnTextCapture {
+            reasoning: reasoning_text,
+            output,
+            reasoning_truncated,
+            output_truncated,
+        } = &mut *buf;
+        let (target, truncated) = if reasoning {
+            (reasoning_text, reasoning_truncated)
+        } else {
+            (output, output_truncated)
+        };
+        if push_bounded(target, delta, MAX_CAPTURED_TURN_TEXT_BYTES) {
+            *truncated = true;
+        }
     }
 
     pub fn record_vision_offload(&self, image_count: usize) {
@@ -1115,7 +1625,9 @@ impl ActiveTaskGuard {
         self.hub.notify_change();
     }
 
-    pub fn record_thought(&self, delta_chars: usize) {
+    pub fn record_thought(&self, delta: &str) {
+        let delta_chars = delta.chars().count();
+        self.capture_text(delta, true);
         let now_ms = unix_timestamp_ms();
         let should_notify = {
             let mut guard = match self.hub.inner.lock() {
@@ -1170,6 +1682,7 @@ impl ActiveTaskGuard {
     }
 
     pub fn record_text(&self, delta: &str) {
+        self.capture_text(delta, false);
         let now_ms = unix_timestamp_ms();
         let should_notify = {
             let mut guard = match self.hub.inner.lock() {
@@ -1380,6 +1893,15 @@ impl ActiveTaskGuard {
         let now_ms = unix_timestamp_ms();
         let turn_prompt_tokens = usage.total_prompt_tokens();
         let turn_hit_bps = usage.cache_hit_bps();
+        let measure = diagnostics
+            .as_ref()
+            .map(|d| measure_messages(d.messages, d.delta_start_index));
+        let context_sample_segments = diagnostics
+            .as_ref()
+            .zip(measure.as_ref())
+            .map(|(d, m)| message_context_segments(m, d.tools_delta_xml.map_or(0, str::len)));
+        let full_context_capture =
+            self.build_full_context_capture(diagnostics.as_ref(), measure.as_ref(), usage, now_ms);
 
         let (capture_settings, task_snapshot_preview) = {
             let guard = match self.hub.inner.lock() {
@@ -1415,6 +1937,7 @@ impl ActiveTaskGuard {
         let prebuilt_low_cache_extras = if let (
             Some(hit_bps),
             Some(diag),
+            Some(measure),
             Some((
                 None,
                 session_reused,
@@ -1427,13 +1950,17 @@ impl ActiveTaskGuard {
                 emitted_client_tools,
                 output_preview,
             )),
-        ) =
-            (turn_hit_bps, diagnostics.as_ref(), task_snapshot_preview)
-            && capture_settings.0 > 0
+        ) = (
+            turn_hit_bps,
+            diagnostics.as_ref(),
+            measure.as_ref(),
+            task_snapshot_preview,
+        ) && capture_settings.0 > 0
             && hit_bps < capture_settings.1
         {
             let (metrics, cause) = build_low_cache_request_metrics(
                 diag,
+                measure,
                 session_reused,
                 stream,
                 usage,
@@ -1471,6 +1998,16 @@ impl ActiveTaskGuard {
             let payload_dir = guard.cache_store.payload_dir.clone();
 
             if let Some(mut task) = guard.active_tasks.remove(&self.task_id) {
+                if let (Some(segments), Some(session_id)) =
+                    (context_sample_segments, task.session_id.as_deref())
+                {
+                    let sample = SessionContextSample {
+                        model_id: task.resolved_model.clone(),
+                        captured_at_unix_ms: now_ms,
+                        segments,
+                    };
+                    guard.store_session_sample(session_id, sample);
+                }
                 let elapsed_ms = now_ms.saturating_sub(task.started_at_unix_ms);
                 task.phase = TaskPhase::Completed;
                 task.finished_at_unix_ms = Some(now_ms);
@@ -1636,7 +2173,98 @@ impl ActiveTaskGuard {
 
         remove_payload_files(payload_dir.as_deref(), &evicted_records);
         self.hub.flush_prepared_persist(prepared);
+        if let Some(capture) = full_context_capture {
+            self.hub.persist_context_capture(capture);
+        }
         self.hub.notify_change();
+    }
+
+    /// Materializes the full-context capture of a completed turn while its borrowed state is
+    /// still alive; `None` unless capture was enabled when the turn began.
+    fn build_full_context_capture(
+        &self,
+        diagnostics: Option<&TurnCompletionDiagnostics<'_>>,
+        measure: Option<&MessageMeasure>,
+        usage: AcpUsage,
+        now_ms: u64,
+    ) -> Option<PendingContextCapture> {
+        let capture = self.text_capture.as_ref()?;
+        let diag = diagnostics?;
+        let (slot, ticket, (session_id, resolved_model, prompt_preview, output_preview)) = {
+            let mut guard = self.hub.lock_inner();
+            if !guard.context_store.is_capturing() {
+                return None;
+            }
+            let task = guard.active_tasks.get(&self.task_id)?;
+            let fields = (
+                task.session_id.clone(),
+                task.resolved_model.clone(),
+                task.prompt_preview.clone(),
+                task.output_preview.clone(),
+            );
+            // Admit before materializing: when the disk falls behind, skip this turn rather than
+            // queue another multi-megabyte payload in memory.
+            let Ok(slot) = Arc::clone(&self.hub.context_write_slots).try_acquire_owned() else {
+                guard.context_store.note_skipped();
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    "skipping full-context capture: earlier captures are still being written"
+                );
+                return None;
+            };
+            // Reserved now, in completion order; the blocking writer may finish later.
+            (slot, guard.context_store.reserve(), fields)
+        };
+        let TurnTextCapture {
+            reasoning,
+            output,
+            reasoning_truncated,
+            output_truncated,
+        } = {
+            let mut buf = match capture.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            std::mem::take(&mut *buf)
+        };
+        let request = build_full_request_payload(
+            &self.task_id,
+            now_ms,
+            diag,
+            diag.clamped_delta_start(),
+            &output_preview,
+            CONTEXT_CAPTURE_PAYLOAD_BUDGET,
+        );
+        let record = ContextCaptureRecord {
+            task_id: self.task_id.clone(),
+            recorded_at_unix_ms: now_ms,
+            session_id,
+            harness_profile: Some(self.harness_profile().to_owned()),
+            resolved_model,
+            session_turn_index: diag.session_turn_index,
+            cache_hit_rate_bps: usage.cache_hit_bps(),
+            total_prompt_tokens: usage.total_prompt_tokens(),
+            output_tokens: usage.output_tokens,
+            message_count: diag.messages.len(),
+            delta_message_count: measure.map_or(0, |m| m.delta_message_count),
+            payload_bytes: 0,
+            prompt_preview,
+        };
+        let mut payload = FullContextPayload {
+            request,
+            assistant_reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            assistant_output: (!output.is_empty()).then_some(output),
+            assistant_reasoning_truncated: reasoning_truncated,
+            assistant_output_truncated: output_truncated,
+        };
+        // One indicator for "this capture is incomplete", wherever the cut happened.
+        payload.request.payload_truncated |= reasoning_truncated || output_truncated;
+        Some(PendingContextCapture {
+            slot,
+            ticket,
+            record,
+            payload,
+        })
     }
 
     pub fn fail(mut self, error_message: String) {
@@ -1762,12 +2390,156 @@ fn message_content_bytes(msg: &CanonicalMessage) -> usize {
     })
 }
 
+/// Byte and part counts of a conversation, split by content kind.
+#[derive(Clone, Copy, Debug, Default)]
+struct MessageMeasure {
+    delta_message_count: usize,
+    conversational_message_count: usize,
+    user_message_count: usize,
+    assistant_message_count: usize,
+    total_conversation_bytes: usize,
+    delta_messages_bytes: usize,
+    developer_instructions_blocks: usize,
+    developer_instructions_bytes: usize,
+    user_text_bytes: usize,
+    assistant_text_bytes: usize,
+    reasoning_part_count: usize,
+    reasoning_bytes: usize,
+    tool_call_part_count: usize,
+    tool_call_bytes: usize,
+    tool_result_part_count: usize,
+    tool_result_bytes: usize,
+    image_part_count: usize,
+    image_bytes: usize,
+}
+
+fn measure_messages(messages: &[CanonicalMessage], delta_start_index: usize) -> MessageMeasure {
+    let mut m = MessageMeasure::default();
+    let clamped_delta_start = delta_start_index.min(messages.len());
+    m.delta_message_count = messages.len().saturating_sub(clamped_delta_start);
+
+    for (idx, msg) in messages.iter().enumerate() {
+        let msg_bytes = message_content_bytes(msg);
+        m.total_conversation_bytes = m.total_conversation_bytes.saturating_add(msg_bytes);
+        if idx >= clamped_delta_start {
+            m.delta_messages_bytes = m.delta_messages_bytes.saturating_add(msg_bytes);
+        }
+
+        match msg.role {
+            CanonicalRole::User => m.user_message_count = m.user_message_count.saturating_add(1),
+            CanonicalRole::Assistant => {
+                m.assistant_message_count = m.assistant_message_count.saturating_add(1);
+            }
+        }
+
+        let mut has_conversational_part = false;
+        for part in &msg.parts {
+            match part {
+                CanonicalPart::Text(t) => {
+                    if is_developer_instructions_text(t) {
+                        m.developer_instructions_blocks =
+                            m.developer_instructions_blocks.saturating_add(1);
+                        m.developer_instructions_bytes =
+                            m.developer_instructions_bytes.saturating_add(t.len());
+                    } else {
+                        has_conversational_part = true;
+                        match msg.role {
+                            CanonicalRole::User => {
+                                m.user_text_bytes = m.user_text_bytes.saturating_add(t.len());
+                            }
+                            CanonicalRole::Assistant => {
+                                m.assistant_text_bytes =
+                                    m.assistant_text_bytes.saturating_add(t.len());
+                            }
+                        }
+                    }
+                }
+                CanonicalPart::Reasoning(r) => {
+                    has_conversational_part = true;
+                    m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
+                    m.reasoning_bytes = m.reasoning_bytes.saturating_add(r.len());
+                }
+                CanonicalPart::ImageBase64 { media_type, data } => {
+                    has_conversational_part = true;
+                    m.image_part_count = m.image_part_count.saturating_add(1);
+                    m.image_bytes = m
+                        .image_bytes
+                        .saturating_add(media_type.len())
+                        .saturating_add(data.len());
+                }
+                CanonicalPart::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    has_conversational_part = true;
+                    m.tool_call_part_count = m.tool_call_part_count.saturating_add(1);
+                    m.tool_call_bytes = m
+                        .tool_call_bytes
+                        .saturating_add(call_id.len())
+                        .saturating_add(name.len())
+                        .saturating_add(arguments.len());
+                }
+                CanonicalPart::ToolResult {
+                    call_id, output, ..
+                } => {
+                    has_conversational_part = true;
+                    m.tool_result_part_count = m.tool_result_part_count.saturating_add(1);
+                    m.tool_result_bytes = m
+                        .tool_result_bytes
+                        .saturating_add(call_id.len())
+                        .saturating_add(output.len());
+                }
+            }
+        }
+        if has_conversational_part {
+            m.conversational_message_count = m.conversational_message_count.saturating_add(1);
+        }
+    }
+    m
+}
+
+fn estimate_text_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes.saturating_add(3) / 4).unwrap_or(u64::MAX)
+}
+
+/// Message-derived context segments of one turn (wire tools and bridge prompts are added by
+/// the catalog builder from the live MCP handle).
+fn message_context_segments(m: &MessageMeasure, tools_delta_bytes: usize) -> Vec<ContextSegment> {
+    let text = |key, bytes| ContextSegment {
+        key,
+        bytes,
+        tokens_est: estimate_text_tokens(bytes),
+    };
+    vec![
+        text(ContextSegmentKey::ClientToolsUpdate, tools_delta_bytes),
+        text(
+            ContextSegmentKey::DeveloperInstructions,
+            m.developer_instructions_bytes,
+        ),
+        text(ContextSegmentKey::UserText, m.user_text_bytes),
+        text(ContextSegmentKey::AssistantText, m.assistant_text_bytes),
+        text(ContextSegmentKey::Reasoning, m.reasoning_bytes),
+        text(ContextSegmentKey::ToolCalls, m.tool_call_bytes),
+        text(ContextSegmentKey::ToolResults, m.tool_result_bytes),
+        ContextSegment {
+            key: ContextSegmentKey::Images,
+            bytes: m.image_bytes,
+            tokens_est: u64::try_from(m.image_part_count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(IMAGE_TOKENS_ESTIMATE),
+        },
+    ]
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "aggregates turn routing, token, and task-level counters into a single flat metrics struct"
 )]
 fn build_low_cache_request_metrics(
     diag: &TurnCompletionDiagnostics<'_>,
+    measure: &MessageMeasure,
     session_reused: bool,
     stream: bool,
     usage: AcpUsage,
@@ -1779,102 +2551,26 @@ fn build_low_cache_request_metrics(
     emitted_client_tools: Vec<String>,
     stop_reason: &str,
 ) -> (LowCacheRequestMetrics, LowCacheDiagnosticCause) {
-    let mut conversational_message_count: usize = 0;
-    let mut user_message_count: usize = 0;
-    let mut assistant_message_count: usize = 0;
-    let mut total_conversation_bytes: usize = 0;
-    let mut delta_messages_bytes: usize = 0;
-    let mut developer_instructions_blocks: usize = 0;
-    let mut developer_instructions_bytes: usize = 0;
-    let mut user_text_bytes: usize = 0;
-    let mut assistant_text_bytes: usize = 0;
-    let mut reasoning_part_count: usize = 0;
-    let mut reasoning_bytes: usize = 0;
-    let mut tool_call_part_count: usize = 0;
-    let mut tool_call_bytes: usize = 0;
-    let mut tool_result_part_count: usize = 0;
-    let mut tool_result_bytes: usize = 0;
-    let mut image_part_count: usize = 0;
-    let mut image_bytes: usize = 0;
-
-    let clamped_delta_start = diag.delta_start_index.min(diag.messages.len());
-    let delta_message_count = diag.messages.len().saturating_sub(clamped_delta_start);
-
-    for (idx, msg) in diag.messages.iter().enumerate() {
-        let msg_bytes = message_content_bytes(msg);
-        total_conversation_bytes = total_conversation_bytes.saturating_add(msg_bytes);
-        if idx >= clamped_delta_start {
-            delta_messages_bytes = delta_messages_bytes.saturating_add(msg_bytes);
-        }
-
-        match msg.role {
-            CanonicalRole::User => user_message_count = user_message_count.saturating_add(1),
-            CanonicalRole::Assistant => {
-                assistant_message_count = assistant_message_count.saturating_add(1);
-            }
-        }
-
-        let mut has_conversational_part = false;
-        for part in &msg.parts {
-            match part {
-                CanonicalPart::Text(t) => {
-                    if is_developer_instructions_text(t) {
-                        developer_instructions_blocks =
-                            developer_instructions_blocks.saturating_add(1);
-                        developer_instructions_bytes =
-                            developer_instructions_bytes.saturating_add(t.len());
-                    } else {
-                        has_conversational_part = true;
-                        match msg.role {
-                            CanonicalRole::User => {
-                                user_text_bytes = user_text_bytes.saturating_add(t.len());
-                            }
-                            CanonicalRole::Assistant => {
-                                assistant_text_bytes = assistant_text_bytes.saturating_add(t.len());
-                            }
-                        }
-                    }
-                }
-                CanonicalPart::Reasoning(r) => {
-                    has_conversational_part = true;
-                    reasoning_part_count = reasoning_part_count.saturating_add(1);
-                    reasoning_bytes = reasoning_bytes.saturating_add(r.len());
-                }
-                CanonicalPart::ImageBase64 { media_type, data } => {
-                    has_conversational_part = true;
-                    image_part_count = image_part_count.saturating_add(1);
-                    image_bytes = image_bytes
-                        .saturating_add(media_type.len())
-                        .saturating_add(data.len());
-                }
-                CanonicalPart::ToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    has_conversational_part = true;
-                    tool_call_part_count = tool_call_part_count.saturating_add(1);
-                    tool_call_bytes = tool_call_bytes
-                        .saturating_add(call_id.len())
-                        .saturating_add(name.len())
-                        .saturating_add(arguments.len());
-                }
-                CanonicalPart::ToolResult {
-                    call_id, output, ..
-                } => {
-                    has_conversational_part = true;
-                    tool_result_part_count = tool_result_part_count.saturating_add(1);
-                    tool_result_bytes = tool_result_bytes
-                        .saturating_add(call_id.len())
-                        .saturating_add(output.len());
-                }
-            }
-        }
-        if has_conversational_part {
-            conversational_message_count = conversational_message_count.saturating_add(1);
-        }
-    }
+    let MessageMeasure {
+        delta_message_count,
+        conversational_message_count,
+        user_message_count,
+        assistant_message_count,
+        total_conversation_bytes,
+        delta_messages_bytes,
+        developer_instructions_blocks,
+        developer_instructions_bytes,
+        user_text_bytes,
+        assistant_text_bytes,
+        reasoning_part_count,
+        reasoning_bytes,
+        tool_call_part_count,
+        tool_call_bytes,
+        tool_result_part_count,
+        tool_result_bytes,
+        image_part_count,
+        image_bytes,
+    } = *measure;
 
     let client_tools_schema_bytes = diag.client_tools.iter().fold(0usize, |acc, t| {
         acc.saturating_add(t.estimated_heap_bytes())
@@ -2031,6 +2727,7 @@ fn build_and_persist_low_cache_capture(
             diag,
             clamped_delta_start,
             output_preview,
+            LOW_CACHE_PAYLOAD_BUDGET,
         );
         if let Some(saved_path) = persist_full_payload_atomic(dir, task_id, &full_payload) {
             full_payload_saved = true;
@@ -2120,13 +2817,18 @@ fn summarize_message_inline(
     }
 }
 
-fn bound_part_string(raw: &str, budget_remaining: &mut usize, truncated: &mut bool) -> String {
-    let cap = (*budget_remaining).min(MAX_FULL_PART_BYTES);
+fn bound_part_string(
+    raw: &str,
+    budget_remaining: &mut usize,
+    per_part: usize,
+    truncated: &mut bool,
+) -> String {
+    let cap = (*budget_remaining).min(per_part);
     if cap == 0 {
         if !raw.is_empty() {
             *truncated = true;
         }
-        return "[...omitted: full diagnostic payload exceeded 2 MiB safety cap...]".to_owned();
+        return "[...omitted: diagnostic payload exceeded its safety cap...]".to_owned();
     }
     if raw.len() <= cap {
         *budget_remaining = budget_remaining.saturating_sub(raw.len());
@@ -2145,23 +2847,25 @@ fn build_full_request_payload(
     diag: &TurnCompletionDiagnostics<'_>,
     clamped_delta_start: usize,
     output_preview: &str,
+    limits: PayloadBudget,
 ) -> LowCacheFullRequestPayload {
-    let mut budget = MAX_FULL_PAYLOAD_BUDGET_BYTES;
+    let mut budget = limits.total;
+    let per_part = limits.per_part;
     let mut truncated = false;
 
     let acp_system_append = diag
         .acp_system_append
-        .map(|s| bound_part_string(s, &mut budget, &mut truncated));
+        .map(|s| bound_part_string(s, &mut budget, per_part, &mut truncated));
     let tools_delta_xml = diag
         .tools_delta_xml
-        .map(|s| bound_part_string(s, &mut budget, &mut truncated));
+        .map(|s| bound_part_string(s, &mut budget, per_part, &mut truncated));
 
     let mut outbound_acp_prompt_blocks = Vec::with_capacity(diag.outbound_acp_blocks.len());
     for block in diag.outbound_acp_blocks {
         match block {
             AcpPromptBlock::Text { text } => {
                 let bytes = text.len();
-                let saved = bound_part_string(text, &mut budget, &mut truncated);
+                let saved = bound_part_string(text, &mut budget, per_part, &mut truncated);
                 outbound_acp_prompt_blocks
                     .push(CapturedAcpPromptBlock::Text { bytes, text: saved });
             }
@@ -2202,7 +2906,7 @@ fn build_full_request_payload(
                 CanonicalPart::Text(t) => {
                     let is_dev = is_developer_instructions_text(t);
                     let bytes = t.len();
-                    let text = bound_part_string(t, &mut budget, &mut truncated);
+                    let text = bound_part_string(t, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::Text {
                         is_developer_instructions: is_dev,
                         bytes,
@@ -2211,7 +2915,7 @@ fn build_full_request_payload(
                 }
                 CanonicalPart::Reasoning(r) => {
                     let bytes = r.len();
-                    let text = bound_part_string(r, &mut budget, &mut truncated);
+                    let text = bound_part_string(r, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::Reasoning { bytes, text });
                 }
                 CanonicalPart::ImageBase64 { media_type, data } => {
@@ -2227,7 +2931,8 @@ fn build_full_request_payload(
                     is_custom,
                 } => {
                     let bytes = arguments.len();
-                    let saved_args = bound_part_string(arguments, &mut budget, &mut truncated);
+                    let saved_args =
+                        bound_part_string(arguments, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::ToolCall {
                         call_id: call_id.clone(),
                         name: name.clone(),
@@ -2242,7 +2947,8 @@ fn build_full_request_payload(
                     is_error,
                 } => {
                     let bytes = output.len();
-                    let saved_out = bound_part_string(output, &mut budget, &mut truncated);
+                    let saved_out =
+                        bound_part_string(output, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::ToolResult {
                         call_id: call_id.clone(),
                         is_error: *is_error,
@@ -2275,9 +2981,9 @@ fn build_full_request_payload(
         let description = tool
             .description
             .as_deref()
-            .map(|d| bound_part_string(d, &mut budget, &mut truncated));
+            .map(|d| bound_part_string(d, &mut budget, per_part, &mut truncated));
         let schema_or_format =
-            raw_schema.map(|s| bound_part_string(s, &mut budget, &mut truncated));
+            raw_schema.map(|s| bound_part_string(s, &mut budget, per_part, &mut truncated));
         client_tools.push(CapturedToolSpec {
             name: tool.name.clone(),
             kind,
@@ -2459,6 +3165,137 @@ mod tests {
         assert_eq!(summary.total_cached_read_tokens, 1_450);
         assert_eq!(summary.warm_prompt_tokens, 1_250);
         assert_eq!(summary.warm_cached_read_tokens, 1_050);
+    }
+
+    fn capture_test_diagnostics(messages: &[CanonicalMessage]) -> TurnCompletionDiagnostics<'_> {
+        TurnCompletionDiagnostics {
+            routing_strategy: LowCacheRoutingStrategy::PrefixHash,
+            delta_start_index: 0,
+            session_turn_index: 1,
+            session_idle_ms: None,
+            previous_session_context_tokens: 0,
+            model_switched: false,
+            previous_model: None,
+            previous_response_id: None,
+            prefix_hash_hex: None,
+            base_state_hash_hex: "00",
+            reasoning_effort: None,
+            web_cfg: WebToolBridgeConfig::default(),
+            acp_system_append: None,
+            tools_delta_xml: None,
+            outbound_acp_blocks: &[],
+            messages,
+            client_tools: &[],
+        }
+    }
+
+    #[test]
+    fn full_context_capture_skips_turns_instead_of_queueing_behind_slow_writes() {
+        let dir = std::env::temp_dir().join(format!("liftgate-ctx-backlog-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let hub = Arc::new(TelemetryHub::with_telemetry_config(TelemetryConfig {
+            context_capture: ContextCaptureConfig {
+                enabled: true,
+                dir: Some(dir.clone()),
+                max_pending_writes: std::num::NonZeroUsize::MIN,
+                ..ContextCaptureConfig::default()
+            },
+            ..TelemetryConfig::default()
+        }));
+        let messages = vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::Text("hi".to_owned())],
+        }];
+        let run_turn = |task_id: &str| {
+            let guard = hub.begin_task(
+                task_id.to_owned(),
+                TaskProtocol::OpenaiResponses,
+                false,
+                "gemini-4-carbon-high".to_owned(),
+                None,
+                &messages,
+            );
+            guard.bind_session("sess_capture", false, "gemini-4-carbon-high");
+            guard.complete_with_diagnostics(
+                "end_turn".to_owned(),
+                AcpUsage::default(),
+                Some(capture_test_diagnostics(&messages)),
+            );
+        };
+
+        // An earlier write still holds the only slot: the turn is counted as skipped, not queued.
+        let held = Arc::clone(&hub.context_write_slots)
+            .try_acquire_owned()
+            .expect("free write slot");
+        run_turn("task_backlogged");
+        let summary = hub.context_capture_summary();
+        assert_eq!(summary.skipped_records, 1);
+        assert_eq!(summary.stored_records, 0);
+
+        // With the slot free again the next turn is captured (inline: no runtime in this test)
+        // and its slot is returned once the write finishes.
+        drop(held);
+        run_turn("task_captured");
+        let listed = hub.context_captures();
+        assert_eq!(listed.summary.skipped_records, 1);
+        let ids: Vec<&str> = listed.records.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, ["task_captured"]);
+        assert_eq!(hub.context_write_slots.available_permits(), 1);
+        assert!(
+            hub.context_capture_detail("task_captured")
+                .expect("read capture")
+                .is_some()
+        );
+
+        // Clearing resets the skip counter along with the captures.
+        let cleared = hub.clear_context_captures();
+        assert_eq!((cleared.stored_records, cleared.skipped_records), (0, 0));
+
+        // Output beyond the per-field cap is dropped, and the capture says so.
+        let guard = hub.begin_task(
+            "task_long_output".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &messages,
+        );
+        guard.bind_session("sess_capture", false, "gemini-4-carbon-high");
+        guard.record_thought("short reasoning");
+        let chunk = "é".repeat(64 * 1024);
+        for _ in 0..12 {
+            guard.record_text(&chunk);
+        }
+        guard.complete_with_diagnostics(
+            "end_turn".to_owned(),
+            AcpUsage::default(),
+            Some(capture_test_diagnostics(&messages)),
+        );
+        let detail = hub
+            .context_capture_detail("task_long_output")
+            .expect("read capture")
+            .expect("captured");
+        let output = detail.payload.assistant_output.unwrap_or_default();
+        assert!(output.len() <= MAX_CAPTURED_TURN_TEXT_BYTES);
+        assert!(output.len() > MAX_CAPTURED_TURN_TEXT_BYTES - 4);
+        assert!(detail.payload.assistant_output_truncated);
+        assert!(!detail.payload.assistant_reasoning_truncated);
+        assert!(detail.payload.request.payload_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn push_bounded_reports_dropped_text_on_char_boundaries() {
+        let mut buf = String::new();
+        assert!(!push_bounded(&mut buf, "abc", 5));
+        assert!(
+            push_bounded(&mut buf, "dé", 5),
+            "`é` does not fit in the last byte"
+        );
+        assert_eq!(buf, "abcd");
+        assert!(push_bounded(&mut buf, "x", 4));
+        assert!(!push_bounded(&mut buf, "", 4));
+        assert_eq!(buf, "abcd");
     }
 
     #[test]

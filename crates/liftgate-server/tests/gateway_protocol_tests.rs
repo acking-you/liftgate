@@ -11071,3 +11071,578 @@ async fn elastic_io_telemetry_tracks_30_tool_codex_passthrough_compound_exec_mul
 
     let _ = std::fs::remove_dir_all(&spill_dir);
 }
+
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn zero_usage_mcp_suspension_still_samples_and_captures_context() {
+    // No usage update arrives before the first client tool call suspends the cascade.
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 0,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "ls" }),
+                expect_reply_substrings: vec!["README.md"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 4_000,
+                thoughts: vec![],
+                chunks_template: vec!["Listed.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cached_read_tokens: 3_000,
+                    cached_write_tokens: 0,
+                    thought_tokens: 0,
+                    total_tokens: 4_010,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+    let root = std::env::temp_dir().join(format!(
+        "liftgate-zero-usage-capture-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let capture_dir = root.join("context-captures");
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    state.telemetry = Arc::new(TelemetryHub::with_telemetry_config(
+        liftgate_server::telemetry::TelemetryConfig {
+            context_capture: liftgate_server::context_capture::ContextCaptureConfig {
+                enabled: true,
+                dir: Some(capture_dir.clone()),
+                ..liftgate_server::context_capture::ContextCaptureConfig::default()
+            },
+            ..liftgate_server::telemetry::TelemetryConfig::default()
+        },
+    ));
+    let app = build_router(state.clone());
+    let tools_json = json!([{
+        "type": "function",
+        "name": "Bash",
+        "description": "Execute shell command",
+        "parameters": {
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }
+    }]);
+
+    let (status, r1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "tools": tools_json,
+            "input": "List the files."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let call_id = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .and_then(|fc| fc["call_id"].as_str())
+        .expect("Bash function_call")
+        .to_owned();
+
+    // The suspended turn is captured although its usage is still zero.
+    let mut captured = false;
+    for _ in 0..250 {
+        let (_, listed) = get_json(&app, "/api/telemetry/context-captures").await;
+        if listed["records"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|c| c["task_id"] == r1["id"]))
+        {
+            captured = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(captured, "zero-usage suspension must still be captured");
+
+    // ... and the session's context composition is sampled for the tool catalog.
+    let (_, calls) = get_json(&app, "/api/telemetry/tool-calls").await;
+    let session_id = calls["records"][0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let (status, catalog) = get_json(
+        &app,
+        &format!("/api/telemetry/sessions/{session_id}/tool-catalog"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        catalog["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["key"] == "user_text" && s["bytes"].as_u64().unwrap_or(0) > 0),
+        "context sample recorded: {catalog}"
+    );
+
+    let (status, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "previous_response_id": r1["id"],
+            "tools": tools_json,
+            "input": [{ "type": "function_call_output", "call_id": call_id, "output": "README.md" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 6_000,
+                thoughts: vec!["Look up the shell tool first.".to_owned()],
+                pre_text_templates: vec![],
+                mcp_name: "search_client_tools".to_owned(),
+                arguments: json!({ "query": "Bash" }),
+                expect_reply_substrings: vec!["Bash"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 6_400,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Bash".to_owned(),
+                arguments: json!({ "command": "git status --short" }),
+                expect_reply_substrings: vec!["M src/lib.rs"],
+            },
+            McpMockStep::CallTool {
+                usage_used: 7_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "Read".to_owned(),
+                arguments: json!({}),
+                expect_reply_substrings: vec!["file_path"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 7_300,
+                thoughts: vec!["One modified file.".to_owned()],
+                chunks_template: vec!["Only src/lib.rs changed.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 2_000,
+                    output_tokens: 120,
+                    cached_read_tokens: 5_000,
+                    cached_write_tokens: 0,
+                    thought_tokens: 40,
+                    total_tokens: 7_120,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let root = std::env::temp_dir().join(format!(
+        "liftgate-tool-telemetry-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings_path = root.join("settings.json");
+    let capture_dir = root.join("context-captures");
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    state.telemetry = Arc::new(TelemetryHub::with_telemetry_config(
+        liftgate_server::telemetry::TelemetryConfig {
+            cache: CacheTelemetryConfig {
+                settings_path: Some(settings_path.clone()),
+                ..CacheTelemetryConfig::default()
+            },
+            tool_calls: liftgate_server::tool_calls::ToolCallLimits::default(),
+            context_capture: liftgate_server::context_capture::ContextCaptureConfig {
+                enabled: false,
+                dir: Some(capture_dir.clone()),
+                ..liftgate_server::context_capture::ContextCaptureConfig::default()
+            },
+        },
+    ));
+    let app = build_router(state.clone());
+
+    // Capture is opt-in: switch it on from the dashboard endpoint and persist it to settings.json.
+    let (status, summary) = post_json(
+        &app,
+        "/api/telemetry/context-capture",
+        json!({ "enabled": true, "max_records": 50, "max_total_mib": 64 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(summary["enabled"], true);
+    assert_eq!(summary["max_total_bytes"], 64 * 1024 * 1024);
+    let settings: Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["capture_full_context"], true);
+    assert_eq!(settings["max_context_captures"], 50);
+    let (status, _) = post_json(
+        &app,
+        "/api/telemetry/context-capture",
+        json!({ "max_total_mib": 1 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "quota below 16 MiB is rejected"
+    );
+
+    let tools_json = json!([
+        {
+            "type": "function",
+            "name": "Read",
+            "description": "Read file contents",
+            "parameters": {
+                "type": "object",
+                "properties": { "file_path": { "type": "string" } },
+                "required": ["file_path"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "Bash",
+            "description": "Execute shell command",
+            "parameters": {
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }
+        }
+    ]);
+
+    let (status, r1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "instructions": "Check the workspace.",
+            "tools": tools_json,
+            "input": "What changed?"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let fc = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("Bash function_call")
+        .clone();
+    let call_id = fc["call_id"].as_str().unwrap().to_owned();
+
+    let (_, calls) = get_json(&app, "/api/telemetry/tool-calls").await;
+    let records = calls["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "0-RTT search plus the pending Bash call");
+    let search = records
+        .iter()
+        .find(|r| r["route"] == "zero_rtt_search")
+        .expect("search record");
+    assert_eq!(search["status"], "ok");
+    assert_eq!(search["wire_tool_name"], "mcp_lg_search_client_tools");
+    assert!(search["client_tool_name"].is_null());
+    let bash = records
+        .iter()
+        .find(|r| r["call_id"] == call_id.as_str())
+        .expect("bash record");
+    assert_eq!(bash["status"], "pending");
+    assert_eq!(bash["route"], "client_roundtrip");
+    assert_eq!(bash["wire_tool_name"], "mcp_lg_Bash");
+    assert_eq!(bash["client_tool_name"], "Bash");
+    assert_eq!(bash["harness_profile"], "claude-code");
+    assert!(bash["session_id"].is_string());
+    let revision_after_r1 = calls["summary"]["revision"].as_u64().unwrap();
+
+    let (status, r2) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "previous_response_id": r1["id"],
+            "tools": tools_json,
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "\u{1b}[31m M src/lib.rs\u{1b}[0m\n"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let final_text = r2["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap()["content"][0]["text"]
+        .clone();
+    assert_eq!(final_text, "Only src/lib.rs changed.");
+
+    let (_, delta) = get_json(
+        &app,
+        &format!("/api/telemetry/tool-calls?since={revision_after_r1}"),
+    )
+    .await;
+    let changed = delta["records"].as_array().unwrap();
+    assert!(changed.iter().any(|r| r["call_id"] == call_id.as_str()));
+    assert!(changed.iter().all(|r| r["route"] != "zero_rtt_search"));
+    let preflight = changed
+        .iter()
+        .find(|r| r["route"] == "zero_rtt_preflight")
+        .expect("Read preflight rejection");
+    assert_eq!(preflight["status"], "preflight_rejected");
+    assert_eq!(preflight["error_kind"], "preflight_rejected");
+    assert_eq!(delta["summary"]["stored_records"], 3);
+
+    let (status, detail) = get_json(&app, &format!("/api/telemetry/tool-calls/{call_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["status"], "ok");
+    assert_eq!(detail["output_sanitized"], true);
+    assert!(detail["duration_ms"].is_u64());
+    assert!(
+        detail["wire_arguments"]
+            .as_str()
+            .unwrap()
+            .contains("git status --short")
+    );
+    let out_text = detail["output_blocks"][0]["text"].as_str().unwrap();
+    assert!(out_text.contains("M src/lib.rs") && !out_text.contains('\u{1b}'));
+    let (status, _) = get_json(&app, "/api/telemetry/tool-calls/call_nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The session catalog explains how the declared tools were mounted for the model.
+    let session_id = state.pool.snapshot().sessions[0].session_id.clone();
+    let (status, catalog) = get_json(
+        &app,
+        &format!("/api/telemetry/sessions/{session_id}/tool-catalog"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["session_id"], session_id.as_str());
+    let tools = catalog["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().all(|t| t["tier"] == "direct"));
+    assert!(
+        catalog["wire_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["wire_name"] == "search_client_tools" && w["role"] == "gateway")
+    );
+    assert!(
+        catalog["bridge_rules_prompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("<api_gateway_bridge_rules>")
+    );
+    assert!(catalog["captured_at_unix_ms"].as_u64().unwrap() > 0);
+    let segments = catalog["segments"].as_array().unwrap();
+    let wire_segment = segments
+        .iter()
+        .find(|s| s["key"] == "wire_tools")
+        .expect("wire tools segment");
+    assert!(wire_segment["bytes"].as_u64().unwrap() > 0);
+    let (status, _) = get_json(&app, "/api/telemetry/sessions/nope/tool-catalog").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Full-context captures are written off the async workers; wait for both turns.
+    let mut captures = Value::Null;
+    for _ in 0..250 {
+        let (_, listed) = get_json(&app, "/api/telemetry/context-captures").await;
+        if listed["records"].as_array().is_some_and(|r| r.len() >= 2) {
+            captures = listed;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let capture_records = captures["records"].as_array().expect("two captures");
+    let newest = &capture_records[0];
+    assert_eq!(newest["task_id"], r2["id"]);
+    assert!(newest["payload_bytes"].as_u64().unwrap() > 0);
+    let (status, detail) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/context-captures/{}",
+            newest["task_id"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        detail["payload"]["assistant_output"],
+        "Only src/lib.rs changed."
+    );
+    assert!(
+        detail["payload"]["assistant_reasoning"]
+            .as_str()
+            .is_some_and(|r| r.contains("One modified file."))
+    );
+    assert!(!detail["payload"]["messages"].as_array().unwrap().is_empty());
+    let capture_files = std::fs::read_dir(&capture_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("ctx-"))
+        .count();
+    assert_eq!(capture_files, 2);
+
+    let (_, trimmed) = post_json(
+        &app,
+        "/api/telemetry/context-capture",
+        json!({ "max_records": 1 }),
+    )
+    .await;
+    assert_eq!(trimmed["stored_records"], 1);
+    let (_, cleared) = post_json(&app, "/api/telemetry/context-captures/clear", json!({})).await;
+    assert_eq!(cleared["stored_records"], 0);
+    let leftover = std::fs::read_dir(&capture_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("ctx-"))
+        .count();
+    assert_eq!(leftover, 0);
+
+    let (_, snap) = get_json(&app, "/api/telemetry/snapshot").await;
+    assert_eq!(snap["tool_call_telemetry"]["stored_records"], 3);
+    assert_eq!(snap["context_capture"]["enabled"], true);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(start_paused = true)]
+async fn xml_tool_calls_are_recorded_and_completed_by_the_next_request() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![
+                "<agy_tool_call_{NONCE}>".to_owned(),
+                "{\"name\":\"shell\",\"arguments\":{\"cmd\":\"cargo check\"}}</agy_tool_call_{NONCE}>".to_owned(),
+            ],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Build succeeded!".to_owned()],
+        },
+    ]));
+    let state = test_state(Arc::clone(&backend), 30, None);
+    let app = build_router(state.clone());
+    let tools = json!([{
+        "type": "function",
+        "name": "shell",
+        "description": "Execute command",
+        "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } }
+    }]);
+
+    let (status, r1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-codex",
+            "stream": false,
+            "instructions": "You are Codex.",
+            "input": [{ "role": "user", "content": "Run cargo check" }],
+            "tools": tools
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let call_id = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .unwrap()["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let pending = state
+        .telemetry
+        .tool_call_detail(&call_id)
+        .expect("recorded");
+    assert_eq!(
+        pending.record.status,
+        liftgate_types::telemetry::ToolCallStatus::Pending
+    );
+    assert_eq!(pending.record.wire_tool_name, "shell");
+    assert_eq!(
+        pending.record.route,
+        liftgate_types::telemetry::ToolCallRoute::ClientRoundtrip
+    );
+
+    let (status, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5-codex",
+            "previous_response_id": r1["id"],
+            "stream": false,
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "Finished dev profile"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let done = state
+        .telemetry
+        .tool_call_detail(&call_id)
+        .expect("still recorded");
+    assert_eq!(
+        done.record.status,
+        liftgate_types::telemetry::ToolCallStatus::Ok
+    );
+    assert_eq!(done.record.output_preview, "Finished dev profile");
+    assert!(done.record.duration_ms.is_some());
+}

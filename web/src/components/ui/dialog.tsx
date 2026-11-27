@@ -3,97 +3,109 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-const Dialog = DialogPrimitive.Root;
-const DialogTrigger = DialogPrimitive.Trigger;
-const DialogPortal = DialogPrimitive.Portal;
-const DialogClose = DialogPrimitive.Close;
+/** Land focus on the panel itself, so opening with the mouse does not ring the close button. */
+function focusPanel(ev: Event): void {
+  ev.preventDefault();
+  if (ev.currentTarget instanceof HTMLElement) ev.currentTarget.focus();
+}
 
-const DialogOverlay = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Overlay>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
->(({ className, ...props }, ref) => (
-  <DialogPrimitive.Overlay
-    ref={ref}
-    className={cn(
-      "fixed inset-0 z-50 bg-[rgba(20,20,19,0.46)] backdrop-blur-[3px]",
-      className,
-    )}
-    {...props}
-  />
-));
-DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
-
-const DialogContent = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
-  <DialogPortal>
-    <DialogOverlay />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-[calc(100vw-24px)] max-w-2xl translate-x-[-50%] translate-y-[-50%] gap-4 rounded-[12px] border border-[var(--border-strong)] bg-[var(--surface)] p-6 text-[var(--text)] shadow-[var(--shadow-overlay)] max-h-[88vh] overflow-y-auto focus:outline-none",
-        className,
-      )}
-      {...props}
-    >
-      {children}
-      <DialogPrimitive.Close className="sf-btn sf-btn--ghost sf-btn--icon absolute right-3.5 top-3.5 rounded-full">
-        <X className="h-4 w-4" />
-        <span className="sr-only">关闭</span>
-      </DialogPrimitive.Close>
-    </DialogPrimitive.Content>
-  </DialogPortal>
-));
-DialogContent.displayName = DialogPrimitive.Content.displayName;
-
-function DialogHeader({
-  className,
-  ...props
-}: React.HTMLAttributes<HTMLDivElement>): React.JSX.Element {
+function CloseButton(): React.JSX.Element {
   return (
-    <div
-      className={cn("flex flex-col space-y-1.5 pr-8 text-left", className)}
-      {...props}
-    />
+    <DialogPrimitive.Close className="lg-btn shrink-0" data-variant="ghost" data-icon="true" aria-label="关闭">
+      <X />
+    </DialogPrimitive.Close>
   );
 }
 
-const DialogTitle = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Title>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
->(({ className, ...props }, ref) => (
-  <DialogPrimitive.Title
-    ref={ref}
-    className={cn(
-      "font-serif text-[1.2rem] font-normal leading-snug tracking-[-0.015em] text-[var(--text)]",
-      className,
-    )}
-    {...props}
-  />
-));
-DialogTitle.displayName = DialogPrimitive.Title.displayName;
+/** Centered dialog for short, focused tasks (connection settings, live probe). */
+export function Modal({
+  open,
+  onOpenChange,
+  title,
+  description,
+  className,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: React.ReactNode;
+  description?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="lg-overlay" />
+        <DialogPrimitive.Content
+          className={cn("lg-dialog", className)}
+          onOpenAutoFocus={focusPanel}
+          {...(description ? {} : { "aria-describedby": undefined })}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <DialogPrimitive.Title className="m-0 text-[15px] font-semibold text-fg">
+                {title}
+              </DialogPrimitive.Title>
+              {description && (
+                <DialogPrimitive.Description className="m-0 mt-1 text-[12.5px] text-fg-3">
+                  {description}
+                </DialogPrimitive.Description>
+              )}
+            </div>
+            <CloseButton />
+          </div>
+          {children}
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  );
+}
 
-const DialogDescription = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Description>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
->(({ className, ...props }, ref) => (
-  <DialogPrimitive.Description
-    ref={ref}
-    className={cn("text-[13px] text-[var(--muted)]", className)}
-    {...props}
-  />
-));
-DialogDescription.displayName = DialogPrimitive.Description.displayName;
-
-export {
-  Dialog,
-  DialogPortal,
-  DialogOverlay,
-  DialogTrigger,
-  DialogClose,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-};
+/** Right-hand inspector: detail on demand without losing the list behind it. */
+export function Sheet({
+  open,
+  onOpenChange,
+  title,
+  description,
+  size = "default",
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: React.ReactNode;
+  description?: React.ReactNode;
+  size?: "default" | "wide";
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="lg-overlay" />
+        <DialogPrimitive.Content
+          className="lg-sheet"
+          data-size={size}
+          onOpenAutoFocus={focusPanel}
+          {...(description ? {} : { "aria-describedby": undefined })}
+        >
+          <div className="lg-sheet-head">
+            <div className="min-w-0 flex-1">
+              <DialogPrimitive.Title asChild>
+                <div className="flex flex-wrap items-center gap-2 text-[15px] font-semibold text-fg">
+                  {title}
+                </div>
+              </DialogPrimitive.Title>
+              {description && (
+                <DialogPrimitive.Description asChild>
+                  <div className="mt-1 text-[12.5px] text-fg-3">{description}</div>
+                </DialogPrimitive.Description>
+              )}
+            </div>
+            <CloseButton />
+          </div>
+          <div className="lg-sheet-body">{children}</div>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  );
+}
