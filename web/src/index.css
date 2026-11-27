@@ -2412,6 +2412,34 @@
     padding-left: 10px;
   }
 
+  /* Table cell value that doubles as a one-click filter toggle. */
+  .lg-cellfilter {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: -3px -7px;
+    padding: 2px 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 120ms, border-color 120ms;
+  }
+
+  .lg-cellfilter:hover {
+    border-color: var(--lg-line);
+    background: var(--lg-hover);
+  }
+
+  .lg-cellfilter[aria-pressed="true"] {
+    border-color: var(--lg-accent);
+    background: var(--lg-accent-soft);
+    color: var(--lg-accent-fg);
+  }
+
   /* Virtualization map: wire tools on the left, declared client tools on the right. */
   .lg-map {
     display: grid;

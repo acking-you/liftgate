@@ -208,6 +208,10 @@ pub struct TaskSnapshot {
     pub resolved_model: String,
     pub session_id: Option<String>,
     pub session_reused: bool,
+    /// Harness profile (`codex`, `claude-code`, `opencode`, `omp`, `generic`) attributed once the
+    /// turn binds a session; `None` while initializing or on gateways that predate attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auxiliary_task: Option<AuxiliaryTaskKind>,
     pub phase: TaskPhase,

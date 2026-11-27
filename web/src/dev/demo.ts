@@ -772,6 +772,7 @@ function buildTasks(): TaskSnapshot[] {
         resolved_model: session.model,
         session_id: session.id,
         session_reused: turn > 1,
+        harness_profile: session.harness,
         phase: pending ? "calling_client_tool" : "completed",
         started_at_unix_ms: first.started_at_unix_ms - 3000,
         finished_at_unix_ms: pending ? null : first.started_at_unix_ms + elapsed,
