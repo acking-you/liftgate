@@ -83,6 +83,18 @@ impl StatePaths {
         self.root.join("cache-telemetry.json")
     }
 
+    /// Custom per-model prices set from the dashboard.
+    #[must_use]
+    pub fn model_pricing_file(&self) -> PathBuf {
+        self.root.join("model-pricing.json")
+    }
+
+    /// Per-model token usage with its quarter-hour history, for the dashboard's usage view.
+    #[must_use]
+    pub fn usage_ledger_file(&self) -> PathBuf {
+        self.root.join("usage-ledger.json")
+    }
+
     #[must_use]
     pub fn title_model_file(&self) -> PathBuf {
         self.root.join("title-model")

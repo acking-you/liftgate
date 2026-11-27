@@ -1,18 +1,21 @@
 import * as React from "react";
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 
 export function CopyButton({
   value,
   label,
-  title = "复制",
+  title,
 }: {
   value: string | (() => string);
   /** When set the button shows text; otherwise it is an icon-only control. */
   label?: string;
   title?: string;
 }): React.JSX.Element {
+  const { m } = useI18n();
   const [copied, setCopied] = useState(false);
+  const hint = title ?? m.common.copy;
 
   const handleCopy = (ev: React.MouseEvent): void => {
     ev.stopPropagation();
@@ -35,12 +38,12 @@ export function CopyButton({
       data-size="sm"
       data-variant={label ? undefined : "ghost"}
       data-icon={label ? undefined : "true"}
-      title={label ? undefined : title}
-      aria-label={label ? undefined : title}
+      title={label ? undefined : hint}
+      aria-label={label ? undefined : hint}
       onClick={handleCopy}
     >
       {copied ? <Check className="text-ok" /> : <Copy />}
-      {label && <span>{copied ? "已复制" : label}</span>}
+      {label && <span>{copied ? m.common.copied : label}</span>}
     </button>
   );
 }

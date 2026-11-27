@@ -128,6 +128,8 @@ export interface TaskSnapshot {
   error_message: string | null;
   usage: AcpUsage | null;
   cache_hit_rate_bps?: number | null;
+  /** Cost in USD at the model's current price; absent while unknown or unpriced. */
+  cost_usd?: number | null;
 }
 
 export type LowCacheHitReason =
@@ -393,6 +395,8 @@ export interface GatewayTelemetrySnapshot {
   tool_call_telemetry?: ToolCallTelemetrySummary;
   /** Present once the gateway supports opt-in full-context capture (issue #21). */
   context_capture?: ContextCaptureSummary;
+  /** Recorded usage and cost (absent on gateways that predate pricing). */
+  usage?: UsageSummary;
   active_tasks: TaskSnapshot[];
   recent_tasks: TaskSnapshot[];
   available_models: AvailableModel[];
@@ -660,4 +664,105 @@ export interface ContextCaptureConfigUpdate {
   max_records?: number;
   /** Disk quota in MiB (16..=65536). */
   max_total_mib?: number;
+}
+
+/* ---------- Usage & pricing (`/api/telemetry/usage`, `/api/telemetry/pricing`) ---------- */
+
+/** Tokens split the way providers bill them; `thought` is a share of `output`. */
+export interface UsageTokens {
+  input: number;
+  cached_input: number;
+  cache_write: number;
+  output: number;
+  thought: number;
+}
+
+export interface UsageSummary {
+  revision: number;
+  /** Start of the covered range: when recording started (or was reset), or the requested `from`. */
+  since_unix_ms: number;
+  /** End of the requested range; absent for the all-time totals. */
+  until_unix_ms?: number;
+  /** Where bucketed history starts; earlier usage only counts toward the all-time totals. */
+  history_from_unix_ms?: number;
+  calls: number;
+  tokens: UsageTokens;
+  /** Cost of priced usage. */
+  cost_usd: number;
+  /** What cache hits saved versus uncached input, priced per price period. */
+  cache_savings_usd?: number;
+  /** Calls on models without a price, left out of `cost_usd`. */
+  unpriced_calls: number;
+}
+
+/** Usage within one interval of `GET /api/telemetry/usage/series`. */
+export interface UsageInterval {
+  start_unix_ms: number;
+  end_unix_ms: number;
+  calls: number;
+  auxiliary_calls: number;
+  tokens: UsageTokens;
+  /** Cost of priced usage in the interval. */
+  cost_usd: number;
+  cache_savings_usd: number;
+  /** Calls on models without a price, left out of `cost_usd`. */
+  unpriced_calls: number;
+}
+
+/** One interval per consecutive pair of requested bounds, e.g. the viewer's local midnights. */
+export interface UsageSeriesResponse {
+  revision: number;
+  /** Width of the usage buckets the intervals are cut from. */
+  bucket_ms: number;
+  /** Where bucketed history starts; intervals before it read as zero. */
+  history_from_unix_ms: number;
+  intervals: UsageInterval[];
+}
+
+export interface ModelUsage {
+  model_id: string;
+  pricing_key: string;
+  calls: number;
+  auxiliary_calls: number;
+  tokens: UsageTokens;
+  /** Null when the model has neither a default nor a custom price. */
+  cost_usd: number | null;
+  first_used_at_unix_ms: number;
+  last_used_at_unix_ms: number;
+}
+
+export interface UsageResponse {
+  summary: UsageSummary;
+  /** Costliest first. */
+  models: ModelUsage[];
+}
+
+/** USD per 1M tokens. */
+export interface ModelPrice {
+  input: number;
+  cached_input: number;
+  cache_write: number;
+  output: number;
+}
+
+export interface ScheduledPrice {
+  effective_from_unix_ms: number;
+  price: ModelPrice;
+}
+
+export interface ModelPricingEntry {
+  key: string;
+  label: string | null;
+  model_ids: string[];
+  default_price: ModelPrice | null;
+  upcoming_defaults: ScheduledPrice[];
+  custom_price: ModelPrice | null;
+  source_url: string | null;
+}
+
+export interface PricingResponse {
+  revision: number;
+  currency: string;
+  defaults_as_of: string;
+  entries: ModelPricingEntry[];
 }

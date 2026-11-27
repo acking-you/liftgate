@@ -86,6 +86,7 @@ function isSameSnapshot(prev: GatewayTelemetrySnapshot, next: GatewayTelemetrySn
     (next.cache_telemetry?.revision ?? 0) === (prev.cache_telemetry?.revision ?? 0) &&
     (next.tool_call_telemetry?.revision ?? 0) === (prev.tool_call_telemetry?.revision ?? 0) &&
     (next.context_capture?.revision ?? 0) === (prev.context_capture?.revision ?? 0) &&
+    (next.usage?.revision ?? 0) === (prev.usage?.revision ?? 0) &&
     next.vision_offload_enabled === prev.vision_offload_enabled &&
     next.mcp_tool_bridge_enabled === prev.mcp_tool_bridge_enabled &&
     next.acp_process.connected === prev.acp_process.connected &&

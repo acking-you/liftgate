@@ -1,14 +1,22 @@
 import * as React from "react";
 import { useMemo, useState } from "react";
-import { Activity, ArrowRight, Gauge, Layers, Sparkles, Wrench } from "lucide-react";
+import { Activity, ArrowRight, CircleDollarSign, Gauge, Layers, Sparkles, Wrench } from "lucide-react";
 import { CacheTrendChart } from "@/components/charts";
 import { Skyline } from "@/components/Skyline";
-import { ModelRoute, PhasePill, TaskActivity, TaskSheet } from "@/components/TaskSheet";
+import {
+  ModelRoute,
+  PhasePill,
+  TaskActivity,
+  TaskSheet,
+  ToolOutcome,
+  taskTone,
+} from "@/components/TaskSheet";
 import {
   Card,
   EmptyState,
   Figure,
   HitRate,
+  Latency,
   Meter,
   Pager,
   Pill,
@@ -16,27 +24,33 @@ import {
   Stat,
   StatGrid,
   Tag,
+  Usd,
 } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
+import { useRevisionResource } from "@/hooks/useResource";
+import { useToday } from "@/hooks/useToday";
+import { addDays } from "@/lib/days";
 import {
   formatBpsPct,
   formatBytes,
   formatClock,
   formatCompact,
-  formatDurationMs,
   formatNumber,
   formatPct,
+  formatUsd,
   protocolPath,
   shortId,
   taskHitBps,
   taskPromptTokens,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import {
   WIRE_BUDGET_BYTES,
   cacheStats,
   elasticStats,
   sessionReuseRatio,
 } from "@/lib/stats";
+import { toolOutcomesByTask } from "@/lib/toolcalls";
 import type { ElasticIoTelemetry, SessionSummary, TaskProtocol, TaskSnapshot } from "@/types/telemetry";
 import type { ViewProps } from "@/views/types";
 
@@ -49,39 +63,33 @@ function ElasticCard({
   io: ElasticIoTelemetry;
   sessions: SessionSummary[];
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.overview.elastic;
   const s = elasticStats(io);
-  const peakWire = sessions.reduce((m, sess) => Math.max(m, sess.mcp?.wire_bytes ?? 0), 0);
+  const peakWire = sessions.reduce((max, sess) => Math.max(max, sess.mcp?.wire_bytes ?? 0), 0);
   const wireRatio = peakWire / WIRE_BUDGET_BYTES;
   return (
-    <Card title="弹性 I/O">
+    <Card title={t.title}>
       <div className="grid grid-cols-2 gap-x-8 gap-y-5 xl:grid-cols-4">
         <Figure
-          label="编排器 / Shell 聚合调用"
+          label={t.orchestrated}
           value={formatPct(s.orchestrationRatio)}
-          sub={`${formatNumber(s.orchestrator)} / ${formatNumber(s.forwarded)} 次调用`}
+          sub={t.callsOf(formatNumber(s.orchestrator), formatNumber(s.forwarded))}
         />
+        <Figure label={t.inline} value={formatPct(s.inlineRatio)} sub={t.spills(formatNumber(s.resultsSpilled))} />
         <Figure
-          label="输出未超内联上限"
-          value={formatPct(s.inlineRatio)}
-          sub={`${formatNumber(s.resultsSpilled)} 次 Spill`}
-        />
-        <Figure
-          label="0-RTT 本地闭环"
+          label={t.zeroRtt}
           value={formatNumber(s.zeroRttTotal)}
-          sub={`检索 ${s.zeroRttSearches} · 分片读 ${s.zeroRttSpillReads} · 预检 ${s.zeroRttPreflight}`}
+          sub={t.zeroRttParts(s.zeroRttSearches, s.zeroRttSpillReads, s.zeroRttPreflight)}
         />
         <div className="min-w-0">
-          <div className="text-[12px] text-fg-3">Wire 工具体积峰值</div>
+          <div className="text-[12px] text-fg-3">{t.wirePeak}</div>
           <div className="mt-0.5 text-[15px] font-semibold text-fg">
             {formatBytes(peakWire)}
             <span className="ml-1 text-[12px] font-normal text-fg-4">/ {formatBytes(WIRE_BUDGET_BYTES)}</span>
           </div>
           <div className="mt-2">
-            <Meter
-              ratio={wireRatio}
-              tone={wireRatio > 0.9 ? "warn" : undefined}
-              label="Wire 工具体积占预算比例"
-            />
+            <Meter ratio={wireRatio} tone={wireRatio > 0.9 ? "warn" : undefined} label={t.wireRatio} />
           </div>
         </div>
       </div>
@@ -90,6 +98,7 @@ function ElasticCard({
 }
 
 function InFlight({ task }: { task: TaskSnapshot }): React.JSX.Element {
+  const { m } = useI18n();
   return (
     <div className="lg-activity">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -100,9 +109,18 @@ function InFlight({ task }: { task: TaskSnapshot }): React.JSX.Element {
             <ModelRoute task={task} />
           </span>
         </span>
-        <span className="lg-num text-[12px] text-fg-3">
-          {formatDurationMs(task.elapsed_ms)}
-          {task.ttft_ms != null ? ` · TTFT ${formatDurationMs(task.ttft_ms)}` : ""}
+        <span className="flex items-center gap-2 text-[12px] text-fg-3">
+          <Latency ms={task.elapsed_ms} kind="elapsed" pending />
+          {task.ttft_ms != null ? (
+            <span className="flex items-center gap-1">
+              TTFT <Latency ms={task.ttft_ms} kind="ttft" />
+            </span>
+          ) : (
+            // Still waiting for the first token: judge the wait so far against the TTFT scale.
+            <span className="flex items-center gap-1">
+              TTFT <Latency ms={task.elapsed_ms} kind="ttft" />…
+            </span>
+          )}
         </span>
       </div>
       {task.prompt_preview && (
@@ -117,11 +135,11 @@ function InFlight({ task }: { task: TaskSnapshot }): React.JSX.Element {
         <span className="lg-num">{task.task_id}</span>
         {task.session_id && (
           <span className="lg-num">
-            {task.session_reused ? "复用" : "新建"} {shortId(task.session_id)}
+            {task.session_reused ? m.overview.reused : m.overview.created} {shortId(task.session_id)}
           </span>
         )}
         <span className="lg-num">
-          思考 {formatNumber(task.thought_chars)} · 输出 {formatNumber(task.output_chars)} 字符
+          {m.overview.inFlightChars(formatNumber(task.thought_chars), formatNumber(task.output_chars))}
         </span>
         <TaskActivity task={task} />
       </div>
@@ -130,7 +148,9 @@ function InFlight({ task }: { task: TaskSnapshot }): React.JSX.Element {
 }
 
 export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
-  const { snapshot, lowCacheRecords, toolCalls } = useGateway();
+  const { client, baseUrl, snapshot, lowCacheRecords, toolCalls } = useGateway();
+  const { m } = useI18n();
+  const t = m.overview;
   const [protocol, setProtocol] = useState<"all" | TaskProtocol>("all");
   const [selectedTask, setSelectedTask] = useState<TaskSnapshot | null>(null);
   const [taskPage, setTaskPage] = useState(1);
@@ -139,6 +159,14 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const pool = snapshot?.session_pool;
   const cacheSummary = snapshot?.cache_telemetry;
   const toolSummary = snapshot?.tool_call_telemetry;
+  const usage = snapshot?.usage;
+  const today = useToday();
+  const todayUsage = useRevisionResource(
+    usage ? () => client.usage({ from: today, to: addDays(today, 1) }) : null,
+    `${baseUrl}|${client.demo}|usage-today|${today}`,
+    usage?.revision ?? -1,
+  );
+  const todaySummary = todayUsage.data?.summary;
   const activeTasks = snapshot?.active_tasks ?? [];
   const recentTasks = useMemo(() => snapshot?.recent_tasks ?? [], [snapshot?.recent_tasks]);
   const thresholdBps = cacheSummary?.low_cache_threshold_bps ?? 5000;
@@ -148,6 +176,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const storedLow = cacheSummary?.stored_low_cache_count ?? lowCacheRecords.length;
   const parked = (pool?.idle_cached_sessions ?? 0) + (pool?.suspended_mcp_sessions ?? 0);
   const failed = metrics?.failed_requests ?? 0;
+  const outcomes = useMemo(() => toolOutcomesByTask(toolCalls), [toolCalls]);
 
   const pulse = useMemo(
     () =>
@@ -158,7 +187,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   );
 
   const filteredTasks = useMemo(
-    () => (protocol === "all" ? recentTasks : recentTasks.filter((t) => t.protocol === protocol)),
+    () => (protocol === "all" ? recentTasks : recentTasks.filter((task) => task.protocol === protocol)),
     [recentTasks, protocol],
   );
   const taskPages = Math.max(1, Math.ceil(filteredTasks.length / TASK_PAGE_SIZE));
@@ -172,69 +201,85 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
     <>
       <StatGrid>
         <Stat
-          label="缓存命中率"
+          label={t.stats.hitRate}
           icon={<Gauge />}
           value={formatBpsPct(stats.hitBps)}
           onClick={() => navigate("cache")}
           foot={
             <span className={warmMisses > 0 ? "text-err" : undefined}>
-              {storedLow > 0 ? `${formatNumber(storedLow)} 轮低于 ${Math.round(thresholdBps / 100)}%` : "没有低命中轮次"}
+              {storedLow > 0
+                ? t.stats.lowTurns(formatNumber(storedLow), Math.round(thresholdBps / 100))
+                : t.stats.noLowTurns}
             </span>
           }
         >
           <Meter
             ratio={(stats.hitBps ?? 0) / 10000}
             tone={stats.hitBps !== null && stats.hitBps < thresholdBps ? "warn" : undefined}
-            label="Prompt 缓存命中率"
+            label={t.stats.hitMeter}
           />
         </Stat>
         <Stat
-          label="请求"
+          label={t.stats.requests}
           icon={<Activity />}
           value={formatNumber(metrics?.total_requests ?? 0)}
           foot={
             failed > 0 ? (
-              <span className="text-err">{formatNumber(failed)} 次失败</span>
+              <span className="text-err">{t.stats.failures(formatNumber(failed))}</span>
             ) : (
-              <span>{activeTasks.length > 0 ? `${activeTasks.length} 个执行中` : "全部成功"}</span>
+              <span>{activeTasks.length > 0 ? t.stats.running(activeTasks.length) : t.stats.allOk}</span>
             )
           }
         />
         <Stat
-          label="会话复用率"
+          label={t.stats.reuse}
           icon={<Layers />}
           value={formatPct(reuse)}
           onClick={() => navigate("sessions")}
-          foot={
-            <span>
-              驻留 {parked} / {pool?.max_idle_sessions ?? 0}
-            </span>
-          }
+          foot={<span>{t.stats.parked(parked, pool?.max_idle_sessions ?? 0)}</span>}
         />
-        <Stat
-          label="Token"
-          icon={<Sparkles />}
-          value={formatCompact(stats.promptTokens + (metrics?.total_output_tokens ?? 0))}
-          foot={
-            <span>
-              输入 {formatCompact(stats.promptTokens)} · 输出 {formatCompact(metrics?.total_output_tokens ?? 0)}
-            </span>
-          }
-        />
+        {usage ? (
+          <Stat
+            label={t.stats.costToday}
+            icon={<CircleDollarSign />}
+            value={todaySummary ? formatUsd(todaySummary.cost_usd) : "—"}
+            onClick={() => navigate("usage", "today")}
+            foot={
+              todaySummary && todaySummary.unpriced_calls > 0 ? (
+                <span className="text-warn">{t.stats.unpricedFoot(formatNumber(todaySummary.unpriced_calls))}</span>
+              ) : (
+                <span>{t.stats.costTotalFoot(formatUsd(usage.cost_usd), formatNumber(usage.calls))}</span>
+              )
+            }
+          />
+        ) : (
+          <Stat
+            label={t.stats.tokens}
+            icon={<Sparkles />}
+            value={formatCompact(stats.promptTokens + (metrics?.total_output_tokens ?? 0))}
+            foot={
+              <span>
+                {t.stats.tokensFoot(
+                  formatCompact(stats.promptTokens),
+                  formatCompact(metrics?.total_output_tokens ?? 0),
+                )}
+              </span>
+            }
+          />
+        )}
       </StatGrid>
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        <Card
-          title="逐轮缓存命中率">
+        <Card title={t.trendTitle}>
           <CacheTrendChart tasks={recentTasks} thresholdBps={thresholdBps} onSelect={setSelectedTask} />
         </Card>
 
         <Card
-          title="工具脉搏"
+          title={t.pulseTitle}
           actions={
             pulse.length > 0 ? (
               <button type="button" className="lg-link" onClick={() => navigate("tools")}>
-                调用流
+                {t.callStream}
                 <ArrowRight />
               </button>
             ) : undefined
@@ -250,10 +295,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
               onHover={() => undefined}
             />
           ) : (
-            <EmptyState
-              icon={<Wrench />}
-              title={toolSummary ? "还没有工具调用" : "当前网关不记录逐次工具调用"}
-            />
+            <EmptyState icon={<Wrench />} title={toolSummary ? t.noToolCalls : t.toolCallsUnsupported} />
           )}
         </Card>
       </div>
@@ -261,7 +303,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
       {snapshot?.elastic_io && <ElasticCard io={snapshot.elastic_io} sessions={pool?.sessions ?? []} />}
 
       {activeTasks.length > 0 && (
-        <Card title={`执行中 · ${activeTasks.length}`}>
+        <Card title={t.inFlight(activeTasks.length)}>
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             {activeTasks.map((task) => (
               <InFlight key={task.task_id} task={task} />
@@ -272,17 +314,17 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
 
       <Card
         flush
-        title="最近的请求"
+        title={t.recent}
         actions={
           <Segmented<"all" | TaskProtocol>
-            ariaLabel="按协议筛选"
+            ariaLabel={t.protocolFilter}
             value={protocol}
             onChange={(next) => {
               setProtocol(next);
               setTaskPage(1);
             }}
             options={[
-              { value: "all", label: "全部", count: recentTasks.length },
+              { value: "all", label: t.all, count: recentTasks.length },
               { value: "openai_responses", label: "Responses" },
               { value: "anthropic_messages", label: "Messages" },
             ]}
@@ -290,74 +332,90 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
         }
       >
         {shownTasks.length === 0 ? (
-          <EmptyState
-            icon={<Activity />}
-            title="还没有请求"
-          />
+          <EmptyState icon={<Activity />} title={t.noRequests} />
         ) : (
           <div className="lg-table-wrap">
             <table className="lg-table">
               <thead>
                 <tr>
-                  <th>时间</th>
-                  <th>模型</th>
-                  <th className="hide-sm">会话</th>
-                  <th className="hide-sm">活动</th>
-                  <th className="num">命中率</th>
-                  <th className="num hide-sm">输入 / 输出</th>
-                  <th className="num">耗时</th>
+                  <th>{t.col.time}</th>
+                  <th>{t.col.model}</th>
+                  <th className="hide-sm">{t.col.session}</th>
+                  <th className="hide-sm">{t.col.activity}</th>
+                  <th className="num">{t.col.hitRate}</th>
+                  <th className="num hide-sm">{t.col.io}</th>
+                  <th className="num" title={t.ttftHeaderHint}>
+                    {t.col.ttft}
+                  </th>
+                  <th className="num hide-sm">{t.col.elapsed}</th>
+                  {usage && <th className="num">{t.col.cost}</th>}
                 </tr>
               </thead>
               <tbody>
-                {shownTasks.map((task) => (
-                  <tr
-                    key={task.task_id}
-                    data-clickable="true"
-                    tabIndex={0}
-                    onClick={() => setSelectedTask(task)}
-                    onKeyDown={(ev) => {
-                      if (ev.key === "Enter") setSelectedTask(task);
-                    }}
-                  >
-                    <td className="lg-num whitespace-nowrap text-[12px] text-fg-3">
-                      {formatClock(task.started_at_unix_ms)}
-                    </td>
-                    <td className="text-[12px] text-fg">
-                      <ModelRoute task={task} />
-                    </td>
-                    <td className="hide-sm whitespace-nowrap">
-                      {task.session_id ? (
-                        <span className="inline-flex items-center gap-1.5">
-                          <span className="lg-num text-[12px]">{shortId(task.session_id)}</span>
-                          {!task.session_reused && <Pill>新建</Pill>}
+                {shownTasks.map((task) => {
+                  const toolOutcome = outcomes.get(task.task_id);
+                  return (
+                    <tr
+                      key={task.task_id}
+                      data-clickable="true"
+                      data-tone={taskTone(task, toolOutcome)}
+                      tabIndex={0}
+                      onClick={() => setSelectedTask(task)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === "Enter") setSelectedTask(task);
+                      }}
+                    >
+                      <td className="lg-num whitespace-nowrap text-[12px] text-fg-3">
+                        {formatClock(task.started_at_unix_ms)}
+                      </td>
+                      <td className="text-[12px] text-fg">
+                        <ModelRoute task={task} />
+                      </td>
+                      <td className="hide-sm whitespace-nowrap">
+                        {task.session_id ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <span className="lg-num text-[12px]">{shortId(task.session_id)}</span>
+                            {!task.session_reused && <Pill>{t.created}</Pill>}
+                          </span>
+                        ) : (
+                          <span className="text-fg-4">—</span>
+                        )}
+                      </td>
+                      <td className="hide-sm">
+                        <span className="inline-flex flex-wrap items-center gap-1.5">
+                          {task.phase !== "completed" && <PhasePill phase={task.phase} />}
+                          <ToolOutcome counts={toolOutcome} />
+                          <TaskActivity task={task} />
                         </span>
-                      ) : (
-                        <span className="text-fg-4">—</span>
+                      </td>
+                      <td className="num whitespace-nowrap">
+                        <HitRate bps={taskHitBps(task)} thresholdBps={thresholdBps} />
+                      </td>
+                      <td className="num hide-sm whitespace-nowrap">
+                        {task.usage ? (
+                          <>
+                            {formatNumber(taskPromptTokens(task))}
+                            <span className="text-fg-4"> / </span>
+                            {formatNumber(task.usage.outputTokens)}
+                          </>
+                        ) : (
+                          <span className="text-fg-4">—</span>
+                        )}
+                      </td>
+                      <td className="num whitespace-nowrap">
+                        <Latency ms={task.ttft_ms} kind="ttft" />
+                      </td>
+                      <td className="num hide-sm whitespace-nowrap">
+                        <Latency ms={task.elapsed_ms} kind="elapsed" />
+                      </td>
+                      {usage && (
+                        <td className="num whitespace-nowrap">
+                          <Usd value={task.cost_usd} unpricedHint={task.usage !== null} />
+                        </td>
                       )}
-                    </td>
-                    <td className="hide-sm">
-                      <span className="inline-flex flex-wrap items-center gap-1.5">
-                        {task.phase !== "completed" && <PhasePill phase={task.phase} />}
-                        <TaskActivity task={task} />
-                      </span>
-                    </td>
-                    <td className="num whitespace-nowrap">
-                      <HitRate bps={taskHitBps(task)} thresholdBps={thresholdBps} />
-                    </td>
-                    <td className="num hide-sm whitespace-nowrap">
-                      {task.usage ? (
-                        <>
-                          {formatNumber(taskPromptTokens(task))}
-                          <span className="text-fg-4"> / </span>
-                          {formatNumber(task.usage.outputTokens)}
-                        </>
-                      ) : (
-                        <span className="text-fg-4">—</span>
-                      )}
-                    </td>
-                    <td className="num whitespace-nowrap">{formatDurationMs(task.elapsed_ms)}</td>
-                  </tr>
-                ))}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -368,6 +426,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
       <TaskSheet
         task={selectedTask}
         thresholdBps={thresholdBps}
+        toolOutcome={selectedTask ? outcomes.get(selectedTask.task_id) : undefined}
         onClose={() => setSelectedTask(null)}
         onOpenToolCalls={toolSummary ? (taskId) => navigate("tools", taskId) : undefined}
       />

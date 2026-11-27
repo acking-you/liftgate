@@ -32,6 +32,7 @@ use liftgate_types::{
         WebSearchAction, WebSearchSource, build_codex_model_catalog_with_tool_mode,
         normalize_responses_request, split_namespaced_tool_name,
     },
+    pricing::{MAX_PRICING_KEY_BYTES, ModelPrice},
     session_key::{INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL},
     telemetry::{GatewayTelemetrySnapshot, TaskProtocol},
 };
@@ -51,6 +52,7 @@ use crate::{
         ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
         generate_short_nonce,
     },
+    usage_ledger::{MAX_SERIES_BOUNDS, PriceUpdate},
     web_fetch::WebFetchOutcome,
 };
 
@@ -253,6 +255,16 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
         .route(
             "/api/telemetry/context-capture",
             post(handle_set_context_capture::<B>),
+        )
+        .route("/api/telemetry/usage", get(handle_get_usage::<B>))
+        .route(
+            "/api/telemetry/usage/series",
+            get(handle_get_usage_series::<B>),
+        )
+        .route("/api/telemetry/usage/reset", post(handle_reset_usage::<B>))
+        .route(
+            "/api/telemetry/pricing",
+            get(handle_get_pricing::<B>).post(handle_set_model_price::<B>),
         )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
@@ -3601,6 +3613,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         elastic_io,
         tool_call_telemetry: state.telemetry.tool_call_summary(),
         context_capture: state.telemetry.context_capture_summary(),
+        usage: state.telemetry.usage_summary(),
         active_tasks,
         recent_tasks,
         available_models,
@@ -4137,6 +4150,181 @@ async fn handle_get_context_capture_detail<B: AcpBackend>(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 "the capture file could not be read".to_owned(),
+            )
+        }
+    }
+}
+
+async fn handle_get_usage<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let range = match (query_param(&uri, "from"), query_param(&uri, "to")) {
+        (None, None) => None,
+        (Some(from), Some(to)) => match (from.parse::<u64>(), to.parse::<u64>()) {
+            (Ok(from), Ok(to)) if from < to => Some((from, to)),
+            _ => {
+                return telemetry_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "`from` and `to` must be unix-ms instants with `from` before `to`".to_owned(),
+                );
+            }
+        },
+        _ => {
+            return telemetry_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`from` and `to` must be given together".to_owned(),
+            );
+        }
+    };
+    Json(state.telemetry.usage_report(range)).into_response()
+}
+
+/// Parses `bounds` (`t0,t1,…` in unix ms, commas optionally percent-encoded): two to
+/// [`MAX_SERIES_BOUNDS`] strictly ascending instants.
+fn parse_series_bounds(raw: &str) -> Result<Vec<u64>, String> {
+    let raw = raw.replace("%2C", ",").replace("%2c", ",");
+    let mut bounds: Vec<u64> = Vec::new();
+    for part in raw.split(',') {
+        if bounds.len() >= MAX_SERIES_BOUNDS {
+            return Err(format!(
+                "`bounds` takes at most {MAX_SERIES_BOUNDS} instants"
+            ));
+        }
+        let Ok(bound) = part.trim().parse::<u64>() else {
+            return Err("`bounds` must be comma-separated unix-ms instants".to_owned());
+        };
+        if bounds.last().is_some_and(|last| *last >= bound) {
+            return Err("`bounds` must be strictly ascending".to_owned());
+        }
+        bounds.push(bound);
+    }
+    if bounds.len() < 2 {
+        return Err("`bounds` needs at least two instants".to_owned());
+    }
+    Ok(bounds)
+}
+
+async fn handle_get_usage_series<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    match query_param(&uri, "bounds").map(parse_series_bounds) {
+        Some(Ok(bounds)) => Json(state.telemetry.usage_series(&bounds)).into_response(),
+        Some(Err(message)) => {
+            telemetry_error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        }
+        None => telemetry_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`bounds` is required: comma-separated, ascending unix-ms instants".to_owned(),
+        ),
+    }
+}
+
+async fn handle_reset_usage<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let telemetry = Arc::clone(&state.telemetry);
+    match tokio::task::spawn_blocking(move || telemetry.reset_usage()).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => {
+            tracing::warn!(error = ?err, "usage reset task failed");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "usage could not be reset".to_owned(),
+            )
+        }
+    }
+}
+
+async fn handle_get_pricing<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let catalog = state.backend.available_models();
+    Json(state.telemetry.pricing_report(&catalog)).into_response()
+}
+
+/// `POST /api/telemetry/pricing`: `price: null` restores the default price of `key`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelPriceUpdatePayload {
+    key: String,
+    #[serde(default)]
+    price: Option<ModelPrice>,
+}
+
+async fn handle_set_model_price<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let parsed: ModelPriceUpdatePayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return GatewayError::from(RequestBodyError::from(err)).into_openai_response();
+        }
+    };
+    let key = parsed.key.trim().to_owned();
+    if key.is_empty() || key.len() > MAX_PRICING_KEY_BYTES {
+        return telemetry_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("`key` must be 1 to {MAX_PRICING_KEY_BYTES} bytes"),
+        );
+    }
+    if let Some(Err(err)) = parsed.price.as_ref().map(ModelPrice::validate) {
+        return telemetry_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            err.to_string(),
+        );
+    }
+    let telemetry = Arc::clone(&state.telemetry);
+    let price = parsed.price;
+    let outcome =
+        tokio::task::spawn_blocking(move || telemetry.set_custom_price(&key, price)).await;
+    match outcome {
+        Ok(PriceUpdate::Changed | PriceUpdate::Unchanged) => {
+            let catalog = state.backend.available_models();
+            Json(state.telemetry.pricing_report(&catalog)).into_response()
+        }
+        Ok(PriceUpdate::Full) => telemetry_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "too many custom prices; remove one before adding another".to_owned(),
+        ),
+        Err(err) => {
+            tracing::warn!(error = ?err, "model price update task failed");
+            telemetry_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "price could not be saved".to_owned(),
             )
         }
     }

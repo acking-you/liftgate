@@ -4,63 +4,103 @@ import { ProseBlock } from "@/components/CodeBlock";
 import { SegmentedBar } from "@/components/charts";
 import { ToolGlyph } from "@/components/ToolExchange";
 import { Sheet } from "@/components/ui/dialog";
-import { Figure, HitRate, KV, Note, Pill, Tag, type Tone } from "@/components/ui";
+import { Figure, HitRate, KV, Latency, Note, Pill, Tag, type Tone, Usd } from "@/components/ui";
 import {
-  formatDurationMs,
   formatNumber,
   formatSmartTime,
   protocolPath,
   taskHitBps,
   taskPromptTokens,
 } from "@/lib/format";
-import { classifyTool, countBy } from "@/lib/toolcalls";
+import { type Messages, useI18n } from "@/lib/i18n";
+import { type ToolOutcomeCounts, classifyTool, countBy } from "@/lib/toolcalls";
 import type { TaskPhase, TaskSnapshot } from "@/types/telemetry";
 
-const PHASE: Record<TaskPhase, { label: string; tone: Tone; live: boolean }> = {
-  initializing_session: { label: "初始化会话", tone: "accent", live: true },
-  thinking: { label: "思考中", tone: "accent", live: true },
-  searching_web: { label: "联网搜索", tone: "accent", live: true },
-  fetching_web: { label: "抓取网页", tone: "accent", live: true },
-  streaming_text: { label: "输出中", tone: "accent", live: true },
-  calling_client_tool: { label: "调用工具", tone: "accent", live: true },
-  completed: { label: "完成", tone: "ok", live: false },
-  failed: { label: "失败", tone: "err", live: false },
-  cancelled: { label: "已取消", tone: "neutral", live: false },
+const PHASE_TONE: Record<TaskPhase, { tone: Tone; live: boolean }> = {
+  initializing_session: { tone: "accent", live: true },
+  thinking: { tone: "accent", live: true },
+  searching_web: { tone: "accent", live: true },
+  fetching_web: { tone: "accent", live: true },
+  streaming_text: { tone: "accent", live: true },
+  calling_client_tool: { tone: "accent", live: true },
+  completed: { tone: "ok", live: false },
+  failed: { tone: "err", live: false },
+  cancelled: { tone: "warn", live: false },
 };
 
 export function PhasePill({ phase }: { phase: TaskPhase }): React.JSX.Element {
-  const meta = PHASE[phase];
+  const { m } = useI18n();
+  const meta = PHASE_TONE[phase];
   return (
     <Pill tone={meta.tone} icon={meta.live ? <LoaderCircle className="lg-spin" /> : undefined}>
-      {meta.label}
+      {m.overview.phase[phase]}
     </Pill>
   );
 }
 
-function activityItems(task: TaskSnapshot): Array<[string, number, string]> {
-  const items: Array<[string, number, string]> = [
-    ["工具", task.client_tool_calls.length, "客户端工具调用次数"],
-    ["搜索", task.native_web_searches, "原生联网搜索"],
-    ["抓取", task.native_web_fetches, "原生网页抓取"],
-    ["视觉卸载", task.vision_offloaded_images ?? 0, "由视觉子会话旁路处理的图像"],
-    ["0-RTT", task.zero_rtt_mcp_ops ?? 0, "网关本地闭环、没有客户端往返的操作"],
-    ["Spill", task.spilled_tool_results ?? 0, "超过内联上限而分片落盘的工具输出"],
+/** Row tone for a request: red when it failed, amber when it was cancelled or a tool failed. */
+export function taskTone(task: TaskSnapshot, tools?: ToolOutcomeCounts): "err" | "warn" | undefined {
+  if (task.phase === "failed") return "err";
+  if (task.phase === "cancelled") return "warn";
+  if (tools && tools.failed + tools.rejected > 0) return "warn";
+  return undefined;
+}
+
+function activityItems(
+  task: TaskSnapshot,
+  m: Messages,
+): Array<{ key: string; label: string; hint: string; count: number }> {
+  const a = m.overview.activity;
+  const items = [
+    { key: "tools", ...a.tools, count: task.client_tool_calls.length },
+    { key: "searches", ...a.searches, count: task.native_web_searches },
+    { key: "fetches", ...a.fetches, count: task.native_web_fetches },
+    { key: "vision", ...a.vision, count: task.vision_offloaded_images ?? 0 },
+    { key: "zeroRtt", ...a.zeroRtt, count: task.zero_rtt_mcp_ops ?? 0 },
+    { key: "spills", ...a.spills, count: task.spilled_tool_results ?? 0 },
   ];
-  return items.filter(([, count]) => count > 0);
+  return items.filter((item) => item.count > 0);
 }
 
 /** Side activity of a turn as quiet tags: only what actually happened shows up. */
 export function TaskActivity({ task }: { task: TaskSnapshot }): React.JSX.Element | null {
-  const shown = activityItems(task);
+  const { m } = useI18n();
+  const shown = activityItems(task, m);
   if (shown.length === 0) return null;
   return (
     <span className="inline-flex flex-wrap gap-1">
-      {shown.map(([label, count, title]) => (
-        <Tag key={label} title={title}>
-          {label} {count}
+      {shown.map((item) => (
+        <Tag key={item.key} title={item.hint}>
+          {item.label} {item.count}
         </Tag>
       ))}
     </span>
+  );
+}
+
+/** Loud pills for tool calls that failed, were rejected, or are still out with the client. */
+export function ToolOutcome({ counts }: { counts: ToolOutcomeCounts | undefined }): React.JSX.Element | null {
+  const { m } = useI18n();
+  if (!counts) return null;
+  const o = m.overview.outcome;
+  return (
+    <>
+      {counts.failed > 0 && (
+        <Pill tone="err" title={o.failedHint}>
+          {o.failed(counts.failed)}
+        </Pill>
+      )}
+      {counts.rejected > 0 && (
+        <Pill tone="warn" title={o.rejectedHint}>
+          {o.rejected(counts.rejected)}
+        </Pill>
+      )}
+      {counts.waiting > 0 && (
+        <Pill tone="accent" title={o.waitingHint}>
+          {o.waiting(counts.waiting)}
+        </Pill>
+      )}
+    </>
   );
 }
 
@@ -80,17 +120,23 @@ export function ModelRoute({ task }: { task: TaskSnapshot }): React.JSX.Element 
 export function TaskSheet({
   task,
   thresholdBps,
+  toolOutcome,
   onClose,
   onOpenToolCalls,
 }: {
   task: TaskSnapshot | null;
   thresholdBps: number;
+  /** How this turn's recorded tool calls ended, when the gateway records them. */
+  toolOutcome?: ToolOutcomeCounts;
   onClose: () => void;
   /** Jump to the tool-call stream filtered to this turn. */
   onOpenToolCalls?: (taskId: string) => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.overview.sheet;
   const usage = task?.usage ?? null;
   const toolCounts = task ? countBy(task.client_tool_calls, (n) => n) : [];
+  const live = task !== null && task.finished_at_unix_ms === null;
   return (
     <Sheet
       open={task !== null}
@@ -122,39 +168,38 @@ export function TaskSheet({
             </Note>
           )}
 
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            <Figure label="总耗时" value={formatDurationMs(task.elapsed_ms)} />
-            <Figure label="首字延迟" value={formatDurationMs(task.ttft_ms)} />
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
+            <Figure label={t.elapsed} value={<Latency ms={task.elapsed_ms} kind="elapsed" pending={live} />} />
+            <Figure label={t.ttft} value={<Latency ms={task.ttft_ms} kind="ttft" />} />
             <Figure
-              label="缓存命中率"
+              label={t.hitRate}
               value={<HitRate bps={taskHitBps(task)} thresholdBps={thresholdBps} digits={2} />}
             />
-            <Figure label="输出" value={usage ? formatNumber(usage.outputTokens) : "—"} sub="tokens" />
+            <Figure label={t.output} value={usage ? formatNumber(usage.outputTokens) : "—"} sub="tokens" />
+            <Figure label={t.cost} value={<Usd value={task.cost_usd} unpricedHint={usage !== null} />} />
           </div>
 
           {usage && taskPromptTokens(task) > 0 && (
             <section>
-              <h3 className="lg-section-title">
-                输入 Token 构成 · 共 {formatNumber(taskPromptTokens(task))}
-              </h3>
+              <h3 className="lg-section-title">{t.inputMix(formatNumber(taskPromptTokens(task)))}</h3>
               <SegmentedBar
-                ariaLabel="本轮输入 Token 构成"
+                ariaLabel={t.inputMixAria}
                 format={formatNumber}
                 parts={[
-                  { key: "read", label: "缓存读", value: usage.cachedReadTokens, color: "var(--lg-s1)" },
+                  { key: "read", label: t.cacheRead, value: usage.cachedReadTokens, color: "var(--lg-s1)" },
                   {
                     key: "write",
-                    label: "缓存写",
+                    label: t.cacheWrite,
                     value: usage.cachedWriteTokens,
                     color: "var(--lg-s4)",
                     ink: "dark",
                   },
-                  { key: "input", label: "未命中输入", value: usage.inputTokens, color: "var(--lg-s-neutral)" },
+                  { key: "input", label: t.uncached, value: usage.inputTokens, color: "var(--lg-s-neutral)" },
                 ]}
               />
               {usage.thoughtTokens > 0 && (
                 <p className="lg-hint m-0 mt-2">
-                  另有思考 <span className="lg-num text-fg-2">{formatNumber(usage.thoughtTokens)}</span> tokens。
+                  {t.thinking(<span className="lg-num text-fg-2">{formatNumber(usage.thoughtTokens)}</span>)}
                 </p>
               )}
             </section>
@@ -162,33 +207,33 @@ export function TaskSheet({
 
           <KV
             items={[
-              ["模型", <ModelRoute key="m" task={task} />],
+              [t.model, <ModelRoute key="m" task={task} />],
               [
-                "会话",
+                t.session,
                 task.session_id ? (
                   <>
                     {task.session_id}{" "}
-                    <span className="text-fg-3">· {task.session_reused ? "复用热会话" : "新建"}</span>
+                    <span className="text-fg-3">· {task.session_reused ? t.warm : t.created}</span>
                   </>
                 ) : (
                   "—"
                 ),
               ],
-              ["停止原因", task.stop_reason ?? "—"],
-              ["思考 / 输出", `${formatNumber(task.thought_chars)} / ${formatNumber(task.output_chars)} 字符`],
+              [t.stopReason, task.stop_reason ?? "—"],
+              [t.thoughtOutput, t.chars(formatNumber(task.thought_chars), formatNumber(task.output_chars))],
               ...(task.auxiliary_task
-                ? ([["辅助请求", task.auxiliary_task]] as Array<readonly [string, React.ReactNode]>)
+                ? ([[t.auxiliary, task.auxiliary_task]] as Array<readonly [string, React.ReactNode]>)
                 : []),
             ]}
           />
 
-          {activityItems(task).length > 0 && (
+          {activityItems(task, m).length > 0 && (
             <section>
               <div className="mb-2 flex items-center justify-between gap-2">
-                <h3 className="lg-section-title m-0">本轮活动</h3>
+                <h3 className="lg-section-title m-0">{t.activity}</h3>
                 {onOpenToolCalls && task.client_tool_calls.length > 0 && (
                   <button type="button" className="lg-link" onClick={() => onOpenToolCalls(task.task_id)}>
-                    查看每次调用的输入输出
+                    {t.openCalls}
                     <ArrowRight />
                   </button>
                 )}
@@ -205,13 +250,18 @@ export function TaskSheet({
                     ))}
                   </div>
                 )}
-                <TaskActivity task={task} />
+                <span className="inline-flex flex-wrap items-center gap-1.5">
+                  <ToolOutcome counts={toolOutcome} />
+                  <TaskActivity task={task} />
+                </span>
               </div>
             </section>
           )}
 
-          {task.prompt_preview && <ProseBlock text={task.prompt_preview} title="输入摘要" maxHeight={220} />}
-          {task.output_preview && <ProseBlock text={task.output_preview} title="输出摘要" maxHeight={220} />}
+          {task.prompt_preview && <ProseBlock text={task.prompt_preview} title={t.prompt} maxHeight={220} />}
+          {task.output_preview && (
+            <ProseBlock text={task.output_preview} title={t.outputPreview} maxHeight={220} />
+          )}
         </>
       )}
     </Sheet>

@@ -11108,6 +11108,200 @@ async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, V
 }
 
 #[tokio::test]
+async fn usage_and_pricing_endpoints_price_each_request_by_model() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 400_000,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                output_tokens: 20_000,
+                thought_tokens: 5_000,
+                total_tokens: 420_000,
+            },
+            reply: "Cold reply".to_owned(),
+        },
+        MockScript::ImmediateWithExactUsage {
+            usage: AcpUsage {
+                input_tokens: 100_000,
+                cached_read_tokens: 300_000,
+                cached_write_tokens: 0,
+                output_tokens: 10_000,
+                thought_tokens: 0,
+                total_tokens: 410_000,
+            },
+            reply: "Warm reply".to_owned(),
+        },
+    ]));
+    let state = test_state(Arc::clone(&backend), 30, None);
+    let app = build_router(state.clone());
+    let mut previous: Option<String> = None;
+    for prompt in ["First question", "Second question"] {
+        let mut body = json!({
+            "model": "gemini-4-hydrogen-xhigh",
+            "stream": false,
+            "store": true,
+            "input": prompt
+        });
+        if let Some(prev) = previous.as_deref() {
+            body["previous_response_id"] = json!(prev);
+        }
+        let (status, resp) = post_json(&app, "/v1/responses", body).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        previous = resp["id"].as_str().map(str::to_owned);
+    }
+
+    // Hydrogen ($1.50 / $0.075 cached / $7.50 output per 1M): 0.6 + 0.15, then
+    // 0.15 + 0.0225 + 0.075.
+    let expected = 0.75 + 0.2475;
+    let (status, usage) = get_json(&app, "/api/telemetry/usage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(usage["summary"]["calls"], 2);
+    assert_eq!(usage["summary"]["tokens"]["cached_input"], 300_000);
+    assert_eq!(usage["summary"]["tokens"]["thought"], 5_000);
+    assert!(
+        (usage["summary"]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9,
+        "{usage}"
+    );
+    let model = &usage["models"][0];
+    assert_eq!(model["model_id"], "gemini-4-hydrogen-xhigh");
+    assert_eq!(model["pricing_key"], "gemini-4-hydrogen");
+    assert_eq!(model["calls"], 2);
+
+    // Ranges and per-interval series are cut from the same usage, in the caller's own bounds.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap();
+    let day = 86_400_000;
+    let (status, ranged) = get_json(
+        &app,
+        &format!("/api/telemetry/usage?from={}&to={}", now - day, now + day),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ranged}");
+    assert_eq!(ranged["summary"]["calls"], 2);
+    assert_eq!(ranged["summary"]["until_unix_ms"], now + day);
+    assert!((ranged["summary"]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+    let (_, earlier) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/usage?from={}&to={}",
+            now - 3 * day,
+            now - 2 * day
+        ),
+    )
+    .await;
+    assert_eq!(earlier["summary"]["calls"], 0);
+    assert!(earlier["models"].as_array().unwrap().is_empty());
+    let (status, series) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/usage/series?bounds={},{}%2C{}",
+            now - 2 * day,
+            now - day,
+            now + day
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{series}");
+    assert_eq!(series["bucket_ms"], 900_000);
+    let intervals = series["intervals"].as_array().unwrap();
+    assert_eq!(intervals.len(), 2);
+    assert_eq!(intervals[0]["calls"], 0);
+    assert_eq!(intervals[1]["calls"], 2);
+    assert!((intervals[1]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+    for bad in [
+        "/api/telemetry/usage?from=10".to_owned(),
+        "/api/telemetry/usage?from=10&to=10".to_owned(),
+        "/api/telemetry/usage?from=x&to=10".to_owned(),
+        "/api/telemetry/usage/series".to_owned(),
+        "/api/telemetry/usage/series?bounds=5".to_owned(),
+        "/api/telemetry/usage/series?bounds=5,5".to_owned(),
+        "/api/telemetry/usage/series?bounds=9,5".to_owned(),
+        format!(
+            "/api/telemetry/usage/series?bounds={}",
+            (0..=400)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ] {
+        let (status, body) = get_json(&app, &bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+
+    let (_, snapshot) = get_json(&app, "/api/telemetry/snapshot").await;
+    assert_eq!(snapshot["usage"]["calls"], 2);
+    let recent = snapshot["recent_tasks"].as_array().unwrap();
+    let costs: Vec<f64> = recent
+        .iter()
+        .filter_map(|t| t["cost_usd"].as_f64())
+        .collect();
+    assert_eq!(
+        costs.len(),
+        2,
+        "every completed request is priced: {snapshot}"
+    );
+    assert!((costs.iter().sum::<f64>() - expected).abs() < 1e-9);
+
+    let (status, pricing) = get_json(&app, "/api/telemetry/pricing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pricing["currency"], "USD");
+    let hydrogen = pricing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "gemini-4-hydrogen")
+        .expect("hydrogen entry")
+        .clone();
+    assert_eq!(hydrogen["default_price"]["output"], 7.5);
+    assert!(hydrogen["custom_price"].is_null());
+    assert_eq!(
+        hydrogen["model_ids"],
+        json!(["gemini-4-hydrogen-low", "gemini-4-hydrogen-xhigh"]),
+        "catalog and recorded models are listed under their family"
+    );
+
+    // Invalid updates are rejected without side effects.
+    for bad in [
+        json!({ "key": "", "price": null }),
+        json!({ "key": "gemini-4-hydrogen", "price": { "input": -1, "cached_input": 0, "cache_write": 0, "output": 0 } }),
+        json!({ "key": "gemini-4-hydrogen", "price": null, "extra": true }),
+    ] {
+        let (status, _) = post_json(&app, "/api/telemetry/pricing", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // A custom price re-prices everything recorded; `null` restores the default.
+    let (status, updated) = post_json(
+        &app,
+        "/api/telemetry/pricing",
+        json!({ "key": "gemini-4-hydrogen", "price": { "input": 1.0, "cached_input": 0.0, "cache_write": 1.0, "output": 0.0 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated["revision"].as_u64().unwrap() > pricing["revision"].as_u64().unwrap());
+    let (_, usage) = get_json(&app, "/api/telemetry/usage").await;
+    assert!((usage["summary"]["cost_usd"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    let (status, _) = post_json(
+        &app,
+        "/api/telemetry/pricing",
+        json!({ "key": "gemini-4-hydrogen", "price": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, usage) = get_json(&app, "/api/telemetry/usage").await;
+    assert!((usage["summary"]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+
+    let (status, reset) = post_json(&app, "/api/telemetry/usage/reset", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reset["calls"], 0);
+    let (_, usage) = get_json(&app, "/api/telemetry/usage").await;
+    assert!(usage["models"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn zero_usage_mcp_suspension_still_samples_and_captures_context() {
     // No usage update arrives before the first client tool call suspends the cascade.
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
@@ -11305,6 +11499,8 @@ async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
                 dir: Some(capture_dir.clone()),
                 ..liftgate_server::context_capture::ContextCaptureConfig::default()
             },
+            pricing_path: None,
+            usage_path: None,
         },
     ));
     let app = build_router(state.clone());

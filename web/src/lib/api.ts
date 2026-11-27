@@ -7,10 +7,15 @@ import type {
   GatewayTelemetrySnapshot,
   LowCacheHitsResponse,
   LowCachePayloadDetailResponse,
+  ModelPrice,
+  PricingResponse,
   SessionToolCatalog,
   TaskProtocol,
   ToolCallDetail,
   ToolCallsResponse,
+  UsageResponse,
+  UsageSeriesResponse,
+  UsageSummary,
 } from "@/types/telemetry";
 
 export type StreamConnectionState = "connecting" | "live" | "reconnecting";
@@ -75,7 +80,22 @@ export interface GatewayClient {
   updateContextCapture(update: ContextCaptureConfigUpdate): Promise<ContextCaptureSummary>;
   clearContextCaptures(): Promise<ContextCaptureSummary>;
 
+  /** Everything recorded, or only the usage within `range`. */
+  usage(range?: UsageRange): Promise<UsageResponse>;
+  /** Usage per interval between consecutive `bounds` (ascending unix ms, e.g. local midnights). */
+  usageSeries(bounds: readonly number[]): Promise<UsageSeriesResponse>;
+  resetUsage(): Promise<UsageSummary>;
+  pricing(): Promise<PricingResponse>;
+  /** `null` restores the default price of `key`. */
+  setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse>;
+
   probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string>;
+}
+
+/** A half-open time range `[from, to)` in unix ms. */
+export interface UsageRange {
+  from: number;
+  to: number;
 }
 
 const RECONNECT_DELAY_MS = 2000;
@@ -249,6 +269,30 @@ export class HttpGatewayClient implements GatewayClient {
 
   clearContextCaptures(): Promise<ContextCaptureSummary> {
     return this.request("/api/telemetry/context-captures/clear", { method: "POST" });
+  }
+
+  usage(range?: UsageRange): Promise<UsageResponse> {
+    return this.request(
+      range
+        ? `/api/telemetry/usage?from=${Math.floor(range.from)}&to=${Math.floor(range.to)}`
+        : "/api/telemetry/usage",
+    );
+  }
+
+  usageSeries(bounds: readonly number[]): Promise<UsageSeriesResponse> {
+    return this.request(`/api/telemetry/usage/series?bounds=${bounds.map((b) => Math.floor(b)).join(",")}`);
+  }
+
+  resetUsage(): Promise<UsageSummary> {
+    return this.request("/api/telemetry/usage/reset", { method: "POST" });
+  }
+
+  pricing(): Promise<PricingResponse> {
+    return this.request("/api/telemetry/pricing");
+  }
+
+  setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse> {
+    return this.request("/api/telemetry/pricing", { method: "POST", body: { key, price } });
   }
 
   async probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string> {

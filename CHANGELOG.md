@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.18] - 2026-11-28
+
+### Added
+- **Per-request pricing and per-model usage**:
+  - Every completed request is priced in USD from its model's API price, and its uncached input, cached input, cache write, and output tokens (thinking included in output) are added to a per-model usage ledger persisted in `usage-ledger.json` across restarts.
+  - The ledger keeps exact all-time totals plus quarter-hour history (up to 50,000 buckets, about 520 days of one model in constant use), so usage can be totalled for any day or range in the viewer's own time zone: every UTC offset in use is a whole number of quarter hours, so local midnights always fall on a bucket boundary.
+  - Defaults ship for every catalog family at the providers' published standard API prices, checked 2026-11-27: Gemini 4 Neon / Carbon / Argon / Hydrogen and Gemini 3.8 Flash (Gemini API), Claude Opus 5.5 and Sonnet 5.5 (Claude API), and GPT-OSS 120B (Vertex AI). Announced price changes (Gemini 4 Carbon and Argon on 2026-12-01, Gemini 3.8 Flash on 2027-01-01) take effect at their date without re-pricing earlier usage.
+  - Any model's price can be overridden from the dashboard; custom prices persist in `model-pricing.json` and re-price all recorded usage. Models without a default show as unpriced until given one.
+  - New `GET /api/telemetry/usage[?from=&to=]`, `GET /api/telemetry/usage/series?bounds=`, `POST /api/telemetry/usage/reset`, `GET /api/telemetry/pricing`, and `POST /api/telemetry/pricing`; the snapshot gains `usage` totals and every recent request a `cost_usd`.
+- **Usage & cost view (`#/usage`)**: total cost, calls, tokens, the share of input served from cache with an estimate of what caching saved, the token mix, a per-model breakdown with totals and cost share, and the price list with scheduled changes and an editor. The overview shows today's cost next to the running total, the recent-requests table a cost column, and the models view each model's price.
+- **Usage by day**: the usage view switches between today, yesterday, the last 7 or 30 days, any single day, and everything recorded, with every figure, the token mix, and the per-model table following the choice. A daily chart of the last 30 days (14 on phones) plots cost, tokens, calls, or cache hits per local day; hovering shows a day's figures, clicking selects it, and the arrows page back through history. Periods are linkable (`#/usage/today`, `#/usage/7d`, `#/usage/2026-11-25`).
+- **Bilingual dashboard**: every view is available in Chinese and English, following the system language until switched from the top bar.
+
+### Changed
+- **Latency and failure cues in the dashboard**: recent requests show TTFT, and TTFT, request duration, and tool-call duration carry a traffic-light dot (green fast, blue normal, amber slow, red very slow) whose tooltip names the band. Requests and tool calls that failed, were rejected, or are still waiting get coloured stripes and pills, the overview's request rows show failed or rejected tool calls per request, and the tool-call navigation badge turns into a red failure count when calls fail.
+
 ## [0.2.17] - 2026-11-28
 
 ### Changed

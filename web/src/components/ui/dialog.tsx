@@ -1,6 +1,7 @@
 import * as React from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /** Land focus on the panel itself, so opening with the mouse does not ring the close button. */
@@ -10,8 +11,9 @@ function focusPanel(ev: Event): void {
 }
 
 function CloseButton(): React.JSX.Element {
+  const { m } = useI18n();
   return (
-    <DialogPrimitive.Close className="lg-btn shrink-0" data-variant="ghost" data-icon="true" aria-label="关闭">
+    <DialogPrimitive.Close className="lg-btn shrink-0" data-variant="ghost" data-icon="true" aria-label={m.common.close}>
       <X />
     </DialogPrimitive.Close>
   );

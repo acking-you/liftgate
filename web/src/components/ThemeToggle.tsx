@@ -1,6 +1,7 @@
 import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import { Moon, Sun } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 
 declare global {
   interface Window {
@@ -13,6 +14,7 @@ function readIsDark(): boolean {
 }
 
 export function ThemeToggle(): React.JSX.Element {
+  const { m } = useI18n();
   const [isDark, setIsDark] = useState<boolean>(readIsDark);
   const btnRef = useRef<HTMLButtonElement | null>(null);
 
@@ -25,7 +27,7 @@ export function ThemeToggle(): React.JSX.Element {
     return () => window.removeEventListener("lg-theme-change", handler);
   }, []);
 
-  const label = isDark ? "切换到浅色主题" : "切换到深色主题";
+  const label = isDark ? m.common.themeToLight : m.common.themeToDark;
 
   return (
     <button

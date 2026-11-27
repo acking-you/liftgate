@@ -6,6 +6,7 @@ import { Modal } from "@/components/ui/dialog";
 import { Button, Field, Segmented } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
 import { errorMessage } from "@/lib/api";
+import { useI18n } from "@/lib/i18n";
 import type { TaskProtocol } from "@/types/telemetry";
 
 export function ConnectionModal({
@@ -16,6 +17,8 @@ export function ConnectionModal({
   onOpenChange: (open: boolean) => void;
 }): React.JSX.Element {
   const { baseUrl, apiKey, updateConnection } = useGateway();
+  const { m } = useI18n();
+  const t = m.shell.connect;
   const [draftUrl, setDraftUrl] = useState(baseUrl);
   const [draftKey, setDraftKey] = useState(apiKey);
 
@@ -30,8 +33,8 @@ export function ConnectionModal({
     <Modal
       open={open}
       onOpenChange={onOpenChange}
-      title="连接网关"
-      description="默认连接提供这个页面的同源网关。网关在别的地址或开启了密钥时，在这里指定。"
+      title={t.title}
+      description={t.description}
     >
       <form
         className="flex flex-col gap-3.5"
@@ -41,7 +44,7 @@ export function ConnectionModal({
           onOpenChange(false);
         }}
       >
-        <Field label="网关地址" htmlFor="conn-base-url" hint="留空表示同源。">
+        <Field label={t.baseUrl} htmlFor="conn-base-url" hint={t.baseUrlHint}>
           <input
             id="conn-base-url"
             className="lg-input lg-num"
@@ -50,21 +53,21 @@ export function ConnectionModal({
             onChange={(e) => setDraftUrl(e.target.value)}
           />
         </Field>
-        <Field label="API Key" htmlFor="conn-api-key" hint="网关用 --api-key 启动时需要。只保存在这个浏览器里。">
+        <Field label="API Key" htmlFor="conn-api-key" hint={t.apiKeyHint}>
           <input
             id="conn-api-key"
             className="lg-input lg-num"
             type="password"
             autoComplete="off"
-            placeholder="可选"
+            placeholder={t.optional}
             value={draftKey}
             onChange={(e) => setDraftKey(e.target.value)}
           />
         </Field>
         <div className="flex justify-end gap-2 pt-1">
-          <Button onClick={() => onOpenChange(false)}>取消</Button>
+          <Button onClick={() => onOpenChange(false)}>{m.common.cancel}</Button>
           <Button type="submit" variant="primary">
-            保存并重连
+            {t.saveReconnect}
           </Button>
         </div>
       </form>
@@ -84,8 +87,10 @@ export function ProbeModal({
   onModelChange: (model: string) => void;
 }): React.JSX.Element {
   const { client, snapshot } = useGateway();
+  const { m } = useI18n();
+  const t = m.shell.probeModal;
   const [protocol, setProtocol] = useState<TaskProtocol>("openai_responses");
-  const [prompt, setPrompt] = useState("用一句话介绍 Rust 2024 Edition 的优势。");
+  const [prompt, setPrompt] = useState(t.defaultPrompt);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const models = snapshot?.available_models ?? [];
@@ -106,8 +111,8 @@ export function ProbeModal({
     <Modal
       open={open}
       onOpenChange={onOpenChange}
-      title="拨测"
-      description="向网关发一条真实的非流式请求，验证协议转换、会话与缓存统计是否正常。会消耗少量额度。"
+      title={t.title}
+      description={t.description}
       className="max-w-[560px]"
     >
       <form
@@ -118,7 +123,7 @@ export function ProbeModal({
         }}
       >
         <Segmented<TaskProtocol>
-          ariaLabel="协议"
+          ariaLabel={t.protocol}
           value={protocol}
           onChange={setProtocol}
           options={[
@@ -126,7 +131,7 @@ export function ProbeModal({
             { value: "anthropic_messages", label: "Anthropic /v1/messages" },
           ]}
         />
-        <Field label="模型" htmlFor="probe-model">
+        <Field label={t.model} htmlFor="probe-model">
           <input
             id="probe-model"
             className="lg-input lg-num"
@@ -135,14 +140,14 @@ export function ProbeModal({
             onChange={(e) => onModelChange(e.target.value)}
           />
           <datalist id="probe-model-list">
-            {models.map((m) => (
-              <option key={m.modelId} value={m.modelId}>
-                {m.name}
+            {models.map((entry) => (
+              <option key={entry.modelId} value={entry.modelId}>
+                {entry.name}
               </option>
             ))}
           </datalist>
         </Field>
-        <Field label="提示词" htmlFor="probe-prompt">
+        <Field label={t.prompt} htmlFor="probe-prompt">
           <textarea
             id="probe-prompt"
             className="lg-input h-auto py-2"
@@ -154,16 +159,16 @@ export function ProbeModal({
         {result && (
           <ProseBlock
             text={result.text}
-            title={result.ok ? "响应" : "请求失败"}
+            title={result.ok ? t.response : t.failed}
             tone={result.ok ? undefined : "err"}
             maxHeight={240}
           />
         )}
         <div className="flex justify-end gap-2 pt-1">
-          <Button onClick={() => onOpenChange(false)}>关闭</Button>
+          <Button onClick={() => onOpenChange(false)}>{m.common.close}</Button>
           <Button type="submit" variant="primary" disabled={running || model.trim() === ""}>
             {running ? <LoaderCircle className="lg-spin" /> : <Play />}
-            {running ? "请求中…" : "发送"}
+            {running ? t.sending : t.send}
           </Button>
         </div>
       </form>

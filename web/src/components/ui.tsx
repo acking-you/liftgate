@@ -1,6 +1,9 @@
 import * as React from "react";
 import { ChevronRight, PlugZap, Search } from "lucide-react";
+import { formatDurationMs, formatUsd } from "@/lib/format";
 import { harnessMeta } from "@/lib/harness";
+import { useI18n } from "@/lib/i18n";
+import { LATENCY_SCALES, type LatencyKind, latencyTone } from "@/lib/latency";
 import { cn } from "@/lib/utils";
 
 export type Tone = "neutral" | "ok" | "warn" | "err" | "accent";
@@ -361,13 +364,14 @@ export function Unsupported({
   endpoint: string;
   children?: React.ReactNode;
 }): React.JSX.Element {
+  const { m } = useI18n();
   return (
     <EmptyState
       icon={<PlugZap />}
-      title={`当前网关尚未提供${feature}`}
+      title={m.common.unsupportedTitle(feature)}
       hint={
         <>
-          需要 <code className="lg-num text-fg-2">{endpoint}</code>，升级网关后自动点亮。
+          {m.common.unsupportedHint(<code className="lg-num text-fg-2">{endpoint}</code>)}
           {children}
         </>
       }
@@ -375,8 +379,9 @@ export function Unsupported({
   );
 }
 
-export function Loading({ label = "加载中…" }: { label?: string }): React.JSX.Element {
-  return <div className="px-4 py-10 text-center text-[12.5px] text-fg-3">{label}</div>;
+export function Loading({ label }: { label?: string }): React.JSX.Element {
+  const { m } = useI18n();
+  return <div className="px-4 py-10 text-center text-[12.5px] text-fg-3">{label ?? m.common.loading}</div>;
 }
 
 /* ---------- Layout helpers ---------- */
@@ -432,18 +437,17 @@ export function Pager({
   total: number;
   onPage: (page: number) => void;
 }): React.JSX.Element | null {
+  const { m } = useI18n();
   if (pages <= 1) return null;
   return (
     <div className="lg-card-foot">
-      <span className="lg-num">
-        {page} / {pages} · 共 {total.toLocaleString("en-US")} 条
-      </span>
+      <span className="lg-num">{m.common.pager(page, pages, total.toLocaleString("en-US"))}</span>
       <div className="flex gap-1.5">
         <Button size="sm" disabled={page <= 1} onClick={() => onPage(page - 1)}>
-          上一页
+          {m.common.prevPage}
         </Button>
         <Button size="sm" disabled={page >= pages} onClick={() => onPage(page + 1)}>
-          下一页
+          {m.common.nextPage}
         </Button>
       </div>
     </div>
@@ -552,6 +556,7 @@ export function ConfirmButton({
   disabled?: boolean;
   onConfirm: () => void;
 }): React.JSX.Element {
+  const { m } = useI18n();
   const [armed, setArmed] = React.useState(false);
 
   React.useEffect(() => {
@@ -582,7 +587,7 @@ export function ConfirmButton({
         {confirmLabel}
       </Button>
       <Button size="sm" variant="ghost" onClick={() => setArmed(false)}>
-        取消
+        {m.common.cancel}
       </Button>
     </span>
   );
@@ -653,4 +658,52 @@ export function HitRate({
       {(bps / 100).toFixed(digits)}%
     </span>
   );
+}
+
+/**
+ * A latency figure with a traffic-light dot: green when fast, plain when normal, amber when
+ * slow, red when very slow. The tooltip names the band and the scale.
+ */
+export function Latency({
+  ms,
+  kind,
+  pending = false,
+}: {
+  ms: number | null | undefined;
+  kind: LatencyKind;
+  /** Still waiting: show the live figure without judging it yet. */
+  pending?: boolean;
+}): React.JSX.Element {
+  const { m } = useI18n();
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return <span className="text-fg-4">—</span>;
+  const scale = LATENCY_SCALES[kind];
+  const tone = pending ? "neutral" : latencyTone(ms, scale);
+  const label = m.common.latency[kind];
+  const title = `${m.common.latency.hint(label, formatDurationMs(ms), m.common.latency.levels[tone])}\n${m.common.latency.scale(
+    [formatDurationMs(scale.ok), formatDurationMs(scale.neutral), formatDurationMs(scale.warn)],
+  )}`;
+  return (
+    <span className="lg-lat lg-num" data-tone={tone} title={title}>
+      {formatDurationMs(ms)}
+    </span>
+  );
+}
+
+/** A cost in US dollars, or a muted "unpriced" mark when the model has no price. */
+export function Usd({
+  value,
+  unpricedHint,
+}: {
+  value: number | null | undefined;
+  unpricedHint?: boolean;
+}): React.JSX.Element {
+  const { m } = useI18n();
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return unpricedHint ? (
+      <span className="text-[11.5px] text-warn">{m.common.cost.unpriced}</span>
+    ) : (
+      <span className="text-fg-4">—</span>
+    );
+  }
+  return <span className="lg-num">{formatUsd(value)}</span>;
 }

@@ -4,6 +4,7 @@ import { WrapText } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { byteLength, formatBytes } from "@/lib/format";
 import { type CodeLanguage, tokenizeLines } from "@/lib/highlight";
+import { msg, useI18n } from "@/lib/i18n";
 import { parsePatch, patchFiles } from "@/lib/toolcalls";
 
 /** Phones wrap by default: sideways scrolling inside a sheet is miserable. */
@@ -14,14 +15,22 @@ function prefersWrap(): boolean {
 /** Lines rendered before the reader has to ask for the rest. */
 const COLLAPSED_LINES = 160;
 
-const LANGUAGE_LABEL: Record<CodeLanguage, string> = {
-  js: "JavaScript",
-  py: "Python",
-  sh: "Shell",
-  json: "JSON",
-  xml: "XML",
-  text: "文本",
-};
+function languageLabel(language: CodeLanguage): string {
+  switch (language) {
+    case "js":
+      return "JavaScript";
+    case "py":
+      return "Python";
+    case "sh":
+      return "Shell";
+    case "json":
+      return "JSON";
+    case "xml":
+      return "XML";
+    case "text":
+      return msg().common.text;
+  }
+}
 
 interface FrameProps {
   title?: React.ReactNode;
@@ -53,6 +62,7 @@ function Frame({
   preRef,
   children,
 }: FrameProps): React.JSX.Element {
+  const { m } = useI18n();
   return (
     <figure className="lg-codeblock m-0" data-tone={tone}>
       <figcaption className="lg-codeblock-head">
@@ -66,8 +76,8 @@ function Frame({
             data-variant="ghost"
             data-icon="true"
             aria-pressed={wrap}
-            title="自动换行"
-            aria-label="自动换行"
+            title={m.common.wrap}
+            aria-label={m.common.wrap}
             onClick={onToggleWrap}
           >
             <WrapText />
@@ -87,7 +97,7 @@ function Frame({
       </pre>
       {hiddenLines > 0 && (
         <button type="button" className="lg-codeblock-more" onClick={onExpand}>
-          显示其余 {hiddenLines.toLocaleString("en-US")} 行
+          {m.common.showMoreLines(hiddenLines.toLocaleString("en-US"))}
         </button>
       )}
     </figure>
@@ -143,8 +153,8 @@ export function CodeBlock({
 
   return (
     <Frame
-      title={title ?? LANGUAGE_LABEL[language]}
-      meta={meta ?? `${lines.length.toLocaleString("en-US")} 行 · ${formatBytes(byteLength(code))}`}
+      title={title ?? languageLabel(language)}
+      meta={meta ?? `${msg().common.lines(lines.length.toLocaleString("en-US"))} · ${formatBytes(byteLength(code))}`}
       copyValue={code}
       tone={tone}
       wrap={wrap}
@@ -197,12 +207,11 @@ export function DiffStat({ added, removed }: { added: number; removed: number })
   );
 }
 
-const PATCH_OP_LABEL = { update: "改", add: "增", delete: "删" } as const;
 
 /** V4A / unified patches as a readable diff with a clickable per-file index. */
 export function PatchBlock({
   patch,
-  title = "补丁",
+  title,
   maxHeight = 440,
 }: {
   patch: string;
@@ -224,7 +233,7 @@ export function PatchBlock({
 
   return (
     <Frame
-      title={title}
+      title={title ?? msg().common.patch}
       meta={<DiffStat added={parsed.added} removed={parsed.removed} />}
       copyValue={patch}
       wrap={wrap}
@@ -245,7 +254,7 @@ export function PatchBlock({
                   onClick={() => setFocusLine(file.line)}
                 >
                   <span className="lg-fileop" data-op={file.op}>
-                    {PATCH_OP_LABEL[file.op]}
+                    {msg().common.patchOps[file.op]}
                   </span>
                   <span className="lg-num min-w-0 flex-1 truncate text-left" title={file.path}>
                     {file.path}
@@ -293,7 +302,7 @@ export function ProseBlock({
   return (
     <figure className="lg-codeblock m-0" data-tone={tone}>
       <figcaption className="lg-codeblock-head">
-        <span className="flex min-w-0 items-center gap-2 truncate">{title ?? "文本"}</span>
+        <span className="flex min-w-0 items-center gap-2 truncate">{title ?? msg().common.text}</span>
         <span className="flex flex-none items-center gap-1">
           <span className="lg-num mr-1">{formatBytes(byteLength(text))}</span>
           <CopyButton value={text} />
@@ -308,7 +317,7 @@ export function ProseBlock({
       </pre>
       {clipped && (
         <button type="button" className="lg-codeblock-more" onClick={() => setExpanded(true)}>
-          显示其余 {(text.length - clipChars).toLocaleString("en-US")} 个字符
+          {msg().common.showMoreChars((text.length - clipChars).toLocaleString("en-US"))}
         </button>
       )}
     </figure>

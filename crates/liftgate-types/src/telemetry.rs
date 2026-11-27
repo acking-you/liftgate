@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::{AcpUsage, AvailableModel};
 use crate::canonical::{AuxiliaryTaskKind, ReasoningEffort};
+use crate::pricing::UsageSummary;
 
 /// Single bounded stderr diagnostic line captured from `agy acp`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -234,6 +235,9 @@ pub struct TaskSnapshot {
     pub usage: Option<AcpUsage>,
     #[serde(default)]
     pub cache_hit_rate_bps: Option<u16>,
+    /// Cost of `usage` in USD at the model's price, `None` while unknown or unpriced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Diagnostic classification for why a completed turn experienced a low prompt cache hit rate.
@@ -799,6 +803,9 @@ pub struct GatewayTelemetrySnapshot {
     pub tool_call_telemetry: ToolCallTelemetrySummary,
     #[serde(default)]
     pub context_capture: ContextCaptureSummary,
+    /// Recorded token usage and its cost.
+    #[serde(default)]
+    pub usage: UsageSummary,
     pub active_tasks: Vec<TaskSnapshot>,
     pub recent_tasks: Vec<TaskSnapshot>,
     pub available_models: Vec<AvailableModel>,

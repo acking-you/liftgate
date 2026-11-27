@@ -24,6 +24,7 @@ import {
   prettyJson,
 } from "@/lib/toolcalls";
 import type { ToolCallRecord, ToolOutputBlock } from "@/types/telemetry";
+import { msg, useI18n } from "@/lib/i18n";
 
 const KIND_ICON: Record<ToolKind, React.ComponentType<{ className?: string }>> = {
   orchestrator: Braces,
@@ -67,6 +68,7 @@ interface FlowNode {
 }
 
 function flowNodes(rec: ToolCallRecord): FlowNode[] {
+  const f = msg().tools.flow;
   const failed = rec.status === "error";
   const endTone =
     rec.status === "pending"
@@ -77,17 +79,17 @@ function flowNodes(rec: ToolCallRecord): FlowNode[] {
           ? undefined
           : "ok";
   const harness = harnessMeta(rec.harness_profile).label;
-  const model: FlowNode = { caption: "模型发出", name: rec.model_id };
+  const model: FlowNode = { caption: f.modelEmits, name: rec.model_id };
   const client = rec.client_tool_name ?? rec.wire_tool_name;
   switch (rec.route) {
     case "client_roundtrip":
     case "unknown":
       return [
         model,
-        { caption: rec.is_orchestrator ? "CodeMode 编排器" : "Wire 工具", name: rec.wire_tool_name },
+        { caption: rec.is_orchestrator ? f.orchestrator : f.wireTool, name: rec.wire_tool_name },
         {
-          caption: `${harness} 执行`,
-          name: rec.status === "abandoned" ? "结果未返回" : "客户端往返",
+          caption: f.runs(harness),
+          name: rec.status === "abandoned" ? f.noResult : f.roundtrip,
           tone: endTone,
           skipped: rec.status === "abandoned",
         },
@@ -97,39 +99,39 @@ function flowNodes(rec: ToolCallRecord): FlowNode[] {
       return [
         model,
         {
-          caption: rec.route === "namespace_hub" ? "命名空间 Hub" : "通用分发器",
+          caption: rec.route === "namespace_hub" ? f.hub : f.dispatcher,
           name: rec.wire_tool_name,
         },
-        { caption: "网关解包为", name: client },
-        { caption: `${harness} 执行`, name: "客户端往返", tone: endTone },
+        { caption: f.unwrapsTo, name: client },
+        { caption: f.runs(harness), name: f.roundtrip, tone: endTone },
       ];
     case "zero_rtt_preflight":
       return [
         model,
-        { caption: "Wire 工具", name: rec.wire_tool_name },
+        { caption: f.wireTool, name: rec.wire_tool_name },
         {
-          caption: "网关预检",
-          name: rec.status === "preflight_rejected" ? "拦截并本地报错" : "本地自愈",
+          caption: f.preflight,
+          name: rec.status === "preflight_rejected" ? f.rejectedLocally : f.healed,
           tone: rec.status === "preflight_rejected" ? "warn" : "ok",
         },
-        { caption: `${harness}`, name: "未到达客户端", skipped: true },
+        { caption: `${harness}`, name: f.neverReached, skipped: true },
       ];
     case "zero_rtt_search":
     case "zero_rtt_spill_read":
       return [
         model,
-        { caption: "网关内置工具", name: rec.wire_tool_name },
+        { caption: f.builtin, name: rec.wire_tool_name },
         {
-          caption: "0-RTT 本地应答",
-          name: rec.route === "zero_rtt_search" ? "检索工具索引" : "读取分片",
+          caption: f.localReply,
+          name: rec.route === "zero_rtt_search" ? f.searchIndex : f.readSpill,
           tone: endTone,
         },
       ];
     case "gateway_managed":
       return [
         model,
-        { caption: "网关托管工具", name: rec.wire_tool_name },
-        { caption: "网关执行", name: "无客户端往返", tone: endTone },
+        { caption: f.managed, name: rec.wire_tool_name },
+        { caption: f.gatewayRuns, name: f.noRoundtrip, tone: endTone },
       ];
   }
 }
@@ -139,7 +141,7 @@ export function RouteFlow({ record }: { record: ToolCallRecord }): React.JSX.Ele
   const nodes = flowNodes(record);
   const live = record.status === "pending";
   return (
-    <ol className="lg-flow" aria-label="调用路由">
+    <ol className="lg-flow" aria-label={msg().tools.flow.aria}>
       {nodes.map((node, idx) => (
         <React.Fragment key={`${node.caption}-${node.name}`}>
           {idx > 0 && (
@@ -212,7 +214,7 @@ export function ToolInputView({
   isOrchestrator,
   language,
   maxHeight = 440,
-  label = "输入",
+  label,
   aside,
 }: {
   toolName: string;
@@ -224,6 +226,8 @@ export function ToolInputView({
   /** Extra controls rendered beside the heading. */
   aside?: React.ReactNode;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const ti = m.tools.input;
   const [showRaw, setShowRaw] = useState(false);
   const [focusTool, setFocusTool] = useState<string | null>(null);
   const parsed = useMemo(
@@ -242,23 +246,23 @@ export function ToolInputView({
 
   let body: React.ReactNode;
   if (raw.trim().length === 0) {
-    body = <p className="lg-hint m-0">这次调用没有携带参数。</p>;
+    body = <p className="lg-hint m-0">{ti.noArgs}</p>;
   } else if (showRaw) {
-    body = <CodeBlock code={raw} language="text" title="模型原始输出的参数字符串" wrap maxHeight={maxHeight} />;
+    body = <CodeBlock code={raw} language="text" title={ti.rawTitle} wrap maxHeight={maxHeight} />;
   } else if (parsed.view === "code") {
     body = (
       <>
         <ParamChips params={parsed.params} />
         {nested.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[12px] text-fg-3">脚本内调用</span>
+            <span className="text-[12px] text-fg-3">{ti.inScript}</span>
             {nested.map((use) => (
               <button
                 key={use.name}
                 type="button"
                 className="lg-chip"
                 aria-pressed={focusTool === use.name}
-                title={`定位到 tools.${use.name} 所在的 ${use.lines.length} 行`}
+                title={ti.locate(use.name, use.lines.length)}
                 onClick={() => setFocusTool((cur) => (cur === use.name ? null : use.name))}
               >
                 <ToolGlyph kind={classifyTool(use.name)} size="sm" />
@@ -272,9 +276,7 @@ export function ToolInputView({
           code={parsed.code}
           language={parsed.language}
           title={
-            kind === "shell"
-              ? "$ 命令"
-              : `脚本 · ${SCRIPT_TITLE[parsed.language] ?? parsed.language}`
+            kind === "shell" ? ti.command : ti.script(SCRIPT_TITLE[parsed.language] ?? parsed.language)
           }
           maxHeight={maxHeight}
           highlightLines={highlight}
@@ -300,16 +302,16 @@ export function ToolInputView({
         ))}
       </dl>
     ) : (
-      <CodeBlock code={parsed.pretty} language="json" title="参数 · JSON" maxHeight={maxHeight} />
+      <CodeBlock code={parsed.pretty} language="json" title={ti.argsJson} maxHeight={maxHeight} />
     );
   } else {
-    body = <CodeBlock code={parsed.text} language="text" title="参数" wrap maxHeight={maxHeight} />;
+    body = <CodeBlock code={parsed.text} language="text" title={ti.args} wrap maxHeight={maxHeight} />;
   }
 
   return (
     <section className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <h3 className="lg-section-title m-0">{label}</h3>
+        <h3 className="lg-section-title m-0">{label ?? ti.label}</h3>
         <div className="flex items-center gap-1.5">
           {aside}
           {raw.trim().length > 0 && (
@@ -319,10 +321,10 @@ export function ToolInputView({
               data-size="sm"
               data-variant="ghost"
               aria-pressed={showRaw}
-              title="查看未经解析的原始参数字符串"
+              title={ti.rawHint}
               onClick={() => setShowRaw((v) => !v)}
             >
-              原始
+              {ti.raw}
             </button>
           )}
         </div>
@@ -359,7 +361,7 @@ function TerminalOutput({
     <>
       {sections.length > 1 && (
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[12px] text-fg-3">分段</span>
+          <span className="text-[12px] text-fg-3">{msg().tools.output.sections}</span>
           {sections.map((section) => (
             <button
               key={`${section.line}-${section.title}`}
@@ -395,8 +397,10 @@ function TextOutput({
   failed: boolean;
   maxHeight: number | null;
 }): React.JSX.Element {
+  const { m } = useI18n();
+  const to = m.tools.output;
   const tone = failed ? "err" : undefined;
-  const title = "输出";
+  const title = to.label;
   const envelope = useMemo(() => parseOutputEnvelope(block.text), [block.text]);
   const pretty = useMemo(() => (envelope ? null : prettyJson(block.text)), [envelope, block.text]);
 
@@ -407,32 +411,33 @@ function TextOutput({
         <div className="flex flex-wrap items-center gap-1.5">
           {envelope.script !== null && (
             <Pill tone={envelope.script === "completed" ? "ok" : "err"}>
-              {envelope.script === "completed" ? "脚本完成" : "脚本失败"}
+              {envelope.script === "completed" ? to.scriptDone : to.scriptFailed}
             </Pill>
           )}
           {envelope.exitCode !== null && (
-            <Pill tone={envelope.exitCode === 0 ? "ok" : "err"}>退出码 {envelope.exitCode}</Pill>
+            <Pill tone={envelope.exitCode === 0 ? "ok" : "err"}>{to.exitCode(envelope.exitCode)}</Pill>
           )}
-          {envelope.wallSeconds !== null && <Pill>墙钟 {envelope.wallSeconds.toFixed(2)} s</Pill>}
+          {envelope.wallSeconds !== null && <Pill>{to.wall(envelope.wallSeconds.toFixed(2))}</Pill>}
           {envelope.truncated && (
-            <Pill tone="warn" title="Harness 在返回前已截断这段输出">
-              已被截断{envelope.totalLines !== null ? ` · 原 ${formatNumber(envelope.totalLines)} 行` : ""}
+            <Pill tone="warn" title={to.truncatedHint}>
+              {to.truncated}
+              {envelope.totalLines !== null ? to.originalLines(formatNumber(envelope.totalLines)) : ""}
             </Pill>
           )}
           {envelope.originalTokens !== null && (
-            <Pill>原始 {formatNumber(envelope.originalTokens)} tokens</Pill>
+            <Pill>{to.originalTokens(formatNumber(envelope.originalTokens))}</Pill>
           )}
-          {envelope.chunkId !== null && <Pill>分块 {envelope.chunkId}</Pill>}
+          {envelope.chunkId !== null && <Pill>{to.chunk(String(envelope.chunkId))}</Pill>}
         </div>
         {envelope.body.trim().length > 0 ? (
           <TerminalOutput
             body={envelope.body}
-            title="终端输出"
+            title={to.terminal}
             tone={bad ? "err" : tone}
             maxHeight={maxHeight}
           />
         ) : (
-          <p className="lg-hint m-0">没有产生输出。</p>
+          <p className="lg-hint m-0">{to.noOutput}</p>
         )}
       </div>
     );
@@ -463,10 +468,10 @@ function ImageOutput({
         <ImageIcon />
       </div>
       <div className="min-w-0 text-[12.5px]">
-        <div className="font-medium text-fg">图像块</div>
+        <div className="font-medium text-fg">{msg().tools.output.image}</div>
         <div className="lg-num mt-0.5 text-[12px] text-fg-3">
           {block.mime_type}
-          {w && h ? ` · ${w} × ${h}` : " · 尺寸未知"}
+          {w && h ? ` · ${w} × ${h}` : msg().tools.output.unknownSize}
         </div>
         <div className="lg-num text-[12px] text-fg-3">base64 {formatBytes(block.base64_bytes)}</div>
       </div>
@@ -484,7 +489,7 @@ export function ToolOutputView({
   maxHeight?: number | null;
 }): React.JSX.Element {
   if (blocks.length === 0) {
-    return <p className="lg-hint m-0">这次调用没有返回内容。</p>;
+    return <p className="lg-hint m-0">{msg().tools.output.nothing}</p>;
   }
   return (
     <div className="flex min-w-0 flex-col gap-2">

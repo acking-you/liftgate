@@ -2667,6 +2667,7 @@ mod tests {
                                 liftgate_types::telemetry::ToolCallTelemetrySummary::default(),
                             context_capture:
                                 liftgate_types::telemetry::ContextCaptureSummary::default(),
+                            usage: liftgate_types::pricing::UsageSummary::default(),
                             active_tasks: Vec::new(),
                             recent_tasks: Vec::new(),
                             available_models: Vec::new(),
