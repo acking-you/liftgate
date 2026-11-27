@@ -3,10 +3,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_types::{
@@ -686,7 +683,6 @@ impl TelemetryHub {
         ActiveTaskGuard {
             hub: Arc::clone(self),
             task_id,
-            recorded_mcp_turn: AtomicBool::new(false),
             armed: true,
         }
     }
@@ -1041,11 +1037,18 @@ fn is_compound_orchestrator_or_shell_tool(tool_name: &str) -> bool {
         || trimmed == "__codex_local_shell"
 }
 
-fn count_v4a_patch_files(arguments: &str) -> usize {
+fn extract_v4a_patch_file_count(tool_name: &str, arguments: &str) -> Option<usize> {
+    let trimmed_name = tool_name.trim();
+    let is_apply_patch = trimmed_name.eq_ignore_ascii_case("apply_patch");
+    let is_patch = trimmed_name.eq_ignore_ascii_case("patch");
+    if !is_apply_patch && !is_patch {
+        return None;
+    }
     let extracted_json_patch = serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
         .and_then(|val| {
             val.get("patch")
+                .or_else(|| val.get("patchText"))
                 .or_else(|| val.get("input"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
@@ -1060,14 +1063,17 @@ fn count_v4a_patch_files(arguments: &str) -> usize {
                 || l.starts_with("*** Delete File:")
         })
         .count();
-    headers.max(usize::from(!patch_text.trim().is_empty()))
+    if is_apply_patch {
+        Some(headers.max(usize::from(!patch_text.trim().is_empty())))
+    } else {
+        (headers > 0).then_some(headers)
+    }
 }
 
 /// RAII tracker for an in-flight gateway turn.
 pub struct ActiveTaskGuard {
     hub: Arc<TelemetryHub>,
     task_id: String,
-    recorded_mcp_turn: AtomicBool,
     armed: bool,
 }
 
@@ -1225,13 +1231,15 @@ impl ActiveTaskGuard {
 
     /// Records a validated native MCP client tool call forwarded over SSE/JSON to the caller,
     /// classifying compound orchestrators (`exec`/`execute`/`eval`/`Bash`/shell) and V4A multi-file patches.
-    pub fn record_mcp_forwarded_tool(&self, tool_name: &str, arguments: &str) {
+    pub fn record_mcp_forwarded_tool(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+        is_first_in_prompt_turn: bool,
+    ) {
         let now_ms = unix_timestamp_ms();
-        let is_first_for_turn = !self.recorded_mcp_turn.swap(true, Ordering::Relaxed);
         let is_compound = is_compound_orchestrator_or_shell_tool(tool_name);
-        let patch_files = tool_name
-            .eq_ignore_ascii_case("apply_patch")
-            .then(|| count_v4a_patch_files(arguments));
+        let patch_files = extract_v4a_patch_file_count(tool_name, arguments);
         {
             let mut guard = match self.hub.inner.lock() {
                 Ok(g) => g,
@@ -1244,7 +1252,7 @@ impl ActiveTaskGuard {
             }
             guard.elastic_io.mcp_forwarded_tool_calls =
                 guard.elastic_io.mcp_forwarded_tool_calls.saturating_add(1);
-            if is_first_for_turn {
+            if is_first_in_prompt_turn {
                 guard.elastic_io.mcp_tool_using_turns =
                     guard.elastic_io.mcp_tool_using_turns.saturating_add(1);
             }

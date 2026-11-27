@@ -9915,6 +9915,14 @@ async fn opencode_profile_virtualizes_codemode_execute_heals_patchtext_and_route
     let pool_snap = state.pool.snapshot();
     assert_eq!(pool_snap.total_sessions_created, 1);
     assert_eq!(pool_snap.mcp_continuations, 3);
+    let eio = state.telemetry.elastic_io_snapshot();
+    assert_eq!(eio.virtualized_sessions, 1);
+    assert_eq!(eio.mcp_forwarded_tool_calls, 3);
+    assert_eq!(eio.mcp_tool_using_turns, 1);
+    assert_eq!(eio.mcp_orchestrator_calls, 1);
+    assert_eq!(eio.mcp_patch_calls, 1);
+    assert_eq!(eio.mcp_patch_files_total, 1);
+    assert_eq!(eio.mcp_zero_rtt_preflight_heals, 1);
 }
 
 #[tokio::test]
@@ -11044,7 +11052,7 @@ async fn elastic_io_telemetry_tracks_30_tool_codex_passthrough_compound_exec_mul
     assert_eq!(eio["virtualized_sessions"], 0);
     assert_eq!(eio["mcp_forwarded_tool_calls"], 2);
     assert_eq!(eio["mcp_orchestrator_calls"], 1);
-    assert_eq!(eio["mcp_tool_using_turns"], 2);
+    assert_eq!(eio["mcp_tool_using_turns"], 1);
     assert_eq!(eio["mcp_patch_calls"], 1);
     assert_eq!(eio["mcp_multi_file_patch_calls"], 1);
     assert_eq!(eio["mcp_patch_files_total"], 2);

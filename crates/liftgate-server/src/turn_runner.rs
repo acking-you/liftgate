@@ -662,7 +662,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     guard.refresh_mcp_summary(req.client_tools.len());
                     let session_idle_ms = guard.idle_before_checkout_ms();
                     let session_turn_index = guard.turn_count();
-                    guard.refresh_mcp_summary(req.client_tools.len());
                     let mut model_switched = false;
                     let mut previous_model = None;
                     if guard.model_id() != &resolved_model {
@@ -738,6 +737,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     &mut spill_store,
                 )?;
                 let (mut guard, _) = checkout.into_lease_guard(req.messages.len());
+                guard.refresh_mcp_summary(req.client_tools.len());
                 let session_idle_ms = guard.idle_before_checkout_ms();
                 let session_turn_index = guard.turn_count();
                 let mut model_switched = false;
@@ -819,7 +819,6 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 &nonce,
                 &mut spill_store,
             );
-            telemetry.record_mcp_session_registered(catalog.is_passthrough);
             mcp_session_handle = Some(mcp_srv.register_session(catalog));
             out
         } else {
@@ -833,7 +832,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         };
 
         let created = if let Some(ref handle) = mcp_session_handle {
-            timeout_at(
+            let created_mcp = timeout_at(
                 deadline,
                 backend.create_session_with_mcp(
                     &system_append,
@@ -843,7 +842,9 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
             .await
             .map_err(|_| AcpError::TurnTimeout {
                 seconds: timeout_secs,
-            })??
+            })??;
+            telemetry.record_mcp_session_registered(handle.catalog().is_passthrough);
+            created_mcp
         } else {
             timeout_at(deadline, backend.create_session(&system_append))
                 .await
@@ -4319,6 +4320,7 @@ fn record_forwarded_mcp_call(
     forwarded: ForwardedMcpCall,
     task_guard: &ActiveTaskGuard,
     state: &mut TurnStreamState,
+    is_first_in_prompt_turn: bool,
 ) -> (
     PendingMcpCallInfo,
     oneshot::Sender<McpToolCallReply>,
@@ -4335,7 +4337,7 @@ fn record_forwarded_mcp_call(
     let nonce_suffix = generate_short_nonce();
     let call_id = format!("call_{nonce_suffix}");
 
-    task_guard.record_mcp_forwarded_tool(&client_name, &arguments);
+    task_guard.record_mcp_forwarded_tool(&client_name, &arguments, is_first_in_prompt_turn);
     task_guard.record_tool_delta(arg_chars);
     state.emitted_client_tool = true;
     state.assistant_parts.push(CanonicalPart::ToolCall {
@@ -4456,6 +4458,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
     'prompt_loop: loop {
         let mut prev_prompt_tokens: u64 = cur_lease.last_context_used();
         let mut llm_step_idx: u32 = 0;
+        let mut recorded_prompt_tool_turn = false;
         let mut accounted_usage = AcpUsage::default();
         let mut peak_context_used: u64 = cur_lease.last_context_used();
         let mut latest_context_used: u64 = cur_lease.last_context_used();
@@ -5100,8 +5103,14 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                 let mut step_tool_arg_chars: usize = 0;
 
                 for forwarded in ready_forwarded_calls {
-                    let (info, reply_tx, ev, arg_chars) =
-                        record_forwarded_mcp_call(forwarded, &cur_task_guard, &mut state);
+                    let is_first_in_prompt =
+                        !std::mem::replace(&mut recorded_prompt_tool_turn, true);
+                    let (info, reply_tx, ev, arg_chars) = record_forwarded_mcp_call(
+                        forwarded,
+                        &cur_task_guard,
+                        &mut state,
+                        is_first_in_prompt,
+                    );
                     step_tool_arg_chars = step_tool_arg_chars.saturating_add(arg_chars);
                     parked_replies.push((info.nonce_suffix.clone(), reply_tx));
                     pending_infos.push(info);
