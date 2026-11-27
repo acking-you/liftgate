@@ -212,7 +212,16 @@ impl NormalizedTurnRequest {
     /// never carries caller system prompts.
     pub fn materialize_system_instructions(&mut self) {
         if let Some(sys) = self.system_instructions.take() {
-            let effective_sys: std::borrow::Cow<'_, str> = if self.auxiliary_task.is_none()
+            let is_auxiliary = self.auxiliary_task.is_some()
+                || detect_auxiliary_task(
+                    Some(&sys),
+                    &self.messages,
+                    &self.client_tools,
+                    self.enable_native_web_search,
+                    self.enable_native_web_fetch,
+                )
+                .is_some();
+            let effective_sys: std::borrow::Cow<'_, str> = if !is_auxiliary
                 && !crate::session_key::is_compaction_instructions_prompt(&sys)
                 && !crate::session_key::is_compaction_summarization_turn(
                     Some(&sys),

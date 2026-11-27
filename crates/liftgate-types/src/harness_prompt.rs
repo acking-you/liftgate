@@ -641,9 +641,10 @@ pub fn distill_responses_developer_messages(
 
             let treat_as_base = !consumed_base_slot
                 && msg_idx == 0
-                && part_idx == 0
-                && (has_base_instructions_slot
-                    || (is_cold_turn && looks_like_standalone_base_prompt(inner)));
+                && ((has_base_instructions_slot && part_idx == 0)
+                    || (!has_base_instructions_slot
+                        && is_cold_turn
+                        && looks_like_standalone_base_prompt(inner)));
 
             if treat_as_base {
                 consumed_base_slot = true;
@@ -766,6 +767,7 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
         ("<environment_context>", "</environment_context>"),
         ("<project-context>", "</project-context>"),
         ("<INSTRUCTIONS>", "</INSTRUCTIONS>"),
+        ("<permissions instructions>", "</permissions instructions>"),
     ] {
         for block in extract_all_tag_blocks(raw, open_tag, close_tag) {
             sections.push(block.trim().to_owned());
@@ -773,6 +775,17 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
         outside_containers =
             transform_tag_blocks(&outside_containers, open_tag, close_tag, |_| None);
     }
+
+    for collab_inner in extract_all_tag_inners(raw, "<collaboration_mode>", "</collaboration_mode>")
+    {
+        sections.push(compact_collaboration_mode(collab_inner));
+    }
+    outside_containers = transform_tag_blocks(
+        &outside_containers,
+        "<collaboration_mode>",
+        "</collaboration_mode>",
+        |_| None,
+    );
 
     if !raw.contains("<project-context>") {
         for (open_tag, close_tag) in [
@@ -787,11 +800,12 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
         }
     }
 
-    if let Some(skills_inner) =
-        extract_tag_inner(raw, "<skills_instructions>", "</skills_instructions>")
-        && let Some(compacted) = compact_codex_skills_instructions(skills_inner)
+    for skills_inner in
+        extract_all_tag_inners(raw, "<skills_instructions>", "</skills_instructions>")
     {
-        sections.push(compacted);
+        if let Some(compacted) = compact_codex_skills_instructions(skills_inner) {
+            sections.push(compacted);
+        }
     }
     outside_containers = transform_tag_blocks(
         &outside_containers,
@@ -799,10 +813,10 @@ fn append_extracted_structured_sections(sections: &mut Vec<String>, raw: &str) {
         "</skills_instructions>",
         |_| None,
     );
-    if let Some(xml_skills_inner) = extract_tag_inner(raw, "<skills>", "</skills>")
-        && let Some(compacted) = compact_xml_skills_block(xml_skills_inner)
-    {
-        sections.push(compacted);
+    for xml_skills_inner in extract_all_tag_inners(raw, "<skills>", "</skills>") {
+        if let Some(compacted) = compact_xml_skills_block(xml_skills_inner) {
+            sections.push(compacted);
+        }
     }
     outside_containers =
         transform_tag_blocks(&outside_containers, "<skills>", "</skills>", |_| None);
@@ -1085,6 +1099,33 @@ fn extract_tag_inner<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Opti
     tail.get(..rel_end)
 }
 
+fn extract_all_tag_inners<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
+    if !text.contains(open_tag) {
+        return Vec::new();
+    }
+    let mut inners = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(open_tag) {
+        let Some(after_open_idx) = start.checked_add(open_tag.len()) else {
+            break;
+        };
+        let Some(tail) = rest.get(after_open_idx..) else {
+            break;
+        };
+        let Some(rel_end) = tail.find(close_tag) else {
+            break;
+        };
+        if let Some(inner) = tail.get(..rel_end) {
+            inners.push(inner);
+        }
+        let Some(next_idx) = rel_end.checked_add(close_tag.len()) else {
+            break;
+        };
+        rest = tail.get(next_idx..).unwrap_or("");
+    }
+    inners
+}
+
 fn transform_tag_blocks<F>(text: &str, open_tag: &str, close_tag: &str, mut f: F) -> String
 where
     F: FnMut(&str) -> Option<String>,
@@ -1232,9 +1273,9 @@ mod tests {
     #[test]
     fn distills_version_changed_builtin_prompts_while_preserving_env_and_custom_rules() {
         // Simulate a hypothetical future Claude Code v99 whose prose changed completely
-        // and embeds live runtime context tags (`<current_time_reminder>`, `<budget:token_budget>`, `<timestamp>`).
+        // and embeds live runtime context tags plus `<permissions instructions>` and Plan `<collaboration_mode>`.
         let raw_v99_block = format!(
-            "Welcome to NextGen CLI v99.\n{}\n<current_time_reminder>2026-11-28T02:05:00+08:00</current_time_reminder>\n<budget:token_budget>200000</budget:token_budget>\n<context_window>500000</context_window>\n<rollout_budget>100</rollout_budget>\n<timestamp>1795802700</timestamp>\n<env>\nWorking directory: /workspace/demo\nPlatform: darwin\n</env>\ngitStatus: On branch main\n<claude_background_info>Model marketing</claude_background_info>",
+            "Welcome to NextGen CLI v99.\n{}\n<permissions instructions>\nsandbox_mode is read-only.\n</permissions instructions>\n<collaboration_mode>\n# Collaboration Mode: Plan\nEmit `<proposed_plan>` block.\n</collaboration_mode>\n<current_time_reminder>2026-11-28T02:05:00+08:00</current_time_reminder>\n<budget:token_budget>200000</budget:token_budget>\n<context_window>500000</context_window>\n<rollout_budget>100</rollout_budget>\n<timestamp>1795802700</timestamp>\n<env>\nWorking directory: /workspace/demo\nPlatform: darwin\n</env>\ngitStatus: On branch main\n<claude_background_info>Model marketing</claude_background_info>",
             "Verbose built-in tool manual paragraph.\n".repeat(120)
         );
         let segments = vec![
@@ -1248,6 +1289,8 @@ mod tests {
         assert!(!distilled.contains("Verbose built-in tool manual paragraph"));
         assert!(!distilled.contains("Model marketing"));
         assert!(distilled.contains(CLAUDE_CODE_DISTILLED_PROMPT));
+        assert!(distilled.contains("sandbox_mode is read-only."));
+        assert!(distilled.contains("<proposed_plan>"));
         assert!(
             distilled.contains(
                 "<current_time_reminder>2026-11-28T02:05:00+08:00</current_time_reminder>"
@@ -1260,7 +1303,7 @@ mod tests {
         assert!(distilled.contains("<env>\nWorking directory: /workspace/demo"));
         assert!(distilled.contains("gitStatus: On branch main"));
         assert!(distilled.contains("Always respond in Simplified Chinese."));
-        assert!(distilled.len() < 1_500);
+        assert!(distilled.len() < 1_800);
 
         // Idempotence check.
         assert_eq!(

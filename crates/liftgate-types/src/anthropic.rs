@@ -583,27 +583,98 @@ pub fn normalize_anthropic_request(
 #[must_use]
 pub fn estimate_anthropic_tokens(req: &AnthropicMessagesRequest) -> u64 {
     let mut chars: usize = 0;
-    if let Some(sys) = &req.system {
-        let probe_tools: Vec<CanonicalToolSpec> = req
-            .tools
-            .iter()
-            .filter(|t| !t.name.trim().is_empty())
-            .map(|t| CanonicalToolSpec {
-                name: t.name.clone(),
-                description: t.description.clone(),
+    let tool_choice_is_none = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        == Some("none");
+    let mut declared_tools = Vec::new();
+    let mut enable_native_web_search = false;
+    let mut enable_native_web_fetch = false;
+    for tool in &req.tools {
+        if let Some(tt) = &tool.tool_type {
+            if tt.starts_with("web_search") {
+                if !tool_choice_is_none {
+                    enable_native_web_search = true;
+                }
+                continue;
+            }
+            if tt.starts_with("web_fetch") {
+                if !tool_choice_is_none {
+                    enable_native_web_fetch = true;
+                }
+                continue;
+            }
+            if tt.starts_with("code_execution") && tool.input_schema.is_none() {
+                continue;
+            }
+        }
+        if !tool.name.trim().is_empty() {
+            declared_tools.push(CanonicalToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
                 kind: CanonicalToolKind::Function {
-                    parameters_json: t.input_schema.as_ref().map_or_else(
+                    parameters_json: tool.input_schema.as_ref().map_or_else(
                         || "{\"type\":\"object\"}".to_owned(),
                         |r| r.get().to_owned(),
                     ),
                 },
-            })
-            .collect();
+            });
+        }
+    }
+    let active_tools: &[CanonicalToolSpec] = if tool_choice_is_none {
+        &[]
+    } else {
+        &declared_tools
+    };
+
+    let probe_messages: Vec<CanonicalMessage> = req
+        .messages
+        .iter()
+        .filter(|m| !matches!(m.role.as_str(), "system" | "developer"))
+        .map(|m| {
+            let role = if m.role == "assistant" {
+                CanonicalRole::Assistant
+            } else {
+                CanonicalRole::User
+            };
+            let mut parts = Vec::new();
+            match &m.content {
+                AnthropicMessageContent::Text(s) => parts.push(CanonicalPart::Text(s.clone())),
+                AnthropicMessageContent::Blocks(blocks) => {
+                    for b in blocks {
+                        if let AnthropicInputBlock::Text { text } = b {
+                            parts.push(CanonicalPart::Text(text.clone()));
+                        }
+                    }
+                }
+            }
+            CanonicalMessage { role, parts }
+        })
+        .collect();
+
+    if let Some(sys) = &req.system {
         let segments = sys.cleaned_segments();
-        if let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&probe_tools)
-            && !segments
-                .iter()
-                .any(|s| crate::session_key::is_compaction_instructions_prompt(s))
+        let joined_sys = (!segments.is_empty()).then(|| segments.join("\n\n"));
+        let is_auxiliary = detect_auxiliary_task(
+            joined_sys.as_deref(),
+            &probe_messages,
+            active_tools,
+            enable_native_web_search,
+            enable_native_web_fetch,
+        )
+        .is_some();
+        let is_compaction = crate::session_key::is_compaction_summarization_turn(
+            joined_sys.as_deref(),
+            &probe_messages,
+            active_tools,
+        ) || joined_sys
+            .as_deref()
+            .is_some_and(crate::session_key::is_compaction_instructions_prompt);
+        if !is_auxiliary
+            && !is_compaction
+            && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
             && let Some(distilled) =
                 crate::harness_prompt::distill_anthropic_system_prompt(harness, &segments)
         {
@@ -1145,6 +1216,11 @@ mod tests {
             "messages": [{ "role": "user", "content": "<transcript>\nAssistant wants to run cargo test\n</transcript>" }]
         }))
         .expect("valid Auto Mode classifier request");
+        let aux_estimated = estimate_anthropic_tokens(&req_aux_cls);
+        assert!(
+            aux_estimated > 700,
+            "count_tokens must preserve full auxiliary classifier prompt size, got {aux_estimated}"
+        );
         let norm_aux_cls =
             normalize_anthropic_request(req_aux_cls).expect("normalized Auto Mode classifier");
         assert_eq!(
