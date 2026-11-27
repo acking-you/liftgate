@@ -598,7 +598,9 @@ session pool (idle or MCP-suspended sessions can be closed by hand, and the
 Hybrid MCP Tool Bridge and `>=300k` vision offload can be toggled live), the
 model catalog and the last lines of `agy` stderr. A usage view prices every request
 from its model's API price (defaults follow each provider's published standard
-price and can be overridden per model) and totals tokens and cost per model. The
+price and can be overridden per model) and totals tokens and cost per model, for
+today, yesterday, the last 7 or 30 days, any single day, or everything recorded,
+with a daily chart in the browser's own time zone. The
 dashboard follows the system language (Chinese or English) and can be switched
 from the top bar. With `--api-key`, `liftgate ui` passes the key automatically
 (or enter it in the dashboard's connection settings). Serve an extra dedicated
