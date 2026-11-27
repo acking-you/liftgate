@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowRight,
@@ -33,6 +33,7 @@ import {
   Meter,
   Pager,
   Pill,
+  SearchInput,
   Segmented,
   Select,
   Stat,
@@ -74,6 +75,9 @@ import {
   isTaskFilterActive,
   isTaskLowCache,
   isTaskProblem,
+  loadTaskFilter,
+  saveTaskFilter,
+  summarizeTasks,
   taskHarness,
 } from "@/lib/taskfilter";
 import { toolOutcomesByTask } from "@/lib/toolcalls";
@@ -178,7 +182,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const { client, baseUrl, snapshot, lowCacheRecords, toolCalls } = useGateway();
   const { m } = useI18n();
   const t = m.overview;
-  const [filter, setFilter] = useState<TaskFilter>(EMPTY_TASK_FILTER);
+  const [filter, setFilter] = useState<TaskFilter>(loadTaskFilter);
   const [selectedTask, setSelectedTask] = useState<TaskSnapshot | null>(null);
   const [taskPage, setTaskPage] = useState(1);
 
@@ -223,10 +227,12 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const toggleSession = (session: string): void =>
     patchFilter({ session: filter.session === session ? "all" : session });
   const filterActive = isTaskFilterActive(filter);
+  useEffect(() => saveTaskFilter(filter), [filter]);
   const filteredTasks = useMemo(
     () => filterTasks(recentTasks, filter, filterCtx),
     [recentTasks, filter, filterCtx],
   );
+  const scope = useMemo(() => summarizeTasks(filteredTasks, outcomes), [filteredTasks, outcomes]);
   // Facet counts ignore their own facet, so every option shows what picking it would yield.
   const facets = useMemo(() => {
     const without = (patch: Partial<TaskFilter>): TaskSnapshot[] =>
@@ -350,8 +356,8 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
       </StatGrid>
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        <Card title={t.trendTitle}>
-          <CacheTrendChart tasks={recentTasks} thresholdBps={thresholdBps} onSelect={setSelectedTask} />
+        <Card title={t.trendTitle} sub={filterActive ? t.filters.trendFiltered : undefined}>
+          <CacheTrendChart tasks={filteredTasks} thresholdBps={thresholdBps} onSelect={setSelectedTask} />
         </Card>
 
         <Card
@@ -466,6 +472,12 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
               </button>
             </div>
             <div className="lg-toolbar">
+              <SearchInput
+                className="min-w-[200px] flex-[1.4]"
+                value={filter.query}
+                onChange={(query) => patchFilter({ query })}
+                placeholder={t.filters.search}
+              />
               <Select
                 ariaLabel={t.filters.session}
                 className="min-w-[180px] flex-1"
@@ -487,6 +499,38 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                 </Button>
               )}
             </div>
+            {filterActive && filteredTasks.length > 0 && (
+              <div
+                className="flex flex-wrap items-center gap-x-5 gap-y-1 border-t border-line px-4 py-2 text-[12px] text-fg-3"
+                aria-live="polite"
+              >
+                <span className="lg-num text-fg-2">
+                  {t.filters.scope.requests(formatNumber(scope.count), formatNumber(scope.sessions))}
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  {t.filters.scope.problems}
+                  <span className={scope.problems > 0 ? "lg-num font-medium text-err" : "lg-num text-fg"}>
+                    {formatNumber(scope.problems)}
+                  </span>
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  {t.filters.scope.hitRate}
+                  <HitRate bps={scope.hitBps} thresholdBps={thresholdBps} />
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  {t.filters.scope.ttft}
+                  <Latency ms={scope.ttftP50Ms} kind="ttft" />
+                  <span className="text-fg-4">/</span>
+                  <Latency ms={scope.ttftP90Ms} kind="ttft" />
+                </span>
+                {usage && (
+                  <span className="inline-flex items-center gap-1.5">
+                    {t.filters.scope.cost}
+                    <Usd value={scope.costUsd} />
+                  </span>
+                )}
+              </div>
+            )}
           </>
         )}
         {shownTasks.length === 0 ? (

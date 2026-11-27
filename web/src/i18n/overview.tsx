@@ -58,6 +58,15 @@ const zh = {
     clear: "清除筛选",
     matched: (shown: string, total: string) => `${shown} / ${total} 条`,
     noMatch: "没有符合筛选条件的请求",
+    search: "搜索任务 / 会话 id、模型、提示或输出",
+    trendFiltered: "仅包含当前筛选出的请求",
+    scope: {
+      requests: (count: string, sessions: string) => `${count} 条请求 · ${sessions} 个会话`,
+      problems: "异常",
+      hitRate: "加权命中率",
+      ttft: "TTFT p50 / p90",
+      cost: "费用合计",
+    },
   },
   col: {
     time: "时间",
@@ -187,6 +196,16 @@ const en: OverviewMessages = {
     clear: "Clear filters",
     matched: (shown, total) => `${shown} of ${total}`,
     noMatch: "No requests match the filters",
+    search: "Search task / session id, model, prompt, or output",
+    trendFiltered: "Only the requests matching the current filters",
+    scope: {
+      requests: (count, sessions) =>
+        `${count} ${count === "1" ? "request" : "requests"} · ${sessions} ${sessions === "1" ? "session" : "sessions"}`,
+      problems: "Problems",
+      hitRate: "Weighted hit rate",
+      ttft: "TTFT p50 / p90",
+      cost: "Total cost",
+    },
   },
   col: {
     time: "Time",
