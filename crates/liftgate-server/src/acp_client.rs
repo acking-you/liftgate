@@ -129,6 +129,22 @@ pub trait AcpBackend: Send + Sync + 'static {
         async move { crate::web_fetch::fetch_url_sanitized(&url_owned, &allowed, &blocked).await }
     }
 
+    /// Performs a server-managed URL fetch with optional full-page `pattern` filtering (`find_in_page`).
+    fn fetch_web_url_with_pattern(
+        &self,
+        url: &str,
+        pattern: Option<&str>,
+        allowed_domains: &[String],
+        blocked_domains: &[String],
+    ) -> impl Future<Output = crate::web_fetch::WebFetchOutcome> + Send {
+        let pat_owned = pattern.map(str::to_owned);
+        let base_fut = self.fetch_web_url(url, allowed_domains, blocked_domains);
+        async move {
+            let out = base_fut.await;
+            crate::web_fetch::apply_pattern_to_outcome(out, pat_owned.as_deref())
+        }
+    }
+
     /// Snapshot of ACP master process health and JSON-RPC statistics for the companion UI.
     fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
         AcpProcessTelemetry {
@@ -1039,6 +1055,24 @@ impl AcpBackend for Arc<LiveAcpClient> {
             blocked_domains,
             self.cfg.agy_proxy.as_ref(),
             self.cfg.spill_dir.as_deref(),
+        )
+        .await
+    }
+
+    async fn fetch_web_url_with_pattern(
+        &self,
+        url: &str,
+        pattern: Option<&str>,
+        allowed_domains: &[String],
+        blocked_domains: &[String],
+    ) -> crate::web_fetch::WebFetchOutcome {
+        crate::web_fetch::fetch_url_sanitized_with_options_and_pattern(
+            url,
+            allowed_domains,
+            blocked_domains,
+            self.cfg.agy_proxy.as_ref(),
+            self.cfg.spill_dir.as_deref(),
+            pattern,
         )
         .await
     }

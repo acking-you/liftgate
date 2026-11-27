@@ -2093,8 +2093,9 @@ async fn run_turn_pipeline<B: AcpBackend>(
                         } else {
                             completed_web_fetches = completed_web_fetches.saturating_add(1);
                             task_guard.record_web_fetch();
-                            let fetch_fut = backend.fetch_web_url(
+                            let fetch_fut = backend.fetch_web_url_with_pattern(
                                 &raw_url,
+                                fetch_pattern.as_deref(),
                                 &req.web_fetch_allowed_domains,
                                 &req.web_fetch_blocked_domains,
                             );
@@ -2476,11 +2477,7 @@ fn format_web_fetch_continuation(
                 buf.push_str(&pat.replace('"', "'"));
             }
             buf.push_str("\">\n");
-            if let Some(pat) = pattern {
-                append_find_in_page_excerpt(buf, content, pat);
-            } else {
-                buf.push_str(content);
-            }
+            buf.push_str(content);
             buf.push_str("\n</gateway_web_fetch_result>");
         }
         WebFetchOutcome::Error {
@@ -2496,66 +2493,6 @@ fn format_web_fetch_continuation(
             buf.push_str(message);
             buf.push_str("\n</gateway_web_fetch_result>");
         }
-    }
-}
-
-fn append_find_in_page_excerpt(buf: &mut String, content: &str, pattern: &str) {
-    const CONTEXT_RADIUS: usize = 2;
-    const MAX_MATCH_LINES: usize = 120;
-
-    let needle_lower = pattern.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() || needle_lower.is_empty() {
-        buf.push_str(content);
-        return;
-    }
-
-    let mut matched_indices = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if line.to_lowercase().contains(&needle_lower) {
-            matched_indices.push(idx);
-        }
-    }
-
-    if matched_indices.is_empty() {
-        buf.push_str(&format!(
-            "[No lines matched pattern {:?} across {} lines; showing page head preview:]\n",
-            pattern,
-            lines.len()
-        ));
-        for (idx, line) in lines.iter().take(40).enumerate() {
-            buf.push_str(&format!("L{}: {line}\n", idx + 1));
-        }
-        return;
-    }
-
-    buf.push_str(&format!(
-        "[Matched {} line(s) for pattern {:?} across {} lines:]\n",
-        matched_indices.len(),
-        pattern,
-        lines.len()
-    ));
-    let mut emitted = 0usize;
-    let mut next_min_idx = 0usize;
-    for match_idx in matched_indices {
-        if emitted >= MAX_MATCH_LINES {
-            buf.push_str("...[additional matches omitted]...");
-            break;
-        }
-        let start = match_idx.saturating_sub(CONTEXT_RADIUS).max(next_min_idx);
-        let end = (match_idx + CONTEXT_RADIUS + 1).min(lines.len());
-        if start > next_min_idx && next_min_idx > 0 {
-            buf.push_str("--\n");
-        }
-        for (offset, line) in lines.get(start..end).into_iter().flatten().enumerate() {
-            let line_no = start + offset + 1;
-            buf.push_str(&format!("L{line_no}: {line}\n"));
-            emitted += 1;
-            if emitted >= MAX_MATCH_LINES {
-                break;
-            }
-        }
-        next_min_idx = end;
     }
 }
 
@@ -2654,16 +2591,24 @@ async fn forward_acp_update(
                     task_guard.record_web_search();
                 }
                 let query = extract_acp_search_query(raw_input.as_deref(), args.as_deref(), &title);
-                if status != "completed" && !tool_call_id.is_empty() {
-                    state
-                        .active_searches
-                        .insert(tool_call_id.clone(), query.clone());
-                }
+                let phase = classify_acp_tool_status(&status);
+                let normalized_status = match phase {
+                    AcpToolStatusKind::Completed => "completed".to_owned(),
+                    AcpToolStatusKind::Failed => "failed".to_owned(),
+                    AcpToolStatusKind::InProgress => {
+                        if !tool_call_id.is_empty() {
+                            state
+                                .active_searches
+                                .insert(tool_call_id.clone(), query.clone());
+                        }
+                        status
+                    }
+                };
                 return send_cancel_safe(
                     events_tx,
                     TurnEvent::WebSearch {
                         call_id: tool_call_id,
-                        status,
+                        status: normalized_status,
                         query,
                     },
                     cancel,
@@ -2677,7 +2622,8 @@ async fn forward_acp_update(
                 let (extracted_url, pattern) =
                     extract_acp_fetch_target(raw_input.as_deref(), args.as_deref(), &title);
                 let url = extracted_url.unwrap_or_default();
-                if status != "completed" {
+                let phase = classify_acp_tool_status(&status);
+                if phase == AcpToolStatusKind::InProgress {
                     if !tool_call_id.is_empty() {
                         state
                             .active_fetches
@@ -2707,11 +2653,24 @@ async fn forward_acp_update(
                 {
                     return false;
                 }
-                let outcome = WebFetchOutcome::Success {
-                    url,
-                    title: (!title.trim().is_empty()).then(|| title.trim().to_owned()),
-                    media_type: "text/html".to_owned(),
-                    content: String::new(),
+                let outcome = match phase {
+                    AcpToolStatusKind::Completed | AcpToolStatusKind::InProgress => {
+                        WebFetchOutcome::Success {
+                            url,
+                            title: (!title.trim().is_empty()).then(|| title.trim().to_owned()),
+                            media_type: "text/html".to_owned(),
+                            content: String::new(),
+                        }
+                    }
+                    AcpToolStatusKind::Failed => WebFetchOutcome::Error {
+                        url,
+                        error_code: "url_not_accessible",
+                        message: if title.trim().is_empty() {
+                            format!("native ACP web fetch ended with status `{status}`")
+                        } else {
+                            title.trim().to_owned()
+                        },
+                    },
                 };
                 return send_cancel_safe(
                     events_tx,
@@ -2746,24 +2705,32 @@ async fn forward_acp_update(
                 if !tool_call_id.is_empty() && state.seen_search_ids.insert(tool_call_id.clone()) {
                     task_guard.record_web_search();
                 }
-                let merged_query = if status == "completed" {
-                    let prev = state.active_searches.remove(&tool_call_id).flatten();
-                    new_query.or(prev)
-                } else {
-                    let entry = state
-                        .active_searches
-                        .entry(tool_call_id.clone())
-                        .or_default();
-                    if new_query.is_some() {
-                        entry.clone_from(&new_query);
+                let phase = classify_acp_tool_status(&status);
+                let (normalized_status, merged_query) = match phase {
+                    AcpToolStatusKind::Completed => {
+                        let prev = state.active_searches.remove(&tool_call_id).flatten();
+                        ("completed".to_owned(), new_query.or(prev))
                     }
-                    entry.clone()
+                    AcpToolStatusKind::Failed => {
+                        let prev = state.active_searches.remove(&tool_call_id).flatten();
+                        ("failed".to_owned(), new_query.or(prev))
+                    }
+                    AcpToolStatusKind::InProgress => {
+                        let entry = state
+                            .active_searches
+                            .entry(tool_call_id.clone())
+                            .or_default();
+                        if new_query.is_some() {
+                            entry.clone_from(&new_query);
+                        }
+                        (status, entry.clone())
+                    }
                 };
                 return send_cancel_safe(
                     events_tx,
                     TurnEvent::WebSearch {
                         call_id: tool_call_id,
-                        status,
+                        status: normalized_status,
                         query: merged_query,
                     },
                     cancel,
@@ -2779,7 +2746,8 @@ async fn forward_acp_update(
                 }
                 let (new_url, new_pat) =
                     extract_acp_fetch_target(raw_input.as_deref(), args.as_deref(), &title);
-                if status == "completed" {
+                let phase = classify_acp_tool_status(&status);
+                if phase != AcpToolStatusKind::InProgress {
                     let had_started = state.active_fetches.remove(&tool_call_id);
                     let (prev_url, prev_pat) = had_started.clone().unwrap_or_default();
                     let resolved_url = new_url.unwrap_or(prev_url);
@@ -2798,11 +2766,24 @@ async fn forward_acp_update(
                     {
                         return false;
                     }
-                    let outcome = WebFetchOutcome::Success {
-                        url: resolved_url,
-                        title: (!title.trim().is_empty()).then(|| title.trim().to_owned()),
-                        media_type: "text/html".to_owned(),
-                        content: String::new(),
+                    let outcome = match phase {
+                        AcpToolStatusKind::Completed | AcpToolStatusKind::InProgress => {
+                            WebFetchOutcome::Success {
+                                url: resolved_url,
+                                title: (!title.trim().is_empty()).then(|| title.trim().to_owned()),
+                                media_type: "text/html".to_owned(),
+                                content: String::new(),
+                            }
+                        }
+                        AcpToolStatusKind::Failed => WebFetchOutcome::Error {
+                            url: resolved_url,
+                            error_code: "url_not_accessible",
+                            message: if title.trim().is_empty() {
+                                format!("native ACP web fetch ended with status `{status}`")
+                            } else {
+                                title.trim().to_owned()
+                            },
+                        },
                     };
                     return send_cancel_safe(
                         events_tx,
@@ -3414,6 +3395,21 @@ fn extract_web_fetch_target(arguments: &str) -> Option<(String, Option<String>)>
         return Some((trimmed.to_owned(), None));
     }
     None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcpToolStatusKind {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+fn classify_acp_tool_status(status: &str) -> AcpToolStatusKind {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" => AcpToolStatusKind::Completed,
+        "failed" | "error" | "cancelled" | "canceled" | "rejected" => AcpToolStatusKind::Failed,
+        _ => AcpToolStatusKind::InProgress,
+    }
 }
 
 fn is_acp_web_search(kind: &str, name: &str, title: &str) -> bool {
@@ -5642,8 +5638,9 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 } else {
                                     completed_web_fetches = completed_web_fetches.saturating_add(1);
                                     cur_task_guard.record_web_fetch();
-                                    let fetch_fut = backend.fetch_web_url(
+                                    let fetch_fut = backend.fetch_web_url_with_pattern(
                                         &url,
+                                        pattern.as_deref(),
                                         &cur_req.web_fetch_allowed_domains,
                                         &cur_req.web_fetch_blocked_domains,
                                     );
@@ -6088,8 +6085,9 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             } else {
                                 completed_web_fetches = completed_web_fetches.saturating_add(1);
                                 cur_task_guard.record_web_fetch();
-                                let fetch_fut = backend.fetch_web_url(
+                                let fetch_fut = backend.fetch_web_url_with_pattern(
                                     &raw_url,
+                                    fetch_pattern.as_deref(),
                                     &cur_req.web_fetch_allowed_domains,
                                     &cur_req.web_fetch_blocked_domains,
                                 );

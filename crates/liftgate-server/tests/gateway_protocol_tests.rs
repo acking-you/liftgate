@@ -12267,7 +12267,7 @@ async fn previous_response_id_mcp_toggle_retains_historical_developer_slots_on_c
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn real_acp_wire_updates_and_hosted_web_fetch_find_in_page_and_warm_upgrade() {
     let backend = Arc::new(MockAcpBackend::new(vec![
         // Turn 1: Real `agy acp 1.5.18` JSON `session/update` frames for `search_web` + native `fetch`
@@ -12487,4 +12487,136 @@ async fn real_acp_wire_updates_and_hosted_web_fetch_find_in_page_and_warm_upgrad
     );
     assert!(sse3.contains("event: response.web_search_call.searching"));
     assert!(sse3.contains("Humidity is 70%-75%."));
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_native_acp_fetch_emits_error_outcome_on_openai_and_anthropic() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_fail_oai",
+                    "name": "fetch_url",
+                    "args": { "url": "https://unreachable.example.org/spec" },
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "title": "Fetching https://unreachable.example.org/spec"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_fail_oai",
+                    "name": "fetch_url",
+                    "status": "failed",
+                    "kind": "fetch",
+                    "title": "HTTP 502 Bad Gateway"
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Upstream page was unreachable." }
+                }),
+            ],
+            usage: mock_acp_usage(80, 20, 0),
+        },
+        MockScript::RawJsonUpdateFrames {
+            frames: vec![
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_fail_anth",
+                    "name": "fetch_url",
+                    "args": { "url": "https://unreachable.example.org/spec" },
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "title": "Fetching https://unreachable.example.org/spec"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_fail_anth",
+                    "name": "fetch_url",
+                    "status": "failed",
+                    "kind": "fetch",
+                    "title": "HTTP 502 Bad Gateway"
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Could not fetch page." }
+                }),
+            ],
+            usage: mock_acp_usage(80, 20, 0),
+        },
+    ]));
+
+    let app = test_app(backend, 30);
+
+    let resp_oai = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": true,
+                        "tools": [{ "type": "web_search" }],
+                        "input": "Read https://unreachable.example.org/spec"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_oai.status(), StatusCode::OK);
+    let sse_oai = String::from_utf8(
+        resp_oai
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        sse_oai.contains("\"type\":\"web_search_call\"")
+            && sse_oai.contains("\"status\":\"failed\""),
+        "failed native fetch must close web_search_call with status=failed: {sse_oai}"
+    );
+    assert!(
+        !sse_oai.contains("event: response.web_search_call.completed"),
+        "failed native fetch must not emit response.web_search_call.completed: {sse_oai}"
+    );
+
+    let resp_anth = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "stream": false,
+                        "tools": [{ "type": "web_fetch_20250910", "name": "web_fetch" }],
+                        "messages": [{ "role": "user", "content": "Read https://unreachable.example.org/spec" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_anth.status(), StatusCode::OK);
+    let body_anth: Value =
+        serde_json::from_slice(&resp_anth.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let blocks = body_anth["content"].as_array().expect("content array");
+    let wf_result = blocks
+        .iter()
+        .find(|b| b["type"] == "web_fetch_tool_result")
+        .expect("expected web_fetch_tool_result block");
+    assert_eq!(wf_result["content"]["type"], "web_fetch_tool_error");
+    assert_eq!(wf_result["content"]["error_code"], "url_not_accessible");
 }

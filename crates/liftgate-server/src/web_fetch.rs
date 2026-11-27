@@ -4,7 +4,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use liftgate_types::{
-    config::ProxyUrl, error::format_error_chain, session_key::truncate_head_tail_lines_with_spill,
+    config::ProxyUrl,
+    error::format_error_chain,
+    session_key::{NoopSpillSink, TruncationSpillSink, truncate_head_tail_lines_with_spill},
 };
 use thiserror::Error;
 use tokio::process::Command;
@@ -149,6 +151,28 @@ pub async fn fetch_url_sanitized_with_options(
     agy_proxy: Option<&ProxyUrl>,
     spill_dir: Option<&Path>,
 ) -> WebFetchOutcome {
+    fetch_url_sanitized_with_options_and_pattern(
+        raw_url,
+        allowed_domains,
+        blocked_domains,
+        agy_proxy,
+        spill_dir,
+        None,
+    )
+    .await
+}
+
+/// Fetches and sanitizes `raw_url`, optionally scanning the full untruncated page text for
+/// `pattern` (hosted `find_in_page`) before bounding to the 48 KB excerpt budget while still
+/// persisting the full lossless webpage to `spill_dir` when oversized.
+pub async fn fetch_url_sanitized_with_options_and_pattern(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    agy_proxy: Option<&ProxyUrl>,
+    spill_dir: Option<&Path>,
+    pattern: Option<&str>,
+) -> WebFetchOutcome {
     let trimmed = raw_url.trim();
     let parsed = match validate_fetch_url(trimmed, allowed_domains, blocked_domains) {
         Ok(u) => u,
@@ -251,12 +275,38 @@ pub async fn fetch_url_sanitized_with_options(
         (None, body_part.trim().to_owned(), media)
     };
 
-    let bounded = bound_extracted_web_text(&cleaned_text, spill_dir);
+    let bounded = filter_and_bound_web_text(&cleaned_text, pattern, spill_dir);
     WebFetchOutcome::Success {
         url: parsed.normalized_url,
         title,
         media_type: reported_media,
         content: bounded,
+    }
+}
+
+/// Applies `find_in_page` pattern filtering to an already-constructed [`WebFetchOutcome`]
+/// (used by custom/mock [`crate::acp_client::AcpBackend`] implementations).
+#[must_use]
+pub(crate) fn apply_pattern_to_outcome(
+    outcome: WebFetchOutcome,
+    pattern: Option<&str>,
+) -> WebFetchOutcome {
+    let Some(pat) = pattern.map(str::trim).filter(|s| !s.is_empty()) else {
+        return outcome;
+    };
+    match outcome {
+        WebFetchOutcome::Success {
+            url,
+            title,
+            media_type,
+            content,
+        } => WebFetchOutcome::Success {
+            url,
+            title,
+            media_type,
+            content: filter_and_bound_web_text(&content, Some(pat), None),
+        },
+        err @ WebFetchOutcome::Error { .. } => err,
     }
 }
 
@@ -267,6 +317,95 @@ fn bound_extracted_web_text(cleaned_text: &str, spill_dir: Option<&Path>) -> Str
         MAX_EXTRACTED_TEXT_BYTES,
         "fetched web page",
         &mut spill_store,
+    )
+}
+
+pub(crate) fn filter_and_bound_web_text(
+    cleaned_text: &str,
+    pattern: Option<&str>,
+    spill_dir: Option<&Path>,
+) -> String {
+    let Some(pat) = pattern.map(str::trim).filter(|s| !s.is_empty()) else {
+        return bound_extracted_web_text(cleaned_text, spill_dir);
+    };
+
+    const CONTEXT_RADIUS: usize = 2;
+    const MAX_MATCH_LINES: usize = 120;
+
+    let mut spill_store = spill_dir.map(SpillStore::new);
+    let spilled_full_path = if cleaned_text.len() > MAX_EXTRACTED_TEXT_BYTES {
+        spill_store.spill_truncated_content("fetched web page", cleaned_text)
+    } else {
+        None
+    };
+
+    let needle_lower = pat.to_lowercase();
+    let lines: Vec<&str> = cleaned_text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut matched_indices = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.to_lowercase().contains(&needle_lower) {
+            matched_indices.push(idx);
+        }
+    }
+
+    let mut excerpt = String::new();
+    if let Some(ref path) = spilled_full_path {
+        excerpt.push_str(&format!(
+            "[Full lossless webpage ({} bytes, {} lines) saved locally at `{path}` — inspect line ranges via `mcp_lg_read_context_spill`.]\n",
+            cleaned_text.len(),
+            lines.len()
+        ));
+    }
+
+    if matched_indices.is_empty() {
+        excerpt.push_str(&format!(
+            "[No lines matched pattern {:?} across {} lines; showing page head preview:]\n",
+            pat,
+            lines.len()
+        ));
+        for (idx, line) in lines.iter().take(40).enumerate() {
+            excerpt.push_str(&format!("L{}: {line}\n", idx + 1));
+        }
+    } else {
+        excerpt.push_str(&format!(
+            "[Matched {} line(s) for pattern {:?} across {} lines:]\n",
+            matched_indices.len(),
+            pat,
+            lines.len()
+        ));
+        let mut emitted = 0usize;
+        let mut next_min_idx = 0usize;
+        for match_idx in matched_indices {
+            if emitted >= MAX_MATCH_LINES {
+                excerpt.push_str("...[additional matches omitted]...");
+                break;
+            }
+            let start = match_idx.saturating_sub(CONTEXT_RADIUS).max(next_min_idx);
+            let end = (match_idx + CONTEXT_RADIUS + 1).min(lines.len());
+            if start > next_min_idx && next_min_idx > 0 {
+                excerpt.push_str("--\n");
+            }
+            for (offset, line) in lines.get(start..end).into_iter().flatten().enumerate() {
+                let line_no = start + offset + 1;
+                excerpt.push_str(&format!("L{line_no}: {line}\n"));
+                emitted += 1;
+                if emitted >= MAX_MATCH_LINES {
+                    break;
+                }
+            }
+            next_min_idx = end;
+        }
+    }
+
+    truncate_head_tail_lines_with_spill(
+        &excerpt,
+        MAX_EXTRACTED_TEXT_BYTES,
+        "filtered web page excerpt",
+        &mut NoopSpillSink,
     )
 }
 
@@ -603,6 +742,47 @@ mod tests {
         assert!(bounded.contains("WEB_SECTION_0001:"));
         assert!(bounded.contains("WEB_SECTION_1500:"));
         assert!(bounded.contains("Full lossless content saved locally at `"));
+
+        let spilled_files: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().flatten().collect();
+        assert_eq!(spilled_files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(spilled_files[0].path()).unwrap(),
+            large_page
+        );
+
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    #[test]
+    fn oversized_web_page_find_in_page_matches_buried_middle_and_spills_full_page() {
+        let spill_dir = std::env::temp_dir().join(format!(
+            "liftgate-webfetch-find-spill-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let large_page: String = (1..=1_600)
+            .map(|i| {
+                if i == 800 {
+                    "WEB_SECTION_0800: BURIED_RATE_LIMIT_NEEDLE = 120 req/min\n".to_owned()
+                } else {
+                    format!("WEB_SECTION_{i:04}: {}\n", "padding_segment_".repeat(4))
+                }
+            })
+            .collect();
+        assert!(large_page.len() > MAX_EXTRACTED_TEXT_BYTES);
+        let plain_bounded = bound_extracted_web_text(&large_page, None);
+        assert!(!plain_bounded.contains("BURIED_RATE_LIMIT_NEEDLE"));
+
+        let filtered = filter_and_bound_web_text(
+            &large_page,
+            Some("buried_rate_limit_needle"),
+            Some(&spill_dir),
+        );
+        assert!(filtered.len() <= MAX_EXTRACTED_TEXT_BYTES);
+        assert!(filtered.contains("Matched 1 line(s)"));
+        assert!(
+            filtered.contains("L800: WEB_SECTION_0800: BURIED_RATE_LIMIT_NEEDLE = 120 req/min")
+        );
+        assert!(filtered.contains("saved locally at `"));
 
         let spilled_files: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().flatten().collect();
         assert_eq!(spilled_files.len(), 1);

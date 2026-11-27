@@ -672,9 +672,9 @@ async fn collect_openai_response(
     let mut thought_text = String::new();
     let mut msg_text = String::new();
     let mut tool_items: Vec<ResponseOutputItem> = Vec::new();
-    let mut search_items: Vec<(String, Option<String>)> = Vec::new();
+    let mut search_items: Vec<(String, Option<String>, &'static str)> = Vec::new();
     let mut search_index_by_id: HashMap<String, usize> = HashMap::new();
-    let mut fetch_items: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut fetch_items: Vec<(String, String, Option<String>, &'static str)> = Vec::new();
     let mut fetch_index_by_id: HashMap<String, usize> = HashMap::new();
     let mut final_usage = AcpUsage::default();
 
@@ -683,24 +683,30 @@ async fn collect_openai_response(
             TurnEvent::ThoughtDelta(delta) => thought_text.push_str(&delta),
             TurnEvent::WebSearch {
                 call_id,
-                status: _,
+                status,
                 query,
             } => {
                 if opts.emit_web_search_items {
+                    let item_status = match status.as_str() {
+                        "completed" => "completed",
+                        "failed" => "failed",
+                        _ => "in_progress",
+                    };
                     if !call_id.is_empty()
                         && let Some(&idx) = search_index_by_id.get(&call_id)
                     {
-                        if query.is_some()
-                            && let Some(slot) = search_items.get_mut(idx)
-                        {
-                            slot.1 = query;
+                        if let Some(slot) = search_items.get_mut(idx) {
+                            if query.is_some() {
+                                slot.1 = query;
+                            }
+                            slot.2 = item_status;
                         }
                     } else {
                         let idx = search_items.len();
                         if !call_id.is_empty() {
                             search_index_by_id.insert(call_id.clone(), idx);
                         }
-                        search_items.push((call_id, query));
+                        search_items.push((call_id, query, item_status));
                     }
                 }
             }
@@ -726,7 +732,7 @@ async fn collect_openai_response(
                         if !call_id.is_empty() {
                             fetch_index_by_id.insert(call_id.clone(), idx);
                         }
-                        fetch_items.push((call_id, url, pattern));
+                        fetch_items.push((call_id, url, pattern, "in_progress"));
                     }
                 }
             }
@@ -736,9 +742,9 @@ async fn collect_openai_response(
                 outcome,
             } => {
                 if opts.emit_web_fetch_items || opts.emit_web_search_items {
-                    let url = match outcome {
-                        WebFetchOutcome::Success { url, .. }
-                        | WebFetchOutcome::Error { url, .. } => url,
+                    let (url, item_status) = match outcome {
+                        WebFetchOutcome::Success { url, .. } => (url, "completed"),
+                        WebFetchOutcome::Error { url, .. } => (url, "failed"),
                     };
                     if !call_id.is_empty()
                         && let Some(&idx) = fetch_index_by_id.get(&call_id)
@@ -750,13 +756,14 @@ async fn collect_openai_response(
                             if pattern.is_some() {
                                 slot.2 = pattern;
                             }
+                            slot.3 = item_status;
                         }
                     } else {
                         let idx = fetch_items.len();
                         if !call_id.is_empty() {
                             fetch_index_by_id.insert(call_id.clone(), idx);
                         }
-                        fetch_items.push((call_id, url, pattern));
+                        fetch_items.push((call_id, url, pattern, item_status));
                     }
                 }
             }
@@ -787,7 +794,7 @@ async fn collect_openai_response(
     }
 
     if opts.emit_web_search_items && opts.force_web_search && search_items.is_empty() {
-        search_items.push((generate_short_nonce(), opts.query_hint.clone()));
+        search_items.push((generate_short_nonce(), opts.query_hint.clone(), "completed"));
     }
 
     if !thought_text.trim().is_empty() {
@@ -810,10 +817,15 @@ async fn collect_openai_response(
     };
     let ws_sources = build_openai_web_sources(&extracted_links);
 
-    for (ws_id, query) in search_items {
+    for (ws_id, query, raw_status) in search_items {
+        let final_status = if raw_status == "completed" {
+            "completed"
+        } else {
+            "failed"
+        };
         resp.output.push(ResponseOutputItem::WebSearchCall {
             id: format!("ws_{}", sanitize_call_suffix(&ws_id)),
-            status: "completed".to_owned(),
+            status: final_status.to_owned(),
             action: Some(WebSearchAction {
                 action_type: "search".to_owned(),
                 query: query.or_else(|| opts.query_hint.clone()),
@@ -824,10 +836,15 @@ async fn collect_openai_response(
         });
     }
 
-    for (fetch_id, url, pattern) in fetch_items {
+    for (fetch_id, url, pattern, raw_status) in fetch_items {
+        let final_status = if raw_status == "completed" {
+            "completed"
+        } else {
+            "failed"
+        };
         resp.output.push(ResponseOutputItem::WebSearchCall {
             id: format!("ws_{}", sanitize_call_suffix(&fetch_id)),
-            status: "completed".to_owned(),
+            status: final_status.to_owned(),
             action: Some(build_openai_web_fetch_action(url, pattern)),
         });
     }
@@ -1025,7 +1042,8 @@ fn stream_openai_responses(
                     )
                     .await;
 
-                    if status != "completed" {
+                    let is_terminal = matches!(status.as_str(), "completed" | "failed");
+                    if !is_terminal {
                         if let Some(entry) = open_searches.get_mut(&call_id) {
                             if query.is_some() {
                                 entry.2 = query;
@@ -1137,9 +1155,14 @@ fn stream_openai_responses(
                                 (idx, ws_id, init_q)
                             };
                         emitted_search_count = emitted_search_count.saturating_add(1);
+                        let done_status = if status == "failed" {
+                            "failed"
+                        } else {
+                            "completed"
+                        };
                         let done_item = ResponseOutputItem::WebSearchCall {
                             id: ws_id.clone(),
-                            status: "completed".to_owned(),
+                            status: done_status.to_owned(),
                             action: Some(WebSearchAction {
                                 action_type: "search".to_owned(),
                                 query: query.or(prev_q).or_else(|| opts.query_hint.clone()),
@@ -1148,17 +1171,19 @@ fn stream_openai_responses(
                                 sources: None,
                             }),
                         };
-                        let _ = send_sse_frame(
-                            &sse_tx,
-                            "response.web_search_call.completed",
-                            &json!({
-                                "type": "response.web_search_call.completed",
-                                "sequence_number": next_seq(&mut seq),
-                                "output_index": idx,
-                                "item_id": ws_id,
-                            }),
-                        )
-                        .await;
+                        if done_status == "completed" {
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "response.web_search_call.completed",
+                                &json!({
+                                    "type": "response.web_search_call.completed",
+                                    "sequence_number": next_seq(&mut seq),
+                                    "output_index": idx,
+                                    "item_id": ws_id,
+                                }),
+                            )
+                            .await;
+                        }
                         let _ = send_sse_frame(
                             &sse_tx,
                             "response.output_item.done",
@@ -1250,9 +1275,9 @@ fn stream_openai_responses(
                     if !(opts.emit_web_fetch_items || opts.emit_web_search_items) {
                         continue;
                     }
-                    let outcome_url = match outcome {
-                        WebFetchOutcome::Success { url, .. }
-                        | WebFetchOutcome::Error { url, .. } => url,
+                    let (outcome_url, done_status) = match outcome {
+                        WebFetchOutcome::Success { url, .. } => (url, "completed"),
+                        WebFetchOutcome::Error { url, .. } => (url, "failed"),
                     };
                     let (idx, ws_id, url, resolved_pat) =
                         if let Some((idx, ws_id, prev_url, prev_pat)) =
@@ -1313,20 +1338,22 @@ fn stream_openai_responses(
                         };
                     let done_item = ResponseOutputItem::WebSearchCall {
                         id: ws_id.clone(),
-                        status: "completed".to_owned(),
+                        status: done_status.to_owned(),
                         action: Some(build_openai_web_fetch_action(url, resolved_pat)),
                     };
-                    let _ = send_sse_frame(
-                        &sse_tx,
-                        "response.web_search_call.completed",
-                        &json!({
-                            "type": "response.web_search_call.completed",
-                            "sequence_number": next_seq(&mut seq),
-                            "output_index": idx,
-                            "item_id": ws_id,
-                        }),
-                    )
-                    .await;
+                    if done_status == "completed" {
+                        let _ = send_sse_frame(
+                            &sse_tx,
+                            "response.web_search_call.completed",
+                            &json!({
+                                "type": "response.web_search_call.completed",
+                                "sequence_number": next_seq(&mut seq),
+                                "output_index": idx,
+                                "item_id": ws_id,
+                            }),
+                        )
+                        .await;
+                    }
                     let _ = send_sse_frame(
                         &sse_tx,
                         "response.output_item.done",
@@ -1958,11 +1985,11 @@ fn stream_openai_responses(
             }
         }
 
-        // Close any still-open search items cleanly
+        // Close any still-open search/fetch items that never received a completion as failed
         for (_, (idx, ws_id, q)) in open_searches.drain() {
             let done_item = ResponseOutputItem::WebSearchCall {
                 id: ws_id.clone(),
-                status: "completed".to_owned(),
+                status: "failed".to_owned(),
                 action: Some(WebSearchAction {
                     action_type: "search".to_owned(),
                     query: q,
@@ -1971,17 +1998,6 @@ fn stream_openai_responses(
                     sources: None,
                 }),
             };
-            let _ = send_sse_frame(
-                &sse_tx,
-                "response.web_search_call.completed",
-                &json!({
-                    "type": "response.web_search_call.completed",
-                    "sequence_number": next_seq(&mut seq),
-                    "output_index": idx,
-                    "item_id": ws_id,
-                }),
-            )
-            .await;
             let _ = send_sse_frame(
                 &sse_tx,
                 "response.output_item.done",
@@ -1998,20 +2014,9 @@ fn stream_openai_responses(
         for (_, (idx, ws_id, url, pat)) in open_fetches.drain() {
             let done_item = ResponseOutputItem::WebSearchCall {
                 id: ws_id.clone(),
-                status: "completed".to_owned(),
+                status: "failed".to_owned(),
                 action: Some(build_openai_web_fetch_action(url, pat)),
             };
-            let _ = send_sse_frame(
-                &sse_tx,
-                "response.web_search_call.completed",
-                &json!({
-                    "type": "response.web_search_call.completed",
-                    "sequence_number": next_seq(&mut seq),
-                    "output_index": idx,
-                    "item_id": ws_id,
-                }),
-            )
-            .await;
             let _ = send_sse_frame(
                 &sse_tx,
                 "response.output_item.done",
@@ -2640,11 +2645,10 @@ async fn collect_anthropic_messages(
     }
 
     for (srv_id, url) in pending_fetch_srv_ids {
-        let synth_outcome = WebFetchOutcome::Success {
+        let synth_outcome = WebFetchOutcome::Error {
             url,
-            title: None,
-            media_type: "text/html".to_owned(),
-            content: String::new(),
+            error_code: "url_not_accessible",
+            message: "web fetch did not complete before turn ended".to_owned(),
         };
         content.push(AnthropicOutputBlock::WebFetchToolResult {
             tool_use_id: srv_id,
@@ -3282,11 +3286,10 @@ fn stream_anthropic_messages(
         for (srv_id, url) in pending_fetch_srv_ids.drain(..) {
             close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
             close_anthropic_text(&sse_tx, &mut active_text_idx).await;
-            let synth_outcome = WebFetchOutcome::Success {
+            let synth_outcome = WebFetchOutcome::Error {
                 url,
-                title: None,
-                media_type: "text/html".to_owned(),
-                content: String::new(),
+                error_code: "url_not_accessible",
+                message: "web fetch did not complete before turn ended".to_owned(),
             };
             let result_content = build_anthropic_web_fetch_result_content(&synth_outcome);
             let idx = next_block_idx;
