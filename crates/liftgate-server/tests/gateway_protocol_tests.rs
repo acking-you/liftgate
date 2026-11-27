@@ -11168,6 +11168,69 @@ async fn usage_and_pricing_endpoints_price_each_request_by_model() {
     assert_eq!(model["pricing_key"], "gemini-4-hydrogen");
     assert_eq!(model["calls"], 2);
 
+    // Ranges and per-interval series are cut from the same usage, in the caller's own bounds.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap();
+    let day = 86_400_000;
+    let (status, ranged) = get_json(
+        &app,
+        &format!("/api/telemetry/usage?from={}&to={}", now - day, now + day),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ranged}");
+    assert_eq!(ranged["summary"]["calls"], 2);
+    assert_eq!(ranged["summary"]["until_unix_ms"], now + day);
+    assert!((ranged["summary"]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+    let (_, earlier) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/usage?from={}&to={}",
+            now - 3 * day,
+            now - 2 * day
+        ),
+    )
+    .await;
+    assert_eq!(earlier["summary"]["calls"], 0);
+    assert!(earlier["models"].as_array().unwrap().is_empty());
+    let (status, series) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/usage/series?bounds={},{}%2C{}",
+            now - 2 * day,
+            now - day,
+            now + day
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{series}");
+    assert_eq!(series["bucket_ms"], 900_000);
+    let intervals = series["intervals"].as_array().unwrap();
+    assert_eq!(intervals.len(), 2);
+    assert_eq!(intervals[0]["calls"], 0);
+    assert_eq!(intervals[1]["calls"], 2);
+    assert!((intervals[1]["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+    for bad in [
+        "/api/telemetry/usage?from=10".to_owned(),
+        "/api/telemetry/usage?from=10&to=10".to_owned(),
+        "/api/telemetry/usage?from=x&to=10".to_owned(),
+        "/api/telemetry/usage/series".to_owned(),
+        "/api/telemetry/usage/series?bounds=5".to_owned(),
+        "/api/telemetry/usage/series?bounds=5,5".to_owned(),
+        "/api/telemetry/usage/series?bounds=9,5".to_owned(),
+        format!(
+            "/api/telemetry/usage/series?bounds={}",
+            (0..=400)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ] {
+        let (status, body) = get_json(&app, &bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+
     let (_, snapshot) = get_json(&app, "/api/telemetry/snapshot").await;
     assert_eq!(snapshot["usage"]["calls"], 2);
     let recent = snapshot["recent_tasks"].as_array().unwrap();
@@ -11437,6 +11500,7 @@ async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
                 ..liftgate_server::context_capture::ContextCaptureConfig::default()
             },
             pricing_path: None,
+            usage_path: None,
         },
     ));
     let app = build_router(state.clone());

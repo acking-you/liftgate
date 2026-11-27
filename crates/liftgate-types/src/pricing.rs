@@ -408,15 +408,24 @@ pub struct ModelUsage {
     pub last_used_at_unix_ms: u64,
 }
 
-/// Usage totals carried on the snapshot as `usage`.
+/// Usage totals carried on the snapshot as `usage` (everything recorded) and served for a time
+/// range by `GET /api/telemetry/usage?from=&to=`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct UsageSummary {
     /// Bumped whenever usage or prices change.
     #[serde(default)]
     pub revision: u64,
-    /// When recording started (or was last reset).
+    /// Start of the covered range: when recording started (or was last reset) for the all-time
+    /// totals, the requested `from` otherwise.
     #[serde(default)]
     pub since_unix_ms: u64,
+    /// End of the requested range; absent for the all-time totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_unix_ms: Option<u64>,
+    /// Where bucketed history starts. Older usage survives only in the all-time totals, so
+    /// ranges reaching further back are partial.
+    #[serde(default)]
+    pub history_from_unix_ms: u64,
     #[serde(default)]
     pub calls: u64,
     #[serde(default)]
@@ -430,6 +439,44 @@ pub struct UsageSummary {
     /// Calls on models without a price, left out of `cost_usd`.
     #[serde(default)]
     pub unpriced_calls: u64,
+}
+
+/// Usage within one interval of `GET /api/telemetry/usage/series`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsageInterval {
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub auxiliary_calls: u64,
+    #[serde(default)]
+    pub tokens: UsageTokens,
+    /// Cost of priced usage in the interval.
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub cache_savings_usd: f64,
+    /// Calls on models without a price, left out of `cost_usd`.
+    #[serde(default)]
+    pub unpriced_calls: u64,
+}
+
+/// Response served by `GET /api/telemetry/usage/series?bounds=<t0,t1,…>`: one interval per
+/// consecutive pair of bounds. Usage is kept in [`Self::bucket_ms`] buckets counted toward the
+/// interval their start falls in, so bounds on the caller's local midnights yield its local days.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct UsageSeriesResponse {
+    #[serde(default)]
+    pub revision: u64,
+    /// Width of the usage buckets intervals are built from.
+    #[serde(default)]
+    pub bucket_ms: u64,
+    /// Where bucketed history starts; intervals before it read as zero.
+    #[serde(default)]
+    pub history_from_unix_ms: u64,
+    #[serde(default)]
+    pub intervals: Vec<UsageInterval>,
 }
 
 /// Response served by `GET /api/telemetry/usage`.

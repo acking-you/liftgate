@@ -1,28 +1,45 @@
 //! Per-model token usage ledger and the price book that turns it into USD.
 //!
-//! Every completed request adds its token usage to a row keyed by model and default price
-//! period, so an announced price change never re-prices usage recorded before it. Costs are
-//! derived on read from the price book: custom prices (persisted in `model-pricing.json`)
-//! replace the shipped defaults for all recorded usage, which keeps every total consistent with
-//! the prices the dashboard shows.
+//! Every completed request lands twice: in an all-time row keyed by model and default price
+//! period, and in a quarter-hour history bucket of its model. The rows keep all-time totals exact
+//! and cheap to price. The buckets let the dashboard total any day or range in the viewer's own
+//! time zone: every UTC offset in use is a whole number of quarter hours, so each local midnight
+//! starts a bucket. History is capped at [`MAX_HISTORY_BUCKETS`]; the oldest buckets go first and
+//! only the all-time rows remember them.
+//!
+//! Costs are derived on read from the price book. A default price applies to the usage of its own
+//! period, so an announced price change never re-prices earlier usage, while custom prices
+//! (persisted in `model-pricing.json`) replace the defaults for everything recorded.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use liftgate_types::acp::AvailableModel;
 use liftgate_types::pricing::{
     DEFAULT_PRICING, DEFAULT_PRICING_AS_OF, MAX_PRICING_KEY_BYTES, ModelPrice, ModelPricingEntry,
-    ModelUsage, PricingResponse, UsageResponse, UsageSummary, UsageTokens, default_family,
-    family_for_model, pricing_key,
+    ModelUsage, PricingFamily, PricingResponse, UsageInterval, UsageResponse, UsageSeriesResponse,
+    UsageSummary, UsageTokens, default_family, family_for_model, pricing_key,
 };
 use serde::{Deserialize, Serialize};
 
+/// Width of a history bucket: a quarter hour, so local midnight in every time zone in use starts
+/// a bucket.
+pub const HISTORY_BUCKET_MS: u64 = 15 * 60 * 1000;
+/// Most history buckets kept across all models: 520 days of one model used around the clock.
+pub const MAX_HISTORY_BUCKETS: usize = 50_000;
+/// Buckets dropped at once beyond the cap, so pruning stays rare.
+const HISTORY_PRUNE_BATCH: usize = MAX_HISTORY_BUCKETS / 32;
+/// Most bounds one series request may carry: a little over a year of days.
+pub const MAX_SERIES_BOUNDS: usize = 400;
 /// Most (model, price period) rows kept; the least recently used row is dropped beyond it.
 pub const MAX_LEDGER_ROWS: usize = 512;
 /// Most custom prices kept.
 pub const MAX_CUSTOM_PRICES: usize = 256;
+/// Largest usage ledger file read back; a bigger one is ignored as corrupt.
+const MAX_LEDGER_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const LEDGER_SCHEMA_VERSION: u32 = 1;
 const PRICE_BOOK_SCHEMA_VERSION: u32 = 1;
 
 type TokenField = fn(&mut UsageTokens) -> &mut u64;
@@ -36,7 +53,7 @@ const TOKEN_FIELDS: [TokenField; 5] = [
     |t| &mut t.thought,
 ];
 
-/// Usage of one model within one default price period.
+/// All-time usage of one model within one default price period.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LedgerRow {
     pub model_id: String,
@@ -55,14 +72,117 @@ pub struct LedgerRow {
     pub last_used_at_unix_ms: u64,
 }
 
-/// Cumulative token usage per model since `since_unix_ms`.
-#[derive(Clone, Debug, Default)]
-pub struct UsageLedger {
-    rows: Vec<LedgerRow>,
+/// One quarter hour of one model's usage, persisted as `[slot, calls, auxiliary_calls, input,
+/// cached_input, cache_write, output, thought]` to keep the ledger file compact. Missing trailing
+/// fields read as zero and extra ones are ignored, so the layout can grow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(from = "Vec<u64>", into = "[u64; 8]")]
+struct Bucket {
+    /// `start_unix_ms / HISTORY_BUCKET_MS`.
+    slot: u64,
+    calls: u64,
+    auxiliary_calls: u64,
+    tokens: UsageTokens,
+}
+
+impl From<Vec<u64>> for Bucket {
+    fn from(raw: Vec<u64>) -> Self {
+        let mut fields = raw.into_iter();
+        let mut next = || fields.next().unwrap_or(0);
+        // Struct expressions evaluate their fields in source order.
+        Self {
+            slot: next(),
+            calls: next(),
+            auxiliary_calls: next(),
+            tokens: UsageTokens {
+                input: next(),
+                cached_input: next(),
+                cache_write: next(),
+                output: next(),
+                thought: next(),
+            },
+        }
+    }
+}
+
+impl From<Bucket> for [u64; 8] {
+    fn from(b: Bucket) -> Self {
+        [
+            b.slot,
+            b.calls,
+            b.auxiliary_calls,
+            b.tokens.input,
+            b.tokens.cached_input,
+            b.tokens.cache_write,
+            b.tokens.output,
+            b.tokens.thought,
+        ]
+    }
+}
+
+impl Bucket {
+    const fn start_unix_ms(&self) -> u64 {
+        self.slot.saturating_mul(HISTORY_BUCKET_MS)
+    }
+
+    const fn absorb(&mut self, other: &Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.auxiliary_calls = self.auxiliary_calls.saturating_add(other.auxiliary_calls);
+        self.tokens = self.tokens.saturating_add(other.tokens);
+    }
+}
+
+/// On-disk form of [`UsageLedger`] (`usage-ledger.json`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PersistedLedger {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
     since_unix_ms: u64,
+    #[serde(default)]
+    pruned_before_unix_ms: u64,
+    #[serde(default)]
+    totals: Vec<LedgerRow>,
+    #[serde(default)]
+    history: BTreeMap<String, VecDeque<Bucket>>,
+}
+
+/// A ledger snapshot taken under the hub lock and serialized by the writer outside it.
+#[derive(Debug)]
+pub struct PreparedLedger {
+    pub path: PathBuf,
+    /// Orders concurrent writers: only a newer snapshot may replace the file.
+    pub seq: u64,
+    payload: PersistedLedger,
+}
+
+impl PreparedLedger {
+    /// Compact JSON of the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer error, which only a broken writer can produce.
+    pub fn to_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&self.payload)
+    }
+}
+
+/// Cumulative token usage per model since `since_unix_ms`.
+#[derive(Clone, Debug)]
+pub struct UsageLedger {
+    path: Option<PathBuf>,
+    /// All-time usage per (model, default price period).
+    rows: Vec<LedgerRow>,
+    /// Recent usage per model, ascending by slot.
+    history: BTreeMap<String, VecDeque<Bucket>>,
+    bucket_count: usize,
+    since_unix_ms: u64,
+    /// History before this instant was dropped to stay within [`MAX_HISTORY_BUCKETS`].
+    pruned_before_unix_ms: u64,
     revision: u64,
     /// Bumped by [`Self::reset`]; corrections from cascades that began before a reset are dropped.
     epoch: u64,
+    persist_seq: u64,
 }
 
 /// Model id cut to [`MAX_PRICING_KEY_BYTES`] on a char boundary.
@@ -77,35 +197,205 @@ fn period_start(model_id: &str, unix_ms: u64) -> u64 {
     family_for_model(model_id).map_or(0, |family| family.period_start(unix_ms))
 }
 
+fn read_persisted_ledger(path: &Path) -> Option<PersistedLedger> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = ?err, "failed to open usage ledger; starting empty");
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take(MAX_LEDGER_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        tracing::warn!(path = %path.display(), error = ?err, "failed to read usage ledger; starting empty");
+        return None;
+    }
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_LEDGER_FILE_BYTES) {
+        tracing::warn!(path = %path.display(), "usage ledger exceeds its size cap; starting empty");
+        return None;
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(ledger) => Some(ledger),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = ?err, "corrupt usage ledger; starting empty");
+            None
+        }
+    }
+}
+
+/// Buckets of one model starting within `[from, to)`.
+fn buckets_within(
+    buckets: &VecDeque<Bucket>,
+    from: u64,
+    to: u64,
+) -> std::collections::vec_deque::Iter<'_, Bucket> {
+    let lo = buckets.partition_point(|bucket| bucket.start_unix_ms() < from);
+    let hi = buckets
+        .partition_point(|bucket| bucket.start_unix_ms() < to)
+        .max(lo);
+    buckets.range(lo..hi)
+}
+
+/// Growth and shrinkage per token class taking `accounted` to `authoritative`.
+fn corrections(accounted: UsageTokens, authoritative: UsageTokens) -> [(u64, u64); 5] {
+    let mut deltas = [(0, 0); 5];
+    for (delta, field) in deltas.iter_mut().zip(TOKEN_FIELDS) {
+        let (mut acc, mut auth) = (accounted, authoritative);
+        let (acc, auth) = (*field(&mut acc), *field(&mut auth));
+        *delta = (auth.saturating_sub(acc), acc.saturating_sub(auth));
+    }
+    deltas
+}
+
+/// Applies `deltas` to `slots`, newest first: growth lands on the newest slot and shrinkage
+/// drains the newest first, carrying into older ones, so no part of a correction is lost to
+/// saturation.
+fn apply_correction<'a>(
+    slots: impl Iterator<Item = &'a mut UsageTokens>,
+    mut deltas: [(u64, u64); 5],
+) {
+    for (index, tokens) in slots.enumerate() {
+        for ((growth, shrink), field) in deltas.iter_mut().zip(TOKEN_FIELDS) {
+            let value = field(tokens);
+            if index == 0 {
+                *value = value.saturating_add(*growth);
+            }
+            let take = (*shrink).min(*value);
+            *value -= take;
+            *shrink -= take;
+        }
+        if deltas.iter().all(|(_, shrink)| *shrink == 0) {
+            break;
+        }
+    }
+}
+
+/// Adds `(calls, auxiliary_calls)` and `tokens` priced at `price` (unpriced when `None`) to a
+/// model's totals.
+fn add_usage(
+    entry: &mut ModelUsage,
+    cache_savings_usd: &mut f64,
+    price: Option<ModelPrice>,
+    calls: (u64, u64),
+    tokens: &UsageTokens,
+) {
+    let (calls, auxiliary_calls) = calls;
+    entry.calls = entry.calls.saturating_add(calls);
+    entry.auxiliary_calls = entry.auxiliary_calls.saturating_add(auxiliary_calls);
+    entry.tokens = entry.tokens.saturating_add(*tokens);
+    entry.cost_usd = match (entry.cost_usd, price) {
+        (Some(total), Some(price)) => Some(total + price.cost_usd(tokens)),
+        _ => None,
+    };
+    if let Some(price) = price {
+        *cache_savings_usd += price.cache_savings_usd(tokens);
+    }
+}
+
+/// The per-model entry of `model_id`, widened to cover `[first_used, last_used]`.
+fn model_entry<'a>(
+    by_model: &'a mut BTreeMap<String, ModelUsage>,
+    model_id: &str,
+    first_used: u64,
+    last_used: u64,
+) -> &'a mut ModelUsage {
+    let entry = by_model
+        .entry(model_id.to_owned())
+        .or_insert_with(|| ModelUsage {
+            model_id: model_id.to_owned(),
+            pricing_key: pricing_key(model_id).to_owned(),
+            cost_usd: Some(0.0),
+            first_used_at_unix_ms: first_used,
+            last_used_at_unix_ms: last_used,
+            ..ModelUsage::default()
+        });
+    entry.first_used_at_unix_ms = entry.first_used_at_unix_ms.min(first_used);
+    entry.last_used_at_unix_ms = entry.last_used_at_unix_ms.max(last_used);
+    entry
+}
+
 impl UsageLedger {
-    /// Restores persisted rows; a ledger without a start time starts now.
+    /// Restores the ledger persisted at `path` (kept in memory only without one); a ledger
+    /// without a start time starts at `now_ms`.
     #[must_use]
-    pub fn from_persisted(since_unix_ms: u64, mut rows: Vec<LedgerRow>, now_ms: u64) -> Self {
-        rows.retain(|row| !row.model_id.trim().is_empty());
+    pub fn load(path: Option<PathBuf>, now_ms: u64) -> Self {
+        let persisted = path
+            .as_deref()
+            .and_then(read_persisted_ledger)
+            .unwrap_or_default();
+        let mut rows: Vec<LedgerRow> = persisted
+            .totals
+            .into_iter()
+            .filter_map(|mut row| {
+                let id = bounded_id(&row.model_id).to_owned();
+                if id.is_empty() {
+                    return None;
+                }
+                row.model_id = id;
+                Some(row)
+            })
+            .collect();
         if rows.len() > MAX_LEDGER_ROWS {
             rows.sort_by_key(|row| std::cmp::Reverse(row.last_used_at_unix_ms));
             rows.truncate(MAX_LEDGER_ROWS);
         }
-        Self {
+        let mut merged: BTreeMap<String, Vec<Bucket>> = BTreeMap::new();
+        for (model_id, buckets) in persisted.history {
+            let id = bounded_id(&model_id);
+            if !id.is_empty() {
+                merged.entry(id.to_owned()).or_default().extend(buckets);
+            }
+        }
+        let mut history = BTreeMap::new();
+        for (model_id, mut buckets) in merged {
+            buckets.sort_by_key(|bucket| bucket.slot);
+            buckets.dedup_by(|later, earlier| {
+                let same = later.slot == earlier.slot;
+                if same {
+                    earlier.absorb(later);
+                }
+                same
+            });
+            if !buckets.is_empty() {
+                history.insert(model_id, VecDeque::from(buckets));
+            }
+        }
+        let mut ledger = Self {
+            path,
             rows,
-            since_unix_ms: if since_unix_ms > 0 {
-                since_unix_ms
+            bucket_count: history.values().map(VecDeque::len).sum(),
+            history,
+            since_unix_ms: if persisted.since_unix_ms > 0 {
+                persisted.since_unix_ms
             } else {
                 now_ms
             },
+            pruned_before_unix_ms: persisted.pruned_before_unix_ms,
             revision: 1,
             epoch: 0,
-        }
-    }
-
-    #[must_use]
-    pub fn rows(&self) -> &[LedgerRow] {
-        &self.rows
+            persist_seq: 0,
+        };
+        ledger.prune(MAX_HISTORY_BUCKETS);
+        ledger
     }
 
     #[must_use]
     pub const fn since_unix_ms(&self) -> u64 {
         self.since_unix_ms
+    }
+
+    /// Where bucketed history starts; earlier usage survives only in the all-time totals.
+    #[must_use]
+    pub const fn history_from_unix_ms(&self) -> u64 {
+        if self.pruned_before_unix_ms > self.since_unix_ms {
+            self.pruned_before_unix_ms
+        } else {
+            self.since_unix_ms
+        }
     }
 
     #[must_use]
@@ -118,6 +408,16 @@ impl UsageLedger {
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Every model with recorded usage.
+    #[must_use]
+    pub fn model_ids(&self) -> BTreeSet<&str> {
+        self.rows
+            .iter()
+            .map(|row| row.model_id.as_str())
+            .chain(self.history.keys().map(String::as_str))
+            .collect()
     }
 
     fn row_mut(&mut self, model_id: &str, period: u64, now_ms: u64) -> Option<&mut LedgerRow> {
@@ -154,6 +454,63 @@ impl UsageLedger {
         self.rows.get_mut(pos)
     }
 
+    fn add_bucket(&mut self, model_id: &str, incoming: Bucket) {
+        if !self.history.contains_key(model_id) {
+            self.history.insert(model_id.to_owned(), VecDeque::new());
+        }
+        let Some(buckets) = self.history.get_mut(model_id) else {
+            return;
+        };
+        match buckets.binary_search_by_key(&incoming.slot, |bucket| bucket.slot) {
+            Ok(pos) => {
+                if let Some(bucket) = buckets.get_mut(pos) {
+                    bucket.absorb(&incoming);
+                }
+            }
+            Err(pos) => {
+                buckets.insert(pos, incoming);
+                self.bucket_count = self.bucket_count.saturating_add(1);
+            }
+        }
+        if self.bucket_count > MAX_HISTORY_BUCKETS {
+            self.prune(MAX_HISTORY_BUCKETS.saturating_sub(HISTORY_PRUNE_BATCH));
+        }
+    }
+
+    /// Drops the oldest buckets (ties included) until at most `keep` remain.
+    fn prune(&mut self, keep: usize) {
+        let mut slots: Vec<u64> = self
+            .history
+            .values()
+            .flatten()
+            .map(|bucket| bucket.slot)
+            .collect();
+        self.bucket_count = slots.len();
+        let Some(nth) = slots.len().saturating_sub(keep).checked_sub(1) else {
+            return;
+        };
+        if nth >= slots.len() {
+            return;
+        }
+        let (_, threshold, _) = slots.select_nth_unstable(nth);
+        let threshold = *threshold;
+        for buckets in self.history.values_mut() {
+            while buckets
+                .front()
+                .is_some_and(|bucket| bucket.slot <= threshold)
+            {
+                buckets.pop_front();
+            }
+        }
+        self.history.retain(|_, buckets| !buckets.is_empty());
+        self.bucket_count = self.history.values().map(VecDeque::len).sum();
+        self.pruned_before_unix_ms = self.pruned_before_unix_ms.max(
+            threshold
+                .saturating_add(1)
+                .saturating_mul(HISTORY_BUCKET_MS),
+        );
+    }
+
     /// Adds one completed request.
     pub fn record(&mut self, model_id: &str, auxiliary: bool, tokens: UsageTokens, now_ms: u64) {
         let id = bounded_id(model_id);
@@ -161,25 +518,34 @@ impl UsageLedger {
             return;
         }
         let period = period_start(id, now_ms);
-        let Some(row) = self.row_mut(id, period, now_ms) else {
-            return;
-        };
-        row.calls = row.calls.saturating_add(1);
-        if auxiliary {
-            row.auxiliary_calls = row.auxiliary_calls.saturating_add(1);
+        if let Some(row) = self.row_mut(id, period, now_ms) {
+            row.calls = row.calls.saturating_add(1);
+            if auxiliary {
+                row.auxiliary_calls = row.auxiliary_calls.saturating_add(1);
+            }
+            row.tokens = row.tokens.saturating_add(tokens);
+            row.last_used_at_unix_ms = now_ms;
         }
-        row.tokens = row.tokens.saturating_add(tokens);
-        row.last_used_at_unix_ms = now_ms;
+        self.add_bucket(
+            id,
+            Bucket {
+                slot: now_ms / HISTORY_BUCKET_MS,
+                calls: 1,
+                auxiliary_calls: u64::from(auxiliary),
+                tokens,
+            },
+        );
         self.revision = self.revision.saturating_add(1);
     }
 
     /// Replaces step estimates already recorded for `model_id` with the authoritative usage
     /// reported once its MCP cascade finished.
     ///
-    /// Growth lands on the newest price period. Shrinkage drains the newest period first and
-    /// carries into earlier ones, so a cascade that straddled a price change never loses part of
-    /// its correction to saturation and the model's totals stay exact. A cascade that began before
-    /// the latest reset (an older `epoch`) is ignored: its estimates were cleared with the rest.
+    /// The all-time rows and the history are corrected alike: growth lands on the newest price
+    /// period and bucket, and shrinkage drains the newest first, carrying into earlier ones, so a
+    /// cascade that straddled a price change or a bucket boundary keeps the model's totals exact.
+    /// A cascade that began before the latest reset (an older `epoch`) is ignored: its estimates
+    /// were cleared with the rest.
     pub fn reconcile(
         &mut self,
         model_id: &str,
@@ -193,6 +559,7 @@ impl UsageLedger {
         }
         let id = bounded_id(model_id);
         let period = period_start(id, now_ms);
+        let deltas = corrections(accounted, authoritative);
         let mut rows: Vec<&mut LedgerRow> = self
             .rows
             .iter_mut()
@@ -202,26 +569,12 @@ impl UsageLedger {
             return;
         }
         rows.sort_by_key(|row| std::cmp::Reverse(row.period_start_unix_ms));
-        for field in TOKEN_FIELDS {
-            let (mut acc, mut auth) = (accounted, authoritative);
-            let (acc, auth) = (*field(&mut acc), *field(&mut auth));
-            if auth >= acc {
-                if let Some(newest) = rows.first_mut() {
-                    let slot = field(&mut newest.tokens);
-                    *slot = slot.saturating_add(auth - acc);
-                }
-                continue;
-            }
-            let mut excess = acc - auth;
-            for row in &mut rows {
-                if excess == 0 {
-                    break;
-                }
-                let slot = field(&mut row.tokens);
-                let take = excess.min(*slot);
-                *slot -= take;
-                excess -= take;
-            }
+        apply_correction(rows.into_iter().map(|row| &mut row.tokens), deltas);
+        if let Some(buckets) = self.history.get_mut(id) {
+            apply_correction(
+                buckets.iter_mut().rev().map(|bucket| &mut bucket.tokens),
+                deltas,
+            );
         }
         self.revision = self.revision.saturating_add(1);
     }
@@ -229,42 +582,56 @@ impl UsageLedger {
     /// Drops all recorded usage and starts counting again from `now_ms`.
     pub fn reset(&mut self, now_ms: u64) {
         self.rows.clear();
+        self.history.clear();
+        self.bucket_count = 0;
         self.since_unix_ms = now_ms;
+        self.pruned_before_unix_ms = 0;
         self.revision = self.revision.saturating_add(1);
         self.epoch = self.epoch.saturating_add(1);
     }
 
-    /// Per-model usage (periods merged), costliest first, plus totals.
+    /// Per-model usage, costliest first, plus totals: everything recorded when `range` is
+    /// `None`, else the usage of buckets starting within `[from, to)`.
     #[must_use]
-    pub fn report(&self, prices: &PriceBook) -> UsageResponse {
-        let mut by_model: BTreeMap<&str, ModelUsage> = BTreeMap::new();
+    pub fn report(&self, prices: &PriceBook, range: Option<(u64, u64)>) -> UsageResponse {
+        let mut by_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
         let mut cache_savings_usd = 0.0;
-        for row in &self.rows {
-            let key = pricing_key(&row.model_id);
-            let price = prices.price_for(key, row.period_start_unix_ms);
-            let cost = price.map(|price| price.cost_usd(&row.tokens));
-            if let Some(price) = price {
-                cache_savings_usd += price.cache_savings_usd(&row.tokens);
+        match range {
+            None => {
+                for row in &self.rows {
+                    let price =
+                        prices.price_for(pricing_key(&row.model_id), row.period_start_unix_ms);
+                    let entry = model_entry(
+                        &mut by_model,
+                        &row.model_id,
+                        row.first_used_at_unix_ms,
+                        row.last_used_at_unix_ms,
+                    );
+                    add_usage(
+                        entry,
+                        &mut cache_savings_usd,
+                        price,
+                        (row.calls, row.auxiliary_calls),
+                        &row.tokens,
+                    );
+                }
             }
-            let entry = by_model
-                .entry(row.model_id.as_str())
-                .or_insert_with(|| ModelUsage {
-                    model_id: row.model_id.clone(),
-                    pricing_key: key.to_owned(),
-                    cost_usd: Some(0.0),
-                    first_used_at_unix_ms: row.first_used_at_unix_ms,
-                    ..ModelUsage::default()
-                });
-            entry.calls = entry.calls.saturating_add(row.calls);
-            entry.auxiliary_calls = entry.auxiliary_calls.saturating_add(row.auxiliary_calls);
-            entry.tokens = entry.tokens.saturating_add(row.tokens);
-            entry.cost_usd = match (entry.cost_usd, cost) {
-                (Some(total), Some(cost)) => Some(total + cost),
-                _ => None,
-            };
-            entry.first_used_at_unix_ms =
-                entry.first_used_at_unix_ms.min(row.first_used_at_unix_ms);
-            entry.last_used_at_unix_ms = entry.last_used_at_unix_ms.max(row.last_used_at_unix_ms);
+            Some((from, to)) => {
+                for (model_id, buckets) in &self.history {
+                    let rule = prices.rule_for(pricing_key(model_id));
+                    for bucket in buckets_within(buckets, from, to) {
+                        let start = bucket.start_unix_ms();
+                        let entry = model_entry(&mut by_model, model_id, start, start);
+                        add_usage(
+                            entry,
+                            &mut cache_savings_usd,
+                            rule.at(start),
+                            (bucket.calls, bucket.auxiliary_calls),
+                            &bucket.tokens,
+                        );
+                    }
+                }
+            }
         }
         let mut models: Vec<ModelUsage> = by_model.into_values().collect();
         models.sort_by(|a, b| {
@@ -275,7 +642,9 @@ impl UsageLedger {
         });
         let mut summary = UsageSummary {
             revision: self.revision.saturating_add(prices.revision()),
-            since_unix_ms: self.since_unix_ms,
+            since_unix_ms: range.map_or(self.since_unix_ms, |(from, _)| from),
+            until_unix_ms: range.map(|(_, to)| to),
+            history_from_unix_ms: self.history_from_unix_ms(),
             cache_savings_usd,
             ..UsageSummary::default()
         };
@@ -288,6 +657,110 @@ impl UsageLedger {
             }
         }
         UsageResponse { summary, models }
+    }
+
+    /// Usage per interval between consecutive `bounds` (ascending instants, typically the
+    /// caller's local midnights); each bucket counts toward the interval its start falls in.
+    #[must_use]
+    pub fn series(&self, prices: &PriceBook, bounds: &[u64]) -> UsageSeriesResponse {
+        let mut intervals: Vec<UsageInterval> = bounds
+            .windows(2)
+            .filter_map(|pair| match *pair {
+                [start, end] => Some(UsageInterval {
+                    start_unix_ms: start,
+                    end_unix_ms: end,
+                    ..UsageInterval::default()
+                }),
+                _ => None,
+            })
+            .collect();
+        if let (Some(&first), Some(&last)) = (bounds.first(), bounds.last()) {
+            for (model_id, buckets) in &self.history {
+                let rule = prices.rule_for(pricing_key(model_id));
+                let mut cursor = 0;
+                for bucket in buckets_within(buckets, first, last) {
+                    let start = bucket.start_unix_ms();
+                    while intervals
+                        .get(cursor)
+                        .is_some_and(|interval| interval.end_unix_ms <= start)
+                    {
+                        cursor += 1;
+                    }
+                    let Some(interval) = intervals.get_mut(cursor) else {
+                        break;
+                    };
+                    if start < interval.start_unix_ms {
+                        continue;
+                    }
+                    interval.calls = interval.calls.saturating_add(bucket.calls);
+                    interval.auxiliary_calls = interval
+                        .auxiliary_calls
+                        .saturating_add(bucket.auxiliary_calls);
+                    interval.tokens = interval.tokens.saturating_add(bucket.tokens);
+                    match rule.at(start) {
+                        Some(price) => {
+                            interval.cost_usd += price.cost_usd(&bucket.tokens);
+                            interval.cache_savings_usd += price.cache_savings_usd(&bucket.tokens);
+                        }
+                        None => {
+                            interval.unpriced_calls =
+                                interval.unpriced_calls.saturating_add(bucket.calls);
+                        }
+                    }
+                }
+            }
+        }
+        UsageSeriesResponse {
+            revision: self.revision.saturating_add(prices.revision()),
+            bucket_ms: HISTORY_BUCKET_MS,
+            history_from_unix_ms: self.history_from_unix_ms(),
+            intervals,
+        }
+    }
+
+    /// Snapshot for an atomic rewrite of the ledger file; `None` when kept in memory only.
+    pub fn prepare_persist(&mut self) -> Option<PreparedLedger> {
+        let path = self.path.clone()?;
+        self.persist_seq = self.persist_seq.saturating_add(1);
+        Some(PreparedLedger {
+            path,
+            seq: self.persist_seq,
+            payload: PersistedLedger {
+                version: LEDGER_SCHEMA_VERSION,
+                since_unix_ms: self.since_unix_ms,
+                pruned_before_unix_ms: self.pruned_before_unix_ms,
+                totals: self.rows.clone(),
+                history: self.history.clone(),
+            },
+        })
+    }
+
+    #[cfg(test)]
+    fn rows(&self) -> &[LedgerRow] {
+        &self.rows
+    }
+
+    #[cfg(test)]
+    const fn bucket_count(&self) -> usize {
+        self.bucket_count
+    }
+}
+
+/// How one pricing key is priced over time.
+#[derive(Clone, Copy, Debug)]
+enum PriceRule {
+    Custom(ModelPrice),
+    Default(&'static PricingFamily),
+    Unpriced,
+}
+
+impl PriceRule {
+    fn at(self, unix_ms: u64) -> Option<ModelPrice> {
+        match self {
+            Self::Custom(price) => Some(price),
+            Self::Default(family) => family.price_at(unix_ms),
+            Self::Unpriced => None,
+        }
     }
 }
 
@@ -364,13 +837,17 @@ impl PriceBook {
         self.revision
     }
 
+    fn rule_for(&self, key: &str) -> PriceRule {
+        match self.custom.get(key) {
+            Some(price) => PriceRule::Custom(*price),
+            None => default_family(key).map_or(PriceRule::Unpriced, PriceRule::Default),
+        }
+    }
+
     /// Price for `key` at `unix_ms`: the custom price, else the default then in force.
     #[must_use]
     pub fn price_for(&self, key: &str, unix_ms: u64) -> Option<ModelPrice> {
-        self.custom
-            .get(key)
-            .copied()
-            .or_else(|| default_family(key).and_then(|family| family.price_at(unix_ms)))
+        self.rule_for(key).at(unix_ms)
     }
 
     /// Cost of `tokens` used by `model_id` at `unix_ms`, if the model is priced.
@@ -466,7 +943,7 @@ impl PriceBook {
         let seen = catalog
             .iter()
             .map(|model| model.model_id.as_str())
-            .chain(ledger.rows().iter().map(|row| row.model_id.as_str()));
+            .chain(ledger.model_ids());
         for id in seen {
             let id = bounded_id(id);
             if id.is_empty() {
@@ -517,7 +994,7 @@ mod tests {
 
     #[test]
     fn usage_is_priced_per_period_and_custom_prices_replace_defaults() {
-        let mut ledger = UsageLedger::from_persisted(0, Vec::new(), 1_000);
+        let mut ledger = UsageLedger::load(None, 1_000);
         assert_eq!(ledger.since_unix_ms(), 1_000);
         // 1M uncached input + 1M output on Carbon, once before and once after the Dec 1 change.
         ledger.record(
@@ -547,7 +1024,7 @@ mod tests {
         assert_eq!(ledger.rows().len(), 4, "model x period rows");
 
         let mut prices = PriceBook::load(None);
-        let report = ledger.report(&prices);
+        let report = ledger.report(&prices, None);
         let high = report
             .models
             .iter()
@@ -595,13 +1072,13 @@ mod tests {
             prices.set("mystery-model", Some(ModelPrice::default())),
             PriceUpdate::Changed
         );
-        let repriced = ledger.report(&prices);
+        let repriced = ledger.report(&prices, None);
         assert!((repriced.summary.cost_usd - 6.0).abs() < 1e-9);
         assert_eq!(repriced.summary.unpriced_calls, 0);
         assert!(repriced.summary.revision > report.summary.revision);
         assert_eq!(prices.set("mystery-model", None), PriceUpdate::Changed);
         assert_eq!(prices.set("mystery-model", None), PriceUpdate::Unchanged);
-        assert_eq!(ledger.report(&prices).summary.unpriced_calls, 1);
+        assert_eq!(ledger.report(&prices, None).summary.unpriced_calls, 1);
 
         ledger.reset(5_000);
         assert!(ledger.rows().is_empty());
@@ -611,7 +1088,7 @@ mod tests {
     #[test]
     fn cache_savings_follow_the_price_of_each_period() {
         // 1M cached Carbon tokens on each side of the Dec 1 change: $1.90 then $3.80 saved.
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         ledger.record(
             "gemini-4-carbon-high",
             false,
@@ -625,7 +1102,7 @@ mod tests {
             DEC_1_2026 + 10,
         );
         let mut prices = PriceBook::load(None);
-        let saved = ledger.report(&prices).summary.cache_savings_usd;
+        let saved = ledger.report(&prices, None).summary.cache_savings_usd;
         assert!((saved - (1.90 + 3.80)).abs() < 1e-9, "{saved}");
         // A custom price applies to all history, savings included.
         let _ = prices.set(
@@ -637,13 +1114,13 @@ mod tests {
                 output: 1.0,
             }),
         );
-        let saved = ledger.report(&prices).summary.cache_savings_usd;
+        let saved = ledger.report(&prices, None).summary.cache_savings_usd;
         assert!((saved - 1.0).abs() < 1e-9, "{saved}");
     }
 
     #[test]
     fn reconcile_corrects_the_models_latest_period() {
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         ledger.record("gemini-4-neon-high", false, tokens(500, 0, 50), 10);
         ledger.reconcile(
             "gemini-4-neon-high",
@@ -666,7 +1143,7 @@ mod tests {
 
     #[test]
     fn corrections_from_before_a_reset_are_dropped() {
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         let cascade_epoch = ledger.epoch();
         ledger.record("gemini-4-neon-high", false, tokens(100, 0, 0), 10);
         ledger.reset(20);
@@ -688,7 +1165,7 @@ mod tests {
     fn reconcile_spanning_a_price_change_keeps_the_models_total_exact() {
         // A cascade recorded 100 input tokens before Carbon's price change and 10 after it,
         // but upstream billed 90 in total.
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         ledger.record(
             "gemini-4-carbon-high",
             false,
@@ -726,7 +1203,7 @@ mod tests {
 
     #[test]
     fn ledger_rows_are_bounded_and_ids_capped() {
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         for i in 0..(MAX_LEDGER_ROWS + 5) {
             let id = format!("model-{i}");
             ledger.record(
@@ -750,7 +1227,7 @@ mod tests {
 
     #[test]
     fn pricing_report_lists_defaults_custom_and_seen_models() {
-        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let mut ledger = UsageLedger::load(None, 1);
         ledger.record("brand-new-model-low", false, tokens(1, 0, 1), 5);
         let mut prices = PriceBook::load(None);
         let _ = prices.set(
@@ -842,6 +1319,204 @@ mod tests {
         let reloaded = PriceBook::load(Some(path));
         assert!(reloaded.price_for("bad", 0).is_none());
         assert!(reloaded.price_for("ok", 0).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const HOUR: u64 = 3_600_000;
+    const DAY: u64 = 24 * HOUR;
+    /// Local midnight starting day `d` (days since the epoch) at UTC offset `offset_ms`.
+    const fn local_midnight(d: u64, offset_ms: u64) -> u64 {
+        d * DAY - offset_ms
+    }
+
+    #[test]
+    fn ranges_and_series_follow_the_callers_local_midnights() {
+        let shanghai = 8 * HOUR;
+        let (d10, d11, d12) = (
+            local_midnight(10, shanghai),
+            local_midnight(11, shanghai),
+            local_midnight(12, shanghai),
+        );
+        let mut ledger = UsageLedger::load(None, 1);
+        // Neon is $3 in / $0.15 cached / $15 out, with no scheduled change.
+        ledger.record(
+            "gemini-4-neon-high",
+            false,
+            tokens(1_000_000, 0, 0),
+            d10 + HOUR,
+        );
+        ledger.record(
+            "gemini-4-neon-high",
+            true,
+            tokens(0, 0, 1_000_000),
+            d11 - 60_000,
+        );
+        ledger.record("gemini-4-neon-low", false, tokens(0, 1_000_000, 0), d11);
+        ledger.record("mystery-model", false, tokens(5, 0, 5), d11 + 2 * HOUR);
+        let prices = PriceBook::load(None);
+
+        let series = ledger.series(&prices, &[d10, d11, d12]);
+        assert_eq!(series.bucket_ms, HISTORY_BUCKET_MS);
+        assert_eq!(series.history_from_unix_ms, 1);
+        let [first, second] = series.intervals.as_slice() else {
+            panic!("two days: {:?}", series.intervals);
+        };
+        assert_eq!((first.start_unix_ms, first.end_unix_ms), (d10, d11));
+        assert_eq!(
+            (first.calls, first.auxiliary_calls),
+            (2, 1),
+            "23:59 stays on day 10"
+        );
+        assert!((first.cost_usd - 18.0).abs() < 1e-9, "{}", first.cost_usd);
+        assert_eq!((second.calls, second.unpriced_calls), (2, 1));
+        assert!((second.cost_usd - 0.15).abs() < 1e-9, "{}", second.cost_usd);
+        assert!((second.cache_savings_usd - 2.85).abs() < 1e-9);
+
+        let day11 = ledger.report(&prices, Some((d11, d12)));
+        assert_eq!(day11.summary.since_unix_ms, d11);
+        assert_eq!(day11.summary.until_unix_ms, Some(d12));
+        assert_eq!(day11.summary.calls, 2);
+        assert_eq!(day11.summary.unpriced_calls, 1);
+        let ids: Vec<&str> = day11.models.iter().map(|m| m.model_id.as_str()).collect();
+        assert_eq!(ids, ["gemini-4-neon-low", "mystery-model"]);
+        let all = ledger.report(&prices, None);
+        assert_eq!(all.summary.until_unix_ms, None);
+        assert_eq!(all.summary.calls, 4);
+        let ranged = ledger.report(&prices, Some((0, u64::MAX)));
+        assert!((ranged.summary.cost_usd - all.summary.cost_usd).abs() < 1e-9);
+
+        // Nepal is UTC+5:45: its midnight still starts a bucket.
+        let nepal = 5 * HOUR + 45 * 60_000;
+        let midnight = local_midnight(20, nepal);
+        let mut ledger = UsageLedger::load(None, 1);
+        ledger.record(
+            "gemini-4-neon-high",
+            false,
+            tokens(1, 0, 0),
+            midnight - 60_000,
+        );
+        ledger.record(
+            "gemini-4-neon-high",
+            false,
+            tokens(2, 0, 0),
+            midnight + 60_000,
+        );
+        let days = ledger.series(&prices, &[midnight - DAY, midnight, midnight + DAY]);
+        let inputs: Vec<u64> = days.intervals.iter().map(|d| d.tokens.input).collect();
+        assert_eq!(inputs, [1, 2]);
+    }
+
+    #[test]
+    fn history_is_capped_and_drops_its_oldest_buckets_first() {
+        let mut ledger = UsageLedger::load(None, 1);
+        let start = 1_000 * HISTORY_BUCKET_MS;
+        let mut at = start;
+        for _ in 0..=MAX_HISTORY_BUCKETS {
+            ledger.record("gemini-4-neon-high", false, tokens(1, 0, 0), at);
+            at += HISTORY_BUCKET_MS;
+        }
+        let kept = MAX_HISTORY_BUCKETS - HISTORY_PRUNE_BATCH;
+        assert_eq!(ledger.bucket_count(), kept);
+        let dropped = u64::try_from(MAX_HISTORY_BUCKETS + 1 - kept).unwrap_or(0);
+        assert_eq!(
+            ledger.history_from_unix_ms(),
+            start + dropped * HISTORY_BUCKET_MS
+        );
+        let prices = PriceBook::load(None);
+        let all = ledger.report(&prices, None).summary;
+        assert_eq!(
+            all.calls,
+            u64::try_from(MAX_HISTORY_BUCKETS + 1).unwrap_or(0),
+            "all-time totals keep pruned usage"
+        );
+        assert_eq!(all.history_from_unix_ms, ledger.history_from_unix_ms());
+        let recent = ledger.report(&prices, Some((0, u64::MAX))).summary;
+        assert_eq!(recent.calls, u64::try_from(kept).unwrap_or(0));
+    }
+
+    #[test]
+    fn reconcile_corrects_totals_and_history_alike() {
+        let mut ledger = UsageLedger::load(None, 1);
+        let t = 40 * HISTORY_BUCKET_MS;
+        ledger.record("gemini-4-neon-high", false, tokens(100, 0, 0), t);
+        ledger.record(
+            "gemini-4-neon-high",
+            false,
+            tokens(100, 0, 0),
+            t + HISTORY_BUCKET_MS,
+        );
+        ledger.reconcile(
+            "gemini-4-neon-high",
+            ledger.epoch(),
+            tokens(200, 0, 0),
+            tokens(50, 0, 10),
+            t + HISTORY_BUCKET_MS,
+        );
+        let row = ledger.rows().first().expect("row");
+        assert_eq!((row.tokens.input, row.tokens.output), (50, 10));
+        let prices = PriceBook::load(None);
+        let buckets = ledger.series(
+            &prices,
+            &[t, t + HISTORY_BUCKET_MS, t + 2 * HISTORY_BUCKET_MS],
+        );
+        let per_bucket: Vec<(u64, u64)> = buckets
+            .intervals
+            .iter()
+            .map(|b| (b.tokens.input, b.tokens.output))
+            .collect();
+        assert_eq!(per_bucket, [(50, 0), (0, 10)], "newest drained first");
+    }
+
+    #[test]
+    fn ledger_file_round_trips_and_tolerates_layout_changes() {
+        let dir = std::env::temp_dir().join(format!("liftgate-usage-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("mkdir: {err}"));
+        let path = dir.join("usage-ledger.json");
+        let prices = PriceBook::load(None);
+        let mut ledger = UsageLedger::load(Some(path.clone()), 7);
+        ledger.record("gemini-4-neon-high", true, tokens(10, 20, 30), 5 * DAY);
+        ledger.record("gpt-oss-120b", false, tokens(1, 2, 3), 6 * DAY);
+        let prepared = ledger.prepare_persist().unwrap_or_else(|| panic!("path"));
+        let bytes = prepared
+            .to_bytes()
+            .unwrap_or_else(|err| panic!("serialize: {err}"));
+        fs::write(&prepared.path, bytes).unwrap_or_else(|err| panic!("write: {err}"));
+        let restored = UsageLedger::load(Some(path.clone()), 99);
+        assert_eq!(restored.since_unix_ms(), 7);
+        // Revisions restart with the process; everything else is restored.
+        let (mut before, mut after) =
+            (ledger.report(&prices, None), restored.report(&prices, None));
+        before.summary.revision = 0;
+        after.summary.revision = 0;
+        assert_eq!(after, before);
+        let bounds = [4 * DAY, 5 * DAY, 6 * DAY, 7 * DAY];
+        assert_eq!(
+            restored.series(&prices, &bounds).intervals,
+            ledger.series(&prices, &bounds).intervals
+        );
+
+        // Short buckets read missing fields as zero, extra fields are ignored, and duplicate
+        // slots merge.
+        fs::write(
+            &path,
+            br#"{"version":1,"since_unix_ms":3,"history":{"gemini-4-neon-high":[[10,1,0,5],[10,2,1,1,2,3,4,5,99,98],[9,1]]}}"#,
+        )
+        .unwrap_or_else(|err| panic!("write: {err}"));
+        let tolerant = UsageLedger::load(Some(path.clone()), 99);
+        let days = tolerant.series(&prices, &[0, 10 * HISTORY_BUCKET_MS, DAY]);
+        let calls: Vec<u64> = days.intervals.iter().map(|d| d.calls).collect();
+        assert_eq!(calls, [1, 3]);
+        assert_eq!(
+            days.intervals
+                .last()
+                .map(|d| (d.auxiliary_calls, d.tokens.input, d.tokens.thought)),
+            Some((1, 6, 5))
+        );
+
+        fs::write(&path, b"{not json").unwrap_or_else(|err| panic!("write: {err}"));
+        let fresh = UsageLedger::load(Some(path), 42);
+        assert_eq!(fresh.since_unix_ms(), 42);
+        assert_eq!(fresh.report(&prices, None).summary.calls, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -52,7 +52,7 @@ use crate::{
         ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
         generate_short_nonce,
     },
-    usage_ledger::PriceUpdate,
+    usage_ledger::{MAX_SERIES_BOUNDS, PriceUpdate},
     web_fetch::WebFetchOutcome,
 };
 
@@ -257,6 +257,10 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             post(handle_set_context_capture::<B>),
         )
         .route("/api/telemetry/usage", get(handle_get_usage::<B>))
+        .route(
+            "/api/telemetry/usage/series",
+            get(handle_get_usage_series::<B>),
+        )
         .route("/api/telemetry/usage/reset", post(handle_reset_usage::<B>))
         .route(
             "/api/telemetry/pricing",
@@ -4159,7 +4163,73 @@ async fn handle_get_usage<B: AcpBackend>(
     if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
-    Json(state.telemetry.usage_report()).into_response()
+    let range = match (query_param(&uri, "from"), query_param(&uri, "to")) {
+        (None, None) => None,
+        (Some(from), Some(to)) => match (from.parse::<u64>(), to.parse::<u64>()) {
+            (Ok(from), Ok(to)) if from < to => Some((from, to)),
+            _ => {
+                return telemetry_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "`from` and `to` must be unix-ms instants with `from` before `to`".to_owned(),
+                );
+            }
+        },
+        _ => {
+            return telemetry_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`from` and `to` must be given together".to_owned(),
+            );
+        }
+    };
+    Json(state.telemetry.usage_report(range)).into_response()
+}
+
+/// Parses `bounds` (`t0,t1,…` in unix ms, commas optionally percent-encoded): two to
+/// [`MAX_SERIES_BOUNDS`] strictly ascending instants.
+fn parse_series_bounds(raw: &str) -> Result<Vec<u64>, String> {
+    let raw = raw.replace("%2C", ",").replace("%2c", ",");
+    let mut bounds: Vec<u64> = Vec::new();
+    for part in raw.split(',') {
+        if bounds.len() >= MAX_SERIES_BOUNDS {
+            return Err(format!(
+                "`bounds` takes at most {MAX_SERIES_BOUNDS} instants"
+            ));
+        }
+        let Ok(bound) = part.trim().parse::<u64>() else {
+            return Err("`bounds` must be comma-separated unix-ms instants".to_owned());
+        };
+        if bounds.last().is_some_and(|last| *last >= bound) {
+            return Err("`bounds` must be strictly ascending".to_owned());
+        }
+        bounds.push(bound);
+    }
+    if bounds.len() < 2 {
+        return Err("`bounds` needs at least two instants".to_owned());
+    }
+    Ok(bounds)
+}
+
+async fn handle_get_usage_series<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    match query_param(&uri, "bounds").map(parse_series_bounds) {
+        Some(Ok(bounds)) => Json(state.telemetry.usage_series(&bounds)).into_response(),
+        Some(Err(message)) => {
+            telemetry_error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        }
+        None => telemetry_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`bounds` is required: comma-separated, ascending unix-ms instants".to_owned(),
+        ),
+    }
 }
 
 async fn handle_reset_usage<B: AcpBackend>(
