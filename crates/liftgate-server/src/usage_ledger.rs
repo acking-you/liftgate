@@ -25,6 +25,17 @@ pub const MAX_LEDGER_ROWS: usize = 512;
 pub const MAX_CUSTOM_PRICES: usize = 256;
 const PRICE_BOOK_SCHEMA_VERSION: u32 = 1;
 
+type TokenField = fn(&mut UsageTokens) -> &mut u64;
+
+/// Every billed token class, for corrections applied class by class.
+const TOKEN_FIELDS: [TokenField; 5] = [
+    |t| &mut t.input,
+    |t| &mut t.cached_input,
+    |t| &mut t.cache_write,
+    |t| &mut t.output,
+    |t| &mut t.thought,
+];
+
 /// Usage of one model within one default price period.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LedgerRow {
@@ -154,6 +165,10 @@ impl UsageLedger {
 
     /// Replaces step estimates already recorded for `model_id` with the authoritative usage
     /// reported once its MCP cascade finished.
+    ///
+    /// Growth lands on the newest price period. Shrinkage drains the newest period first and
+    /// carries into earlier ones, so a cascade that straddled a price change never loses part of
+    /// its correction to saturation and the model's totals stay exact.
     pub fn reconcile(
         &mut self,
         model_id: &str,
@@ -163,15 +178,36 @@ impl UsageLedger {
     ) {
         let id = bounded_id(model_id);
         let period = period_start(id, now_ms);
-        let Some(row) = self
+        let mut rows: Vec<&mut LedgerRow> = self
             .rows
             .iter_mut()
             .filter(|row| row.model_id == id && row.period_start_unix_ms <= period)
-            .max_by_key(|row| row.period_start_unix_ms)
-        else {
+            .collect();
+        if rows.is_empty() {
             return;
-        };
-        row.tokens = row.tokens.reconcile(accounted, authoritative);
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row.period_start_unix_ms));
+        for field in TOKEN_FIELDS {
+            let (mut acc, mut auth) = (accounted, authoritative);
+            let (acc, auth) = (*field(&mut acc), *field(&mut auth));
+            if auth >= acc {
+                if let Some(newest) = rows.first_mut() {
+                    let slot = field(&mut newest.tokens);
+                    *slot = slot.saturating_add(auth - acc);
+                }
+                continue;
+            }
+            let mut excess = acc - auth;
+            for row in &mut rows {
+                if excess == 0 {
+                    break;
+                }
+                let slot = field(&mut row.tokens);
+                let take = excess.min(*slot);
+                *slot -= take;
+                excess -= take;
+            }
+        }
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -562,6 +598,45 @@ mod tests {
         assert_eq!(row.tokens, tokens(100, 400, 60));
         ledger.reconcile("unknown", tokens(1, 1, 1), tokens(2, 2, 2), 30);
         assert_eq!(ledger.rows().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_spanning_a_price_change_keeps_the_models_total_exact() {
+        // A cascade recorded 100 input tokens before Carbon's price change and 10 after it,
+        // but upstream billed 90 in total.
+        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        ledger.record(
+            "gemini-4-carbon-high",
+            false,
+            tokens(100, 0, 5),
+            DEC_1_2026 - 1,
+        );
+        ledger.record(
+            "gemini-4-carbon-high",
+            false,
+            tokens(10, 0, 5),
+            DEC_1_2026 + 1,
+        );
+        ledger.reconcile(
+            "gemini-4-carbon-high",
+            tokens(110, 0, 10),
+            tokens(90, 0, 12),
+            DEC_1_2026 + 2,
+        );
+        let total = ledger
+            .rows()
+            .iter()
+            .fold(UsageTokens::default(), |acc, row| {
+                acc.saturating_add(row.tokens)
+            });
+        assert_eq!((total.input, total.output), (90, 12));
+        let newer = ledger
+            .rows()
+            .iter()
+            .find(|row| row.period_start_unix_ms == DEC_1_2026)
+            .expect("post-change row");
+        assert_eq!(newer.tokens.input, 0, "drained first");
+        assert_eq!(newer.tokens.output, 7, "growth lands on the newest period");
     }
 
     #[test]

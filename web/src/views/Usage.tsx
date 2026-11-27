@@ -155,7 +155,7 @@ function PriceEditor({
     setError(null);
     try {
       const response = await client.setModelPrice(entry.key, price);
-      onSaved(response, price ? t.saved : t.restored);
+      onSaved(response, price ? t.saved : entry.default_price ? t.restored : t.removed);
       onClose();
     } catch (err) {
       setError(errorMessage(err));
@@ -214,10 +214,11 @@ function PriceEditor({
             </Note>
           )}
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-            {entry.custom_price && entry.default_price ? (
+            {entry.custom_price ? (
+              // Without a default this is the only way back to "unpriced" (and to free a slot).
               <Button variant="ghost" disabled={busy} onClick={() => void submit(null)}>
                 <Undo2 />
-                {t.restore}
+                {entry.default_price ? t.restore : t.remove}
               </Button>
             ) : (
               <span />
@@ -444,14 +445,18 @@ export function UsageView(_props: ViewProps): React.JSX.Element {
     `${key}|pricing`,
     revision,
   );
-  const [override, setOverride] = useState<PricingResponse | null>(null);
+  // The saved price list, shown until the refetch it triggers lands, and only for its gateway.
+  const [override, setOverride] = useState<{
+    key: string;
+    base: PricingResponse | null;
+    data: PricingResponse;
+  } | null>(null);
   const [editing, setEditing] = useState<ModelPricingEntry | null>(null);
   const [banner, setBanner] = useState<Banner>(null);
 
-  // A saved price answers with the new price list right away; the stream catches up after.
   const pricing =
-    override && (!pricingResource.data || override.revision >= pricingResource.data.revision)
-      ? override
+    override && override.key === key && pricingResource.data === override.base
+      ? override.data
       : pricingResource.data;
   const byKey = useMemo(
     () => new Map((pricing?.entries ?? []).map((entry) => [entry.key, entry])),
@@ -598,10 +603,11 @@ export function UsageView(_props: ViewProps): React.JSX.Element {
         entry={editing}
         onClose={() => setEditing(null)}
         onSaved={(response, text) => {
-          setOverride(response);
+          setOverride({ key, base: pricingResource.data, data: response });
           setBanner({ tone: "ok", text });
-          void refresh();
+          pricingResource.reload();
           usage.reload();
+          void refresh();
         }}
       />
     </>

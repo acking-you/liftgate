@@ -136,34 +136,6 @@ impl UsageTokens {
             thought: self.thought.saturating_add(rhs.thought),
         }
     }
-
-    /// Replaces the `accounted` share of these totals with the `authoritative` figures (each
-    /// field moves by `authoritative - accounted`, clamped at zero).
-    #[must_use]
-    pub const fn reconcile(self, accounted: Self, authoritative: Self) -> Self {
-        const fn shift(current: u64, accounted: u64, authoritative: u64) -> u64 {
-            if authoritative >= accounted {
-                current.saturating_add(authoritative - accounted)
-            } else {
-                current.saturating_sub(accounted - authoritative)
-            }
-        }
-        Self {
-            input: shift(self.input, accounted.input, authoritative.input),
-            cached_input: shift(
-                self.cached_input,
-                accounted.cached_input,
-                authoritative.cached_input,
-            ),
-            cache_write: shift(
-                self.cache_write,
-                accounted.cache_write,
-                authoritative.cache_write,
-            ),
-            output: shift(self.output, accounted.output, authoritative.output),
-            thought: shift(self.thought, accounted.thought, authoritative.thought),
-        }
-    }
 }
 
 /// A default price and the instant it takes effect.
@@ -551,34 +523,5 @@ mod tests {
         assert!(p.validate().is_err());
         p.output = MAX_PRICE_PER_MTOK + 1.0;
         assert!(p.validate().is_err());
-    }
-
-    #[test]
-    fn reconcile_moves_each_class_by_the_drift() {
-        let current = UsageTokens {
-            input: 100,
-            cached_input: 1_000,
-            cache_write: 0,
-            output: 50,
-            thought: 10,
-        };
-        let accounted = UsageTokens {
-            input: 100,
-            cached_input: 1_000,
-            cache_write: 0,
-            output: 50,
-            thought: 10,
-        };
-        let authoritative = UsageTokens {
-            input: 40,
-            cached_input: 1_400,
-            cache_write: 0,
-            output: 60,
-            thought: 10,
-        };
-        assert_eq!(current.reconcile(accounted, authoritative), authoritative);
-        let clamped = UsageTokens::default().reconcile(accounted, authoritative);
-        assert_eq!(clamped.input, 0);
-        assert_eq!(clamped.cached_input, 400);
     }
 }

@@ -69,9 +69,11 @@ const zh = {
     output: "输出（含思考）",
     defaultHint: (v: string) => `默认 ${v}`,
     restore: "恢复默认价格",
+    remove: "清除自定义价格",
     invalid: "价格需为 0 到 10000 之间的数字。",
     saved: "价格已保存，费用已重算。",
     restored: "已恢复默认价格。",
+    removed: "已清除自定义价格，这个模型回到未定价状态。",
   },
 };
 
@@ -146,9 +148,11 @@ const en: UsageMessages = {
     output: "Output (incl. thinking)",
     defaultHint: (v) => `Default ${v}`,
     restore: "Restore default price",
+    remove: "Remove custom price",
     invalid: "Prices must be numbers between 0 and 10000.",
     saved: "Price saved; costs recalculated.",
     restored: "Default price restored.",
+    removed: "Custom price removed; the model is unpriced again.",
   },
 };
 
