@@ -6,11 +6,13 @@ use serde_json::{Value, value::RawValue};
 use crate::acp::AcpUsage;
 use crate::canonical::{
     CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
-    NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task,
+    NormalizedTurnRequest, ProtocolDeveloperSlot, ProtocolDeveloperSlotKind, ReasoningEffort,
+    detect_auxiliary_task,
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
-    materialize_system_prompt_into_messages, strip_billing_noise, wrap_developer_instructions_block,
+    MaterializedSystemSlot, materialize_system_prompt_into_messages_with_slot, strip_billing_noise,
+    wrap_developer_instructions_block,
 };
 
 pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
@@ -56,15 +58,30 @@ pub enum AnthropicSystemPrompt {
 
 impl AnthropicSystemPrompt {
     #[must_use]
-    pub fn into_joined_text(self) -> String {
+    pub fn cleaned_segments(&self) -> Vec<String> {
         match self {
-            Self::Text(s) => sanitize_system_segment(&s).unwrap_or_default(),
+            Self::Text(s) => sanitize_system_segment(s).into_iter().collect(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.as_deref().and_then(sanitize_system_segment))
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn into_cleaned_segments(self) -> Vec<String> {
+        match self {
+            Self::Text(s) => sanitize_system_segment(&s).into_iter().collect(),
             Self::Blocks(blocks) => blocks
                 .into_iter()
                 .filter_map(|b| b.text.and_then(|t| sanitize_system_segment(&t)))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+                .collect(),
         }
+    }
+
+    #[must_use]
+    pub fn into_joined_text(self) -> String {
+        self.into_cleaned_segments().join("\n\n")
     }
 }
 
@@ -242,34 +259,32 @@ pub struct AnthropicThinkingConfig {
 pub fn normalize_anthropic_request(
     req: AnthropicMessagesRequest,
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
-    let mut aux_system = req
+    let system_segments = req
         .system
-        .map(AnthropicSystemPrompt::into_joined_text)
-        .map(|s| strip_billing_noise(&s))
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
+        .map(AnthropicSystemPrompt::into_cleaned_segments)
+        .unwrap_or_default();
 
-    if let Some(schema) = req
+    let json_schema_directive = req
         .output_config
         .as_ref()
         .and_then(|cfg| cfg.format.as_ref())
         .filter(|fmt| fmt.get("type").and_then(Value::as_str) == Some("json_schema"))
         .and_then(|fmt| fmt.get("schema"))
-        && let Ok(schema_json) = serde_json::to_string(schema)
-    {
-        let directive = format!(
-            "Respond ONLY with valid JSON conforming strictly to this JSON schema:\n{schema_json}"
-        );
-        match &mut aux_system {
-            Some(existing) => {
-                existing.push_str("\n\n");
-                existing.push_str(&directive);
-            }
-            None => aux_system = Some(directive),
-        }
+        .and_then(|schema| serde_json::to_string(schema).ok())
+        .map(|schema_json| {
+            format!(
+                "Respond ONLY with valid JSON conforming strictly to this JSON schema:\n{schema_json}"
+            )
+        });
+
+    let mut raw_system_parts = system_segments.clone();
+    if let Some(directive) = &json_schema_directive {
+        raw_system_parts.push(directive.clone());
     }
+    let aux_system = (!raw_system_parts.is_empty()).then(|| raw_system_parts.join("\n\n"));
 
     let mut conv_messages = Vec::with_capacity(req.messages.len());
+    let mut developer_slots: Vec<ProtocolDeveloperSlot> = Vec::new();
     let mut has_conversational_input = false;
     for msg in req.messages {
         let is_system_or_developer = matches!(msg.role.as_str(), "system" | "developer");
@@ -280,10 +295,12 @@ pub fn normalize_anthropic_request(
         };
 
         let mut parts = Vec::new();
+        let mut msg_dev_part_indices = Vec::new();
         match msg.content {
             AnthropicMessageContent::Text(s) => {
                 if is_system_or_developer {
                     if let Some(wrapped) = wrap_developer_instructions_block(&s) {
+                        msg_dev_part_indices.push(parts.len());
                         parts.push(CanonicalPart::Text(wrapped));
                     }
                 } else {
@@ -297,6 +314,7 @@ pub fn normalize_anthropic_request(
                         AnthropicInputBlock::Text { text } => {
                             if is_system_or_developer {
                                 if let Some(wrapped) = wrap_developer_instructions_block(&text) {
+                                    msg_dev_part_indices.push(parts.len());
                                     parts.push(CanonicalPart::Text(wrapped));
                                 }
                             } else {
@@ -393,6 +411,17 @@ pub fn normalize_anthropic_request(
         }
 
         if !parts.is_empty() {
+            let msg_index = conv_messages.len();
+            let allow_standalone_base = system_segments.is_empty() && msg_index == 0;
+            for part_index in msg_dev_part_indices {
+                developer_slots.push(ProtocolDeveloperSlot {
+                    msg_index,
+                    part_index,
+                    kind: ProtocolDeveloperSlotKind::DeveloperItem {
+                        allow_standalone_base,
+                    },
+                });
+            }
             conv_messages.push(CanonicalMessage { role, parts });
         }
     }
@@ -413,48 +442,56 @@ pub fn normalize_anthropic_request(
         .and_then(Value::as_str);
     let tool_choice_is_none = choice_type == Some("none");
 
-    let mut client_tools = Vec::new();
+    let mut declared_tools = Vec::new();
     let mut enable_native_web_search = false;
     let mut enable_native_web_fetch = false;
     let mut web_fetch_max_uses = None;
     let mut web_fetch_allowed_domains = Vec::new();
     let mut web_fetch_blocked_domains = Vec::new();
 
-    if !tool_choice_is_none {
-        for tool in req.tools {
-            if let Some(tt) = &tool.tool_type {
-                if tt.starts_with("web_search") {
+    for tool in req.tools {
+        if let Some(tt) = &tool.tool_type {
+            if tt.starts_with("web_search") {
+                if !tool_choice_is_none {
                     enable_native_web_search = true;
-                    continue;
                 }
-                if tt.starts_with("web_fetch") {
+                continue;
+            }
+            if tt.starts_with("web_fetch") {
+                if !tool_choice_is_none {
                     enable_native_web_fetch = true;
                     if tool.max_uses.is_some() {
                         web_fetch_max_uses = tool.max_uses;
                     }
                     web_fetch_allowed_domains.extend(tool.allowed_domains);
                     web_fetch_blocked_domains.extend(tool.blocked_domains);
-                    continue;
                 }
-                if tt.starts_with("code_execution") && tool.input_schema.is_none() {
-                    continue;
-                }
+                continue;
             }
-            if !tool.name.trim().is_empty() {
-                let schema_json = tool.input_schema.as_ref().map_or_else(
-                    || "{\"type\":\"object\"}".to_owned(),
-                    |r| r.get().to_owned(),
-                );
-                client_tools.push(CanonicalToolSpec {
-                    name: tool.name,
-                    description: tool.description,
-                    kind: CanonicalToolKind::Function {
-                        parameters_json: schema_json,
-                    },
-                });
+            if tt.starts_with("code_execution") && tool.input_schema.is_none() {
+                continue;
             }
         }
+        if !tool.name.trim().is_empty() {
+            let schema_json = tool.input_schema.as_ref().map_or_else(
+                || "{\"type\":\"object\"}".to_owned(),
+                |r| r.get().to_owned(),
+            );
+            declared_tools.push(CanonicalToolSpec {
+                name: tool.name,
+                description: tool.description,
+                kind: CanonicalToolKind::Function {
+                    parameters_json: schema_json,
+                },
+            });
+        }
     }
+
+    let client_tools = if tool_choice_is_none {
+        Vec::new()
+    } else {
+        declared_tools.clone()
+    };
 
     let auxiliary_task = detect_auxiliary_task(
         aux_system.as_deref(),
@@ -464,13 +501,43 @@ pub fn normalize_anthropic_request(
         enable_native_web_fetch,
     );
 
+    let is_compaction = crate::session_key::is_compaction_summarization_turn(
+        aux_system.as_deref(),
+        &conv_messages,
+        &client_tools,
+    ) || aux_system
+        .as_deref()
+        .is_some_and(crate::session_key::is_compaction_instructions_prompt);
+    let detected_harness = crate::harness_prompt::detect_harness_by_tools(&declared_tools);
+    let allow_prompt_distillation = auxiliary_task.is_none() && !is_compaction;
+
     let mut messages = conv_messages;
-    materialize_system_prompt_into_messages(
+    match materialize_system_prompt_into_messages_with_slot(
         aux_system.as_deref(),
         false,
         &client_tools,
         &mut messages,
-    );
+    ) {
+        Some(MaterializedSystemSlot::InsertedAtZero) => {
+            for slot in &mut developer_slots {
+                slot.msg_index = slot.msg_index.saturating_add(1);
+            }
+            if !system_segments.is_empty() {
+                developer_slots.insert(
+                    0,
+                    ProtocolDeveloperSlot {
+                        msg_index: 0,
+                        part_index: 0,
+                        kind: ProtocolDeveloperSlotKind::AnthropicSystem {
+                            segments: system_segments,
+                            json_schema_directive,
+                        },
+                    },
+                );
+            }
+        }
+        Some(MaterializedSystemSlot::AppendedCompaction) | None => {}
+    }
 
     let force_native_web_search = enable_native_web_search
         && (choice_tool_name == Some("web_search")
@@ -525,6 +592,9 @@ pub fn normalize_anthropic_request(
         omit_thinking_text,
         include_encrypted_reasoning: false,
         stream: req.stream.unwrap_or(false),
+        detected_harness,
+        allow_prompt_distillation,
+        developer_slots,
     })
 }
 
@@ -532,15 +602,105 @@ pub fn normalize_anthropic_request(
 #[must_use]
 pub fn estimate_anthropic_tokens(req: &AnthropicMessagesRequest) -> u64 {
     let mut chars: usize = 0;
-    if let Some(sys) = &req.system {
-        match sys {
-            AnthropicSystemPrompt::Text(s) => chars = chars.saturating_add(s.len()),
-            AnthropicSystemPrompt::Blocks(blocks) => {
-                for b in blocks {
-                    if let Some(t) = &b.text {
-                        chars = chars.saturating_add(t.len());
+    let tool_choice_is_none = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        == Some("none");
+    let mut declared_tools = Vec::new();
+    let mut enable_native_web_search = false;
+    let mut enable_native_web_fetch = false;
+    for tool in &req.tools {
+        if let Some(tt) = &tool.tool_type {
+            if tt.starts_with("web_search") {
+                if !tool_choice_is_none {
+                    enable_native_web_search = true;
+                }
+                continue;
+            }
+            if tt.starts_with("web_fetch") {
+                if !tool_choice_is_none {
+                    enable_native_web_fetch = true;
+                }
+                continue;
+            }
+            if tt.starts_with("code_execution") && tool.input_schema.is_none() {
+                continue;
+            }
+        }
+        if !tool.name.trim().is_empty() {
+            declared_tools.push(CanonicalToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                kind: CanonicalToolKind::Function {
+                    parameters_json: tool.input_schema.as_ref().map_or_else(
+                        || "{\"type\":\"object\"}".to_owned(),
+                        |r| r.get().to_owned(),
+                    ),
+                },
+            });
+        }
+    }
+    let active_tools: &[CanonicalToolSpec] = if tool_choice_is_none {
+        &[]
+    } else {
+        &declared_tools
+    };
+
+    let probe_messages: Vec<CanonicalMessage> = req
+        .messages
+        .iter()
+        .filter(|m| !matches!(m.role.as_str(), "system" | "developer"))
+        .map(|m| {
+            let role = if m.role == "assistant" {
+                CanonicalRole::Assistant
+            } else {
+                CanonicalRole::User
+            };
+            let mut parts = Vec::new();
+            match &m.content {
+                AnthropicMessageContent::Text(s) => parts.push(CanonicalPart::Text(s.clone())),
+                AnthropicMessageContent::Blocks(blocks) => {
+                    for b in blocks {
+                        if let AnthropicInputBlock::Text { text } = b {
+                            parts.push(CanonicalPart::Text(text.clone()));
+                        }
                     }
                 }
+            }
+            CanonicalMessage { role, parts }
+        })
+        .collect();
+
+    if let Some(sys) = &req.system {
+        let segments = sys.cleaned_segments();
+        let joined_sys = (!segments.is_empty()).then(|| segments.join("\n\n"));
+        let is_auxiliary = detect_auxiliary_task(
+            joined_sys.as_deref(),
+            &probe_messages,
+            active_tools,
+            enable_native_web_search,
+            enable_native_web_fetch,
+        )
+        .is_some();
+        let is_compaction = crate::session_key::is_compaction_summarization_turn(
+            joined_sys.as_deref(),
+            &probe_messages,
+            active_tools,
+        ) || joined_sys
+            .as_deref()
+            .is_some_and(crate::session_key::is_compaction_instructions_prompt);
+        if !is_auxiliary
+            && !is_compaction
+            && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
+            && let Some(distilled) =
+                crate::harness_prompt::distill_anthropic_system_prompt(harness, &segments)
+        {
+            chars = chars.saturating_add(distilled.len());
+        } else {
+            for seg in &segments {
+                chars = chars.saturating_add(seg.len());
             }
         }
     }
@@ -932,5 +1092,291 @@ mod tests {
         assert_eq!(norm_cm.requested_model.as_deref(), Some("claude-fable-5-2"));
         assert_eq!(norm_cm.client_tools.len(), 2);
         assert_eq!(norm_cm.client_tools[0].name, "REPL");
+    }
+
+    #[test]
+    fn distills_claude_code_and_opencode_system_prompts_by_tools_without_touching_generic_callers()
+    {
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+
+        // 1. Claude Code Turn 1 (Plan Mode tools) -> Turn 2 (Full Act tools): prefix hash stays identical!
+        let raw_cc_system = json!([
+            { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.99.0;" },
+            { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+            {
+                "type": "text",
+                "text": format!(
+                    "Future Claude Code v2.99 massive manual.\n{}\n<env>\nWorking directory: /Users/dev/liftgate\nIs directory a git repo: Yes\n</env>\ngitStatus: On branch main",
+                    "Built-in Bash/Edit/Task tutorial line.\n".repeat(400)
+                )
+            },
+            { "type": "text", "text": "Always explain tradeoffs concisely." }
+        ]);
+
+        let req_plan: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": raw_cc_system,
+            "tools": [
+                { "name": "Read", "input_schema": { "type": "object" } },
+                { "name": "Glob", "input_schema": { "type": "object" } },
+                { "name": "Grep", "input_schema": { "type": "object" } },
+                { "name": "ExitPlanMode", "input_schema": { "type": "object" } }
+            ],
+            "messages": [{ "role": "user", "content": "<system-reminder>\n# claudeMd\nObey docs/2026-11-09-RUST.md\n</system-reminder>\nhi" }]
+        }))
+        .expect("valid Claude Plan request");
+        let estimated = estimate_anthropic_tokens(&req_plan);
+        assert!(
+            estimated < 800,
+            "count_tokens should reflect distilled system prompt, got {estimated}"
+        );
+        let norm_plan = normalize_anthropic_request(req_plan).expect("normalized Plan turn");
+        assert!(matches!(
+            norm_plan.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Built-in Bash/Edit/Task tutorial line")
+        ));
+        let outbound_plan = norm_plan.render_messages_for_outbound(0, norm_plan.detected_harness);
+        let dev_text = match outbound_plan[0].parts.first() {
+            Some(CanonicalPart::Text(t)) => t.as_str(),
+            other => panic!("expected developer_instructions part, got {other:?}"),
+        };
+        assert!(!dev_text.contains("Built-in Bash/Edit/Task tutorial line"));
+        assert!(dev_text.contains("Working directory: /Users/dev/liftgate"));
+        assert!(dev_text.contains("gitStatus: On branch main"));
+        assert!(dev_text.contains("Always explain tradeoffs concisely."));
+
+        let reply1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text("Ready.".to_owned())],
+        };
+        let t1_hash = hash_conversation_with_reply(
+            None,
+            &norm_plan.client_tools,
+            web_cfg,
+            &model,
+            &norm_plan.messages,
+            &reply1,
+        );
+
+        let req_act: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": raw_cc_system,
+            "tools": [
+                { "name": "Bash", "input_schema": { "type": "object" } },
+                { "name": "Read", "input_schema": { "type": "object" } },
+                { "name": "Edit", "input_schema": { "type": "object" } },
+                { "name": "Write", "input_schema": { "type": "object" } },
+                { "name": "TodoWrite", "input_schema": { "type": "object" } }
+            ],
+            "messages": [
+                { "role": "user", "content": "<system-reminder>\n# claudeMd\nObey docs/2026-11-09-RUST.md\n</system-reminder>\nhi" },
+                { "role": "assistant", "content": "Ready." },
+                { "role": "user", "content": "Implement the fix" }
+            ]
+        }))
+        .expect("valid Claude Act request");
+        let norm_act = normalize_anthropic_request(req_act).expect("normalized Act turn");
+        let plan = compute_routing_plan(
+            None,
+            &norm_act.client_tools,
+            web_cfg,
+            &model,
+            &norm_act.messages,
+        );
+        assert_eq!(plan.prefix_lookup.map(|(h, _)| h), Some(t1_hash));
+
+        // Disabling tool execution (`tool_choice: {"type": "none"}`) on a continuation turn while
+        // declaring the same harness tools preserves the exact distilled prefix hash!
+        let req_tool_choice_none: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": raw_cc_system,
+            "tool_choice": { "type": "none" },
+            "tools": [
+                { "name": "Bash", "input_schema": { "type": "object" } },
+                { "name": "Read", "input_schema": { "type": "object" } }
+            ],
+            "messages": [
+                { "role": "user", "content": "<system-reminder>\n# claudeMd\nObey docs/2026-11-09-RUST.md\n</system-reminder>\nhi" },
+                { "role": "assistant", "content": "Ready." },
+                { "role": "user", "content": "Summarize without calling tools" }
+            ]
+        }))
+        .expect("valid tool_choice=none continuation");
+        let norm_none = normalize_anthropic_request(req_tool_choice_none)
+            .expect("normalized tool_choice=none turn");
+        assert!(norm_none.client_tools.is_empty());
+        let plan_none = compute_routing_plan(
+            None,
+            &norm_none.client_tools,
+            web_cfg,
+            &model,
+            &norm_none.messages,
+        );
+        assert_eq!(plan_none.prefix_lookup.map(|(h, _)| h), Some(t1_hash));
+
+        // Auxiliary Auto Mode classifier request with Claude Code tools attached (`Bash`, `Read`)
+        // and a >2 KB classifier system prompt MUST keep its classifier system prompt intact!
+        let classifier_sys = format!(
+            "You are a security classifier for Claude Code Auto Mode. Return <block>yes</block> or <block>no</block>.\n{}",
+            "CLASSIFIER_POLICY_RULE_LINE\n".repeat(100)
+        );
+        let req_aux_cls: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 256,
+            "system": classifier_sys,
+            "tools": [
+                { "name": "Bash", "input_schema": { "type": "object" } },
+                { "name": "Read", "input_schema": { "type": "object" } }
+            ],
+            "messages": [{ "role": "user", "content": "<transcript>\nAssistant wants to run cargo test\n</transcript>" }]
+        }))
+        .expect("valid Auto Mode classifier request");
+        let aux_estimated = estimate_anthropic_tokens(&req_aux_cls);
+        assert!(
+            aux_estimated > 700,
+            "count_tokens must preserve full auxiliary classifier prompt size, got {aux_estimated}"
+        );
+        let norm_aux_cls =
+            normalize_anthropic_request(req_aux_cls).expect("normalized Auto Mode classifier");
+        let outbound_aux_cls =
+            norm_aux_cls.render_messages_for_outbound(0, norm_aux_cls.detected_harness);
+        assert_eq!(
+            norm_aux_cls.auxiliary_task,
+            Some(crate::canonical::AuxiliaryTaskKind::AutoModeClassifier)
+        );
+        assert!(matches!(
+            outbound_aux_cls[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("CLASSIFIER_POLICY_RULE_LINE")
+        ));
+
+        // 2. OpenCode multi-block system prompt preserves `<env>` and `Instructions from: AGENTS.md`.
+        let req_oc: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 8192,
+            "system": [
+                { "type": "text", "text": format!("OpenCode Beast Mode Prompt.\n{}", "Built-in OpenCode prose.\n".repeat(250)) },
+                { "type": "text", "text": "Here is some useful information about the environment you are running in:\n<env>\nWorking directory: /repo\n</env>\n\nInstructions from: /repo/AGENTS.md\nNo unwrap on fallible paths." }
+            ],
+            "tools": [
+                { "name": "execute", "input_schema": { "type": "object", "properties": { "code": { "type": "string" } } } },
+                { "name": "patch", "input_schema": { "type": "object", "properties": { "patchText": { "type": "string" } } } }
+            ],
+            "messages": [{ "role": "user", "content": "Check repo" }]
+        }))
+        .expect("valid OpenCode request");
+        let norm_oc = normalize_anthropic_request(req_oc).expect("normalized OpenCode");
+        let outbound_oc = norm_oc.render_messages_for_outbound(0, norm_oc.detected_harness);
+        let oc_dev = match outbound_oc[0].parts.first() {
+            Some(CanonicalPart::Text(t)) => t.as_str(),
+            other => panic!("expected developer_instructions, got {other:?}"),
+        };
+        assert!(!oc_dev.contains("Built-in OpenCode prose"));
+        assert!(oc_dev.contains("<env>\nWorking directory: /repo\n</env>"));
+        assert!(oc_dev.contains("Instructions from: /repo/AGENTS.md"));
+        assert!(oc_dev.contains("No unwrap on fallible paths."));
+
+        // 3. Generic caller WITHOUT characteristic harness tools is untouched even if its system prompt mentions Claude Code!
+        let req_generic: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": format!("You are Claude Code simulator.\n{}", "Keep this custom domain rule.\n".repeat(120)),
+            "tools": [{ "name": "search_crm", "input_schema": { "type": "object" } }],
+            "messages": [{ "role": "user", "content": "Find customer" }]
+        }))
+        .expect("valid generic Anthropic request");
+        let norm_gen = normalize_anthropic_request(req_generic).expect("normalized generic");
+        let outbound_gen = norm_gen.render_messages_for_outbound(0, norm_gen.detected_harness);
+        assert!(matches!(
+            outbound_gen[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Keep this custom domain rule.")
+        ));
+    }
+
+    #[test]
+    fn anthropic_normalization_preserves_hashes_across_tool_threshold_mutations_and_assistant_literals()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let sys_prompt = format!(
+            "You are Claude Code, Anthropic's official CLI for Claude.\n{}",
+            "Built-in Claude Code manual line.\n".repeat(200)
+        );
+
+        // Turn 1 declares only `[Read]` (`detected_harness == None`).
+        let req_t1: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 4096,
+            "system": sys_prompt,
+            "tools": [{ "name": "Read", "input_schema": { "type": "object" } }],
+            "messages": [{ "role": "user", "content": "Show <developer_instructions> example" }]
+        }))
+        .expect("valid t1");
+        let norm_t1 = normalize_anthropic_request(req_t1).expect("norm t1");
+        assert_eq!(norm_t1.detected_harness, None);
+
+        let assistant_literal = "<developer_instructions><apps_instructions>example</apps_instructions></developer_instructions>";
+        let reply_t1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(assistant_literal.to_owned())],
+        };
+        let t1_hash = hash_conversation_with_reply(
+            None,
+            &norm_t1.client_tools,
+            web_cfg,
+            &model,
+            &norm_t1.messages,
+            &reply_t1,
+        );
+
+        // Turn 2 enables `[Read, Glob]` (`Some(ClaudeCode)`) and replays the literal assistant block.
+        let req_t2: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 4096,
+            "system": sys_prompt,
+            "tools": [
+                { "name": "Read", "input_schema": { "type": "object" } },
+                { "name": "Glob", "input_schema": { "type": "object" } }
+            ],
+            "messages": [
+                { "role": "user", "content": "Show <developer_instructions> example" },
+                { "role": "assistant", "content": assistant_literal },
+                { "role": "user", "content": "Now explain it" }
+            ]
+        }))
+        .expect("valid t2");
+        let norm_t2 = normalize_anthropic_request(req_t2).expect("norm t2");
+        assert_eq!(
+            norm_t2.detected_harness,
+            Some(crate::harness_prompt::DetectedHarness::ClaudeCode)
+        );
+        let plan_t2 = compute_routing_plan(
+            None,
+            &norm_t2.client_tools,
+            web_cfg,
+            &model,
+            &norm_t2.messages,
+        );
+        assert_eq!(plan_t2.prefix_lookup, Some((t1_hash, 3)));
+
+        // Assistant `<developer_instructions>` text is preserved verbatim in outbound rendering.
+        let outbound_t2 = norm_t2.render_messages_for_outbound(0, norm_t2.detected_harness);
+        assert_eq!(
+            outbound_t2[2].parts,
+            vec![CanonicalPart::Text(assistant_literal.to_owned())]
+        );
     }
 }

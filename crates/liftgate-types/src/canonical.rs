@@ -177,6 +177,52 @@ pub struct MarkdownLinkSpan {
     pub end_char: usize,
 }
 
+/// Wire-protocol origin of a `<developer_instructions>` text part inside [`CanonicalMessage`].
+///
+/// Recording exact protocol slot coordinates ensures outbound prompt distillation transforms only
+/// genuine top-level `instructions`/`system` and `role: "developer" | "system"` items — never
+/// conversational `user` or `assistant` messages that quote literal `<developer_instructions>` text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtocolDeveloperSlotKind {
+    /// Primary top-level `instructions` / `system_instructions` slot.
+    PrimaryBase,
+    /// Ordered top-level Anthropic `system` blocks plus optional JSON-schema output directive.
+    AnthropicSystem {
+        segments: Vec<String>,
+        json_schema_directive: Option<String>,
+    },
+    /// Individual `role: "developer" | "system"` message item inside `input` / `messages`.
+    DeveloperItem { allow_standalone_base: bool },
+}
+
+/// Coordinates of a protocol-originated developer/system text part within
+/// [`NormalizedTurnRequest::messages`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolDeveloperSlot {
+    pub msg_index: usize,
+    pub part_index: usize,
+    pub kind: ProtocolDeveloperSlotKind,
+}
+
+impl ProtocolDeveloperSlot {
+    /// Estimates structural plus heap bytes retained by this slot metadata.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let kind_bytes = match &self.kind {
+            ProtocolDeveloperSlotKind::PrimaryBase
+            | ProtocolDeveloperSlotKind::DeveloperItem { .. } => 0,
+            ProtocolDeveloperSlotKind::AnthropicSystem {
+                segments,
+                json_schema_directive,
+            } => segments
+                .iter()
+                .fold(0usize, |acc, s| acc.saturating_add(s.len()))
+                .saturating_add(json_schema_directive.as_deref().map_or(0, str::len)),
+        };
+        std::mem::size_of::<Self>().saturating_add(kind_bytes)
+    }
+}
+
 /// Protocol-agnostic normalized turn request ready for ACP session routing.
 #[derive(Clone, Debug)]
 #[expect(
@@ -203,22 +249,128 @@ pub struct NormalizedTurnRequest {
     pub omit_thinking_text: bool,
     pub include_encrypted_reasoning: bool,
     pub stream: bool,
+    pub detected_harness: Option<crate::harness_prompt::DetectedHarness>,
+    pub allow_prompt_distillation: bool,
+    pub developer_slots: Vec<ProtocolDeveloperSlot>,
 }
 
 impl NormalizedTurnRequest {
     /// Enforces the canonical ACP gateway invariant across every protocol adapter (OpenAI,
     /// Anthropic, and future harnesses such as OpenCode): drains any caller `system_instructions`
     /// into `<developer_instructions>` blocks inside `messages` so `_meta.antigravity.systemPrompt.append`
-    /// never carries caller system prompts.
+    /// never carries caller system prompts while keeping `messages` raw and tool-invariant for
+    /// deterministic `SessionPool` prefix hashing.
     pub fn materialize_system_instructions(&mut self) {
         if let Some(sys) = self.system_instructions.take() {
-            crate::session_key::materialize_system_prompt_into_messages(
+            let is_auxiliary = self.auxiliary_task.is_some()
+                || detect_auxiliary_task(
+                    Some(&sys),
+                    &self.messages,
+                    &self.client_tools,
+                    self.enable_native_web_search,
+                    self.enable_native_web_fetch,
+                )
+                .is_some();
+            let is_compaction = crate::session_key::is_compaction_instructions_prompt(&sys)
+                || crate::session_key::is_compaction_summarization_turn(
+                    Some(&sys),
+                    &self.messages,
+                    &self.client_tools,
+                );
+            if is_auxiliary || is_compaction {
+                self.allow_prompt_distillation = false;
+            }
+            if self.detected_harness.is_none() {
+                self.detected_harness =
+                    crate::harness_prompt::detect_harness_by_tools(&self.client_tools);
+            }
+            match crate::session_key::materialize_system_prompt_into_messages_with_slot(
                 Some(&sys),
                 self.previous_response_id.is_some(),
                 &self.client_tools,
                 &mut self.messages,
-            );
+            ) {
+                Some(crate::session_key::MaterializedSystemSlot::InsertedAtZero) => {
+                    self.shift_developer_slots(1);
+                    self.developer_slots.insert(
+                        0,
+                        ProtocolDeveloperSlot {
+                            msg_index: 0,
+                            part_index: 0,
+                            kind: ProtocolDeveloperSlotKind::PrimaryBase,
+                        },
+                    );
+                }
+                Some(crate::session_key::MaterializedSystemSlot::AppendedCompaction) | None => {}
+            }
         }
+    }
+
+    /// Shifts recorded protocol developer slot message indices when prior session history is
+    /// prepended to `self.messages` (for example on a `previous_response_id` fallback).
+    pub fn shift_developer_slots(&mut self, msg_offset: usize) {
+        if msg_offset == 0 {
+            return;
+        }
+        for slot in &mut self.developer_slots {
+            slot.msg_index = slot.msg_index.saturating_add(msg_offset);
+        }
+    }
+
+    /// Prepends cached conversation history and its protocol developer-slot provenance ahead of
+    /// `self.messages`, shifting current-turn developer slot indices by `prior_messages.len()`.
+    pub fn prepend_history_with_slots(
+        &mut self,
+        mut prior_messages: Vec<CanonicalMessage>,
+        mut prior_slots: Vec<ProtocolDeveloperSlot>,
+    ) {
+        let saved_len = prior_messages.len();
+        if saved_len == 0 {
+            return;
+        }
+        self.shift_developer_slots(saved_len);
+        prior_slots.append(&mut self.developer_slots);
+        self.developer_slots = prior_slots;
+        prior_messages.extend(std::mem::take(&mut self.messages));
+        self.messages = prior_messages;
+    }
+
+    /// Renders `self.messages[range_start..]` for outbound ACP prompt delivery, distilling only
+    /// recorded protocol-originated developer/system slots while keeping `self.messages` untouched
+    /// for deterministic `SessionPool` prefix hashing and exact conversational fidelity.
+    #[must_use]
+    pub fn render_messages_for_outbound(
+        &self,
+        range_start: usize,
+        harness_override: Option<crate::harness_prompt::DetectedHarness>,
+    ) -> std::borrow::Cow<'_, [CanonicalMessage]> {
+        let Some(slice) = self.messages.get(range_start..) else {
+            return std::borrow::Cow::Borrowed(&[]);
+        };
+        if !self.allow_prompt_distillation || self.auxiliary_task.is_some() {
+            return std::borrow::Cow::Borrowed(slice);
+        }
+        let Some(harness) = harness_override.or(self.detected_harness) else {
+            return std::borrow::Cow::Borrowed(slice);
+        };
+        if crate::harness_prompt::distilled_harness_system_prompt(harness).is_none() {
+            return std::borrow::Cow::Borrowed(slice);
+        }
+        if !self
+            .developer_slots
+            .iter()
+            .any(|slot| slot.msg_index >= range_start)
+        {
+            return std::borrow::Cow::Borrowed(slice);
+        }
+        let mut rendered = slice.to_vec();
+        crate::harness_prompt::apply_developer_slots_to_slice(
+            harness,
+            &self.developer_slots,
+            range_start,
+            &mut rendered,
+        );
+        std::borrow::Cow::Owned(rendered)
     }
 }
 

@@ -3,15 +3,69 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+pub use liftgate_types::harness_prompt::{
+    DetectedHarness, ProtocolHint, detect_harness, detect_harness_by_tools, is_omp_input_edit_spec,
+    is_opencode_v4a_patch_spec, json_schema_declares_property,
+};
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
     session_key::{
-        McpOrchestratorContract, is_code_mode_custom_exec, is_omp_eval_orchestrator_tool,
-        is_opencode_execute_orchestrator_tool, split_code_mode_ts_declaration,
+        McpOrchestratorContract, is_code_mode_custom_exec, split_code_mode_ts_declaration,
     },
 };
 
 use crate::budget::VirtualizerBudget;
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let mut a = a.as_bytes();
+    let mut b = b.as_bytes();
+    while let (Some((&ha, ta)), Some((&hb, tb))) = (a.split_first(), b.split_first()) {
+        if ha != hb {
+            return false;
+        }
+        a = ta;
+        b = tb;
+    }
+    a.is_empty() && b.is_empty()
+}
+
+const _: () = {
+    assert!(
+        const_str_eq(
+            DetectedHarness::Codex.id(),
+            crate::profiles::CodexToolProfile::ID
+        ),
+        "DetectedHarness::Codex.id() must match CodexToolProfile::ID"
+    );
+    assert!(
+        const_str_eq(
+            DetectedHarness::ClaudeCode.id(),
+            crate::profiles::ClaudeCodeToolProfile::ID
+        ),
+        "DetectedHarness::ClaudeCode.id() must match ClaudeCodeToolProfile::ID"
+    );
+    assert!(
+        const_str_eq(
+            DetectedHarness::OpenCode.id(),
+            crate::profiles::OpenCodeToolProfile::ID
+        ),
+        "DetectedHarness::OpenCode.id() must match OpenCodeToolProfile::ID"
+    );
+    assert!(
+        const_str_eq(
+            DetectedHarness::Omp.id(),
+            crate::profiles::OmpToolProfile::ID
+        ),
+        "DetectedHarness::Omp.id() must match OmpToolProfile::ID"
+    );
+    assert!(
+        const_str_eq(
+            DetectedHarness::Generic.id(),
+            crate::profiles::GenericToolProfile::ID
+        ),
+        "DetectedHarness::Generic.id() must match GenericToolProfile::ID"
+    );
+};
 
 /// Tiered placement decision returned by [`HarnessToolProfile::classify_tool`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,41 +136,6 @@ pub fn default_apply_patch_v4a_contract(spec: &CanonicalToolSpec) -> Option<V4aP
             }
         }
     }
-}
-
-/// Returns `true` when a tool named `patch` carries OpenCode's V4A `patchText` / `*** Begin Patch`
-/// contract rather than a generic unified-diff or JSON-Patch schema.
-#[must_use]
-pub fn is_opencode_v4a_patch_spec(spec: &CanonicalToolSpec) -> bool {
-    if spec.name != "patch" {
-        return false;
-    }
-    let desc_has_v4a = spec
-        .description
-        .as_deref()
-        .is_some_and(|d| d.contains("*** Begin Patch"));
-    match &spec.kind {
-        CanonicalToolKind::Function { parameters_json } => {
-            json_schema_declares_property(parameters_json, "patchText")
-                || (desc_has_v4a && json_schema_declares_property(parameters_json, "patch"))
-        }
-        CanonicalToolKind::Custom { format_json } => {
-            let grammar_has_v4a = format_json
-                .as_deref()
-                .is_some_and(|g| g.contains("*** Begin Patch"));
-            desc_has_v4a || grammar_has_v4a
-        }
-    }
-}
-
-#[must_use]
-pub(crate) fn json_schema_declares_property(parameters_json: &str, prop_name: &str) -> bool {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
-        return false;
-    };
-    val.get("properties")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|props| props.contains_key(prop_name))
 }
 
 /// Zero-cost compile-time adapter tailoring 3-tier MCP tool virtualization to a coding harness.
@@ -197,272 +216,6 @@ pub trait HarnessToolProfile: Copy + Default + Send + Sync + 'static {
             return ("patch", crate::schema::apply_patch_input_schema());
         }
         ("input", crate::schema::freeform_custom_input_schema())
-    }
-}
-
-/// Optional ingress wire-protocol hint supplied by the HTTP route layer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProtocolHint {
-    #[default]
-    Unknown,
-    OpenAiResponses,
-    AnthropicMessages,
-}
-
-/// Closed set of statically dispatched built-in harness profiles.
-///
-/// Adding a new harness (e.g. `Omp` or `OpenCode`) requires only implementing
-/// [`HarnessToolProfile`] on a new ZST and adding a variant here—exhaustive `match` blocks
-/// without `_` wildcards ensure compile-time completeness across planning and routing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetectedHarness {
-    Codex,
-    ClaudeCode,
-    OpenCode,
-    Omp,
-    Generic,
-}
-
-impl DetectedHarness {
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Codex => crate::profiles::CodexToolProfile::ID,
-            Self::ClaudeCode => crate::profiles::ClaudeCodeToolProfile::ID,
-            Self::OpenCode => crate::profiles::OpenCodeToolProfile::ID,
-            Self::Omp => crate::profiles::OmpToolProfile::ID,
-            Self::Generic => crate::profiles::GenericToolProfile::ID,
-        }
-    }
-}
-
-/// Returns `true` when an `edit` tool carries Oh My Pi (`omp`)'s `{ input: string }` or custom
-/// Lark grammar shape (`hashline` / `sloppy` / `magic` / `apply_patch`).
-#[must_use]
-pub fn is_omp_input_edit_spec(spec: &CanonicalToolSpec) -> bool {
-    if spec.name != "edit" {
-        return false;
-    }
-    match &spec.kind {
-        CanonicalToolKind::Custom { .. } => true,
-        CanonicalToolKind::Function { parameters_json } => {
-            json_schema_declares_property(parameters_json, "input")
-                && !json_schema_declares_property(parameters_json, "oldString")
-                && !json_schema_declares_property(parameters_json, "old_string")
-        }
-    }
-}
-
-#[must_use]
-fn is_omp_distinctive_bash_or_todo_spec(spec: &CanonicalToolSpec) -> bool {
-    let CanonicalToolKind::Function { parameters_json } = &spec.kind else {
-        return false;
-    };
-    match spec.name.as_str() {
-        "bash" => {
-            json_schema_declares_property(parameters_json, "pty")
-                && json_schema_declares_property(parameters_json, "ready")
-        }
-        "todo" => {
-            json_schema_declares_property(parameters_json, "op")
-                && json_schema_declares_property(parameters_json, "items")
-        }
-        _ => false,
-    }
-}
-
-/// Detects the active caller harness from tool signatures and optional wire-protocol hint.
-#[must_use]
-pub fn detect_harness(hint: ProtocolHint, client_tools: &[CanonicalToolSpec]) -> DetectedHarness {
-    let mut codex_score: u32 = 0;
-    let mut claude_score: u32 = 0;
-    let mut opencode_score: u32 = 0;
-    let mut has_omp_identity = false;
-    let mut omp_primary_score: u32 = 0;
-    let mut omp_secondary_score: u32 = 0;
-
-    for spec in client_tools {
-        let name = spec.name.as_str();
-        if (is_code_mode_custom_exec(spec) && name != "execute")
-            || matches!(
-                name,
-                "exec_command"
-                    | "write_stdin"
-                    | "__codex_local_shell"
-                    | "__codex_tool_search"
-                    | "view_image"
-                    | "update_plan"
-                    | "request_user_input"
-                    | "request_user_input_async"
-                    | "send_message_to_user_async"
-                    | "js_repl"
-                    | "js_repl_reset"
-            )
-            || name.starts_with("mcp__codex_apps__")
-            || name.starts_with("mcp__codex_tui")
-            || name.starts_with("mcp__node_repl")
-            || name.starts_with("mcp__cua_repl")
-            || name.starts_with("multi_agent_v1.")
-            || (name == "apply_patch" && matches!(spec.kind, CanonicalToolKind::Custom { .. }))
-            || spec
-                .description
-                .as_deref()
-                .is_some_and(|d| d.contains("exec tool declaration:"))
-        {
-            codex_score = codex_score.saturating_add(4);
-        }
-
-        if matches!(
-            name,
-            "Bash"
-                | "PowerShell"
-                | "MultiEdit"
-                | "NotebookEdit"
-                | "TodoWrite"
-                | "TaskCreate"
-                | "TaskUpdate"
-                | "TaskGet"
-                | "TaskList"
-                | "TaskOutput"
-                | "TaskStop"
-                | "BashOutput"
-                | "KillShell"
-                | "EnterPlanMode"
-                | "ExitPlanMode"
-                | "EnterWorktree"
-                | "ExitWorktree"
-                | "AskUserQuestion"
-                | "Skill"
-                | "SlashCommand"
-                | "ToolSearch"
-                | "REPL"
-                | "Agent"
-                | "TeamCreate"
-                | "TeamDelete"
-                | "SendMessage"
-                | "CronCreate"
-                | "ScheduleWakeup"
-                | "ListMcpResourcesTool"
-                | "ReadMcpResourceTool"
-        ) || name.starts_with("mcp__claude_ai_")
-            || name.starts_with("mcp__plugin_")
-        {
-            claude_score = claude_score.saturating_add(4);
-        } else if matches!(
-            name,
-            "Read" | "Edit" | "Write" | "Glob" | "Grep" | "LS" | "LSP" | "WebFetch" | "WebSearch"
-        ) {
-            claude_score = claude_score.saturating_add(2);
-        }
-
-        if matches!(
-            name,
-            "execute"
-                | "subagent"
-                | "question"
-                | "webfetch"
-                | "websearch"
-                | "todowrite"
-                | "todoread"
-                | "codesearch"
-                | "multiedit"
-                | "shell"
-                | "skill"
-        ) || is_opencode_v4a_patch_spec(spec)
-            || is_opencode_execute_orchestrator_tool(spec)
-            || name.starts_with("opencode_")
-            || name.starts_with("opencode.")
-            || name.starts_with("automation_")
-            || name.starts_with("machine_")
-            || spec
-                .description
-                .as_deref()
-                .is_some_and(|d| d.contains("Code Mode runtime") || d.contains("Code Mode catalog"))
-        {
-            opencode_score = opencode_score.saturating_add(4);
-        } else if matches!(
-            name,
-            "bash" | "read" | "edit" | "write" | "glob" | "grep" | "lsp"
-        ) {
-            opencode_score = opencode_score.saturating_add(2);
-        }
-
-        if is_omp_eval_orchestrator_tool(spec)
-            || is_omp_input_edit_spec(spec)
-            || is_omp_distinctive_bash_or_todo_spec(spec)
-            || matches!(
-                name,
-                "ast_edit"
-                    | "ast_grep"
-                    | "context_notes"
-                    | "new_context"
-                    | "manage_skill"
-                    | "memory_edit"
-            )
-            || name.starts_with("hindsight_")
-            || name.starts_with("mnemopi_")
-            || spec.description.as_deref().is_some_and(|d| {
-                d.contains("help://")
-                    || d.contains("omp://")
-                    || d.contains("Copy `[FILENAME#TAG]`")
-                    || d.contains("Copy [FILENAME#TAG]")
-                    || d.contains("Put line ranges in `path`")
-            })
-        {
-            has_omp_identity = true;
-            omp_primary_score = omp_primary_score.saturating_add(5);
-        } else if matches!(
-            name,
-            "checkpoint"
-                | "rewind"
-                | "security_scan"
-                | "ask"
-                | "web_search"
-                | "retain"
-                | "recall"
-                | "reflect"
-                | "learn"
-                | "find"
-                | "debug"
-                | "yield"
-                | "bash"
-                | "read"
-                | "edit"
-                | "write"
-                | "glob"
-                | "grep"
-                | "lsp"
-                | "task"
-                | "todo"
-        ) || name.starts_with("irc_")
-        {
-            omp_secondary_score = omp_secondary_score.saturating_add(2);
-        }
-    }
-
-    let omp_score = if has_omp_identity {
-        omp_primary_score.saturating_add(omp_secondary_score)
-    } else {
-        0
-    };
-
-    if omp_score > codex_score && omp_score > claude_score && omp_score > opencode_score {
-        return DetectedHarness::Omp;
-    }
-    if opencode_score > codex_score && opencode_score > claude_score {
-        return DetectedHarness::OpenCode;
-    }
-    if codex_score > claude_score && codex_score >= opencode_score && codex_score > 0 {
-        return DetectedHarness::Codex;
-    }
-    if claude_score > codex_score && claude_score >= opencode_score && claude_score > 0 {
-        return DetectedHarness::ClaudeCode;
-    }
-
-    match hint {
-        ProtocolHint::OpenAiResponses => DetectedHarness::Codex,
-        ProtocolHint::AnthropicMessages => DetectedHarness::ClaudeCode,
-        ProtocolHint::Unknown => DetectedHarness::Generic,
     }
 }
 

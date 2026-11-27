@@ -11646,3 +11646,399 @@ async fn xml_tool_calls_are_recorded_and_completed_by_the_next_request() {
     assert_eq!(done.record.output_preview, "Finished dev profile");
     assert!(done.record.duration_ms.is_some());
 }
+
+#[tokio::test]
+async fn distills_raw_harness_system_prompts_strictly_by_characteristic_tools_end_to_end() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Claude distilled ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Claude Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["OMP distilled ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Generic SDK untouched.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    // 1. Claude Code Turn 1 -> Turn 2 (with raw 30 KB system prompt + `<env>` + custom append)
+    let cc_system = json!([
+        { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.50.0;" },
+        { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+        {
+            "type": "text",
+            "text": format!(
+                "Raw Claude Code CLI manual v2.50.\n{}\n<env>\nWorking directory: /workspace/app\n</env>",
+                "Verbose Bash/Edit/TodoWrite paragraph.\n".repeat(700)
+            )
+        },
+        { "type": "text", "text": "Custom team rule: keep functions short." }
+    ]);
+    let cc_tools = json!([
+        { "name": "Bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } },
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+        { "name": "Edit", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } }
+    ]);
+    let (st1, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": cc_system,
+            "tools": cc_tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+
+    let (st2, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": cc_system,
+            "tools": cc_tools,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "Claude distilled ok." },
+                { "role": "user", "content": "check status" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+
+    // 2. Oh My Pi (`omp`) on `/v1/responses` (28 KB raw instructions + internal eval prelude + `<project-context>`)
+    let (st3, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "stream": false,
+            "instructions": format!("You are omp's trusted coding assistant.\n{}", "OMP internal manual.\n".repeat(1200)),
+            "tools": [
+                { "type": "function", "name": "eval", "description": "Execute Python or JavaScript in persistent kernel with tool.<name>", "parameters": { "type": "object", "properties": { "code": { "type": "string" } } } },
+                { "type": "function", "name": "edit", "parameters": { "type": "object", "properties": { "input": { "type": "string" } } } },
+                { "type": "function", "name": "bash", "parameters": { "type": "object", "properties": { "command": { "type": "string" }, "pty": { "type": "boolean" }, "ready": { "type": "string" } } } }
+            ],
+            "input": [
+                { "role": "developer", "content": "Binary analysis lives in eval's `dsm` namespace; read `help://eval/dsm` before use." },
+                { "role": "developer", "content": "<project-context><repo-rules>Strict zero-copy Rust</repo-rules></project-context>" },
+                { "role": "user", "content": "hi" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    // 3. Generic caller WITHOUT harness tools retains full custom prompt even if wording mentions Codex/Claude
+    let (st4, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 512,
+            "system": format!("You are Claude Code lookalike.\n{}", "PRESERVE_GENERIC_SDK_RULE\n".repeat(120)),
+            "tools": [{ "name": "fetch_invoice", "input_schema": { "type": "object" } }],
+            "messages": [{ "role": "user", "content": "invoice #7" }]
+        }),
+    )
+    .await;
+    assert_eq!(st4, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+
+    // Claude Code Turn 1: raw 28 KB manual stripped, `<env>` and custom append preserved, Turn 2 reuses warm session!
+    assert!(
+        !prompts[0]
+            .text_joined
+            .contains("Verbose Bash/Edit/TodoWrite paragraph")
+    );
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("Working directory: /workspace/app")
+    );
+    assert!(
+        prompts[0]
+            .text_joined
+            .contains("Custom team rule: keep functions short.")
+    );
+    assert!(prompts[0].text_joined.len() < 2_500);
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert!(
+        !prompts[1]
+            .text_joined
+            .contains("Working directory: /workspace/app")
+    );
+
+    // OMP: 28 KB manual and `help://eval/dsm` stripped, `<project-context>` preserved!
+    assert!(!prompts[2].text_joined.contains("OMP internal manual."));
+    assert!(!prompts[2].text_joined.contains("help://eval/dsm"));
+    assert!(prompts[2].text_joined.contains("Strict zero-copy Rust"));
+    assert!(prompts[2].text_joined.len() < 2_500);
+
+    // Generic caller: custom prompt preserved intact!
+    assert!(prompts[3].text_joined.contains("PRESERVE_GENERIC_SDK_RULE"));
+}
+
+#[tokio::test]
+async fn warm_session_survives_tool_threshold_mutations_and_literal_assistant_developer_blocks() {
+    let literal_assistant = "<developer_instructions><apps_instructions>literal assistant example</apps_instructions></developer_instructions>";
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![literal_assistant.to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 3 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Cold replay preserves assistant literal.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let raw_sys = format!(
+        "You are Claude Code, Anthropic's official CLI for Claude.\n{}",
+        "Verbose CLI manual line.\n".repeat(400)
+    );
+    let read_only_tools = json!([
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } }
+    ]);
+    let read_and_glob_tools = json!([
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+        { "name": "Glob", "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } } } }
+    ]);
+
+    // Turn 1: Only `[Read]` declared (`detect_harness_by_tools == None`); assistant emits literal `<developer_instructions>`.
+    let (st1, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_only_tools,
+            "messages": [{ "role": "user", "content": "Show literal wrapper example" }]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+
+    // Turn 2: Enables `[Read, Glob]` (`Some(ClaudeCode)`), replays literal assistant block, and adds a protocol developer item.
+    let (st2, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_and_glob_tools,
+            "messages": [
+                { "role": "user", "content": "Show literal wrapper example" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps</apps_instructions>\n<permissions instructions>sandbox_mode is read-only</permissions instructions>" },
+                { "role": "user", "content": "Continue with Glob enabled" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+
+    // Turn 3: Drops `Glob` back to `[Read]` (`None`); warm session MUST still match prefix hash!
+    let (st3, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_only_tools,
+            "messages": [
+                { "role": "user", "content": "Show literal wrapper example" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps</apps_instructions>\n<permissions instructions>sandbox_mode is read-only</permissions instructions>" },
+                { "role": "user", "content": "Continue with Glob enabled" },
+                { "role": "assistant", "content": "Turn 2 warm ok." },
+                { "role": "user", "content": "Continue with Read only" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    // Turn 4: Cold session with `[Read, Glob]` and pre-existing literal assistant `<developer_instructions>` in history.
+    let (st4, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_and_glob_tools,
+            "messages": [
+                { "role": "user", "content": "Cold history question" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "user", "content": "Follow up" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st4, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+
+    // Turns 1 -> 2 -> 3 all reused the exact same warm ACP session across `[Read] -> [Read, Glob] -> [Read]`!
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert_eq!(prompts[2].session_id, prompts[0].session_id);
+    assert!(!prompts[1].text_joined.contains("drop protocol apps"));
+    assert!(prompts[1].text_joined.contains("sandbox_mode is read-only"));
+    assert!(prompts[1].text_joined.contains("<client_tools_update>"));
+
+    // Cold Turn 4 distilled the built-in system prompt while keeping the assistant's literal `<developer_instructions>` intact!
+    assert!(!prompts[3].text_joined.contains("Verbose CLI manual line."));
+    assert!(prompts[3].text_joined.contains(literal_assistant));
+}
+
+#[tokio::test]
+async fn previous_response_id_mcp_toggle_retains_historical_developer_slots_on_cold_rebuild() {
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 1 ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 3 rebuilt cold ok.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let raw_codex_inst = format!(
+        "You are Codex.\n{}",
+        "Upstream Codex CLI manual line.\n".repeat(450)
+    );
+    let codex_tools = json!([
+        { "type": "custom", "name": "exec", "description": "Run JS Code Mode" },
+        { "type": "function", "name": "exec_command", "parameters": { "type": "object" } },
+        { "type": "custom", "name": "apply_patch", "description": "Apply V4A patch" }
+    ]);
+
+    let (st1, body1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn1 apps</apps_instructions>\n<permissions instructions>danger-full-access</permissions instructions>" },
+                { "role": "user", "content": "first question" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+    let resp1_id = body1["id"].as_str().expect("resp1 id").to_owned();
+
+    let (st2, body2) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "previous_response_id": resp1_id,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn2 apps</apps_instructions>\n<collaboration_mode># Collaboration Mode: Plan\nEmit <proposed_plan>.</collaboration_mode>" },
+                { "role": "user", "content": "second question" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+    let resp2_id = body2["id"].as_str().expect("resp2 id").to_owned();
+
+    // Flip live MCP bridge off to trigger `mcp_mode_mismatch` history reconstruction on Turn 3.
+    state
+        .config
+        .mcp_tool_bridge
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let (st3, _) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "store": true,
+            "previous_response_id": resp2_id,
+            "instructions": raw_codex_inst,
+            "tools": codex_tools,
+            "input": [
+                { "role": "developer", "content": "<apps_instructions>drop turn3 apps</apps_instructions>" },
+                { "role": "user", "content": "third question after MCP toggle" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert_ne!(prompts[2].session_id, prompts[0].session_id);
+
+    // Replacement cold session 2 must still receive distilled historical base + developer slots!
+    assert!(
+        !prompts[2]
+            .text_joined
+            .contains("Upstream Codex CLI manual line.")
+    );
+    assert!(!prompts[2].text_joined.contains("drop turn1 apps"));
+    assert!(!prompts[2].text_joined.contains("drop turn2 apps"));
+    assert!(!prompts[2].text_joined.contains("drop turn3 apps"));
+    assert!(prompts[2].text_joined.contains("danger-full-access"));
+    assert!(prompts[2].text_joined.contains("<proposed_plan>"));
+    assert!(prompts[2].text_joined.contains("first question"));
+    assert!(prompts[2].text_joined.contains("Turn 2 warm ok."));
+    assert!(
+        prompts[2]
+            .text_joined
+            .contains("third question after MCP toggle")
+    );
+}
