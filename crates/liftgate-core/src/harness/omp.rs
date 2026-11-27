@@ -3,11 +3,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use liftgate_harness::merge_endpoint_no_proxy;
 use liftgate_harness::omp::{
     OmpInvocationKind, classify_omp_invocation, collect_existing_omp_extensions,
     merge_omp_config_files_env,
 };
-use liftgate_server::platform::merge_loopback_no_proxy;
 
 use crate::cli::{OmpArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::config_sync::{
@@ -15,7 +15,7 @@ use crate::config_sync::{
     build_omp_ephemeral_overlay_yaml, build_omp_provider_extension_ts, resolve_fast_model,
     strip_agy_provider_prefix,
 };
-use crate::daemon::ensure_gateway_ready;
+use crate::daemon::ensure_gateway_ready_for_target;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths};
 use crate::terminal::TerminalLaunchSpec;
@@ -82,9 +82,10 @@ pub(super) async fn build_omp_invocation(
         .map(strip_agy_provider_prefix)
         .filter(|s| !s.is_empty());
 
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         requested_model,
         true,
@@ -140,11 +141,12 @@ pub(super) async fn build_omp_invocation(
         std::env::var_os("PI_CONFIG_FILES").as_deref(),
         overlay_guard.path(),
     );
-    let no_proxy = merge_loopback_no_proxy(
+    let no_proxy = merge_endpoint_no_proxy(
         std::env::var("NO_PROXY")
             .ok()
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
+        Some(target.client.base_url()),
     );
 
     let mut env_set = vec![

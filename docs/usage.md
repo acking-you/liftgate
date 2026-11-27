@@ -47,6 +47,7 @@ lg agy                          # inspect agy binary, version, login status, pro
 lg agy install                  # download, SHA-512-verify & install official agy CLI
 lg agy login                    # interactive Google login via official `agy acp --login`
 lg proxy 7890                   # force outbound proxy into agy (`lg proxy off` restores direct default)
+lg remote 10.0.0.8:8787         # target a remote Liftgate gateway (`--api-key`, `lg remote local` resets)
 lg top                          # full-screen live TUI dashboard (aliases: tui, dash, monitor)
 lg up                           # start background gateway + embedded Web UI (full: start)
 lg up --open                    # start and open http://127.0.0.1:8787/ in your browser

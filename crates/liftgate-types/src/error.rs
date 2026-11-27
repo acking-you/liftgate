@@ -42,6 +42,45 @@ pub enum ProxyUrlError {
     UnbracketedIpv6Host,
 }
 
+/// Specific syntax or range failure when parsing a [`crate::config::GatewayEndpoint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum GatewayEndpointError {
+    #[error("gateway endpoint must not be empty")]
+    Empty,
+
+    #[error("gateway endpoint must not contain whitespace or control characters")]
+    WhitespaceOrControl,
+
+    #[error("port number must be an integer between 1 and 65535")]
+    InvalidPort,
+
+    #[error("endpoint scheme must be http:// (or omit scheme for <ip:port>)")]
+    UnsupportedScheme,
+
+    #[error(
+        "gateway endpoint must not embed URL userinfo credentials (`@`); pass `--api-key` instead"
+    )]
+    ContainsCredentials,
+
+    #[error("gateway endpoint must not contain a URL path beyond optional `/v1`")]
+    ContainsPath,
+
+    #[error("gateway endpoint host must not be empty")]
+    EmptyHost,
+
+    #[error("unclosed IPv6 bracket in gateway endpoint host")]
+    UnclosedIpv6Bracket,
+
+    #[error("IPv6 gateway endpoint host must not be empty")]
+    EmptyIpv6Host,
+
+    #[error("unexpected characters after IPv6 host bracket")]
+    UnexpectedAfterIpv6Bracket,
+
+    #[error("IPv6 endpoint host must be enclosed in brackets (e.g. [fd00::1]:8787)")]
+    UnbracketedIpv6Host,
+}
+
 /// Validation failures for wire, configuration, and identifier invariants.
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -79,6 +118,13 @@ pub enum ValidationError {
         value: String,
         #[source]
         source: ProxyUrlError,
+    },
+
+    #[error("invalid gateway endpoint `{value}`")]
+    InvalidGatewayEndpoint {
+        value: String,
+        #[source]
+        source: GatewayEndpointError,
     },
 }
 

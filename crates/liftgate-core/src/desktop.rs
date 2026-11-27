@@ -35,9 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use liftgate_server::platform::{
-    canonicalize_clean, is_executable_file, merge_loopback_no_proxy, split_expanded_path_var,
-};
+use liftgate_harness::merge_endpoint_no_proxy;
+use liftgate_server::platform::{canonicalize_clean, is_executable_file, split_expanded_path_var};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -50,7 +49,7 @@ use crate::client::DiscoveredModel;
 use crate::config_sync::{
     build_offline_codex_catalog_bytes_with_mode, merge_isolated_codex_app_config_toml,
 };
-use crate::daemon::{configure_detached_command, ensure_gateway_ready, is_pid_alive};
+use crate::daemon::{configure_detached_command, ensure_gateway_ready_for_target, is_pid_alive};
 use crate::error::{CliError, DesktopLaunchError};
 use crate::harness::resolve_codex_command;
 use crate::state::{StatePaths, now_unix_ms, user_home_dir, write_file_atomic};
@@ -374,9 +373,10 @@ pub async fn launch_codex_app(
         sweep_stale_desktop_sessions(state_paths);
     }
 
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         args.model.as_deref(),
         true,
@@ -484,11 +484,12 @@ pub async fn launch_codex_app(
     }
     launch_args.extend(args.passthrough_args.iter().cloned());
 
-    let merged_no_proxy = merge_loopback_no_proxy(
+    let merged_no_proxy = merge_endpoint_no_proxy(
         std::env::var("NO_PROXY")
             .ok()
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
+        Some(target.client.base_url()),
     );
     let mut extra_env: Vec<(String, String)> = vec![
         ("CODEX_HOME".to_owned(), codex_home.display().to_string()),
@@ -581,9 +582,10 @@ pub async fn launch_claude_desktop(
     // before snapshotting clean baseline files.
     let _ = force_restore_claude_desktop_sessions(state_paths);
 
-    let target = ensure_gateway_ready(
+    let target = ensure_gateway_ready_for_target(
         state_paths,
         args.listen,
+        args.remote.as_deref(),
         args.api_key.clone(),
         args.model.as_deref(),
         true,
@@ -630,11 +632,12 @@ pub async fn launch_claude_desktop(
         build_claude_desktop_3p_profile(&gateway_3p_url, &auth_token, &primary_model, &discovered);
     apply_claude_desktop_3p_profile(&path_sets, &profile_doc)?;
 
-    let merged_no_proxy = merge_loopback_no_proxy(
+    let merged_no_proxy = merge_endpoint_no_proxy(
         std::env::var("NO_PROXY")
             .ok()
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
+        Some(target.client.base_url()),
     );
     let extra_env = vec![
         ("NO_PROXY".to_owned(), merged_no_proxy.clone()),

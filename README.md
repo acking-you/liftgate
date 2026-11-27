@@ -115,6 +115,7 @@ Monitor live traffic, hot-switch models, or sync persistent configs from anywher
 
 ```bash
 lg agy                   # inspect `agy` version, login status, forced proxy & idle auto-update
+lg remote 10.0.0.8:8787  # route `lg cx`/`cc`/`oc`/`omp`/`top` to a remote Liftgate host (`lg remote local` resets)
 lg top                   # full-screen real-time terminal dashboard (turns, pool, models, logs)
 lg m -i                  # interactively filter & hot-switch default Antigravity model
 lg up --open             # start background gateway + open embedded Web dashboard

@@ -653,14 +653,19 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
     let mut fixed_overhead = 128usize;
     for msg in &stage4_work {
         fixed_overhead = fixed_overhead.saturating_add(16);
+        let is_assistant = msg.role == CanonicalRole::Assistant;
         for part in &msg.parts {
             match part {
                 CanonicalPart::Text(t) => {
                     let cleaned = strip_billing_noise(t);
                     let trimmed = cleaned.trim();
                     if !trimmed.is_empty() {
-                        variable_lens.push(trimmed.len());
-                        fixed_overhead = fixed_overhead.saturating_add(16);
+                        if is_assistant {
+                            fixed_overhead = fixed_overhead.saturating_add(trimmed.len() + 16);
+                        } else {
+                            variable_lens.push(trimmed.len());
+                            fixed_overhead = fixed_overhead.saturating_add(16);
+                        }
                     }
                 }
                 CanonicalPart::ToolResult {
@@ -675,11 +680,19 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                     call_id,
                     name,
                     arguments,
-                    ..
+                    is_custom,
                 } => {
-                    variable_lens.push(arguments.len());
-                    fixed_overhead = fixed_overhead
-                        .saturating_add(call_id.len() + name.len() + tool_nonce.len() * 2 + 96);
+                    // Never waterfill-truncate real assistant tool calls (`ToolCall` outputs):
+                    // reserve their full JSON-encoded wire length in `fixed_overhead` so caller
+                    // inputs/results absorb compaction without corrupting tool-call payloads.
+                    let encoded_args_len = if *is_custom {
+                        serde_json::to_string(arguments).map_or(arguments.len(), |s| s.len())
+                    } else {
+                        arguments.len()
+                    };
+                    fixed_overhead = fixed_overhead.saturating_add(
+                        call_id.len() + name.len() + encoded_args_len + tool_nonce.len() * 2 + 96,
+                    );
                 }
                 CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
             }
@@ -689,9 +702,13 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
     let available_var = budget.saturating_sub(fixed_overhead);
     let universal_cap = compute_waterfill_cap(&variable_lens, available_var).max(512);
     for (msg_idx, msg) in stage4_work.iter_mut().enumerate() {
+        let is_assistant = msg.role == CanonicalRole::Assistant;
         for (part_idx, part) in msg.parts.iter_mut().enumerate() {
             match part {
                 CanonicalPart::Text(text) => {
+                    if is_assistant {
+                        continue;
+                    }
                     let cleaned = strip_billing_noise(text);
                     let trimmed = cleaned.trim();
                     if trimmed.len() > universal_cap {
@@ -739,29 +756,9 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                         *output = trimmed.to_owned();
                     }
                 }
-                CanonicalPart::ToolCall {
-                    arguments,
-                    is_custom,
-                    ..
-                } => {
-                    if arguments.len() > universal_cap {
-                        let preview = truncate_head_tail_lines_with_spill(
-                            arguments,
-                            universal_cap.saturating_sub(96),
-                            "tool call arguments",
-                            spill,
-                        );
-                        if *is_custom {
-                            *arguments = preview;
-                        } else {
-                            *arguments = serde_json::json!({
-                                "_truncated_arguments_preview": preview
-                            })
-                            .to_string();
-                        }
-                    }
-                }
-                CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::ToolCall { .. }
+                | CanonicalPart::ImageBase64 { .. }
+                | CanonicalPart::Reasoning(_) => {}
             }
         }
     }
@@ -901,12 +898,22 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
                     emit_images: false,
                 },
             )
+        } else if idx >= history_slice.len().saturating_sub(4) && budget >= 48_000 {
+            (
+                2,
+                PartRenderLimits {
+                    max_text_bytes: 12_000,
+                    max_tool_call_bytes: 24_000,
+                    max_tool_result_bytes: 6_000,
+                    emit_images: false,
+                },
+            )
         } else if idx >= recent_tail_start {
             (
                 2,
                 PartRenderLimits {
                     max_text_bytes: 4_000,
-                    max_tool_call_bytes: 2_000,
+                    max_tool_call_bytes: 6_000,
                     max_tool_result_bytes: 3_200,
                     emit_images: false,
                 },

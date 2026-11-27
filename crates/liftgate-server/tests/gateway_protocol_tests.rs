@@ -10614,3 +10614,208 @@ async fn anthropic_messages_claude_code_profile_virtualizes_pascal_families_plug
     assert_eq!(pool_snap.total_sessions_created, 1);
     assert_eq!(pool_snap.mcp_continuations, 3);
 }
+
+#[tokio::test]
+async fn mcp_tool_spill_below_10kb_cliff_zero_rtt_read_context_spill_and_no_false_compaction_retire()
+ {
+    let large_file_output = (1..=320)
+        .map(|ln| format!("line_{ln:03}: pub fn exact_symbol_{ln:03}() -> usize {{ {ln} }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        large_file_output.len() > 14_000,
+        "output must exceed 9.6KB inline spill threshold"
+    );
+    let expected_spill_name = liftgate_types::session_key::format_content_addressed_spill_filename(
+        "tool_result:exec_command",
+        &large_file_output,
+    );
+
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        // Turn 1:
+        // Step 1 (`usage_used = 300_000`): calls `exec_command` -> receives >14KB output spilled <9.6KB
+        // Step 2 (0-RTT inside same prompt): calls `read_context_spill` on `expected_spill_name`
+        // Step 3 (`usage_used = 0` on FinalReply, cumulative `final_usage.total_tokens = 1_850_000`
+        //         across internal subcalls): must NOT poison `last_context_used`!
+        MockScript::McpInteractive {
+            steps: vec![
+                McpMockStep::CallTool {
+                    usage_used: 300_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "exec_command".to_owned(),
+                    arguments: json!({ "cmd": "cat src/planner.rs" }),
+                    expect_reply_substrings: vec![
+                        "mcp_lg_read_context_spill",
+                        "tool-result-exec-command-",
+                    ],
+                },
+                McpMockStep::CallTool {
+                    usage_used: 302_000,
+                    thoughts: vec![],
+                    pre_text_templates: vec![],
+                    mcp_name: "read_context_spill".to_owned(),
+                    arguments: json!({
+                        "path": expected_spill_name,
+                        "start_line": 150,
+                        "max_lines": 5
+                    }),
+                    expect_reply_substrings: vec![
+                        "lines 150..=154 of 320",
+                        "L150: line_150: pub fn exact_symbol_150()",
+                        "L154: line_154: pub fn exact_symbol_154()",
+                    ],
+                },
+                McpMockStep::FinalReply {
+                    usage_used: 0,
+                    thoughts: vec![],
+                    chunks_template: vec!["Read middle lines 150..154 losslessly.".to_owned()],
+                    final_usage: AcpUsage {
+                        input_tokens: 48_000,
+                        output_tokens: 2_000,
+                        cached_read_tokens: 1_800_000,
+                        cached_write_tokens: 0,
+                        thought_tokens: 400,
+                        total_tokens: 1_850_000,
+                    },
+                },
+            ],
+            cancelled_usage: AcpUsage::default(),
+        },
+        // Turn 2: Follow-up turn emits `UsageUpdate { used: 306_000 }` (`306k * 2 = 612k`).
+        // Previously `last_context_used` was poisoned to `1_850_000`, causing `612k < 1_850_000`
+        // to falsely retire `sess_1` as internally compacted! Now `sess_1` stays warm!
+        MockScript::ImmediateWithUsage {
+            usage_updates: vec![(306_000, 1_048_576)],
+            chunks_template: vec!["Warm session preserved without false compaction!".to_owned()],
+        },
+    ]));
+
+    let spill_dir =
+        std::env::temp_dir().join(format!("liftgate-mcp-spill-e2e-{}", uuid::Uuid::new_v4()));
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    state.config.spill_dir = Some(spill_dir.clone());
+    let app = build_router(state.clone());
+
+    let tools = json!([
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Execute command",
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        }
+    ]);
+
+    // Step 1a: initial user request -> suspends on `exec_command`
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "tools": tools,
+                        "input": "Inspect planner.rs lines 150..154"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp1_id = b1["id"].as_str().unwrap().to_owned();
+    let call_id = b1["output"][0]["call_id"].as_str().unwrap().to_owned();
+
+    // Step 1b: client returns >14KB tool output -> gateway spills <9.6KB, serves `read_context_spill`
+    // in 0-RTT (never forwarded to client!), and finishes Turn 1 with bounded single-window usage!
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp1_id,
+                        "tools": tools,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": large_file_output
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let b2: Value =
+        serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let resp2_id = b2["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        b2["output"][0]["content"][0]["text"],
+        "Read middle lines 150..154 losslessly."
+    );
+    let reported_total = b2["usage"]["total_tokens"].as_u64().unwrap();
+    assert!(
+        reported_total < 500_000,
+        "wire total_tokens must reflect single-window occupancy instead of 1.85M multi-subcall sum, got {reported_total}"
+    );
+
+    // Turn 2: Follow-up request reuses warm `sess_1` (`total_sessions_created == 1`, 0 retirements!)
+    let r3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "stream": false,
+                        "store": true,
+                        "previous_response_id": resp2_id,
+                        "tools": tools,
+                        "input": "Now summarize what you found."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    let b3: Value =
+        serde_json::from_slice(&r3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        b3["output"][0]["content"][0]["text"],
+        "Warm session preserved without false compaction!"
+    );
+
+    let pool_snap = state.pool.snapshot();
+    assert_eq!(
+        pool_snap.total_sessions_created, 1,
+        "warm session must not be falsely retired as compacted after multi-subcall MCP turn"
+    );
+    assert_eq!(pool_snap.total_sessions_closed_or_evicted, 0);
+
+    let _ = std::fs::remove_dir_all(&spill_dir);
+}

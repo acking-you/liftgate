@@ -10,9 +10,11 @@ use serde_json::{Map, Value};
 use crate::cli::{
     ConfigArgs, ConfigTarget, PLACEHOLDER_API_KEY, ServeArgs, normalize_optional_api_key,
 };
-use crate::daemon::{ensure_gateway_ready, resolve_client_api_key};
+use crate::daemon::{ensure_gateway_ready_for_target, resolve_client_api_key};
 use crate::error::CliError;
-use crate::state::{StatePaths, format_connect_url};
+use crate::state::{
+    EffectiveTargetMode, StatePaths, format_connect_url, resolve_effective_target_mode,
+};
 
 pub use liftgate_harness::claude::{
     build_claude_settings_map, merged_claude_settings_into, strip_claude_settings,
@@ -447,12 +449,21 @@ pub async fn execute_config_sync(
         });
     }
 
+    let settings = state_paths.read_settings()?;
+    let effective_target = resolve_effective_target_mode(
+        args.listen,
+        args.remote.as_deref(),
+        args.api_key.as_deref(),
+        &settings,
+    )?;
+
     let live_target = if args.offline {
         None
     } else {
-        match ensure_gateway_ready(
+        match ensure_gateway_ready_for_target(
             state_paths,
             args.listen,
+            args.remote.as_deref(),
             args.api_key.clone(),
             args.model.as_deref(),
             !args.print,
@@ -474,12 +485,16 @@ pub async fn execute_config_sync(
 
     let gateway_base_url = if let Some(t) = &live_target {
         t.client.base_url().to_owned()
+    } else if let EffectiveTargetMode::Remote { ref endpoint, .. } = effective_target {
+        endpoint.base_url().to_owned()
     } else {
         format_connect_url(resolved_listen)
     };
 
     let configured_api_key = if let Some(t) = &live_target {
         normalize_optional_api_key(t.api_key.as_deref())
+    } else if let EffectiveTargetMode::Remote { ref api_key, .. } = effective_target {
+        normalize_optional_api_key(api_key.as_deref())
     } else {
         resolve_client_api_key(args.api_key.as_deref(), daemon.as_ref(), resolved_listen)
     };

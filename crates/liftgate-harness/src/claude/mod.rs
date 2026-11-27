@@ -13,7 +13,7 @@ use crate::{DiscoveredModel, HarnessSyncParams};
 pub mod invocation;
 use crate::error::HarnessError;
 use crate::fs_util::{
-    backup_once_if_exists, merge_loopback_no_proxy, read_existing_json_object, resolve_base_dir,
+    backup_once_if_exists, merge_endpoint_no_proxy, read_existing_json_object, resolve_base_dir,
     user_home_dir, write_file_atomic,
 };
 use crate::resolve::{HarnessLookupSpec, ResolvedCommand, resolve_harness_command};
@@ -85,11 +85,12 @@ pub fn merged_claude_settings_into(existing: &mut Map<String, Value>, params: &H
         }
     }
 
-    let no_proxy = merge_loopback_no_proxy(
+    let no_proxy = merge_endpoint_no_proxy(
         std::env::var("NO_PROXY")
             .ok()
             .or_else(|| std::env::var("no_proxy").ok())
             .as_deref(),
+        Some(&params.gateway_base_url),
     );
 
     let env_entry = existing

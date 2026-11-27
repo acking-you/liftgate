@@ -20,21 +20,24 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
         ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, ConfigArgs, DoctorArgs, LogsArgs,
-        ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RestartArgs, ServeArgs, StartArgs,
-        StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
+        ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RemoteArgs, RestartArgs, ServeArgs,
+        StartArgs, StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
     },
     client::GatewayClient,
     config_sync::execute_config_sync,
     daemon::{
         AliasActionStatus, GatewayStatusMode, build_authenticated_dashboard_url, clear_gateway_log,
-        execute_alias, inspect_doctor, inspect_gateway_status, inspect_models, is_pid_alive,
-        open_browser, read_log_tail, resolve_client_api_key, resolve_ui_target, restart_daemon,
-        start_daemon, stop_daemon,
+        execute_alias, execute_remote, inspect_doctor, inspect_gateway_status, inspect_models,
+        is_pid_alive, open_browser, read_log_tail, resolve_client_api_key, resolve_ui_target,
+        restart_daemon, start_daemon, stop_daemon,
     },
     desktop::{DesktopLaunchOutcome, launch_claude_desktop, launch_codex_app},
     error::CliError,
     harness,
-    state::{DaemonState, StatePaths, resolve_effective_agy_bin, resolve_effective_agy_proxy},
+    state::{
+        DaemonState, EffectiveTargetMode, StatePaths, resolve_effective_agy_bin,
+        resolve_effective_agy_proxy, resolve_effective_target_mode,
+    },
     upgrade::{TransferProgress, execute_upgrade_with_progress},
 };
 use liftgate_types::telemetry::{TaskPhase, TaskProtocol};
@@ -150,6 +153,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         let payload = json!({
             "status": report.mode.status_label(),
             "healthy": report.healthy,
+            "is_remote": report.is_remote,
             "pid": report.pid,
             "gateway_url": report.gateway_url,
             "dashboard_url": report.dashboard_url,
@@ -179,7 +183,7 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
 
     let pill_tone = match report.mode {
         GatewayStatusMode::Managed => Tone::Ok,
-        GatewayStatusMode::External => Tone::Info,
+        GatewayStatusMode::External | GatewayStatusMode::Remote => Tone::Info,
         GatewayStatusMode::Offline => Tone::Err,
     };
     ui::banner(
@@ -208,6 +212,12 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         }
         (Some(path), None) => {
             ui::kv("Antigravity CLI", &path.display().to_string());
+        }
+        (None, Some(ver)) if report.is_remote => {
+            ui::kv("Antigravity CLI", &format!("v{ver}  (remote host)"));
+        }
+        (None, None) if report.is_remote => {
+            ui::kv("Antigravity CLI", "managed on remote host");
         }
         (None, _) => {
             ui::kv(
@@ -259,7 +269,9 @@ pub async fn run_status(state_paths: &StatePaths, args: StatusArgs) -> Result<()
         "Context Policy",
         "native single-turn (500k Gemini / 200k Claude / 128k GPT-OSS)",
     );
-    ui::kv("Service Log", &report.log_file.display().to_string());
+    if !report.is_remote {
+        ui::kv("Service Log", &report.log_file.display().to_string());
+    }
 
     if let Some(snap) = report.telemetry {
         println!();
@@ -475,36 +487,58 @@ pub async fn run_logs(state_paths: &StatePaths, args: LogsArgs) -> Result<(), Cl
     }
 
     if args.acp {
-        let daemon = state_paths.read_daemon().ok().flatten();
-        let active_daemon = daemon.as_ref().filter(|d| is_pid_alive(d.pid));
-        let mut candidate_addrs = Vec::with_capacity(2);
-        if let Some(d) = active_daemon {
-            candidate_addrs.push(d.listen);
-        } else {
-            if let Some(d) = daemon.as_ref() {
-                candidate_addrs.push(d.listen);
-            }
-            let default_listen = ServeArgs::default().listen;
-            if !candidate_addrs.contains(&default_listen) {
-                candidate_addrs.push(default_listen);
-            }
-        }
-
-        for listen in candidate_addrs {
-            let key = resolve_client_api_key(None, active_daemon, listen);
-            let client = GatewayClient::new(listen, key);
-            if let Ok(snap) = client.fetch_telemetry().await {
-                if !snap.acp_process.recent_stderr.is_empty() {
-                    ui::section("`agy acp` Recent Stderr");
-                    for entry in &snap.acp_process.recent_stderr {
-                        ui::print_log_line(&format!(
-                            "{}  {}",
-                            ui::format_utc_hms(entry.timestamp_unix_ms),
-                            entry.line
-                        ));
-                    }
+        let settings = state_paths.read_settings().unwrap_or_default();
+        if let Ok(EffectiveTargetMode::Remote { endpoint, api_key }) = resolve_effective_target_mode(
+            None,
+            args.remote.as_deref(),
+            args.api_key.as_deref(),
+            &settings,
+        ) {
+            let client = GatewayClient::from_endpoint(endpoint, api_key);
+            if let Ok(snap) = client.fetch_telemetry().await
+                && !snap.acp_process.recent_stderr.is_empty()
+            {
+                ui::section("`agy acp` Recent Stderr (Remote)");
+                for entry in &snap.acp_process.recent_stderr {
+                    ui::print_log_line(&format!(
+                        "{}  {}",
+                        ui::format_utc_hms(entry.timestamp_unix_ms),
+                        entry.line
+                    ));
                 }
-                break;
+            }
+        } else {
+            let daemon = state_paths.read_daemon().ok().flatten();
+            let active_daemon = daemon.as_ref().filter(|d| is_pid_alive(d.pid));
+            let mut candidate_addrs = Vec::with_capacity(2);
+            if let Some(d) = active_daemon {
+                candidate_addrs.push(d.listen);
+            } else {
+                if let Some(d) = daemon.as_ref() {
+                    candidate_addrs.push(d.listen);
+                }
+                let default_listen = ServeArgs::default().listen;
+                if !candidate_addrs.contains(&default_listen) {
+                    candidate_addrs.push(default_listen);
+                }
+            }
+
+            for listen in candidate_addrs {
+                let key = resolve_client_api_key(args.api_key.as_deref(), active_daemon, listen);
+                let client = GatewayClient::new(listen, key);
+                if let Ok(snap) = client.fetch_telemetry().await {
+                    if !snap.acp_process.recent_stderr.is_empty() {
+                        ui::section("`agy acp` Recent Stderr");
+                        for entry in &snap.acp_process.recent_stderr {
+                            ui::print_log_line(&format!(
+                                "{}  {}",
+                                ui::format_utc_hms(entry.timestamp_unix_ms),
+                                entry.line
+                            ));
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -605,6 +639,12 @@ pub async fn run_models(state_paths: &StatePaths, args: ModelsArgs) -> Result<()
             );
             return Ok(());
         }
+        if report.is_remote {
+            return Err(CliError::UnsupportedInRemoteMode {
+                operation: "lg models --pick",
+                endpoint: report.gateway_url,
+            });
+        }
         let managed_running = state_paths
             .read_daemon()?
             .is_some_and(|d| is_pid_alive(d.pid));
@@ -673,6 +713,7 @@ pub async fn run_claude_cli(state_paths: &StatePaths, args: ClaudeArgs) -> Resul
             state_paths,
             ClaudeDesktopArgs {
                 listen: args.listen,
+                remote: args.remote,
                 api_key: args.api_key,
                 model: args.model,
                 restart_app: args.restart_app,
@@ -693,6 +734,7 @@ pub async fn run_codex_cli(state_paths: &StatePaths, args: CodexArgs) -> Result<
             state_paths,
             CodexAppArgs {
                 listen: args.listen,
+                remote: args.remote,
                 api_key: args.api_key,
                 model: args.model,
                 no_bypass: args.no_bypass,
@@ -1128,6 +1170,111 @@ pub async fn run_proxy(state_paths: &StatePaths, args: ProxyArgs) -> Result<(), 
             &format!("{bin} proxy socks5://127.0.0.1:1080"),
         );
         ui::cmd_hint("Disable proxy (default)", &format!("{bin} proxy off"));
+    }
+    Ok(())
+}
+
+pub async fn run_remote(state_paths: &StatePaths, args: RemoteArgs) -> Result<(), CliError> {
+    let sp = (!args.json && !args.no_verify)
+        .then(|| Spinner::start("Inspecting Liftgate gateway target…"));
+    let out_res = execute_remote(state_paths, &args).await;
+    if let Some(s) = sp {
+        s.finish_and_clear().await;
+    }
+    let out = out_res?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_owned())
+        );
+        return Ok(());
+    }
+
+    let bin = invoked_bin_name();
+    if out.updated {
+        match &out.configured_endpoint {
+            Some(ep) => ui::headline(
+                Tone::Ok,
+                &format!("Configured remote Liftgate endpoint -> {ep}/"),
+            ),
+            None => ui::headline(
+                Tone::Ok,
+                "Switched Liftgate target back to local managed daemon mode",
+            ),
+        }
+    } else {
+        let badge = if out.effective_is_remote {
+            (Tone::Info, "REMOTE ENDPOINT")
+        } else {
+            (Tone::Ok, "LOCAL DAEMON")
+        };
+        ui::banner("Liftgate Target Routing", Some(badge), None);
+    }
+
+    ui::kv_accent(
+        "Active Target",
+        &format!(
+            "{}/ ({})",
+            out.effective_endpoint,
+            if out.effective_is_remote {
+                "remote"
+            } else {
+                "local"
+            }
+        ),
+    );
+    ui::kv(
+        "Saved Remote",
+        out.configured_endpoint
+            .as_deref()
+            .unwrap_or("none (local daemon by default)"),
+    );
+    ui::kv(
+        "Saved API Key",
+        if out.has_saved_api_key {
+            "configured (Bearer)"
+        } else {
+            "none"
+        },
+    );
+    if let Some(ref env_val) = out.env_override {
+        ui::kv("Env Override", env_val);
+    }
+    ui::kv("Settings File", &out.settings_file.display().to_string());
+
+    if let Some(probe) = &out.probe {
+        if probe.healthy {
+            let model_str = probe.default_model.as_deref().unwrap_or("unknown");
+            let cnt_str = probe
+                .live_model_count
+                .map_or_else(String::new, |n| format!(", {n} live models"));
+            ui::headline(
+                Tone::Ok,
+                &format!(
+                    "Remote gateway reachable in {} (default={model_str}{cnt_str})",
+                    ui::format_latency_ms(probe.latency_ms)
+                ),
+            );
+        } else {
+            ui::note(
+                Tone::Warn,
+                "Remote gateway did not respond to `/healthz` yet.",
+            );
+        }
+    }
+
+    if !out.updated {
+        println!();
+        ui::cmd_hint(
+            "Target a remote Liftgate host",
+            &format!("{bin} remote 192.168.1.50:8787"),
+        );
+        ui::cmd_hint(
+            "One-off override for any harness",
+            &format!("{bin} cx --remote 192.168.1.50:8787"),
+        );
+        ui::cmd_hint("Reset to local daemon", &format!("{bin} remote local"));
     }
     Ok(())
 }

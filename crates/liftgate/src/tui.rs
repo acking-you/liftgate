@@ -41,11 +41,14 @@ use liftgate_core::cli::{RestartArgs, ServeArgs, TopArgs};
 use liftgate_core::client::{DiscoveredModel, GatewayClient};
 use liftgate_core::config_sync::resolve_fast_model;
 use liftgate_core::daemon::{
-    build_authenticated_dashboard_url, ensure_gateway_ready, is_pid_alive, open_browser,
+    build_authenticated_dashboard_url, ensure_gateway_ready_for_target, is_pid_alive, open_browser,
     read_log_tail, resolve_client_api_key, restart_daemon, start_daemon, stop_daemon,
 };
 use liftgate_core::error::CliError;
-use liftgate_core::state::{StatePaths, format_connect_url, now_unix_ms, write_file_atomic};
+use liftgate_core::state::{
+    EffectiveTargetMode, StatePaths, format_connect_url, now_unix_ms,
+    resolve_effective_target_mode, write_file_atomic,
+};
 use liftgate_server::title_model::title_model;
 use liftgate_types::config::ModelId;
 use liftgate_types::error::format_error_chain;
@@ -262,6 +265,7 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
 struct CockpitSummary {
     healthy: bool,
     managed: bool,
+    is_remote: bool,
     pid: Option<u32>,
     endpoint: String,
     default_model: String,
@@ -279,13 +283,27 @@ struct CockpitSummary {
 
 async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
     let local_agy = liftgate_core::agy_manager::quick_local_agy_summary(state_paths, None).await;
+    let settings = state_paths.read_settings().unwrap_or_default();
     let daemon = state_paths.read_daemon().ok().flatten();
     let default_serve = ServeArgs::default();
-    let listen = daemon.as_ref().map_or(default_serve.listen, |d| d.listen);
-    let api_key = resolve_client_api_key(None, daemon.as_ref(), listen);
-    let client = GatewayClient::new(listen, api_key);
-    let managed_alive = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
-    let healthy = client.check_health(Duration::from_millis(350)).await;
+    let (client, managed_alive, is_remote) =
+        match resolve_effective_target_mode(None, None, None, &settings) {
+            Ok(EffectiveTargetMode::Remote { endpoint, api_key }) => {
+                (GatewayClient::from_endpoint(endpoint, api_key), false, true)
+            }
+            _ => {
+                let listen = daemon.as_ref().map_or(default_serve.listen, |d| d.listen);
+                let api_key = resolve_client_api_key(None, daemon.as_ref(), listen);
+                let alive = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
+                (GatewayClient::new(listen, api_key), alive, false)
+            }
+        };
+    let probe_dur = if is_remote {
+        Duration::from_millis(900)
+    } else {
+        Duration::from_millis(350)
+    };
+    let healthy = client.check_health(probe_dur).await;
     let snap = if healthy {
         client.fetch_telemetry().await.ok()
     } else {
@@ -296,9 +314,9 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
         .as_ref()
         .map(|s| s.acp_process.default_model.clone())
         .or_else(|| {
-            daemon
-                .as_ref()
-                .map(|d| d.default_model.clone())
+            (!is_remote)
+                .then(|| daemon.as_ref().map(|d| d.default_model.clone()))
+                .flatten()
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or(default_serve.default_model);
@@ -327,6 +345,7 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
     CockpitSummary {
         healthy,
         managed: healthy && managed_alive,
+        is_remote,
         pid: daemon
             .as_ref()
             .filter(|_| managed_alive)
@@ -349,7 +368,7 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
                 .total_input_tokens
                 .saturating_add(s.metrics.total_output_tokens)
         }),
-        agy_installed: local_agy.binary_path.is_some(),
+        agy_installed: local_agy.binary_path.is_some() || (is_remote && healthy),
         agy_version,
         agy_proxy,
         agy_auto_update,
@@ -440,7 +459,9 @@ fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mu
         .split(area);
 
     let status_spans = if summary.healthy {
-        let mode_tag = if summary.managed {
+        let mode_tag = if summary.is_remote {
+            "remote"
+        } else if summary.managed {
             "managed"
         } else {
             "external"
@@ -974,6 +995,7 @@ fn draw_model_picker(
 struct PolledData {
     healthy: bool,
     managed: bool,
+    is_remote: bool,
     daemon_pid: Option<u32>,
     gateway_url: String,
     dashboard_url: String,
@@ -1078,22 +1100,98 @@ impl TopApp {
     }
 }
 
+struct ResolvedTuiClient {
+    client: GatewayClient,
+    daemon: Option<liftgate_core::state::DaemonState>,
+    listen_opt: Option<SocketAddr>,
+    api_key: Option<String>,
+    is_remote: bool,
+}
+
+fn resolve_tui_gateway_client(
+    state_paths: &StatePaths,
+    explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
+    explicit_key: Option<&str>,
+) -> Result<ResolvedTuiClient, CliError> {
+    let settings = state_paths.read_settings().unwrap_or_default();
+    match resolve_effective_target_mode(explicit_listen, explicit_remote, explicit_key, &settings)?
+    {
+        EffectiveTargetMode::Remote { endpoint, api_key } => {
+            let listen_opt = endpoint.socket_addr();
+            let client = GatewayClient::from_endpoint(endpoint, api_key.clone());
+            Ok(ResolvedTuiClient {
+                client,
+                daemon: None,
+                listen_opt,
+                api_key,
+                is_remote: true,
+            })
+        }
+        EffectiveTargetMode::Local {
+            explicit_listen: local_listen,
+        } => {
+            let daemon = state_paths.read_daemon().ok().flatten();
+            let default_serve = ServeArgs::default();
+            let listen = local_listen
+                .or_else(|| daemon.as_ref().map(|d| d.listen))
+                .unwrap_or(default_serve.listen);
+            let api_key = resolve_client_api_key(explicit_key, daemon.as_ref(), listen);
+            let client = GatewayClient::new(listen, api_key.clone());
+            Ok(ResolvedTuiClient {
+                client,
+                daemon,
+                listen_opt: Some(listen),
+                api_key,
+                is_remote: false,
+            })
+        }
+    }
+}
+
 async fn poll_gateway_snapshot(
     state_paths: &StatePaths,
     explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
     explicit_key: Option<&str>,
 ) -> PolledData {
-    let daemon = state_paths.read_daemon().ok().flatten();
     let default_serve = ServeArgs::default();
-    let listen = explicit_listen
-        .or_else(|| daemon.as_ref().map(|d| d.listen))
-        .unwrap_or(default_serve.listen);
-    let api_key = resolve_client_api_key(explicit_key, daemon.as_ref(), listen);
-    let client = GatewayClient::new(listen, api_key.clone());
-    let managed_alive = daemon
-        .as_ref()
-        .is_some_and(|d| d.listen == listen && is_pid_alive(d.pid));
-    let healthy = client.check_health(Duration::from_millis(600)).await;
+    let ResolvedTuiClient {
+        client,
+        daemon,
+        listen_opt,
+        api_key,
+        is_remote,
+    } = match resolve_tui_gateway_client(
+        state_paths,
+        explicit_listen,
+        explicit_remote,
+        explicit_key,
+    ) {
+        Ok(res) => res,
+        Err(_) => {
+            let addr = explicit_listen.unwrap_or(default_serve.listen);
+            ResolvedTuiClient {
+                client: GatewayClient::new(addr, None),
+                daemon: None,
+                listen_opt: Some(addr),
+                api_key: None,
+                is_remote: false,
+            }
+        }
+    };
+    let managed_alive = !is_remote
+        && listen_opt.is_some_and(|l| {
+            daemon
+                .as_ref()
+                .is_some_and(|d| d.listen == l && is_pid_alive(d.pid))
+        });
+    let timeout_dur = if is_remote {
+        Duration::from_millis(1200)
+    } else {
+        Duration::from_millis(600)
+    };
+    let healthy = client.check_health(timeout_dur).await;
 
     let telemetry = if healthy {
         client.fetch_telemetry().await.ok()
@@ -1125,12 +1223,13 @@ async fn poll_gateway_snapshot(
 
     let dashboard_base = daemon
         .as_ref()
+        .filter(|_| managed_alive)
         .map_or_else(|| client.base_url().to_owned(), |d| d.dashboard_base_url());
     let dashboard_url =
         build_authenticated_dashboard_url(&dashboard_base, client.base_url(), api_key.as_deref());
 
     let log_file = state_paths.log_file();
-    let service_log_lines = if log_file.is_file() {
+    let service_log_lines = if !is_remote && log_file.is_file() {
         read_log_tail(&log_file, 120)
             .unwrap_or_default()
             .lines()
@@ -1143,6 +1242,7 @@ async fn poll_gateway_snapshot(
     PolledData {
         healthy,
         managed: healthy && managed_alive,
+        is_remote,
         daemon_pid: daemon.as_ref().filter(|_| managed_alive).map(|d| d.pid),
         gateway_url: format!("{}/", client.base_url()),
         dashboard_url,
@@ -1159,11 +1259,24 @@ async fn poll_gateway_snapshot(
 /// Runs the full-screen real-time observability dashboard (`lg top` / `lg tui`).
 pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliError> {
     if args.auto_start {
-        let _ = ensure_gateway_ready(state_paths, args.listen, args.api_key.clone(), None, true)
-            .await?;
+        let _ = ensure_gateway_ready_for_target(
+            state_paths,
+            args.listen,
+            args.remote.as_deref(),
+            args.api_key.clone(),
+            None,
+            true,
+        )
+        .await?;
     }
 
-    let initial = poll_gateway_snapshot(state_paths, args.listen, args.api_key.as_deref()).await;
+    let initial = poll_gateway_snapshot(
+        state_paths,
+        args.listen,
+        args.remote.as_deref(),
+        args.api_key.as_deref(),
+    )
+    .await;
     let mut session = TerminalSession::enter("live terminal dashboard (`lg top`)")?;
     let mut app = TopApp::new(initial);
 
@@ -1175,6 +1288,7 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
     let mut tasks = JoinSet::new();
     let poll_paths = state_paths.clone();
     let poll_listen = args.listen;
+    let poll_remote = args.remote.clone();
     let poll_key = args.api_key.clone();
     let poll_interval = Duration::from_millis(args.interval_ms.max(250));
     tasks.spawn(async move {
@@ -1188,7 +1302,13 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                 }
                 () = tokio::time::sleep(poll_interval) => {}
             }
-            let snap = poll_gateway_snapshot(&poll_paths, poll_listen, poll_key.as_deref()).await;
+            let snap = poll_gateway_snapshot(
+                &poll_paths,
+                poll_listen,
+                poll_remote.as_deref(),
+                poll_key.as_deref(),
+            )
+            .await;
             if data_tx.send(snap).await.is_err() {
                 break;
             }
@@ -1197,91 +1317,120 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
 
     let worker_paths = state_paths.clone();
     let worker_listen = args.listen;
+    let worker_remote = args.remote.clone();
     let worker_key = args.api_key.clone();
     let worker_refresh = refresh_tx.clone();
     tasks.spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let outcome: Result<String, TuiActionError> = match cmd {
                 TuiCommand::CloseSession(sess_id) => {
-                    let daemon = worker_paths.read_daemon().ok().flatten();
-                    let addr = worker_listen
-                        .or_else(|| daemon.as_ref().map(|d| d.listen))
-                        .unwrap_or_else(|| ServeArgs::default().listen);
-                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
-                    let client = GatewayClient::new(addr, key);
-                    match client.close_idle_session(&sess_id).await {
-                        Ok(true) => Ok(format!("Closed session {sess_id}")),
-                        Ok(false) => Err(TuiActionError::SessionInactiveOrClosed {
-                            session_id: sess_id,
-                        }),
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) => match resolved.client.close_idle_session(&sess_id).await {
+                            Ok(true) => Ok(format!("Closed session {sess_id}")),
+                            Ok(false) => Err(TuiActionError::SessionInactiveOrClosed {
+                                session_id: sess_id,
+                            }),
+                            Err(err) => Err(TuiActionError::Cli(err)),
+                        },
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
                 TuiCommand::ToggleVisionOffload => {
-                    let daemon = worker_paths.read_daemon().ok().flatten();
-                    let addr = worker_listen
-                        .or_else(|| daemon.as_ref().map(|d| d.listen))
-                        .unwrap_or_else(|| ServeArgs::default().listen);
-                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
-                    let client = GatewayClient::new(addr, key);
-                    match client.set_vision_offload(None).await {
-                        Ok(enabled) => {
-                            if let Ok(mut settings) = worker_paths.read_settings() {
-                                settings.vision_offload = enabled;
-                                let _ = worker_paths.write_settings(&settings);
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) => match resolved.client.set_vision_offload(None).await {
+                            Ok(enabled) => {
+                                if !resolved.is_remote {
+                                    if let Ok(mut settings) = worker_paths.read_settings() {
+                                        settings.vision_offload = enabled;
+                                        let _ = worker_paths.write_settings(&settings);
+                                    }
+                                    if let (Some(mut d), Some(addr)) =
+                                        (resolved.daemon, resolved.listen_opt)
+                                        && d.listen == addr
+                                    {
+                                        d.vision_offload = enabled;
+                                        let _ = worker_paths.write_daemon(&d);
+                                    }
+                                }
+                                Ok(format!(
+                                    "Vision offload (>=300k ephemeral sub-session): {}",
+                                    if enabled { "ON" } else { "OFF" }
+                                ))
                             }
-                            if let Some(mut d) = daemon
-                                && d.listen == addr
-                            {
-                                d.vision_offload = enabled;
-                                let _ = worker_paths.write_daemon(&d);
-                            }
-                            Ok(format!(
-                                "Vision offload (>=300k ephemeral sub-session): {}",
-                                if enabled { "ON" } else { "OFF" }
-                            ))
-                        }
+                            Err(err) => Err(TuiActionError::Cli(err)),
+                        },
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
                 TuiCommand::ToggleMcpToolBridge => {
-                    let daemon = worker_paths.read_daemon().ok().flatten();
-                    let addr = worker_listen
-                        .or_else(|| daemon.as_ref().map(|d| d.listen))
-                        .unwrap_or_else(|| ServeArgs::default().listen);
-                    let key = resolve_client_api_key(worker_key.as_deref(), daemon.as_ref(), addr);
-                    let client = GatewayClient::new(addr, key);
-                    match client.set_mcp_tool_bridge(None).await {
-                        Ok(enabled) => {
-                            if let Ok(mut settings) = worker_paths.read_settings() {
-                                settings.mcp_tool_bridge = enabled;
-                                let _ = worker_paths.write_settings(&settings);
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) => match resolved.client.set_mcp_tool_bridge(None).await {
+                            Ok(enabled) => {
+                                if !resolved.is_remote {
+                                    if let Ok(mut settings) = worker_paths.read_settings() {
+                                        settings.mcp_tool_bridge = enabled;
+                                        let _ = worker_paths.write_settings(&settings);
+                                    }
+                                    if let (Some(mut d), Some(addr)) =
+                                        (resolved.daemon, resolved.listen_opt)
+                                        && d.listen == addr
+                                    {
+                                        d.mcp_tool_bridge = enabled;
+                                        let _ = worker_paths.write_daemon(&d);
+                                    }
+                                }
+                                Ok(format!(
+                                    "MCP Tool Bridge (loopback suspension): {}",
+                                    if enabled { "ON" } else { "OFF" }
+                                ))
                             }
-                            if let Some(mut d) = daemon
-                                && d.listen == addr
-                            {
-                                d.mcp_tool_bridge = enabled;
-                                let _ = worker_paths.write_daemon(&d);
-                            }
-                            Ok(format!(
-                                "MCP Tool Bridge (loopback suspension): {}",
-                                if enabled { "ON" } else { "OFF" }
-                            ))
-                        }
+                            Err(err) => Err(TuiActionError::Cli(err)),
+                        },
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
                 TuiCommand::SwitchDefaultModel(model_id) => {
-                    let restart_args = RestartArgs {
-                        listen: worker_listen,
-                        default_model: Some(model_id.clone()),
-                        api_key: worker_key.clone(),
-                        ..RestartArgs::default()
-                    };
-                    restart_daemon(&worker_paths, restart_args)
-                        .await
-                        .map(|_| format!("Switched default model to {model_id}"))
-                        .map_err(TuiActionError::Cli)
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) if resolved.is_remote => {
+                            Err(TuiActionError::Cli(CliError::UnsupportedInRemoteMode {
+                                operation: "daemon restart / default model switch",
+                                endpoint: resolved.client.base_url().to_owned(),
+                            }))
+                        }
+                        Ok(_) => {
+                            let restart_args = RestartArgs {
+                                listen: worker_listen,
+                                default_model: Some(model_id.clone()),
+                                api_key: worker_key.clone(),
+                                ..RestartArgs::default()
+                            };
+                            restart_daemon(&worker_paths, restart_args)
+                                .await
+                                .map(|_| format!("Switched default model to {model_id}"))
+                                .map_err(TuiActionError::Cli)
+                        }
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
                 }
                 TuiCommand::SetTitleModel(model_id) => {
                     write_file_atomic(&worker_paths.title_model_file(), model_id.as_bytes(), false)
@@ -1289,48 +1438,82 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         .map_err(TuiActionError::Cli)
                 }
                 TuiCommand::StartOrRestartDaemon => {
-                    let daemon = worker_paths.read_daemon().ok().flatten();
-                    let running = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
-                    let res = if running {
-                        restart_daemon(
-                            &worker_paths,
-                            RestartArgs {
-                                listen: worker_listen,
-                                api_key: worker_key.clone(),
-                                ..RestartArgs::default()
-                            },
-                        )
-                        .await
-                        .map(|_| "Restarted background gateway".to_owned())
-                    } else {
-                        let mut serve = ServeArgs::default();
-                        if let Some(addr) = worker_listen {
-                            serve.listen = addr;
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) if resolved.is_remote => {
+                            Err(TuiActionError::Cli(CliError::UnsupportedInRemoteMode {
+                                operation: "start / restart local daemon",
+                                endpoint: resolved.client.base_url().to_owned(),
+                            }))
                         }
-                        if let Some(k) = worker_key.clone() {
-                            serve.api_key = Some(k);
+                        Ok(_) => {
+                            let daemon = worker_paths.read_daemon().ok().flatten();
+                            let running = daemon.as_ref().is_some_and(|d| is_pid_alive(d.pid));
+                            let res = if running {
+                                restart_daemon(
+                                    &worker_paths,
+                                    RestartArgs {
+                                        listen: worker_listen,
+                                        api_key: worker_key.clone(),
+                                        ..RestartArgs::default()
+                                    },
+                                )
+                                .await
+                                .map(|_| "Restarted background gateway".to_owned())
+                            } else {
+                                let mut serve = ServeArgs::default();
+                                if let Some(addr) = worker_listen {
+                                    serve.listen = addr;
+                                }
+                                if let Some(k) = worker_key.clone() {
+                                    serve.api_key = Some(k);
+                                }
+                                start_daemon(&worker_paths, serve, false).await.map(|out| {
+                                    format!(
+                                        "Started gateway (PID {}) on {}",
+                                        out.daemon.pid,
+                                        format_connect_url(out.daemon.listen)
+                                    )
+                                })
+                            };
+                            res.map_err(TuiActionError::Cli)
                         }
-                        start_daemon(&worker_paths, serve, false).await.map(|out| {
-                            format!(
-                                "Started gateway (PID {}) on {}",
-                                out.daemon.pid,
-                                format_connect_url(out.daemon.listen)
-                            )
-                        })
-                    };
-                    res.map_err(TuiActionError::Cli)
-                }
-                TuiCommand::StopDaemon => match stop_daemon(&worker_paths).await {
-                    Ok(out) if out.stopped_pid.is_some() => {
-                        Ok("Stopped background gateway".to_owned())
+                        Err(err) => Err(TuiActionError::Cli(err)),
                     }
-                    Ok(_) => Err(TuiActionError::NoManagedDaemon),
+                }
+                TuiCommand::StopDaemon => match resolve_tui_gateway_client(
+                    &worker_paths,
+                    worker_listen,
+                    worker_remote.as_deref(),
+                    worker_key.as_deref(),
+                ) {
+                    Ok(resolved) if resolved.is_remote => {
+                        Err(TuiActionError::Cli(CliError::UnsupportedInRemoteMode {
+                            operation: "stop local daemon",
+                            endpoint: resolved.client.base_url().to_owned(),
+                        }))
+                    }
+                    Ok(_) => match stop_daemon(&worker_paths).await {
+                        Ok(out) if out.stopped_pid.is_some() => {
+                            Ok("Stopped background gateway".to_owned())
+                        }
+                        Ok(_) => Err(TuiActionError::NoManagedDaemon),
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    },
                     Err(err) => Err(TuiActionError::Cli(err)),
                 },
                 TuiCommand::OpenBrowser => {
-                    let snap =
-                        poll_gateway_snapshot(&worker_paths, worker_listen, worker_key.as_deref())
-                            .await;
+                    let snap = poll_gateway_snapshot(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    )
+                    .await;
                     open_browser(&snap.dashboard_url)
                         .map(|()| format!("Opened Web UI ({})", snap.gateway_url))
                         .map_err(TuiActionError::Cli)
@@ -1593,10 +1776,14 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     ];
 
     if app.data.healthy {
-        let mode = match (app.data.managed, app.data.daemon_pid) {
-            (true, Some(pid)) => format!("managed pid {pid}"),
-            (true, None) => "managed".to_owned(),
-            (false, _) => "external".to_owned(),
+        let mode = if app.data.is_remote {
+            "remote".to_owned()
+        } else {
+            match (app.data.managed, app.data.daemon_pid) {
+                (true, Some(pid)) => format!("managed pid {pid}"),
+                (true, None) => "managed".to_owned(),
+                (false, _) => "external".to_owned(),
+            }
         };
         let up = app.data.telemetry.as_ref().map_or_else(
             || "—".to_owned(),

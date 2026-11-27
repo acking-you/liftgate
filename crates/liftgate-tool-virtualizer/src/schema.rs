@@ -30,6 +30,11 @@ pub struct McpBridgedTool {
     pub unwrap_custom_key: Option<&'static str>,
     pub v4a_patch: Option<V4aPatchContract>,
     pub parameters_json: Option<String>,
+    pub non_nullable_required_fields: Vec<String>,
+    pub present_required_fields: Vec<String>,
+    pub declares_tool_summary: bool,
+    pub requires_string_intent_i: bool,
+    pub has_root_combinator: bool,
 }
 
 /// Measures serialized JSON wire size of `(name, description, schema)` without allocating a `String`.
@@ -112,6 +117,37 @@ pub fn gateway_web_fetch_input_schema() -> Value {
     })
 }
 
+/// Input JSON Schema for the gateway-local 0-RTT `read_context_spill` MCP tool.
+#[must_use]
+pub fn read_context_spill_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Spill file path or `<slug>-<hash>.txt` / `<slug>-<hash>.json` filename referenced in a truncation notice."
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "1-based starting line number (default 1)."
+            },
+            "byte_offset": {
+                "type": "integer",
+                "description": "0-based byte offset within `start_line` to resume reading an overlong single line (default 0; e.g. minified JSON)."
+            },
+            "max_lines": {
+                "type": "integer",
+                "description": "Maximum lines to return (1..200, default 120)."
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional case-insensitive substring filter returning matching lines with line numbers."
+            }
+        },
+        "required": ["path"]
+    })
+}
+
 /// Normalizes a caller tool's JSON Schema string into a valid root `{"type": "object", ...}` MCP schema.
 ///
 /// Always returns a valid object schema so 100% of `Function` tools are bridged natively over MCP
@@ -162,17 +198,127 @@ pub fn normalize_mcp_object_schema(parameters_json: &str) -> Value {
     }
 }
 
-/// Extracts `(required_fields, declares_tool_summary, has_root_combinator, property_names_joined)`
-/// from a raw JSON Schema string for preflight validation and lexical indexing.
+/// Pre-extracted structural metadata from a tool's JSON Schema for 0-RTT preflight and search indexing.
+#[derive(Clone, Debug, Default)]
+pub struct ExtractedSchemaMeta {
+    pub required_fields: Vec<String>,
+    /// Required fields whose schema rejects `null` (must be both present AND non-null).
+    pub non_nullable_required_fields: Vec<String>,
+    /// Required fields with unconstrained schemas (e.g. `{}`) where `null` is valid when present,
+    /// while complete key omission (`!map.contains_key`) is still missing.
+    pub present_required_fields: Vec<String>,
+    pub declares_tool_summary: bool,
+    pub requires_string_intent_i: bool,
+    pub has_root_combinator: bool,
+    pub prop_names_joined: String,
+}
+
+fn schema_explicitly_declares_null_or_ref(prop_schema: &Value) -> bool {
+    let Value::Object(obj) = prop_schema else {
+        return false;
+    };
+    if obj.contains_key("$ref") || obj.contains_key("$dynamicRef") {
+        return true;
+    }
+    if let Some(ty) = obj.get("type") {
+        match ty {
+            Value::String(s) if s == "null" => return true,
+            Value::Array(arr) if arr.iter().any(|v| v.as_str() == Some("null")) => return true,
+            _ => {}
+        }
+    }
+    if let Some(const_val) = obj.get("const")
+        && const_val.is_null()
+    {
+        return true;
+    }
+    if let Some(Value::Array(enum_vals)) = obj.get("enum")
+        && enum_vals.iter().any(Value::is_null)
+    {
+        return true;
+    }
+    for union_key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = obj.get(union_key)
+            && branches.iter().any(schema_explicitly_declares_null_or_ref)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn schema_property_allows_null(prop_schema: &Value) -> bool {
+    match prop_schema {
+        Value::Bool(allow_all) => *allow_all,
+        Value::Object(obj) => {
+            if obj.contains_key("$ref") || obj.contains_key("$dynamicRef") {
+                return true;
+            }
+            if let Some(not_schema) = obj.get("not")
+                && (not_schema.get("type").and_then(Value::as_str) == Some("null")
+                    || not_schema.get("const").is_some_and(Value::is_null))
+            {
+                return false;
+            }
+            if let Some(const_val) = obj.get("const")
+                && !const_val.is_null()
+            {
+                return false;
+            }
+            if let Some(Value::Array(enum_vals)) = obj.get("enum")
+                && !enum_vals.iter().any(Value::is_null)
+            {
+                return false;
+            }
+            if let Some(ty) = obj.get("type") {
+                let allows_null = match ty {
+                    Value::String(s) => s == "null",
+                    Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some("null")),
+                    _ => false,
+                };
+                if !allows_null {
+                    return false;
+                }
+            }
+            if let Some(Value::Array(branches)) = obj.get("anyOf")
+                && !branches.iter().any(schema_property_allows_null)
+            {
+                return false;
+            }
+            if let Some(Value::Array(branches)) = obj.get("oneOf")
+                && !branches.iter().any(schema_property_allows_null)
+            {
+                return false;
+            }
+            if let Some(Value::Array(branches)) = obj.get("allOf")
+                && !branches.iter().all(schema_property_allows_null)
+            {
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn schema_property_is_string(prop_schema: &Value) -> bool {
+    match prop_schema.get("type") {
+        Some(Value::String(s)) => s == "string",
+        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("string")),
+        _ => false,
+    }
+}
+
+/// Extracts [`ExtractedSchemaMeta`] from a raw JSON Schema string for preflight validation and lexical indexing.
 #[must_use]
-pub fn extract_schema_metadata(parameters_json: Option<&str>) -> (Vec<String>, bool, bool, String) {
+pub fn extract_schema_metadata(parameters_json: Option<&str>) -> ExtractedSchemaMeta {
     let Some(raw) = parameters_json else {
-        return (Vec::new(), false, false, String::new());
+        return ExtractedSchemaMeta::default();
     };
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
-        return (Vec::new(), false, false, String::new());
+        return ExtractedSchemaMeta::default();
     };
-    let required = map
+    let required_fields = map
         .get("required")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -182,24 +328,51 @@ pub fn extract_schema_metadata(parameters_json: Option<&str>) -> (Vec<String>, b
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let has_combinator =
+    let has_root_combinator =
         map.contains_key("oneOf") || map.contains_key("anyOf") || map.contains_key("allOf");
-    let mut declares_summary = false;
+    let props_opt = map.get("properties").and_then(Value::as_object);
+    let mut non_nullable_required_fields = Vec::new();
+    let mut present_required_fields = Vec::new();
+    for req_key in &required_fields {
+        match props_opt.and_then(|props| props.get(req_key.as_str())) {
+            Some(prop_schema) if !schema_property_allows_null(prop_schema) => {
+                non_nullable_required_fields.push(req_key.clone());
+            }
+            Some(prop_schema) if !schema_explicitly_declares_null_or_ref(prop_schema) => {
+                present_required_fields.push(req_key.clone());
+            }
+            None => {
+                present_required_fields.push(req_key.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    let requires_string_intent_i = required_fields.iter().any(|r| r == "i")
+        && props_opt
+            .and_then(|props| props.get("i"))
+            .is_some_and(|prop_i| {
+                schema_property_is_string(prop_i) && !schema_property_allows_null(prop_i)
+            });
+
+    let mut declares_tool_summary = false;
     let mut prop_names = Vec::new();
-    if let Some(Value::Object(props)) = map.get("properties") {
+    if let Some(props) = props_opt {
         for k in props.keys() {
             if k == "toolSummary" {
-                declares_summary = true;
+                declares_tool_summary = true;
             }
             prop_names.push(k.as_str());
         }
     }
-    (
-        required,
-        declares_summary,
-        has_combinator,
-        prop_names.join(" "),
-    )
+    ExtractedSchemaMeta {
+        required_fields,
+        non_nullable_required_fields,
+        present_required_fields,
+        declares_tool_summary,
+        requires_string_intent_i,
+        has_root_combinator,
+        prop_names_joined: prop_names.join(" "),
+    }
 }
 
 /// Sanitizes an arbitrary client tool identifier into a unique MCP tool name (`[a-zA-Z_][a-zA-Z0-9_-]{0,51}`).

@@ -7,6 +7,7 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg agy install          Download & install Antigravity CLI (`agy`) automatically
   lg agy login            Sign in to Antigravity interactively (with proxy applied)
   lg proxy 7890           Force `http://127.0.0.1:7890` into `agy` (`lg proxy off` to clear)
+  lg remote <ip:port>     Route CLI/GUI harnesses to a remote Liftgate (`lg remote local` to reset)
   lg cx                   Launch Codex CLI in current dir (0 side effects on exit)
   lg cx resume            Browse & resume Codex sessions (`--last`, `--all`, `<ID>`)
   lg cxa                  Launch Codex App GUI via Liftgate (0 pollution on exit)

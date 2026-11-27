@@ -102,6 +102,7 @@ lg omp -c                               # 继续最近一次 `omp` 会话（支�
 
 ```bash
 lg agy                   # 查看 `agy` 版本、登录状态、强制代理与空闲自动更新策略
+lg remote 10.0.0.8:8787  # 切换为连接远端 Liftgate 网关，无需本机安装 `agy`（`lg remote local` 切回本地）
 lg top                   # 打开全屏实时终端仪表盘（实时请求、会话池管理、模型切换、日志）
 lg m -i                  # 交互式搜索并热切换默认 Antigravity 模型
 lg up --open             # 后台启动网关服务并打开内嵌 Web 监控面板

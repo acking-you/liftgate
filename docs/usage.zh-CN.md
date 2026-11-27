@@ -32,6 +32,7 @@ lg agy                          # 查看 agy 是否存在、版本、登录状�
 lg agy install                  # 跨平台下载官方 agy 并完成 SHA-512 校验与安装
 lg agy login                    # 调用官方 `agy acp --login` 交互式登录 Google 账号
 lg proxy 7890                   # 为 agy 强制设置代理（默认不设任何代理，`lg proxy off` 恢复直连）
+lg remote 10.0.0.8:8787         # 持久指向远端 Liftgate 网关（支持 `--api-key`；`lg remote local` 切回本地）
 lg top                          # 打开全屏实时 TUI 监控仪表盘（别名：tui、dash、monitor）
 lg up                           # 后台启动网关与内嵌 Web 监控面板（全称：start）
 lg up --open                    # 后台启动并自动在浏览器打开监控面板

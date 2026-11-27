@@ -44,7 +44,7 @@ use crate::{
     mcp_bridge::{
         ACP_MCP_TOOL_PREFIX, IncomingMcpToolCall, LocalReplyKind, LoopbackMcpServer,
         McpContentItem, McpSessionHandle, McpToolCallReply, ProtocolHint, ResolvedMcpIncoming,
-        partition_tools_for_mcp_session, strip_call_prefix,
+        strip_call_prefix,
     },
     session_pool::{
         CommittedSessionTurn, IdleCheckoutGuard, IdleSessionEntry, McpDriverCommand,
@@ -790,10 +790,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
                 TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
             };
-            let catalog = partition_tools_for_mcp_session(
+            let catalog = crate::mcp_bridge::partition_tools_for_mcp_session_with_options(
                 proto_hint,
                 &req.client_tools,
-                web_cfg.enable_native_web_fetch,
+                crate::mcp_bridge::McpSessionOptions {
+                    enable_gateway_web_fetch: web_cfg.enable_native_web_fetch,
+                    enable_context_spill_reader: spill_store.is_some(),
+                },
                 &mut spill_store,
             );
             let out = build_session_system_append_for_mcp_with_spill_sink(
@@ -803,6 +806,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     virtualized_hubs: &catalog.virtualized_hubs,
                     has_virtualized_dispatch: catalog.has_virtualized_dispatch,
                     has_gateway_web_fetch: catalog.has_gateway_web_fetch,
+                    has_context_spill_reader: catalog.has_context_spill_reader,
                     orchestrator: catalog.orchestrator_contract(),
                 },
                 web_cfg,
@@ -1644,7 +1648,10 @@ async fn run_turn_pipeline<B: AcpBackend>(
                                 Ok(Ok(Ok(res))) => {
                                     let prompt_tok = res.usage.total_prompt_tokens();
                                     let cached_tok = res.usage.cached_read_tokens;
-                                    let final_ctx = if res.usage.total_tokens > 0 {
+                                    let final_ctx = if approx_ctx > 0 && res.usage.total_tokens > 0
+                                    {
+                                        res.usage.total_tokens.min(approx_ctx.saturating_add(32_768))
+                                    } else if res.usage.total_tokens > 0 {
                                         res.usage.total_tokens
                                     } else {
                                         approx_ctx
@@ -3683,6 +3690,13 @@ impl AcpBannerFilter {
     }
 }
 
+/// Inline byte ceiling for a single MCP `tools/call` text result when `SpillStore` is active.
+///
+/// Kept strictly below `agy acp`'s internal ~10,240-byte MCP tool-output middle-truncation cliff
+/// so `agy acp` never silently excises middle lines into an unreadable host-private brain file;
+/// instead, Liftgate persists 100% of the lossless output in `~/.liftgate/spills` and exposes it
+/// in 0-RTT via `mcp_lg_read_context_spill`.
+const MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES: usize = 9_600;
 const MAX_SINGLE_MCP_TOOL_RESULT_BYTES: usize = 96 * 1024;
 
 type UnpinnedPromptFuture =
@@ -4030,7 +4044,17 @@ fn sanitize_mcp_tool_result_text(
 ) -> String {
     let billing_clean = strip_billing_noise(raw_output);
     let term_clean = scrub_terminal_control_noise(&billing_clean);
-    if term_clean.len() > MAX_SINGLE_MCP_TOOL_RESULT_BYTES {
+    let mut sanitized = if spill_store.is_some()
+        && term_clean.len() > MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES
+    {
+        let label = format!("tool_result:{client_tool_name}");
+        truncate_head_tail_lines_with_spill(
+            &term_clean,
+            MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES,
+            &label,
+            spill_store,
+        )
+    } else if term_clean.len() > MAX_SINGLE_MCP_TOOL_RESULT_BYTES {
         let label = format!("tool_result:{client_tool_name}");
         truncate_head_tail_lines_with_spill(
             &term_clean,
@@ -4040,7 +4064,17 @@ fn sanitize_mcp_tool_result_text(
         )
     } else {
         term_clean.into_owned()
+    };
+    if client_tool_name == "apply_patch"
+        && sanitized
+            .trim_start()
+            .starts_with("apply_patch verification failed:")
+    {
+        sanitized.push_str(
+            "\n[Hint: read the exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated) and keep each `mcp_lg_apply_patch` call scoped to a single file.]",
+        );
     }
+    sanitized
 }
 
 fn build_mcp_tool_replies(
@@ -4793,7 +4827,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 reply,
                                 kind,
                             } => match kind {
-                                LocalReplyKind::Search => {
+                                LocalReplyKind::Search | LocalReplyKind::SpillRead => {
                                     disabled_mcp_rejections = 0;
                                     preflight_mcp_rejections = 0;
                                     let _ = reply_tx.send(reply);
@@ -4824,6 +4858,40 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                     }
                                 }
                             },
+                            ResolvedMcpIncoming::ReadContextSpill {
+                                path,
+                                start_line,
+                                byte_offset,
+                                max_lines,
+                                query,
+                                reply_tx,
+                            } => {
+                                let (text, is_error) = match cur_spill_store.as_ref() {
+                                    Some(store) => match store.read_slice(
+                                        &path,
+                                        start_line,
+                                        byte_offset,
+                                        max_lines,
+                                        query.as_deref(),
+                                    ) {
+                                        Ok(slice_text) => {
+                                            disabled_mcp_rejections = 0;
+                                            preflight_mcp_rejections = 0;
+                                            (slice_text, false)
+                                        }
+                                        Err(err) => (err.to_string(), true),
+                                    },
+                                    None => (
+                                        "Context spill storage is unavailable for this session."
+                                            .to_owned(),
+                                        true,
+                                    ),
+                                };
+                                let _ = reply_tx.send(McpToolCallReply {
+                                    content: vec![McpContentItem::Text { text }],
+                                    is_error,
+                                });
+                            }
                             ResolvedMcpIncoming::ForwardToClient {
                                 client_name,
                                 arguments,
@@ -5209,10 +5277,10 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                             }
                                             let unwound_delta =
                                                 res.usage.saturating_sub(accounted_usage);
-                                            let final_ctx = if res.usage.total_tokens > 0 {
-                                                res.usage.total_tokens
-                                            } else {
+                                            let final_ctx = if latest_context_used > 0 {
                                                 latest_context_used
+                                            } else {
+                                                res.usage.total_tokens
                                             };
                                             let _ = done_tx.send(Ok((
                                                 final_ctx,
@@ -5442,10 +5510,20 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             state.turn_peak_context_used,
                             latest_context_used,
                         );
+                        let wire_m = if state.turn_peak_context_used > 0 {
+                            step_m
+                        } else {
+                            reconcile_turn_context_usage(
+                                step_m,
+                                &state,
+                                latest_context_used.max(prev_prompt_tokens),
+                                step_outbound_bytes,
+                            )
+                        };
                         let combined_tel = step_m.saturating_add(cur_vision_usage);
                         (
                             combined_tel,
-                            step_m,
+                            wire_m,
                             auth.total_prompt_tokens(),
                             auth.cached_read_tokens,
                             Some((accounted_usage.saturating_add(step_m), auth)),
@@ -5561,6 +5639,17 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         };
                         let committed_context_used = if state.turn_peak_context_used > 0 {
                             state.latest_context_used
+                        } else if llm_step_idx > 0 && latest_context_used > 0 {
+                            wire_usage
+                                .total_tokens
+                                .min(
+                                    latest_context_used.saturating_add(
+                                        u64::try_from(step_outbound_bytes / 3)
+                                            .unwrap_or(0)
+                                            .max(16_384),
+                                    ),
+                                )
+                                .max(latest_context_used)
                         } else {
                             wire_usage.total_tokens.max(latest_context_used)
                         };

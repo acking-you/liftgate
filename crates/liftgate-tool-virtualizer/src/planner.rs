@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, NAMESPACE_HUB_MCP_PREFIX,
-    SEARCH_CLIENT_TOOLS_MCP_NAME,
+    READ_CONTEXT_SPILL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
     profile::{
         DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
         detect_harness,
@@ -22,10 +22,18 @@ use crate::{
     },
     router::McpRoutingTable,
     schema::{
-        McpBridgedTool, McpWireTool, code_mode_exec_input_schema, estimate_wire_tool_bytes,
-        gateway_web_fetch_input_schema, normalize_mcp_object_schema, sanitize_mcp_tool_name,
+        ExtractedSchemaMeta, McpBridgedTool, McpWireTool, code_mode_exec_input_schema,
+        estimate_wire_tool_bytes, extract_schema_metadata, gateway_web_fetch_input_schema,
+        normalize_mcp_object_schema, read_context_spill_input_schema, sanitize_mcp_tool_name,
     },
 };
+
+/// Gateway-managed per-session tool capabilities mounted alongside client tools on `lg`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct McpSessionOptions {
+    pub enable_gateway_web_fetch: bool,
+    pub enable_context_spill_reader: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedOrchestratorContract {
@@ -93,6 +101,8 @@ pub struct McpSessionCatalog {
     pub has_virtualized_dispatch: bool,
     /// Whether server-managed `gateway_web_fetch` (`mcp_lg_gateway_web_fetch`) is mounted on `lg`.
     pub has_gateway_web_fetch: bool,
+    /// Whether gateway-local `read_context_spill` (`mcp_lg_read_context_spill`) is mounted on `lg`.
+    pub has_context_spill_reader: bool,
     /// Pure zero-IO routing and 0-RTT search table retained by `McpSessionHandle`.
     pub routing_table: Arc<McpRoutingTable>,
     orchestrator: Option<OwnedOrchestratorContract>,
@@ -146,36 +156,49 @@ pub fn partition_tools_for_mcp_session<S: TruncationSpillSink>(
     enable_gateway_web_fetch: bool,
     spill: &mut S,
 ) -> McpSessionCatalog {
+    partition_tools_for_mcp_session_with_options(
+        hint,
+        client_tools,
+        McpSessionOptions {
+            enable_gateway_web_fetch,
+            enable_context_spill_reader: false,
+        },
+        spill,
+    )
+}
+
+/// Auto-detects the caller harness and partitions `client_tools` with full [`McpSessionOptions`].
+#[must_use]
+pub fn partition_tools_for_mcp_session_with_options<S: TruncationSpillSink>(
+    hint: ProtocolHint,
+    client_tools: &[CanonicalToolSpec],
+    options: McpSessionOptions,
+    spill: &mut S,
+) -> McpSessionCatalog {
     let harness = detect_harness(hint, client_tools);
     match harness {
-        DetectedHarness::Codex => plan_virtualization_with_options(
-            CodexToolProfile,
-            client_tools,
-            enable_gateway_web_fetch,
-            spill,
-        ),
-        DetectedHarness::ClaudeCode => plan_virtualization_with_options(
+        DetectedHarness::Codex => {
+            plan_virtualization_with_session_options(CodexToolProfile, client_tools, options, spill)
+        }
+        DetectedHarness::ClaudeCode => plan_virtualization_with_session_options(
             ClaudeCodeToolProfile,
             client_tools,
-            enable_gateway_web_fetch,
+            options,
             spill,
         ),
-        DetectedHarness::OpenCode => plan_virtualization_with_options(
+        DetectedHarness::OpenCode => plan_virtualization_with_session_options(
             OpenCodeToolProfile,
             client_tools,
-            enable_gateway_web_fetch,
+            options,
             spill,
         ),
-        DetectedHarness::Omp => plan_virtualization_with_options(
-            OmpToolProfile,
-            client_tools,
-            enable_gateway_web_fetch,
-            spill,
-        ),
-        DetectedHarness::Generic => plan_virtualization_with_options(
+        DetectedHarness::Omp => {
+            plan_virtualization_with_session_options(OmpToolProfile, client_tools, options, spill)
+        }
+        DetectedHarness::Generic => plan_virtualization_with_session_options(
             GenericToolProfile,
             client_tools,
-            enable_gateway_web_fetch,
+            options,
             spill,
         ),
     }
@@ -225,6 +248,25 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
     enable_gateway_web_fetch: bool,
     spill: &mut S,
 ) -> McpSessionCatalog {
+    plan_virtualization_with_session_options(
+        profile,
+        client_tools,
+        McpSessionOptions {
+            enable_gateway_web_fetch,
+            enable_context_spill_reader: false,
+        },
+        spill,
+    )
+}
+
+/// Monomorphized zero-cost 3-tier virtualization planner with full [`McpSessionOptions`].
+#[must_use]
+pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: TruncationSpillSink>(
+    profile: P,
+    client_tools: &[CanonicalToolSpec],
+    options: McpSessionOptions,
+    spill: &mut S,
+) -> McpSessionCatalog {
     assert_eq!(
         std::mem::size_of::<P>(),
         0,
@@ -252,6 +294,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         description: Option<String>,
         input_schema: Value,
         parameters_json: Option<String>,
+        schema_meta: ExtractedSchemaMeta,
         est_wire_bytes: usize,
     }
 
@@ -317,6 +360,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         };
         let effective_spec = dehydrated_spec.as_ref().unwrap_or(spec);
         let description = compact_mcp_tool_description(effective_spec, max_desc, spill);
+        let schema_meta = extract_schema_metadata(parameters_json.as_deref());
         let est_wire_bytes =
             estimate_wire_tool_bytes(&spec.name, description.as_deref(), &schema_val);
         eligible.push(EligibleCandidate {
@@ -329,6 +373,7 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
             description,
             input_schema: schema_val,
             parameters_json,
+            schema_meta,
             est_wire_bytes,
         });
     }
@@ -385,7 +430,9 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         .iter()
         .filter(|c| !c.is_orchestrator && !matches!(c.kind, CandidateKind::FoldedIntoOrchestrator))
         .fold(0usize, |acc, c| acc.saturating_add(c.est_wire_bytes));
-    let reserved_slots: usize = 2usize.saturating_add(usize::from(enable_gateway_web_fetch));
+    let reserved_slots: usize = 2usize
+        .saturating_add(usize::from(options.enable_gateway_web_fetch))
+        .saturating_add(usize::from(options.enable_context_spill_reader));
     let passthrough_max_tools = budget
         .direct_passthrough_max_tools
         .min(budget.max_eager_tools.saturating_sub(reserved_slots));
@@ -396,8 +443,11 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         HashSet::with_capacity(budget.max_eager_tools.saturating_add(4));
     used_mcp_names.insert(SEARCH_CLIENT_TOOLS_MCP_NAME.to_owned());
     used_mcp_names.insert(CALL_CLIENT_TOOL_MCP_NAME.to_owned());
-    if enable_gateway_web_fetch {
+    if options.enable_gateway_web_fetch {
         used_mcp_names.insert(GATEWAY_WEB_FETCH_MCP_NAME.to_owned());
+    }
+    if options.enable_context_spill_reader {
+        used_mcp_names.insert(READ_CONTEXT_SPILL_MCP_NAME.to_owned());
     }
 
     let mut wire_tools: Vec<McpWireTool> = Vec::with_capacity(budget.max_eager_tools);
@@ -408,7 +458,12 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
     let mut orchestrator: Option<OwnedOrchestratorContract> = None;
     let call_tool_wire = build_call_client_tool_wire_tool();
     let search_tool_wire = build_search_client_tools_wire_tool(&budget);
-    let web_fetch_wire = enable_gateway_web_fetch.then(build_gateway_web_fetch_wire_tool);
+    let web_fetch_wire = options
+        .enable_gateway_web_fetch
+        .then(build_gateway_web_fetch_wire_tool);
+    let spill_reader_wire = options
+        .enable_context_spill_reader
+        .then(build_read_context_spill_wire_tool);
 
     if !should_virtualize {
         for c in eligible {
@@ -439,12 +494,20 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     unwrap_custom_key: c.unwrap_custom_key,
                     v4a_patch: c.v4a_patch,
                     parameters_json: c.parameters_json,
+                    non_nullable_required_fields: c.schema_meta.non_nullable_required_fields,
+                    present_required_fields: c.schema_meta.present_required_fields,
+                    declares_tool_summary: c.schema_meta.declares_tool_summary,
+                    requires_string_intent_i: c.schema_meta.requires_string_intent_i,
+                    has_root_combinator: c.schema_meta.has_root_combinator,
                 },
             );
             bridged_pairs.push((spec.name.clone(), mcp_name));
         }
         if let Some(wf_wire) = web_fetch_wire {
             wire_tools.push(wf_wire);
+        }
+        if let Some(sp_wire) = spill_reader_wire {
+            wire_tools.push(sp_wire);
         }
         wire_tools.push(call_tool_wire);
         wire_tools.push(search_tool_wire);
@@ -548,6 +611,14 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     &wf_wire.input_schema,
                 ));
         }
+        if let Some(ref sp_wire) = spill_reader_wire {
+            reserved_dispatch_bytes =
+                reserved_dispatch_bytes.saturating_add(estimate_wire_tool_bytes(
+                    &sp_wire.name,
+                    sp_wire.description.as_deref(),
+                    &sp_wire.input_schema,
+                ));
+        }
 
         let mut built_hub_wires: Vec<(String, String, usize, McpWireTool)> =
             Vec::with_capacity(hub_order.len());
@@ -627,6 +698,14 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
                     unwrap_custom_key: c.unwrap_custom_key,
                     v4a_patch: c.v4a_patch,
                     parameters_json: c.parameters_json.clone(),
+                    non_nullable_required_fields: c
+                        .schema_meta
+                        .non_nullable_required_fields
+                        .clone(),
+                    present_required_fields: c.schema_meta.present_required_fields.clone(),
+                    declares_tool_summary: c.schema_meta.declares_tool_summary,
+                    requires_string_intent_i: c.schema_meta.requires_string_intent_i,
+                    has_root_combinator: c.schema_meta.has_root_combinator,
                 },
             );
             bridged_pairs.push((spec.name.clone(), mcp_name));
@@ -641,18 +720,22 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         if let Some(wf_wire) = web_fetch_wire {
             wire_tools.push(wf_wire);
         }
+        if let Some(sp_wire) = spill_reader_wire {
+            wire_tools.push(sp_wire);
+        }
         wire_tools.push(call_tool_wire);
         wire_tools.push(search_tool_wire);
     }
 
-    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_options(
+    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_session_options(
         profile,
         &prepass,
         client_tools,
         by_mcp_name.clone(),
         hub_names_by_namespace,
         true,
-        enable_gateway_web_fetch,
+        options.enable_gateway_web_fetch,
+        options.enable_context_spill_reader,
     ));
 
     McpSessionCatalog {
@@ -662,7 +745,8 @@ pub fn plan_virtualization_with_options<P: HarnessToolProfile, S: TruncationSpil
         bridged_pairs,
         virtualized_hubs,
         has_virtualized_dispatch: true,
-        has_gateway_web_fetch: enable_gateway_web_fetch,
+        has_gateway_web_fetch: options.enable_gateway_web_fetch,
+        has_context_spill_reader: options.enable_context_spill_reader,
         routing_table,
         orchestrator,
     }
@@ -733,17 +817,155 @@ fn summarize_folded_tool_signature(spec: &CanonicalToolSpec) -> String {
             opt_names.push(key.as_str());
         }
     }
+    req_names.sort_by_key(|&k| (k != "i", k));
+    opt_names.sort_unstable();
+
     let mut parts: Vec<String> = Vec::with_capacity(req_names.len() + opt_names.len());
     for r in req_names {
-        parts.push(r.to_owned());
+        let ts_ty = props
+            .get(r)
+            .map_or_else(|| "unknown".to_owned(), |p| summarize_schema_ts_type(p, 0));
+        parts.push(format!("{r}: {ts_ty}"));
     }
     for o in opt_names.iter().take(6) {
-        parts.push(format!("{o}?"));
+        let ts_ty = props
+            .get(*o)
+            .map_or_else(|| "unknown".to_owned(), |p| summarize_schema_ts_type(p, 0));
+        parts.push(format!("{o}?: {ts_ty}"));
     }
     if opt_names.len() > 6 {
         parts.push("...".to_owned());
     }
     format!("{{ {} }}", parts.join(", "))
+}
+
+fn summarize_schema_ts_type(prop: &Value, depth: usize) -> String {
+    if let Some(const_val) = prop.get("const") {
+        return match const_val {
+            Value::String(s) => format!("{s:?}"),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Null => "null".to_owned(),
+            _ => "unknown".to_owned(),
+        };
+    }
+    if let Some(enum_vals) = prop.get("enum").and_then(Value::as_array)
+        && !enum_vals.is_empty()
+    {
+        if enum_vals.len() <= 8 {
+            let mut literals = Vec::with_capacity(enum_vals.len());
+            for item in enum_vals {
+                match item {
+                    Value::String(s) => literals.push(format!("{s:?}")),
+                    Value::Bool(b) => literals.push(b.to_string()),
+                    Value::Number(n) => literals.push(n.to_string()),
+                    Value::Null => literals.push("null".to_owned()),
+                    _ => {}
+                }
+            }
+            if !literals.is_empty() {
+                return literals.join(" | ");
+            }
+        }
+        if enum_vals.iter().all(Value::is_string) {
+            return "string".to_owned();
+        }
+    }
+    if depth <= 1 {
+        for union_key in ["anyOf", "oneOf"] {
+            if let Some(branches) = prop.get(union_key).and_then(Value::as_array)
+                && !branches.is_empty()
+                && branches.len() <= 4
+            {
+                let mut seen = Vec::with_capacity(branches.len());
+                for b in branches {
+                    let rendered = summarize_schema_ts_type(b, depth + 1);
+                    if !seen.contains(&rendered) {
+                        seen.push(rendered);
+                    }
+                }
+                if !seen.is_empty() {
+                    return seen.join(" | ");
+                }
+            }
+        }
+    }
+
+    match prop.get("type") {
+        Some(Value::String(ty)) => match ty.as_str() {
+            "string" => "string".to_owned(),
+            "integer" | "number" => "number".to_owned(),
+            "boolean" => "boolean".to_owned(),
+            "null" => "null".to_owned(),
+            "array" => {
+                if depth <= 2
+                    && let Some(items) = prop.get("items")
+                {
+                    let inner = summarize_schema_ts_type(items, depth + 1);
+                    if !inner.starts_with('{') && inner.contains(" | ") {
+                        format!("({inner})[]")
+                    } else {
+                        format!("{inner}[]")
+                    }
+                } else {
+                    "unknown[]".to_owned()
+                }
+            }
+            "object" => {
+                if depth <= 3
+                    && let Some(sub_props) = prop.get("properties").and_then(Value::as_object)
+                    && !sub_props.is_empty()
+                {
+                    let sub_req: HashSet<&str> = prop
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let mut keys: Vec<&str> = sub_props.keys().map(String::as_str).collect();
+                    keys.sort_by_key(|&k| (!sub_req.contains(k), k));
+                    let mut fields = Vec::with_capacity(keys.len().min(5));
+                    for k in keys.iter().take(5) {
+                        let sub_ty = sub_props.get(*k).map_or_else(
+                            || "unknown".to_owned(),
+                            |sp| summarize_schema_ts_type(sp, depth + 1),
+                        );
+                        if sub_req.contains(*k) {
+                            fields.push(format!("{k}: {sub_ty}"));
+                        } else {
+                            fields.push(format!("{k}?: {sub_ty}"));
+                        }
+                    }
+                    if keys.len() > 5 {
+                        fields.push("...".to_owned());
+                    }
+                    format!("{{ {} }}", fields.join(", "))
+                } else {
+                    "object".to_owned()
+                }
+            }
+            _ => "unknown".to_owned(),
+        },
+        Some(Value::Array(arr)) => {
+            let mut parts = Vec::with_capacity(arr.len());
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    let mapped = match s {
+                        "integer" => "number",
+                        other => other,
+                    };
+                    if !parts.contains(&mapped) {
+                        parts.push(mapped);
+                    }
+                }
+            }
+            if parts.is_empty() {
+                "unknown".to_owned()
+            } else {
+                parts.join(" | ")
+            }
+        }
+        _ => "unknown".to_owned(),
+    }
 }
 
 fn summarize_folded_tool_hint(spec: &CanonicalToolSpec) -> String {
@@ -853,6 +1075,16 @@ fn build_gateway_web_fetch_wire_tool() -> McpWireTool {
             "Fetch the live content of an http:// or https:// URL server-side via the gateway and return extracted readable text/markdown in the current step.".to_owned(),
         ),
         input_schema: gateway_web_fetch_input_schema(),
+    }
+}
+
+fn build_read_context_spill_wire_tool() -> McpWireTool {
+    McpWireTool {
+        name: READ_CONTEXT_SPILL_MCP_NAME.to_owned(),
+        description: Some(
+            "Zero-round-trip gateway reader for full lossless spill files (`~/.liftgate/spills/<slug>-<hash>.txt` or `.json`) referenced in truncation notices. Pass `path` plus `start_line`/`max_lines` or `query`.".to_owned(),
+        ),
+        input_schema: read_context_spill_input_schema(),
     }
 }
 

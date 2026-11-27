@@ -468,3 +468,66 @@ fn omp_subcommand_normalizes_flags_and_session_aliases() {
         Some(Commands::Config(c)) if c.target == ConfigTarget::Omp && !c.global
     ));
 }
+
+#[test]
+fn remote_subcommand_and_harness_remote_flag_normalize_without_codex_collision() {
+    let rem_set = parse_strs(&[
+        "lg",
+        "remote",
+        "192.168.1.50:8787",
+        "--api-key",
+        "tok-123",
+        "--no-verify",
+    ]);
+    match rem_set.command {
+        Some(Commands::Remote(r)) => {
+            assert_eq!(r.target.as_deref(), Some("192.168.1.50:8787"));
+            assert_eq!(r.api_key.as_deref(), Some("tok-123"));
+            assert!(r.no_verify);
+            assert!(!r.off);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let rem_off = parse_strs(&["lg", "endpoint", "--local"]);
+    assert!(matches!(
+        rem_off.command,
+        Some(Commands::Remote(r)) if r.off
+    ));
+
+    // `lg cx --remote <host:port> resume --last` routes `--remote` to Liftgate `CodexArgs`,
+    // whereas `lg cx -- --remote ws://remote-tui` forwards `--remote` to native `codex`!
+    let cx_remote = parse_strs(&[
+        "lg",
+        "cx",
+        "--remote",
+        "192.168.1.50:8787",
+        "resume",
+        "--last",
+    ]);
+    match cx_remote.command {
+        Some(Commands::Codex(c)) => {
+            assert_eq!(c.remote.as_deref(), Some("192.168.1.50:8787"));
+            assert_eq!(c.passthrough_args, vec!["resume", "--last"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cx_native_remote = parse_strs(&["lg", "cx", "--", "--remote", "ws://127.0.0.1:9999"]);
+    match cx_native_remote.command {
+        Some(Commands::Codex(c)) => {
+            assert_eq!(c.remote, None);
+            assert_eq!(c.passthrough_args, vec!["--remote", "ws://127.0.0.1:9999"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let omp_remote = parse_strs(&["lg", "omp", "--remote=devbox.lan:8787", "-c"]);
+    match omp_remote.command {
+        Some(Commands::Omp(o)) => {
+            assert_eq!(o.remote.as_deref(), Some("devbox.lan:8787"));
+            assert_eq!(o.passthrough_args, vec!["-c"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}

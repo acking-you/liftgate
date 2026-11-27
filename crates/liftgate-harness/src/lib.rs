@@ -23,6 +23,7 @@ use liftgate_types::{
 use serde::{Deserialize, Serialize};
 
 pub use error::HarnessError;
+pub use fs_util::{extract_url_host, merge_endpoint_no_proxy, merge_loopback_no_proxy};
 pub use resolve::ResolvedCommand;
 
 /// Model metadata discovered from `/v1/models` on a running Liftgate daemon.
