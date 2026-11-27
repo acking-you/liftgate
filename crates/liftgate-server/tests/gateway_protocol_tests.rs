@@ -11796,3 +11796,132 @@ async fn distills_raw_harness_system_prompts_strictly_by_characteristic_tools_en
     // Generic caller: custom prompt preserved intact!
     assert!(prompts[3].text_joined.contains("PRESERVE_GENERIC_SDK_RULE"));
 }
+
+#[tokio::test]
+async fn warm_session_survives_tool_threshold_mutations_and_literal_assistant_developer_blocks() {
+    let literal_assistant = "<developer_instructions><apps_instructions>literal assistant example</apps_instructions></developer_instructions>";
+    let backend = Arc::new(MockAcpBackend::new(vec![
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec![literal_assistant.to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 2 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Turn 3 warm ok.".to_owned()],
+        },
+        MockScript::Immediate {
+            thoughts: vec![],
+            chunks_template: vec!["Cold replay preserves assistant literal.".to_owned()],
+        },
+    ]));
+
+    let state = test_state_with_mcp(Arc::clone(&backend), 30, None).await;
+    let _mcp_keepalive = state.config.mcp_server.clone().expect("mcp server bound");
+    let app = build_router(state.clone());
+
+    let raw_sys = format!(
+        "You are Claude Code, Anthropic's official CLI for Claude.\n{}",
+        "Verbose CLI manual line.\n".repeat(400)
+    );
+    let read_only_tools = json!([
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } }
+    ]);
+    let read_and_glob_tools = json!([
+        { "name": "Read", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } } },
+        { "name": "Glob", "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } } } }
+    ]);
+
+    // Turn 1: Only `[Read]` declared (`detect_harness_by_tools == None`); assistant emits literal `<developer_instructions>`.
+    let (st1, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_only_tools,
+            "messages": [{ "role": "user", "content": "Show literal wrapper example" }]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+
+    // Turn 2: Enables `[Read, Glob]` (`Some(ClaudeCode)`), replays literal assistant block, and adds a protocol developer item.
+    let (st2, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_and_glob_tools,
+            "messages": [
+                { "role": "user", "content": "Show literal wrapper example" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps</apps_instructions>\n<permissions instructions>sandbox_mode is read-only</permissions instructions>" },
+                { "role": "user", "content": "Continue with Glob enabled" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+
+    // Turn 3: Drops `Glob` back to `[Read]` (`None`); warm session MUST still match prefix hash!
+    let (st3, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_only_tools,
+            "messages": [
+                { "role": "user", "content": "Show literal wrapper example" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps</apps_instructions>\n<permissions instructions>sandbox_mode is read-only</permissions instructions>" },
+                { "role": "user", "content": "Continue with Glob enabled" },
+                { "role": "assistant", "content": "Turn 2 warm ok." },
+                { "role": "user", "content": "Continue with Read only" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+
+    // Turn 4: Cold session with `[Read, Glob]` and pre-existing literal assistant `<developer_instructions>` in history.
+    let (st4, _) = post_json(
+        &app,
+        "/v1/messages",
+        json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 1024,
+            "system": raw_sys,
+            "tools": read_and_glob_tools,
+            "messages": [
+                { "role": "user", "content": "Cold history question" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "user", "content": "Follow up" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(st4, StatusCode::OK);
+
+    let prompts = backend.recorded_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 4);
+
+    // Turns 1 -> 2 -> 3 all reused the exact same warm ACP session across `[Read] -> [Read, Glob] -> [Read]`!
+    assert_eq!(prompts[1].session_id, prompts[0].session_id);
+    assert_eq!(prompts[2].session_id, prompts[0].session_id);
+    assert!(!prompts[1].text_joined.contains("drop protocol apps"));
+    assert!(prompts[1].text_joined.contains("sandbox_mode is read-only"));
+    assert!(prompts[1].text_joined.contains("<client_tools_update>"));
+
+    // Cold Turn 4 distilled the built-in system prompt while keeping the assistant's literal `<developer_instructions>` intact!
+    assert!(!prompts[3].text_joined.contains("Verbose CLI manual line."));
+    assert!(prompts[3].text_joined.contains(literal_assistant));
+}

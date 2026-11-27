@@ -13,6 +13,7 @@ use liftgate_types::{
     },
     config::{AcpModeId, GatewayLimits, ModelId},
     error::format_error_chain,
+    harness_prompt::detect_harness_by_tools,
     model::{resolve_model_id, select_fastest_gemini_model},
     parser::{IncrementalToolParser, ParsedStreamItem, ParsedToolCall},
     session_key::{
@@ -269,11 +270,16 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     &req.messages,
                 )
             {
+                let outbound_harness =
+                    detect_harness_by_tools(&susp_checkout.entry().declared_tools)
+                        .or(req.detected_harness);
+                let delta_for_reply = req
+                    .render_messages_for_outbound(0, outbound_harness)
+                    .into_owned();
                 let delta_start_index = susp_checkout.entry().accumulated_messages.len();
                 let combined_len = delta_start_index.saturating_add(req.messages.len());
                 let (mut promoted, step_lease) =
                     susp_checkout.promote_for_mcp_continuation(combined_len);
-                let delta_for_reply = req.messages.clone();
                 promoted
                     .accumulated_messages
                     .extend(std::mem::take(&mut req.messages));
@@ -311,9 +317,11 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     Arc::clone(&backend),
                 ));
             } else if !saved_history.is_empty() {
+                let saved_len = saved_history.len();
                 let mut rebuilt = saved_history;
                 rebuilt.extend(std::mem::take(&mut req.messages));
                 req.messages = rebuilt;
+                req.shift_developer_slots(saved_len);
             }
         } else if req.previous_response_id.is_none() {
             let susp_routing = compute_routing_plan(
@@ -407,7 +415,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                             delta_slice,
                         )
                     {
-                        let delta_for_reply = delta_slice.to_vec();
+                        let outbound_harness =
+                            detect_harness_by_tools(&checkout.entry().declared_tools)
+                                .or(req.detected_harness);
+                        let delta_for_reply = req
+                            .render_messages_for_outbound(delta_start, outbound_harness)
+                            .into_owned();
                         let combined_len = req.messages.len();
                         let (mut promoted, step_lease) =
                             checkout.promote_for_mcp_continuation(combined_len);
@@ -520,8 +533,10 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     let (retired_lease, mut saved_history) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
                     if !saved_history.is_empty() {
+                        let saved_len = saved_history.len();
                         saved_history.extend(std::mem::take(&mut req.messages));
                         req.messages = saved_history;
+                        req.shift_developer_slots(saved_len);
                     }
                 } else {
                     let delta_start_index = checkout.entry().accumulated_messages.len();
@@ -541,8 +556,12 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         &checkout.entry().tool_nonce,
                         &mut spill_store,
                     );
+                    let outbound_harness =
+                        detect_harness_by_tools(&checkout.entry().declared_tools)
+                            .or(req.detected_harness);
+                    let outbound_delta = req.render_messages_for_outbound(0, outbound_harness);
                     let prompt_blocks = build_acp_prompt_plan_with_spill(
-                        &req.messages,
+                        &outbound_delta,
                         &checkout.entry().tool_nonce,
                         false,
                         tools_delta.as_deref(),
@@ -651,7 +670,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 if mcp_mode_mismatch {
                     let (retired_lease, _) = checkout.into_lease_guard(0);
                     retired_lease.finish_ephemeral();
-                } else if let Some(delta_slice) = req.messages.get(delta_start..) {
+                } else if req.messages.get(delta_start..).is_some() {
                     let previous_session_context_tokens = checkout.entry().last_context_used;
                     let tools_delta = sync_and_build_warm_tools_delta(
                         checkout.entry().mcp_handle.as_ref(),
@@ -660,8 +679,13 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         &checkout.entry().tool_nonce,
                         &mut spill_store,
                     );
+                    let outbound_harness =
+                        detect_harness_by_tools(&checkout.entry().declared_tools)
+                            .or(req.detected_harness);
+                    let outbound_delta =
+                        req.render_messages_for_outbound(delta_start, outbound_harness);
                     let prompt_blocks = build_acp_prompt_plan_with_spill(
-                        delta_slice,
+                        &outbound_delta,
                         &checkout.entry().tool_nonce,
                         false,
                         tools_delta.as_deref(),
@@ -875,8 +899,9 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         )
         .with_mcp_handle(mcp_session_handle);
 
+        let outbound_messages = req.render_messages_for_outbound(0, req.detected_harness);
         let prompt_blocks = build_acp_prompt_plan_with_spill(
-            &req.messages,
+            &outbound_messages,
             guard.tool_nonce(),
             true,
             initial_tools_spill.as_deref(),

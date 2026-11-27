@@ -382,6 +382,13 @@ pub fn wrap_developer_instructions_block(raw_text: &str) -> Option<String> {
     }
 }
 
+/// Placement chosen when materializing top-level `system` / `instructions` into `messages`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaterializedSystemSlot {
+    InsertedAtZero,
+    AppendedCompaction,
+}
+
 /// Protocol-agnostic normalizer that materializes top-level caller `system` / `instructions`
 /// into `<developer_instructions>` blocks inside `messages` instead of
 /// `_meta.antigravity.systemPrompt.append`, keeping every harness (Claude Code, Codex CLI,
@@ -393,15 +400,25 @@ pub fn materialize_system_prompt_into_messages(
     client_tools: &[CanonicalToolSpec],
     messages: &mut Vec<CanonicalMessage>,
 ) {
+    let _ = materialize_system_prompt_into_messages_with_slot(
+        raw_system,
+        has_previous_response_anchor,
+        client_tools,
+        messages,
+    );
+}
+
+pub(crate) fn materialize_system_prompt_into_messages_with_slot(
+    raw_system: Option<&str>,
+    has_previous_response_anchor: bool,
+    client_tools: &[CanonicalToolSpec],
+    messages: &mut Vec<CanonicalMessage>,
+) -> Option<MaterializedSystemSlot> {
     if has_previous_response_anchor {
-        return;
+        return None;
     }
-    let Some(sys_raw) = raw_system else {
-        return;
-    };
-    let Some(wrapped) = wrap_developer_instructions_block(sys_raw) else {
-        return;
-    };
+    let sys_raw = raw_system?;
+    let wrapped = wrap_developer_instructions_block(sys_raw)?;
     if client_tools.is_empty() && is_compaction_instructions_prompt(&wrapped) {
         if let Some(last_user) = messages
             .last_mut()
@@ -414,6 +431,7 @@ pub fn materialize_system_prompt_into_messages(
                 parts: vec![CanonicalPart::Text(wrapped)],
             });
         }
+        Some(MaterializedSystemSlot::AppendedCompaction)
     } else {
         messages.insert(
             0,
@@ -422,6 +440,7 @@ pub fn materialize_system_prompt_into_messages(
                 parts: vec![CanonicalPart::Text(wrapped)],
             },
         );
+        Some(MaterializedSystemSlot::InsertedAtZero)
     }
 }
 

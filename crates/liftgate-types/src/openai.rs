@@ -7,7 +7,8 @@ use serde_json::{Value, value::RawValue};
 use crate::acp::{AcpUsage, AvailableModel};
 use crate::canonical::{
     CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
-    NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task, parse_base64_data_url,
+    NormalizedTurnRequest, ProtocolDeveloperSlot, ProtocolDeveloperSlotKind, ReasoningEffort,
+    detect_auxiliary_task, parse_base64_data_url,
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
@@ -195,6 +196,7 @@ pub fn normalize_responses_request(
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
     let mut aux_system_parts = Vec::new();
     let mut messages: Vec<CanonicalMessage> = Vec::new();
+    let mut developer_slots: Vec<ProtocolDeveloperSlot> = Vec::new();
     let mut has_conversational_input = false;
     let mut has_base_instructions_slot = false;
     let mut deferred_compaction_instructions: Option<String> = None;
@@ -211,9 +213,15 @@ pub fn normalize_responses_request(
                     deferred_compaction_instructions = Some(trimmed.to_owned());
                 } else if let Some(wrapped) = wrap_developer_instructions_block(trimmed) {
                     has_base_instructions_slot = true;
+                    let msg_index = messages.len();
                     messages.push(CanonicalMessage {
                         role: CanonicalRole::User,
                         parts: vec![CanonicalPart::Text(wrapped)],
+                    });
+                    developer_slots.push(ProtocolDeveloperSlot {
+                        msg_index,
+                        part_index: 0,
+                        kind: ProtocolDeveloperSlotKind::PrimaryBase,
                     });
                 }
             }
@@ -376,11 +384,21 @@ pub fn normalize_responses_request(
                                     if let Some(wrapped) =
                                         wrap_developer_instructions_block(trimmed)
                                     {
-                                        push_part(
+                                        let (msg_index, part_index) = push_part(
                                             &mut messages,
                                             CanonicalRole::User,
                                             CanonicalPart::Text(wrapped),
                                         );
+                                        let allow_standalone_base = !has_base_instructions_slot
+                                            && req.previous_response_id.is_none()
+                                            && msg_index == 0;
+                                        developer_slots.push(ProtocolDeveloperSlot {
+                                            msg_index,
+                                            part_index,
+                                            kind: ProtocolDeveloperSlotKind::DeveloperItem {
+                                                allow_standalone_base,
+                                            },
+                                        });
                                     }
                                 }
                             }
@@ -584,17 +602,8 @@ pub fn normalize_responses_request(
     ) || aux_system_hint
         .as_deref()
         .is_some_and(is_compaction_instructions_prompt);
-    if auxiliary_task.is_none()
-        && !is_compaction
-        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
-    {
-        crate::harness_prompt::distill_responses_developer_messages(
-            harness,
-            has_base_instructions_slot,
-            req.previous_response_id.is_none(),
-            &mut messages,
-        );
-    }
+    let detected_harness = crate::harness_prompt::detect_harness_by_tools(&declared_tools);
+    let allow_prompt_distillation = auxiliary_task.is_none() && !is_compaction;
 
     let force_native_web_search = enable_native_web_search
         && req.tool_choice.as_ref().is_some_and(|choice| {
@@ -658,6 +667,9 @@ pub fn normalize_responses_request(
         omit_thinking_text: false,
         include_encrypted_reasoning,
         stream: req.stream.unwrap_or(false),
+        detected_harness,
+        allow_prompt_distillation,
+        developer_slots,
     })
 }
 
@@ -886,17 +898,24 @@ fn normalize_local_shell_action_json(action: &Value) -> String {
     serde_json::to_string(action).unwrap_or_else(|_| "{}".to_owned())
 }
 
-fn push_part(messages: &mut Vec<CanonicalMessage>, role: CanonicalRole, part: CanonicalPart) {
+fn push_part(
+    messages: &mut Vec<CanonicalMessage>,
+    role: CanonicalRole,
+    part: CanonicalPart,
+) -> (usize, usize) {
+    let existing_len = messages.len();
     if let Some(last) = messages.last_mut()
         && last.role == role
     {
+        let part_idx = last.parts.len();
         last.parts.push(part);
-        return;
+        return (existing_len.saturating_sub(1), part_idx);
     }
     messages.push(CanonicalMessage {
         role,
         parts: vec![part],
     });
+    (existing_len, 0)
 }
 
 fn extract_plain_text(content: &ResponseMessageContent) -> String {
@@ -1848,8 +1867,13 @@ mod tests {
         .expect("valid Turn 1 Codex request");
 
         let norm1 = normalize_responses_request(&turn1_req).expect("normalized Turn 1");
+        assert!(matches!(
+            norm1.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Upstream Codex CLI boilerplate rule")
+        ));
+        let outbound1 = norm1.render_messages_for_outbound(0, norm1.detected_harness);
         let joined1: String = norm1
-            .messages
+            .render_messages_for_outbound(0, norm1.detected_harness)
             .iter()
             .flat_map(|m| m.parts.iter())
             .filter_map(|p| match p {
@@ -1858,6 +1882,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        assert_eq!(outbound1.len(), 2);
         assert!(!joined1.contains("Upstream Codex CLI boilerplate rule"));
         assert!(!joined1.contains("Verbose skill blurb"));
         assert!(!joined1.contains("<apps_instructions>"));
@@ -1885,6 +1910,9 @@ mod tests {
         }))
         .expect("stateful Turn 2");
         let norm_stateful_t2 = normalize_responses_request(&stateful_t2).expect("norm stateful t2");
+        let outbound_stateful_t2 = norm_stateful_t2
+            .render_messages_for_outbound(0, norm_stateful_t2.detected_harness)
+            .into_owned();
         let mut combined = norm1.messages.clone();
         combined.push(assistant_1);
         combined.extend(norm_stateful_t2.messages);
@@ -1909,8 +1937,14 @@ mod tests {
         .expect("stateless Turn 2");
         let norm_stateless_t2 =
             normalize_responses_request(&stateless_t2).expect("norm stateless t2");
+        let outbound_stateless_delta =
+            norm_stateless_t2.render_messages_for_outbound(3, norm_stateless_t2.detected_harness);
 
         assert_eq!(combined, norm_stateless_t2.messages);
+        assert_eq!(
+            outbound_stateful_t2.as_slice(),
+            outbound_stateless_delta.as_ref()
+        );
         assert_eq!(
             hash_conversation_state(
                 None,
@@ -1937,9 +1971,122 @@ mod tests {
         }))
         .expect("generic request");
         let norm_generic = normalize_responses_request(&generic_req).expect("norm generic");
+        let outbound_generic =
+            norm_generic.render_messages_for_outbound(0, norm_generic.detected_harness);
         assert!(matches!(
-            norm_generic.messages[0].parts.first(),
+            outbound_generic[0].parts.first(),
             Some(CanonicalPart::Text(t)) if t.contains("Domain rule.")
         ));
+    }
+
+    #[test]
+    fn responses_normalization_preserves_hashes_across_tool_mutations_and_literal_assistant_wrappers()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let raw_inst = format!(
+            "You are Codex.\n{}",
+            "Built-in Codex manual line.\n".repeat(200)
+        );
+        let shell_only = json!([{
+            "type": "function",
+            "name": "shell",
+            "parameters": {
+                "type": "object",
+                "properties": { "command": { "type": "array", "items": { "type": "string" } } }
+            }
+        }]);
+        let shell_and_patch = json!([
+            {
+                "type": "function",
+                "name": "shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "array", "items": { "type": "string" } } }
+                }
+            },
+            {
+                "type": "function",
+                "name": "apply_patch",
+                "parameters": { "type": "object", "properties": { "patch": { "type": "string" } } }
+            }
+        ]);
+
+        let turn1: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_inst,
+            "tools": shell_only,
+            "input": [{ "role": "user", "content": "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>" }]
+        }))
+        .expect("turn 1");
+        let norm1 = normalize_responses_request(&turn1).expect("norm 1");
+        assert_eq!(norm1.detected_harness, None);
+
+        let literal_assistant = "<developer_instructions><apps_instructions>assistant literal</apps_instructions></developer_instructions>";
+        let reply1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(literal_assistant.to_owned())],
+        };
+        let t1_hash = hash_conversation_with_reply(
+            None,
+            &norm1.client_tools,
+            web_cfg,
+            &model,
+            &norm1.messages,
+            &reply1,
+        );
+
+        // Turn 2 crosses detection threshold (`[shell]` -> `[shell, apply_patch]`) and replays
+        // both user and assistant literal `<developer_instructions>` blocks.
+        let turn2: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "instructions": raw_inst,
+            "tools": shell_and_patch,
+            "input": [
+                { "role": "user", "content": "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>" },
+                { "role": "assistant", "content": literal_assistant },
+                { "role": "developer", "content": "<apps_instructions>drop protocol apps prose</apps_instructions>\n<permissions instructions>read-only</permissions instructions>" },
+                { "role": "user", "content": "continue" }
+            ]
+        }))
+        .expect("turn 2");
+        let norm2 = normalize_responses_request(&turn2).expect("norm 2");
+        assert_eq!(
+            norm2.detected_harness,
+            Some(crate::harness_prompt::DetectedHarness::Codex)
+        );
+        let plan2 =
+            compute_routing_plan(None, &norm2.client_tools, web_cfg, &model, &norm2.messages);
+        assert_eq!(plan2.prefix_lookup, Some((t1_hash, 3)));
+
+        // Full outbound rendering distills protocol slots while keeping user & assistant literals untouched.
+        let full_outbound = norm2.render_messages_for_outbound(0, norm2.detected_harness);
+        assert_eq!(
+            full_outbound[1].parts,
+            vec![CanonicalPart::Text(
+                "<developer_instructions><apps_instructions>user literal</apps_instructions></developer_instructions>".to_owned()
+            )]
+        );
+        assert_eq!(
+            full_outbound[2].parts,
+            vec![CanonicalPart::Text(literal_assistant.to_owned())]
+        );
+        let delta_outbound = norm2.render_messages_for_outbound(3, norm2.detected_harness);
+        let delta_joined: String = delta_outbound
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                CanonicalPart::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!delta_joined.contains("drop protocol apps prose"));
+        assert!(delta_joined.contains("read-only"));
     }
 }

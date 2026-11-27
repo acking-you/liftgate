@@ -6,11 +6,13 @@ use serde_json::{Value, value::RawValue};
 use crate::acp::AcpUsage;
 use crate::canonical::{
     CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind, CanonicalToolSpec,
-    NormalizedTurnRequest, ReasoningEffort, detect_auxiliary_task,
+    NormalizedTurnRequest, ProtocolDeveloperSlot, ProtocolDeveloperSlotKind, ReasoningEffort,
+    detect_auxiliary_task,
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
-    materialize_system_prompt_into_messages, strip_billing_noise, wrap_developer_instructions_block,
+    MaterializedSystemSlot, materialize_system_prompt_into_messages_with_slot, strip_billing_noise,
+    wrap_developer_instructions_block,
 };
 
 pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
@@ -282,6 +284,7 @@ pub fn normalize_anthropic_request(
     let aux_system = (!raw_system_parts.is_empty()).then(|| raw_system_parts.join("\n\n"));
 
     let mut conv_messages = Vec::with_capacity(req.messages.len());
+    let mut developer_slots: Vec<ProtocolDeveloperSlot> = Vec::new();
     let mut has_conversational_input = false;
     for msg in req.messages {
         let is_system_or_developer = matches!(msg.role.as_str(), "system" | "developer");
@@ -292,10 +295,12 @@ pub fn normalize_anthropic_request(
         };
 
         let mut parts = Vec::new();
+        let mut msg_dev_part_indices = Vec::new();
         match msg.content {
             AnthropicMessageContent::Text(s) => {
                 if is_system_or_developer {
                     if let Some(wrapped) = wrap_developer_instructions_block(&s) {
+                        msg_dev_part_indices.push(parts.len());
                         parts.push(CanonicalPart::Text(wrapped));
                     }
                 } else {
@@ -309,6 +314,7 @@ pub fn normalize_anthropic_request(
                         AnthropicInputBlock::Text { text } => {
                             if is_system_or_developer {
                                 if let Some(wrapped) = wrap_developer_instructions_block(&text) {
+                                    msg_dev_part_indices.push(parts.len());
                                     parts.push(CanonicalPart::Text(wrapped));
                                 }
                             } else {
@@ -405,6 +411,17 @@ pub fn normalize_anthropic_request(
         }
 
         if !parts.is_empty() {
+            let msg_index = conv_messages.len();
+            let allow_standalone_base = system_segments.is_empty() && msg_index == 0;
+            for part_index in msg_dev_part_indices {
+                developer_slots.push(ProtocolDeveloperSlot {
+                    msg_index,
+                    part_index,
+                    kind: ProtocolDeveloperSlotKind::DeveloperItem {
+                        allow_standalone_base,
+                    },
+                });
+            }
             conv_messages.push(CanonicalMessage { role, parts });
         }
     }
@@ -491,37 +508,36 @@ pub fn normalize_anthropic_request(
     ) || aux_system
         .as_deref()
         .is_some_and(crate::session_key::is_compaction_instructions_prompt);
-    let effective_system = if auxiliary_task.is_none()
-        && !is_compaction
-        && let Some(harness) = crate::harness_prompt::detect_harness_by_tools(&declared_tools)
-    {
-        crate::harness_prompt::distill_responses_developer_messages(
-            harness,
-            false,
-            false,
-            &mut conv_messages,
-        );
-        let mut distilled_parts = Vec::new();
-        if let Some(distilled) =
-            crate::harness_prompt::distill_anthropic_system_prompt(harness, &system_segments)
-        {
-            distilled_parts.push(distilled);
-        }
-        if let Some(directive) = json_schema_directive {
-            distilled_parts.push(directive);
-        }
-        (!distilled_parts.is_empty()).then(|| distilled_parts.join("\n\n"))
-    } else {
-        aux_system
-    };
+    let detected_harness = crate::harness_prompt::detect_harness_by_tools(&declared_tools);
+    let allow_prompt_distillation = auxiliary_task.is_none() && !is_compaction;
 
     let mut messages = conv_messages;
-    materialize_system_prompt_into_messages(
-        effective_system.as_deref(),
+    match materialize_system_prompt_into_messages_with_slot(
+        aux_system.as_deref(),
         false,
         &client_tools,
         &mut messages,
-    );
+    ) {
+        Some(MaterializedSystemSlot::InsertedAtZero) => {
+            for slot in &mut developer_slots {
+                slot.msg_index = slot.msg_index.saturating_add(1);
+            }
+            if !system_segments.is_empty() {
+                developer_slots.insert(
+                    0,
+                    ProtocolDeveloperSlot {
+                        msg_index: 0,
+                        part_index: 0,
+                        kind: ProtocolDeveloperSlotKind::AnthropicSystem {
+                            segments: system_segments,
+                            json_schema_directive,
+                        },
+                    },
+                );
+            }
+        }
+        Some(MaterializedSystemSlot::AppendedCompaction) | None => {}
+    }
 
     let force_native_web_search = enable_native_web_search
         && (choice_tool_name == Some("web_search")
@@ -576,6 +592,9 @@ pub fn normalize_anthropic_request(
         omit_thinking_text,
         include_encrypted_reasoning: false,
         stream: req.stream.unwrap_or(false),
+        detected_harness,
+        allow_prompt_distillation,
+        developer_slots,
     })
 }
 
@@ -1119,7 +1138,12 @@ mod tests {
             "count_tokens should reflect distilled system prompt, got {estimated}"
         );
         let norm_plan = normalize_anthropic_request(req_plan).expect("normalized Plan turn");
-        let dev_text = match norm_plan.messages[0].parts.first() {
+        assert!(matches!(
+            norm_plan.messages[0].parts.first(),
+            Some(CanonicalPart::Text(t)) if t.contains("Built-in Bash/Edit/Task tutorial line")
+        ));
+        let outbound_plan = norm_plan.render_messages_for_outbound(0, norm_plan.detected_harness);
+        let dev_text = match outbound_plan[0].parts.first() {
             Some(CanonicalPart::Text(t)) => t.as_str(),
             other => panic!("expected developer_instructions part, got {other:?}"),
         };
@@ -1223,12 +1247,14 @@ mod tests {
         );
         let norm_aux_cls =
             normalize_anthropic_request(req_aux_cls).expect("normalized Auto Mode classifier");
+        let outbound_aux_cls =
+            norm_aux_cls.render_messages_for_outbound(0, norm_aux_cls.detected_harness);
         assert_eq!(
             norm_aux_cls.auxiliary_task,
             Some(crate::canonical::AuxiliaryTaskKind::AutoModeClassifier)
         );
         assert!(matches!(
-            norm_aux_cls.messages[0].parts.first(),
+            outbound_aux_cls[0].parts.first(),
             Some(CanonicalPart::Text(t)) if t.contains("CLASSIFIER_POLICY_RULE_LINE")
         ));
 
@@ -1248,7 +1274,8 @@ mod tests {
         }))
         .expect("valid OpenCode request");
         let norm_oc = normalize_anthropic_request(req_oc).expect("normalized OpenCode");
-        let oc_dev = match norm_oc.messages[0].parts.first() {
+        let outbound_oc = norm_oc.render_messages_for_outbound(0, norm_oc.detected_harness);
+        let oc_dev = match outbound_oc[0].parts.first() {
             Some(CanonicalPart::Text(t)) => t.as_str(),
             other => panic!("expected developer_instructions, got {other:?}"),
         };
@@ -1267,9 +1294,89 @@ mod tests {
         }))
         .expect("valid generic Anthropic request");
         let norm_gen = normalize_anthropic_request(req_generic).expect("normalized generic");
+        let outbound_gen = norm_gen.render_messages_for_outbound(0, norm_gen.detected_harness);
         assert!(matches!(
-            norm_gen.messages[0].parts.first(),
+            outbound_gen[0].parts.first(),
             Some(CanonicalPart::Text(t)) if t.contains("Keep this custom domain rule.")
         ));
+    }
+
+    #[test]
+    fn anthropic_normalization_preserves_hashes_across_tool_threshold_mutations_and_assistant_literals()
+     {
+        use crate::config::ModelId;
+        use crate::session_key::{
+            WebToolBridgeConfig, compute_routing_plan, hash_conversation_with_reply,
+        };
+
+        let model = ModelId::try_new("gemini-4-carbon-high").expect("valid model");
+        let web_cfg = WebToolBridgeConfig::default();
+        let sys_prompt = format!(
+            "You are Claude Code, Anthropic's official CLI for Claude.\n{}",
+            "Built-in Claude Code manual line.\n".repeat(200)
+        );
+
+        // Turn 1 declares only `[Read]` (`detected_harness == None`).
+        let req_t1: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 4096,
+            "system": sys_prompt,
+            "tools": [{ "name": "Read", "input_schema": { "type": "object" } }],
+            "messages": [{ "role": "user", "content": "Show <developer_instructions> example" }]
+        }))
+        .expect("valid t1");
+        let norm_t1 = normalize_anthropic_request(req_t1).expect("norm t1");
+        assert_eq!(norm_t1.detected_harness, None);
+
+        let assistant_literal = "<developer_instructions><apps_instructions>example</apps_instructions></developer_instructions>";
+        let reply_t1 = CanonicalMessage {
+            role: CanonicalRole::Assistant,
+            parts: vec![CanonicalPart::Text(assistant_literal.to_owned())],
+        };
+        let t1_hash = hash_conversation_with_reply(
+            None,
+            &norm_t1.client_tools,
+            web_cfg,
+            &model,
+            &norm_t1.messages,
+            &reply_t1,
+        );
+
+        // Turn 2 enables `[Read, Glob]` (`Some(ClaudeCode)`) and replays the literal assistant block.
+        let req_t2: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-high",
+            "max_tokens": 4096,
+            "system": sys_prompt,
+            "tools": [
+                { "name": "Read", "input_schema": { "type": "object" } },
+                { "name": "Glob", "input_schema": { "type": "object" } }
+            ],
+            "messages": [
+                { "role": "user", "content": "Show <developer_instructions> example" },
+                { "role": "assistant", "content": assistant_literal },
+                { "role": "user", "content": "Now explain it" }
+            ]
+        }))
+        .expect("valid t2");
+        let norm_t2 = normalize_anthropic_request(req_t2).expect("norm t2");
+        assert_eq!(
+            norm_t2.detected_harness,
+            Some(crate::harness_prompt::DetectedHarness::ClaudeCode)
+        );
+        let plan_t2 = compute_routing_plan(
+            None,
+            &norm_t2.client_tools,
+            web_cfg,
+            &model,
+            &norm_t2.messages,
+        );
+        assert_eq!(plan_t2.prefix_lookup, Some((t1_hash, 3)));
+
+        // Assistant `<developer_instructions>` text is preserved verbatim in outbound rendering.
+        let outbound_t2 = norm_t2.render_messages_for_outbound(0, norm_t2.detected_harness);
+        assert_eq!(
+            outbound_t2[2].parts,
+            vec![CanonicalPart::Text(assistant_literal.to_owned())]
+        );
     }
 }

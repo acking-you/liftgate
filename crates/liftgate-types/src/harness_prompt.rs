@@ -17,7 +17,12 @@
 //!    `Instructions from:`, `--append-system-prompt`, short custom subagent prompts), sandbox
 //!    `<permissions instructions>`, active Plan Mode contracts, and compact skill path indexes.
 
-use crate::canonical::{CanonicalMessage, CanonicalPart, CanonicalToolKind, CanonicalToolSpec};
+use std::collections::BTreeSet;
+
+use crate::canonical::{
+    CanonicalMessage, CanonicalPart, CanonicalToolKind, CanonicalToolSpec, ProtocolDeveloperSlot,
+    ProtocolDeveloperSlotKind,
+};
 use crate::session_key::{
     is_code_mode_custom_exec, is_codex_exec_orchestrator_tool, is_omp_eval_orchestrator_tool,
     is_opencode_execute_orchestrator_tool, strip_billing_noise, wrap_developer_instructions_block,
@@ -620,56 +625,132 @@ pub fn distill_anthropic_system_prompt(
     Some(out_parts.join("\n\n"))
 }
 
-/// Distills `<developer_instructions>` blocks inside normalized OpenAI `/v1/responses` messages
-/// for a positively identified `harness`.
+/// Applies outbound prompt distillation strictly to protocol-originated developer/system slots in
+/// `slice` (representing `messages[range_start..]`).
 ///
-/// Pure and stateless per message part so stateful `previous_response_id` continuations and full
-/// stateless replays always produce byte-for-byte identical `CanonicalMessage` histories.
-pub fn distill_responses_developer_messages(
+/// Conversational `user` and `assistant` parts are never listed in `slots`, so literal
+/// `<developer_instructions>` text emitted by the assistant or user is preserved verbatim.
+pub fn apply_developer_slots_to_slice(
     harness: DetectedHarness,
-    has_base_instructions_slot: bool,
-    is_cold_turn: bool,
-    messages: &mut Vec<CanonicalMessage>,
+    slots: &[ProtocolDeveloperSlot],
+    range_start: usize,
+    slice: &mut Vec<CanonicalMessage>,
 ) {
-    if distilled_harness_system_prompt(harness).is_none() {
+    if distilled_harness_system_prompt(harness).is_none() || slots.is_empty() || slice.is_empty() {
         return;
     }
 
     let mut consumed_base_slot = false;
-    for (msg_idx, msg) in messages.iter_mut().enumerate() {
-        let mut next_parts = Vec::with_capacity(msg.parts.len());
-        for (part_idx, part) in std::mem::take(&mut msg.parts).into_iter().enumerate() {
-            let CanonicalPart::Text(text) = part else {
-                next_parts.push(part);
-                continue;
-            };
-            let Some(inner) = unwrap_developer_instructions(&text) else {
-                next_parts.push(CanonicalPart::Text(text));
-                continue;
-            };
+    let mut dropped_coords: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut touched_msgs: BTreeSet<usize> = BTreeSet::new();
 
-            let treat_as_base = !consumed_base_slot
-                && msg_idx == 0
-                && ((has_base_instructions_slot && part_idx == 0)
-                    || (!has_base_instructions_slot
-                        && is_cold_turn
-                        && looks_like_standalone_base_prompt(inner)));
+    for slot in slots {
+        let Some(rel_msg_idx) = slot.msg_index.checked_sub(range_start) else {
+            match &slot.kind {
+                ProtocolDeveloperSlotKind::PrimaryBase
+                | ProtocolDeveloperSlotKind::AnthropicSystem { .. } => {
+                    consumed_base_slot = true;
+                }
+                ProtocolDeveloperSlotKind::DeveloperItem {
+                    allow_standalone_base,
+                } => {
+                    if *allow_standalone_base {
+                        consumed_base_slot = true;
+                    }
+                }
+            }
+            continue;
+        };
 
-            if treat_as_base {
+        let Some(msg) = slice.get_mut(rel_msg_idx) else {
+            continue;
+        };
+        let Some(CanonicalPart::Text(text)) = msg.parts.get_mut(slot.part_index) else {
+            continue;
+        };
+
+        match &slot.kind {
+            ProtocolDeveloperSlotKind::PrimaryBase => {
                 consumed_base_slot = true;
+                let Some(inner) = unwrap_developer_instructions(text) else {
+                    continue;
+                };
                 let distilled = distill_harness_base_prompt(harness, inner);
                 if let Some(wrapped) = wrap_developer_instructions_block(&distilled) {
-                    next_parts.push(CanonicalPart::Text(wrapped));
+                    *text = wrapped;
+                } else {
+                    dropped_coords.insert((rel_msg_idx, slot.part_index));
+                    touched_msgs.insert(rel_msg_idx);
                 }
-            } else if let Some(distilled_item) = distill_harness_developer_item(harness, inner)
-                && let Some(wrapped) = wrap_developer_instructions_block(&distilled_item)
-            {
-                next_parts.push(CanonicalPart::Text(wrapped));
+            }
+            ProtocolDeveloperSlotKind::AnthropicSystem {
+                segments,
+                json_schema_directive,
+            } => {
+                consumed_base_slot = true;
+                let mut distilled_parts = Vec::new();
+                if let Some(distilled) = distill_anthropic_system_prompt(harness, segments) {
+                    distilled_parts.push(distilled);
+                }
+                if let Some(directive) = json_schema_directive {
+                    distilled_parts.push(directive.clone());
+                }
+                let joined = distilled_parts.join("\n\n");
+                if let Some(wrapped) = wrap_developer_instructions_block(&joined) {
+                    *text = wrapped;
+                } else {
+                    dropped_coords.insert((rel_msg_idx, slot.part_index));
+                    touched_msgs.insert(rel_msg_idx);
+                }
+            }
+            ProtocolDeveloperSlotKind::DeveloperItem {
+                allow_standalone_base,
+            } => {
+                let Some(inner) = unwrap_developer_instructions(text) else {
+                    continue;
+                };
+                if !consumed_base_slot
+                    && *allow_standalone_base
+                    && looks_like_standalone_base_prompt(inner)
+                {
+                    consumed_base_slot = true;
+                    let distilled = distill_harness_base_prompt(harness, inner);
+                    if let Some(wrapped) = wrap_developer_instructions_block(&distilled) {
+                        *text = wrapped;
+                    } else {
+                        dropped_coords.insert((rel_msg_idx, slot.part_index));
+                        touched_msgs.insert(rel_msg_idx);
+                    }
+                } else if let Some(distilled_item) = distill_harness_developer_item(harness, inner)
+                    && let Some(wrapped) = wrap_developer_instructions_block(&distilled_item)
+                {
+                    *text = wrapped;
+                } else {
+                    dropped_coords.insert((rel_msg_idx, slot.part_index));
+                    touched_msgs.insert(rel_msg_idx);
+                }
             }
         }
-        msg.parts = next_parts;
     }
-    messages.retain(|m| !m.parts.is_empty());
+
+    if !dropped_coords.is_empty() {
+        for &rel_msg_idx in &touched_msgs {
+            if let Some(msg) = slice.get_mut(rel_msg_idx) {
+                let mut part_idx = 0usize;
+                msg.parts.retain(|_| {
+                    let keep = !dropped_coords.contains(&(rel_msg_idx, part_idx));
+                    part_idx = part_idx.saturating_add(1);
+                    keep
+                });
+            }
+        }
+        let mut msg_idx = 0usize;
+        slice.retain(|msg| {
+            let drop_empty = touched_msgs.contains(&msg_idx) && msg.parts.is_empty();
+            msg_idx = msg_idx.saturating_add(1);
+            !drop_empty
+        });
+    }
 }
 
 /// Distills a single `role: "developer" | "system"` message item (outside the primary
