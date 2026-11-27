@@ -8,6 +8,7 @@ pub mod error;
 pub mod model;
 pub mod openai;
 pub mod parser;
+pub mod pricing;
 pub mod session_key;
 pub mod telemetry;
 

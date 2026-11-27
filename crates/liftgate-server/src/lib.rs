@@ -14,4 +14,5 @@ pub mod title_model;
 pub mod tool_calls;
 pub mod tool_catalog;
 pub mod turn_runner;
+pub mod usage_ledger;
 pub mod web_fetch;

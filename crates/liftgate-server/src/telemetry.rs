@@ -10,7 +10,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use liftgate_types::{
-    acp::{AcpPromptBlock, AcpUsage, compute_cache_hit_bps},
+    acp::{AcpPromptBlock, AcpUsage, AvailableModel, compute_cache_hit_bps},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
         CanonicalToolSpec, ReasoningEffort,
@@ -18,6 +18,7 @@ use liftgate_types::{
     config::{
         CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit, LowCacheRecordLimit,
     },
+    pricing::{ModelPrice, PricingResponse, UsageResponse, UsageSummary, UsageTokens},
     session_key::{WebToolBridgeConfig, truncate_head_tail_lines},
     telemetry::{
         CacheTelemetrySummary, CapturedAcpPromptBlock, CapturedFullMessage, CapturedFullPart,
@@ -42,6 +43,7 @@ use crate::context_capture::{
 use crate::tool_calls::{
     ToolCallLimits, ToolCallOutcome, ToolCallStart, ToolCallStore, ToolCallTaskContext,
 };
+use crate::usage_ledger::{LedgerRow, PriceBook, PriceUpdate, UsageLedger};
 
 const MAX_RECENT_TASKS: usize = 100;
 const MAX_PROMPT_PREVIEW_CHARS: usize = 180;
@@ -123,6 +125,9 @@ pub struct TelemetryConfig {
     pub tool_calls: ToolCallLimits,
     /// Opt-in full-context capture (disabled by default).
     pub context_capture: ContextCaptureConfig,
+    /// Where custom model prices persist (`~/.liftgate/model-pricing.json`); `None` keeps them in
+    /// memory only.
+    pub pricing_path: Option<PathBuf>,
 }
 
 /// Latest context composition observed for a session, used by the tool catalog view.
@@ -253,6 +258,12 @@ struct PersistedCacheTelemetryFile {
     auxiliary_prompt_tokens: u64,
     #[serde(default)]
     low_cache_records: VecDeque<LowCacheHitRecord>,
+    /// When per-model usage recording started (or was last reset).
+    #[serde(default)]
+    usage_since_unix_ms: u64,
+    /// Per-model, per-price-period token usage.
+    #[serde(default)]
+    model_usage: Vec<LedgerRow>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -267,6 +278,8 @@ struct CacheTelemetryStore {
     revision: u64,
     persist_seq: u64,
     file_state: PersistedCacheTelemetryFile,
+    /// Per-model usage; copied into `file_state` whenever the file is persisted.
+    usage: UsageLedger,
 }
 
 impl CacheTelemetryStore {
@@ -292,6 +305,11 @@ impl CacheTelemetryStore {
         );
         remove_payload_files(payload_dir.as_deref(), &evicted);
         prune_orphan_payload_files(payload_dir.as_deref(), &file_state.low_cache_records);
+        let usage = UsageLedger::from_persisted(
+            file_state.usage_since_unix_ms,
+            std::mem::take(&mut file_state.model_usage),
+            unix_timestamp_ms(),
+        );
 
         Self {
             persist_path: config.persist_path,
@@ -303,6 +321,7 @@ impl CacheTelemetryStore {
             revision: 1,
             persist_seq: 0,
             file_state,
+            usage,
         }
     }
 
@@ -355,6 +374,8 @@ impl CacheTelemetryStore {
         self.file_state.max_low_cache_records = self.max_low_cache_records.get();
         self.file_state.low_cache_threshold_bps = self.low_cache_threshold_bps.get();
         self.file_state.capture_request_details = self.capture_request_details;
+        self.file_state.usage_since_unix_ms = self.usage.since_unix_ms();
+        self.file_state.model_usage = self.usage.rows().to_vec();
         Some((path, self.persist_seq, self.file_state.clone()))
     }
 }
@@ -607,6 +628,7 @@ pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
     persist_lock: Mutex<u64>,
     context_persist_lock: Mutex<u64>,
+    pricing_persist_lock: Mutex<u64>,
     /// One permit per full-context capture allowed to wait for, or be in, its disk write.
     context_write_slots: Arc<Semaphore>,
     settings_path: Option<PathBuf>,
@@ -626,6 +648,7 @@ struct TelemetryInner {
     cache_store: CacheTelemetryStore,
     tool_calls: ToolCallStore,
     context_store: ContextCaptureStore,
+    pricing: PriceBook,
     session_contexts: HashMap<String, SessionContextSample>,
     active_tasks: BTreeMap<String, TaskSnapshot>,
     recent_tasks: VecDeque<TaskSnapshot>,
@@ -683,12 +706,14 @@ impl TelemetryHub {
                 cache_store,
                 tool_calls: ToolCallStore::new(config.tool_calls),
                 context_store: ContextCaptureStore::load(config.context_capture),
+                pricing: PriceBook::load(config.pricing_path),
                 session_contexts: HashMap::new(),
                 active_tasks: BTreeMap::new(),
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
             }),
             persist_lock: Mutex::new(0),
             context_persist_lock: Mutex::new(0),
+            pricing_persist_lock: Mutex::new(0),
             context_write_slots,
             settings_path,
             notify_tx,
@@ -796,6 +821,7 @@ impl TelemetryHub {
             error_message: None,
             usage: None,
             cache_hit_rate_bps: None,
+            cost_usd: None,
         };
 
         let capturing = {
@@ -927,6 +953,80 @@ impl TelemetryHub {
     #[must_use]
     pub fn session_context_sample(&self, session_id: &str) -> Option<SessionContextSample> {
         self.lock_inner().session_contexts.get(session_id).cloned()
+    }
+
+    // ---- usage & pricing ---------------------------------------------------------------
+
+    /// Usage totals and their cost, carried on every snapshot.
+    #[must_use]
+    pub fn usage_summary(&self) -> UsageSummary {
+        let guard = self.lock_inner();
+        guard.cache_store.usage.report(&guard.pricing).summary
+    }
+
+    /// Per-model usage and cost.
+    #[must_use]
+    pub fn usage_report(&self) -> UsageResponse {
+        let guard = self.lock_inner();
+        guard.cache_store.usage.report(&guard.pricing)
+    }
+
+    /// Prices of every shipped family plus every catalog, recorded, or custom-priced model.
+    #[must_use]
+    pub fn pricing_report(&self, catalog: &[AvailableModel]) -> PricingResponse {
+        let guard = self.lock_inner();
+        guard
+            .pricing
+            .report(catalog, &guard.cache_store.usage, unix_timestamp_ms())
+    }
+
+    /// Sets (`Some`) or clears (`None`) the custom price of a pricing key and persists the price
+    /// book.
+    pub fn set_custom_price(&self, key: &str, price: Option<ModelPrice>) -> PriceUpdate {
+        let (outcome, prepared) = {
+            let mut guard = self.lock_inner();
+            let outcome = guard.pricing.set(key, price);
+            let prepared = if outcome == PriceUpdate::Changed {
+                guard.pricing.prepare_persist()
+            } else {
+                None
+            };
+            (outcome, prepared)
+        };
+        if let Some((path, seq, bytes)) = prepared {
+            let mut written_seq = match self.pricing_persist_lock.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if seq > *written_seq {
+                match write_bytes_atomic_private(&path, &bytes) {
+                    Ok(()) => *written_seq = seq,
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        error = ?err,
+                        "failed to persist model pricing"
+                    ),
+                }
+            }
+        }
+        if outcome == PriceUpdate::Changed {
+            self.notify_change();
+        }
+        outcome
+    }
+
+    /// Drops all recorded usage and starts counting again now.
+    pub fn reset_usage(&self) -> UsageSummary {
+        let now_ms = unix_timestamp_ms();
+        let (summary, prepared) = {
+            let mut guard = self.lock_inner();
+            guard.cache_store.usage.reset(now_ms);
+            let summary = guard.cache_store.usage.report(&guard.pricing).summary;
+            (summary, guard.cache_store.prepare_persist_payload(now_ms))
+        };
+        self.flush_prepared_persist(prepared);
+        self.notify_change();
+        summary
     }
 
     // ---- full-context capture ----------------------------------------------------------
@@ -1133,7 +1233,23 @@ impl TelemetryHub {
             .collect();
         active.sort_by_key(|b| std::cmp::Reverse(b.started_at_unix_ms));
 
-        let recent: Vec<TaskSnapshot> = guard.recent_tasks.iter().rev().cloned().collect();
+        let recent: Vec<TaskSnapshot> = guard
+            .recent_tasks
+            .iter()
+            .rev()
+            .cloned()
+            .map(|mut t| {
+                // Priced on read, so a price edit shows up on every listed request at once.
+                t.cost_usd = t.usage.and_then(|usage| {
+                    guard.pricing.cost_of(
+                        &t.resolved_model,
+                        &UsageTokens::from_acp(&usage),
+                        t.finished_at_unix_ms.unwrap_or(now_ms),
+                    )
+                });
+                t
+            })
+            .collect();
         let mut metrics = guard.metrics;
         metrics.active_requests = active.len();
         let cache_summary = guard.cache_store.summary();
@@ -1285,9 +1401,11 @@ impl TelemetryHub {
     }
     /// Reconciles any rounding delta between intermediate `UsageUpdate` step estimates and the
     /// final authoritative `PromptTurnResult.usage` sum when a multi-step suspended MCP
-    /// `session/prompt` completes, guaranteeing 0-token cumulative drift.
+    /// `session/prompt` completes, guaranteeing 0-token cumulative drift (including in the
+    /// per-model usage ledger of `model_id`).
     pub fn reconcile_cascade_usage_drift(
         &self,
+        model_id: &str,
         accounted_sum: AcpUsage,
         authoritative: AcpUsage,
         all_steps_warm: bool,
@@ -1370,6 +1488,12 @@ impl TelemetryHub {
                 .min(cs.file_state.warm_prompt_tokens);
             }
             cs.revision = cs.revision.saturating_add(1);
+            cs.usage.reconcile(
+                model_id,
+                UsageTokens::from_acp(&accounted_sum),
+                UsageTokens::from_acp(&authoritative),
+                now_ms,
+            );
 
             let cumulative_prompt = guard
                 .metrics
@@ -2015,6 +2139,13 @@ impl ActiveTaskGuard {
                 task.stop_reason = Some(stop_reason);
                 task.usage = Some(usage);
                 task.cache_hit_rate_bps = turn_hit_bps;
+                guard.cache_store.usage.record(
+                    &task.resolved_model,
+                    task.auxiliary_task.is_some(),
+                    UsageTokens::from_acp(&usage),
+                    now_ms,
+                );
+                persist_needed = true;
 
                 if let Some(hit_bps) = turn_hit_bps {
                     persist_needed = true;
@@ -3158,7 +3289,7 @@ mod tests {
             total_tokens: 2_380,
             ..AcpUsage::default()
         };
-        hub.reconcile_cascade_usage_drift(accounted, authoritative, false);
+        hub.reconcile_cascade_usage_drift("gemini-4-carbon-high", accounted, authoritative, false);
 
         let summary = hub.low_cache_hits().summary;
         assert_eq!(summary.total_prompt_tokens, 2_250);
@@ -3281,6 +3412,93 @@ mod tests {
         assert!(detail.payload.assistant_output_truncated);
         assert!(!detail.payload.assistant_reasoning_truncated);
         assert!(detail.payload.request.payload_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_ledger_prices_completed_turns_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("liftgate-usage-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config = || TelemetryConfig {
+            cache: CacheTelemetryConfig {
+                persist_path: Some(dir.join("cache-telemetry.json")),
+                ..CacheTelemetryConfig::default()
+            },
+            pricing_path: Some(dir.join("model-pricing.json")),
+            ..TelemetryConfig::default()
+        };
+        let hub = Arc::new(TelemetryHub::with_telemetry_config(config()));
+        let guard = hub.begin_task(
+            "task_priced".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gpt-5.4".to_owned(),
+            None,
+            &[],
+        );
+        guard.bind_session("sess_priced", false, "gemini-4-hydrogen-high");
+        guard.complete(
+            "end_turn".to_owned(),
+            AcpUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 100_000,
+                cached_read_tokens: 2_000_000,
+                cached_write_tokens: 0,
+                thought_tokens: 40_000,
+                total_tokens: 3_100_000,
+            },
+        );
+
+        // Hydrogen: $1.50 input + 2 x $0.075 cached + 0.1 x $7.50 output.
+        let report = hub.usage_report();
+        assert_eq!(report.summary.calls, 1);
+        assert!((report.summary.cost_usd - 2.40).abs() < 1e-9, "{report:?}");
+        let model = report.models.first().expect("model row");
+        assert_eq!(model.model_id, "gemini-4-hydrogen-high");
+        assert_eq!(model.pricing_key, "gemini-4-hydrogen");
+        assert_eq!(model.tokens.thought, 40_000);
+        let (_, _, _, recent) = hub.snapshot_tasks();
+        let task_cost = recent
+            .first()
+            .and_then(|t| t.cost_usd)
+            .expect("priced task");
+        assert!((task_cost - 2.40).abs() < 1e-9);
+
+        // A custom price re-prices recorded usage and listed requests alike.
+        let custom = ModelPrice {
+            input: 1.0,
+            cached_input: 0.0,
+            cache_write: 1.0,
+            output: 0.0,
+        };
+        assert_eq!(
+            hub.set_custom_price("gemini-4-hydrogen", Some(custom)),
+            PriceUpdate::Changed
+        );
+        assert!((hub.usage_summary().cost_usd - 1.0).abs() < 1e-9);
+        let (_, _, _, recent) = hub.snapshot_tasks();
+        assert_eq!(recent.first().and_then(|t| t.cost_usd), Some(1.0));
+        let pricing = hub.pricing_report(&[]);
+        let hydrogen = pricing
+            .entries
+            .iter()
+            .find(|e| e.key == "gemini-4-hydrogen")
+            .expect("hydrogen entry");
+        assert_eq!(hydrogen.custom_price, Some(custom));
+        assert_eq!(hydrogen.model_ids, ["gemini-4-hydrogen-high"]);
+        drop(hub);
+
+        // Usage and custom prices survive a restart.
+        let hub = TelemetryHub::with_telemetry_config(config());
+        let restored = hub.usage_report();
+        assert_eq!(restored.summary.calls, 1);
+        assert!((restored.summary.cost_usd - 1.0).abs() < 1e-9);
+        assert!(restored.summary.since_unix_ms > 0);
+        let reset = hub.reset_usage();
+        assert_eq!((reset.calls, reset.tokens.total()), (0, 0));
+        drop(hub);
+        let hub = TelemetryHub::with_telemetry_config(config());
+        assert_eq!(hub.usage_summary().calls, 0, "reset is persisted");
         let _ = fs::remove_dir_all(&dir);
     }
 

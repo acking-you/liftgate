@@ -246,6 +246,7 @@ pub async fn run_serve_with_hook(
             dir: Some(context_capture_dir),
             ..ContextCaptureConfig::default()
         },
+        pricing_path: Some(state_paths.model_pricing_file()),
     }));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();
