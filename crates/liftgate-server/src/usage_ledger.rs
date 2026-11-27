@@ -61,6 +61,8 @@ pub struct UsageLedger {
     rows: Vec<LedgerRow>,
     since_unix_ms: u64,
     revision: u64,
+    /// Bumped by [`Self::reset`]; corrections from cascades that began before a reset are dropped.
+    epoch: u64,
 }
 
 /// Model id cut to [`MAX_PRICING_KEY_BYTES`] on a char boundary.
@@ -92,6 +94,7 @@ impl UsageLedger {
                 now_ms
             },
             revision: 1,
+            epoch: 0,
         }
     }
 
@@ -108,6 +111,13 @@ impl UsageLedger {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Current reset epoch; capture it when an MCP cascade starts and hand it back to
+    /// [`Self::reconcile`].
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     fn row_mut(&mut self, model_id: &str, period: u64, now_ms: u64) -> Option<&mut LedgerRow> {
@@ -168,14 +178,19 @@ impl UsageLedger {
     ///
     /// Growth lands on the newest price period. Shrinkage drains the newest period first and
     /// carries into earlier ones, so a cascade that straddled a price change never loses part of
-    /// its correction to saturation and the model's totals stay exact.
+    /// its correction to saturation and the model's totals stay exact. A cascade that began before
+    /// the latest reset (an older `epoch`) is ignored: its estimates were cleared with the rest.
     pub fn reconcile(
         &mut self,
         model_id: &str,
+        epoch: u64,
         accounted: UsageTokens,
         authoritative: UsageTokens,
         now_ms: u64,
     ) {
+        if epoch != self.epoch {
+            return;
+        }
         let id = bounded_id(model_id);
         let period = period_start(id, now_ms);
         let mut rows: Vec<&mut LedgerRow> = self
@@ -216,6 +231,7 @@ impl UsageLedger {
         self.rows.clear();
         self.since_unix_ms = now_ms;
         self.revision = self.revision.saturating_add(1);
+        self.epoch = self.epoch.saturating_add(1);
     }
 
     /// Per-model usage (periods merged), costliest first, plus totals.
@@ -590,14 +606,41 @@ mod tests {
         ledger.record("gemini-4-neon-high", false, tokens(500, 0, 50), 10);
         ledger.reconcile(
             "gemini-4-neon-high",
+            ledger.epoch(),
             tokens(500, 0, 50),
             tokens(100, 400, 60),
             20,
         );
         let row = ledger.rows().first().expect("row");
         assert_eq!(row.tokens, tokens(100, 400, 60));
-        ledger.reconcile("unknown", tokens(1, 1, 1), tokens(2, 2, 2), 30);
+        ledger.reconcile(
+            "unknown",
+            ledger.epoch(),
+            tokens(1, 1, 1),
+            tokens(2, 2, 2),
+            30,
+        );
         assert_eq!(ledger.rows().len(), 1);
+    }
+
+    #[test]
+    fn corrections_from_before_a_reset_are_dropped() {
+        let mut ledger = UsageLedger::from_persisted(1, Vec::new(), 1);
+        let cascade_epoch = ledger.epoch();
+        ledger.record("gemini-4-neon-high", false, tokens(100, 0, 0), 10);
+        ledger.reset(20);
+        ledger.record("gemini-4-neon-high", false, tokens(50, 0, 0), 30);
+        // The cascade that started before the reset unwinds with its authoritative total.
+        ledger.reconcile(
+            "gemini-4-neon-high",
+            cascade_epoch,
+            tokens(100, 0, 0),
+            tokens(110, 0, 0),
+            40,
+        );
+        let row = ledger.rows().first().expect("row");
+        assert_eq!(row.tokens.input, 50, "post-reset usage untouched");
+        assert_ne!(ledger.epoch(), cascade_epoch);
     }
 
     #[test]
@@ -619,6 +662,7 @@ mod tests {
         );
         ledger.reconcile(
             "gemini-4-carbon-high",
+            ledger.epoch(),
             tokens(110, 0, 10),
             tokens(90, 0, 12),
             DEC_1_2026 + 2,

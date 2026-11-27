@@ -42,6 +42,8 @@ const zh = {
   },
   totalRow: "合计",
   setPrice: "设置价格",
+  loadFailed: (error: string) => `读取失败：${error}`,
+  retry: "重试",
   pricing: "价格",
   pricingSub: (asOf: string) =>
     `美元 / 百万 tokens。默认取各家官方 API 标准价（${asOf} 核对）；自定义价格会重算全部已记录用量。`,
@@ -121,6 +123,8 @@ const en: UsageMessages = {
   },
   totalRow: "Total",
   setPrice: "Set price",
+  loadFailed: (error) => `Could not load: ${error}`,
+  retry: "Retry",
   pricing: "Prices",
   pricingSub: (asOf) =>
     `USD per 1M tokens. Defaults follow each provider's standard API price (checked ${asOf}); a custom price re-prices all recorded usage.`,

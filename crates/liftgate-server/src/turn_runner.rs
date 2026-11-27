@@ -4654,6 +4654,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
 
     let mut cur_lease = initial_lease;
     let mut cur_task_guard = initial_task_guard;
+    // A usage reset during this cascade voids its final ledger correction.
+    let usage_epoch = cur_task_guard.hub().usage_epoch();
     let mut cur_req = initial_req;
     let mut cur_web_cfg = initial_web_cfg;
     let mut cur_full_messages = initial_full_messages;
@@ -4822,6 +4824,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                             if llm_step_idx > 0 {
                                                 telemetry_hub.reconcile_cascade_usage_drift(
                                                     cur_lease.model_id().as_str(),
+                                                    usage_epoch,
                                                     accounted_usage,
                                                     res.usage,
                                                     initial_session_reused,
@@ -5647,6 +5650,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                             if llm_step_idx > 0 {
                                                 telemetry_hub_ref.reconcile_cascade_usage_drift(
                                                     suspended_model.as_str(),
+                                                    usage_epoch,
                                                     accounted_usage,
                                                     res.usage,
                                                     initial_session_reused,
@@ -5811,6 +5815,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             let accounted_total = accounted_usage.saturating_add(step_delta);
                             cur_task_guard.hub().reconcile_cascade_usage_drift(
                                 cur_lease.model_id().as_str(),
+                                usage_epoch,
                                 accounted_total,
                                 turn_res.usage,
                                 initial_session_reused,
@@ -6063,6 +6068,7 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     if let Some((accounted_total, auth)) = reconcile_cascade_auth {
                         telemetry_hub_ref.reconcile_cascade_usage_drift(
                             cascade_model.as_str(),
+                            usage_epoch,
                             accounted_total,
                             auth,
                             initial_session_reused,
@@ -6369,6 +6375,7 @@ mod tests {
 
         hub.reconcile_cascade_usage_drift(
             "gemini-4-carbon-high",
+            hub.usage_epoch(),
             accounted_prior.saturating_add(step3),
             auth_total,
             false,

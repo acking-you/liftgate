@@ -957,6 +957,13 @@ impl TelemetryHub {
 
     // ---- usage & pricing ---------------------------------------------------------------
 
+    /// Reset epoch of the usage ledger, captured when an MCP cascade starts so its final drift
+    /// correction is dropped if usage was reset in between.
+    #[must_use]
+    pub fn usage_epoch(&self) -> u64 {
+        self.lock_inner().cache_store.usage.epoch()
+    }
+
     /// Usage totals and their cost, carried on every snapshot.
     #[must_use]
     pub fn usage_summary(&self) -> UsageSummary {
@@ -1402,10 +1409,12 @@ impl TelemetryHub {
     /// Reconciles any rounding delta between intermediate `UsageUpdate` step estimates and the
     /// final authoritative `PromptTurnResult.usage` sum when a multi-step suspended MCP
     /// `session/prompt` completes, guaranteeing 0-token cumulative drift (including in the
-    /// per-model usage ledger of `model_id`).
+    /// per-model usage ledger of `model_id`, unless usage was reset after the cascade began at
+    /// `usage_epoch`; see [`Self::usage_epoch`]).
     pub fn reconcile_cascade_usage_drift(
         &self,
         model_id: &str,
+        usage_epoch: u64,
         accounted_sum: AcpUsage,
         authoritative: AcpUsage,
         all_steps_warm: bool,
@@ -1490,6 +1499,7 @@ impl TelemetryHub {
             cs.revision = cs.revision.saturating_add(1);
             cs.usage.reconcile(
                 model_id,
+                usage_epoch,
                 UsageTokens::from_acp(&accounted_sum),
                 UsageTokens::from_acp(&authoritative),
                 now_ms,
@@ -3289,7 +3299,13 @@ mod tests {
             total_tokens: 2_380,
             ..AcpUsage::default()
         };
-        hub.reconcile_cascade_usage_drift("gemini-4-carbon-high", accounted, authoritative, false);
+        hub.reconcile_cascade_usage_drift(
+            "gemini-4-carbon-high",
+            hub.usage_epoch(),
+            accounted,
+            authoritative,
+            false,
+        );
 
         let summary = hub.low_cache_hits().summary;
         assert_eq!(summary.total_prompt_tokens, 2_250);

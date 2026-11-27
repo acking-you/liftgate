@@ -64,10 +64,16 @@ export function ModelsView({
       title={t.title(models.length)}
       actions={
         pricingSupported ? (
-          <button type="button" className="lg-link" onClick={onEditPrices}>
-            {t.editPrices}
-            <ArrowRight />
-          </button>
+          pricing.status === "error" ? (
+            <button type="button" className="lg-link text-err" onClick={pricing.reload}>
+              {t.reloadPrices}
+            </button>
+          ) : (
+            <button type="button" className="lg-link" onClick={onEditPrices}>
+              {t.editPrices}
+              <ArrowRight />
+            </button>
+          )
         ) : undefined
       }
     >

@@ -51,6 +51,21 @@ import type { ViewProps } from "@/views/types";
 
 type Banner = { tone: "ok" | "err"; text: string } | null;
 
+/** A failed fetch, said plainly, with a way to try again. */
+function FetchError({ error, onRetry }: { error: string | null; onRetry: () => void }): React.JSX.Element {
+  const { m } = useI18n();
+  return (
+    <div className="px-4 pb-4">
+      <Note tone="err" icon={<CircleAlert />}>
+        {m.usage.loadFailed(error ?? "")}
+        <Button size="sm" className="ml-2" onClick={onRetry}>
+          {m.usage.retry}
+        </Button>
+      </Note>
+    </div>
+  );
+}
+
 const PRICE_FIELDS = ["input", "cached_input", "cache_write", "output"] as const;
 type PriceField = (typeof PRICE_FIELDS)[number];
 
@@ -581,7 +596,9 @@ export function UsageView(_props: ViewProps): React.JSX.Element {
           ) : undefined
         }
       >
-        {usage.status === "loading" && !report ? (
+        {usage.status === "error" && !report ? (
+          <FetchError error={usage.error} onRetry={usage.reload} />
+        ) : usage.status === "loading" && !report ? (
           <Loading />
         ) : !report || report.models.length === 0 ? (
           <EmptyState icon={<Coins />} title={t.empty} hint={t.emptyHint} />
@@ -596,7 +613,13 @@ export function UsageView(_props: ViewProps): React.JSX.Element {
       </Card>
 
       <Card flush title={t.pricing} sub={pricing ? t.pricingSub(pricing.defaults_as_of) : undefined}>
-        {pricing ? <PricingTable pricing={pricing} onEdit={setEditing} /> : <Loading />}
+        {pricing ? (
+          <PricingTable pricing={pricing} onEdit={setEditing} />
+        ) : pricingResource.status === "error" ? (
+          <FetchError error={pricingResource.error} onRetry={pricingResource.reload} />
+        ) : (
+          <Loading />
+        )}
       </Card>
 
       <PriceEditor
