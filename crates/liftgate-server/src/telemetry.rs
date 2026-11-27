@@ -887,6 +887,7 @@ impl TelemetryHub {
             resolved_model: requested_model,
             session_id: None,
             session_reused: false,
+            harness_profile: None,
             auxiliary_task,
             phase: TaskPhase::InitializingSession,
             started_at_unix_ms: now_ms,
@@ -1771,10 +1772,25 @@ impl ActiveTaskGuard {
         orchestrator_mode: Option<&'static str>,
         turn_index: u64,
     ) {
-        let mut ctx = self.lock_tool_ctx();
-        ctx.harness_profile = harness_profile;
-        ctx.orchestrator_mode = orchestrator_mode;
-        ctx.turn_index = turn_index;
+        {
+            let mut ctx = self.lock_tool_ctx();
+            ctx.harness_profile = harness_profile;
+            ctx.orchestrator_mode = orchestrator_mode;
+            ctx.turn_index = turn_index;
+        }
+        let changed = {
+            let mut guard = self.hub.lock_inner();
+            match guard.active_tasks.get_mut(&self.task_id) {
+                Some(task) if task.harness_profile.as_deref() != Some(harness_profile) => {
+                    task.harness_profile = Some(harness_profile.to_owned());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.hub.notify_change();
+        }
     }
 
     /// Harness profile attributed to this turn.
@@ -3349,6 +3365,39 @@ fn prune_orphan_payload_files(
 mod tests {
     use super::*;
     use liftgate_types::telemetry::TaskProtocol;
+
+    #[test]
+    fn set_tool_context_attributes_harness_to_active_and_recent_task() {
+        let hub = Arc::new(TelemetryHub::new());
+        let guard = hub.begin_task(
+            "task_harness".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            true,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &[],
+        );
+        let (_, _, active, _) = hub.snapshot_tasks();
+        assert_eq!(
+            active.first().and_then(|t| t.harness_profile.as_deref()),
+            None
+        );
+
+        guard.bind_session("sess_harness", false, "gemini-4-carbon-high");
+        guard.set_tool_context("codex", Some("codex_exec"), 1);
+        let (_, _, active, _) = hub.snapshot_tasks();
+        assert_eq!(
+            active.first().and_then(|t| t.harness_profile.as_deref()),
+            Some("codex")
+        );
+
+        guard.complete("end_turn".to_owned(), AcpUsage::default());
+        let (_, _, _, recent) = hub.snapshot_tasks();
+        assert_eq!(
+            recent.first().and_then(|t| t.harness_profile.as_deref()),
+            Some("codex")
+        );
+    }
 
     #[test]
     fn reconcile_cascade_usage_drift_keeps_cold_step_cached_reads_out_of_warm_totals() {
