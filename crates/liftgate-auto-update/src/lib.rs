@@ -676,7 +676,6 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use liftgate_harness::ResolvedCommand;
     use uuid::Uuid;
 
     use super::*;
@@ -784,6 +783,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn supervised_harness_command_captures_version_upgrade() {
+        use liftgate_harness::ResolvedCommand;
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = TempDir::new().unwrap();
