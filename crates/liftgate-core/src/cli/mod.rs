@@ -170,6 +170,10 @@ pub enum Commands {
     #[command(visible_aliases = ["update", "self-update", "upg"])]
     Upgrade(UpgradeArgs),
 
+    /// Manage periodic idle auto-updates for `lg`, `agy`, `codex`, `claude`, `opencode`, and `omp` (opens TUI by default).
+    #[command(visible_aliases = ["autoupdate", "au"])]
+    AutoUpdate(AutoUpdateArgs),
+
     /// Install or remove a short CLI executable alias (`lg` by default) on your PATH.
     Alias(AliasArgs),
 
@@ -187,6 +191,18 @@ pub enum Commands {
     /// out-of-process `IDesktopAppXActivator` COM boundary.
     #[command(name = "__desktop-msix-launch", hide = true)]
     InternalDesktopMsixLaunch(DesktopMsixLaunchArgs),
+
+    /// Internal detached helper that restarts the managed background daemon onto a newly installed binary
+    /// once the previous daemon process has drained and closed its listeners.
+    #[command(name = "__daemon-respawn", hide = true)]
+    InternalDaemonRespawn(DaemonRespawnArgs),
+}
+
+#[derive(Clone, Copy, Debug, Args)]
+pub struct DaemonRespawnArgs {
+    /// PID of the retiring daemon process to wait on before rebinding listeners.
+    #[arg(long)]
+    pub old_pid: u32,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -276,6 +292,14 @@ pub struct ServeArgs {
     /// Disable background idle auto-updating of `agy` CLI for this server run.
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
+
+    /// Override background idle self-updating of `lg` & `liftgate` (`true` or `false`; enabled by default).
+    #[arg(long, env = "LG_AUTO_UPDATE")]
+    pub lg_auto_update: Option<bool>,
+
+    /// Disable background idle self-updating of `lg` & `liftgate` for this server run.
+    #[arg(long, conflicts_with = "lg_auto_update")]
+    pub no_lg_auto_update: bool,
 
     /// Offload incoming images on `>=300k`-token warm sessions to an ephemeral sub-session (`false` by default).
     #[arg(long, env = "AGY_VISION_OFFLOAD")]
@@ -390,6 +414,13 @@ impl Default for ServeArgs {
                 _ => None,
             }
         });
+        let lg_auto_update = std::env::var("LG_AUTO_UPDATE").ok().and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        });
         let vision_offload = std::env::var("AGY_VISION_OFFLOAD").ok().and_then(|s| {
             match s.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "on" | "yes" => Some(true),
@@ -443,6 +474,8 @@ impl Default for ServeArgs {
             agy_proxy,
             agy_auto_update,
             no_agy_auto_update: false,
+            lg_auto_update,
+            no_lg_auto_update: false,
             vision_offload,
             no_vision_offload: false,
             mcp_tool_bridge,
@@ -516,6 +549,14 @@ pub struct RestartArgs {
     /// Disable background idle `agy` auto-update.
     #[arg(long, conflicts_with = "agy_auto_update")]
     pub no_agy_auto_update: bool,
+
+    /// Override background idle `lg` self-update (`true` or `false`).
+    #[arg(long)]
+    pub lg_auto_update: Option<bool>,
+
+    /// Disable background idle `lg` self-update.
+    #[arg(long, conflicts_with = "lg_auto_update")]
+    pub no_lg_auto_update: bool,
 
     /// Override `>=300k`-token ephemeral vision sub-session offload (`true` or `false`).
     #[arg(long)]
@@ -982,6 +1023,94 @@ pub struct UpgradeArgs {
     /// Internal/mirror base URL override (used for self-hosted mirrors and integration tests).
     #[arg(long, hide = true, env = "LIFTGATE_UPDATE_BASE_URL")]
     pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AutoUpdateArgs {
+    #[command(subcommand)]
+    pub action: Option<AutoUpdateCommand>,
+
+    /// Emit structured JSON status when run non-interactively.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum AutoUpdateCommand {
+    /// Open the dedicated interactive Auto-Update Manager TUI.
+    #[command(visible_aliases = ["ui", "manage"])]
+    Tui,
+
+    /// Inspect auto-update toggles, check interval, installed versions, and update history.
+    #[command(visible_alias = "st")]
+    Status(AutoUpdateStatusArgs),
+
+    /// Enable idle auto-update for one or more targets (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `--all`).
+    #[command(visible_alias = "on")]
+    Enable(AutoUpdateTargetsArgs),
+
+    /// Disable idle auto-update for one or more targets (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `--all`).
+    #[command(visible_alias = "off")]
+    Disable(AutoUpdateTargetsArgs),
+
+    /// Configure the periodic idle check interval in minutes (`5..=1440`, `30` by default).
+    Interval(AutoUpdateIntervalArgs),
+
+    /// Reset all auto-update switches to defaults (`lg` & `agy` enabled; harnesses disabled).
+    Reset(AutoUpdateStatusArgs),
+
+    /// Check (or check & install) updates right now for specified or enabled targets.
+    #[command(visible_aliases = ["now", "check-now"])]
+    Run(AutoUpdateRunArgs),
+}
+
+#[derive(Clone, Copy, Debug, Default, Args)]
+pub struct AutoUpdateStatusArgs {
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AutoUpdateTargetsArgs {
+    /// Target names (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `all`).
+    pub targets: Vec<String>,
+
+    /// Apply to all 6 managed targets (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`).
+    #[arg(long)]
+    pub all: bool,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Args)]
+pub struct AutoUpdateIntervalArgs {
+    /// Periodic idle check interval in minutes (`5..=1440`).
+    pub minutes: u64,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AutoUpdateRunArgs {
+    /// Optional target names (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`). Defaults to all enabled targets.
+    pub targets: Vec<String>,
+
+    /// Check/update every supported target regardless of its saved toggle.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Only check versions without installing updates where supported.
+    #[arg(short = 'c', long)]
+    pub check: bool,
+
+    /// Emit structured JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Default for UpgradeArgs {

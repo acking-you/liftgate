@@ -282,6 +282,30 @@ impl Drop for ForegroundJournalGuard {
     }
 }
 
+/// Returns `true` when at least one `lg cxa` or `lg cd` desktop GUI session is still active.
+#[must_use]
+pub fn has_active_desktop_sessions(state_paths: &StatePaths) -> bool {
+    let dir = state_paths.desktop_journals_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(journal) = read_journal_file(&path) else {
+            continue;
+        };
+        let watcher_alive = journal.watcher_pid.is_some_and(is_pid_alive);
+        let launcher_alive = is_pid_alive(journal.launcher_pid);
+        if watcher_alive || launcher_alive || is_journal_session_still_running(&journal) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Replays and cleans up any orphaned desktop session journals left behind by crashed processes
 /// or power loss once both the watcher and the target GUI application are no longer running.
 pub fn sweep_stale_desktop_sessions(state_paths: &StatePaths) {

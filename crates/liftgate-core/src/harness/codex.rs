@@ -49,7 +49,7 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
     }
     let (spec, ephemeral_guard) = build_codex_invocation(state_paths, &args, None, false).await?;
     let cmd = command_from_terminal_spec(&spec);
-    let exit_code = spawn_and_wait_interactive("codex", &spec.program, cmd).await?;
+    let exit_code = spawn_and_wait_interactive(state_paths, "codex", &spec.program, cmd).await?;
     drop(ephemeral_guard);
     Ok(exit_code)
 }

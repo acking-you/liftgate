@@ -33,11 +33,11 @@ use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, EffectiveTargetMode, StatePaths, format_connect_url, now_unix_ms,
     resolve_effective_agy_auto_update, resolve_effective_agy_bin, resolve_effective_agy_proxy,
-    resolve_effective_capture_full_context, resolve_effective_low_cache_capture_payload,
-    resolve_effective_low_cache_threshold_bps, resolve_effective_max_context_capture_mib,
-    resolve_effective_max_context_captures, resolve_effective_max_low_cache_records,
-    resolve_effective_mcp_tool_bridge, resolve_effective_target_mode,
-    resolve_effective_vision_offload, write_file_atomic,
+    resolve_effective_capture_full_context, resolve_effective_lg_auto_update,
+    resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
+    resolve_effective_max_context_capture_mib, resolve_effective_max_context_captures,
+    resolve_effective_max_low_cache_records, resolve_effective_mcp_tool_bridge,
+    resolve_effective_target_mode, resolve_effective_vision_offload, write_file_atomic,
 };
 
 const MAX_LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -85,6 +85,8 @@ pub async fn start_daemon_with_exe(
         serve.no_agy_auto_update,
         &settings,
     );
+    let effective_lg_auto_update =
+        resolve_effective_lg_auto_update(serve.lg_auto_update, serve.no_lg_auto_update, &settings);
     let effective_vision_offload =
         resolve_effective_vision_offload(serve.vision_offload, serve.no_vision_offload, &settings);
     let effective_mcp_tool_bridge = resolve_effective_mcp_tool_bridge(
@@ -138,6 +140,7 @@ pub async fn start_daemon_with_exe(
                 && existing.acp_mode == serve.acp_mode
                 && existing.api_key == requested_key
                 && existing.agy_proxy.as_deref() == effective_proxy.as_ref().map(ProxyUrl::as_str)
+                && existing.lg_auto_update == effective_lg_auto_update
                 && existing.agy_auto_update == effective_auto_update
                 && existing.vision_offload == effective_vision_offload
                 && existing.mcp_tool_bridge == effective_mcp_tool_bridge
@@ -219,12 +222,6 @@ pub async fn start_daemon_with_exe(
         .arg(&resolved_agy)
         .arg("--agy-proxy")
         .arg(effective_proxy.as_ref().map_or("off", ProxyUrl::as_str))
-        .arg("--agy-auto-update")
-        .arg(if effective_auto_update {
-            "true"
-        } else {
-            "false"
-        })
         .arg("--vision-offload")
         .arg(if effective_vision_offload {
             "true"
@@ -282,6 +279,21 @@ pub async fn start_daemon_with_exe(
     }
     if let Some(ui_dir) = &serve.ui_dir {
         cmd.arg("--ui-dir").arg(ui_dir);
+    }
+    if serve.no_agy_auto_update || serve.agy_auto_update.is_some() {
+        cmd.arg("--agy-auto-update").arg(if effective_auto_update {
+            "true"
+        } else {
+            "false"
+        });
+    }
+    if serve.no_lg_auto_update || serve.lg_auto_update.is_some() {
+        cmd.arg("--lg-auto-update")
+            .arg(if effective_lg_auto_update {
+                "true"
+            } else {
+                "false"
+            });
     }
     if let Some(key) = &clean_api_key {
         cmd.env("AGY_GATEWAY_API_KEY", key);
@@ -341,6 +353,7 @@ pub async fn start_daemon_with_exe(
         acp_cwd: serve.acp_cwd,
         ui_dir: serve.ui_dir,
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
+        lg_auto_update: effective_lg_auto_update,
         agy_auto_update: effective_auto_update,
         vision_offload: effective_vision_offload,
         mcp_tool_bridge: effective_mcp_tool_bridge,
@@ -504,6 +517,14 @@ pub async fn restart_daemon(
     }
     if args.no_agy_auto_update {
         serve.no_agy_auto_update = true;
+    }
+    if let Some(lg_au) = args.lg_auto_update {
+        serve.lg_auto_update = Some(lg_au);
+        serve.no_lg_auto_update = false;
+    }
+    if args.no_lg_auto_update {
+        serve.lg_auto_update = None;
+        serve.no_lg_auto_update = true;
     }
     if let Some(vo) = args.vision_offload {
         serve.vision_offload = Some(vo);
@@ -1409,6 +1430,28 @@ pub async fn inspect_doctor(
             ),
         }),
     }
+
+    checks.push(DoctorCheckItem {
+        name: "LG Auto-Update",
+        status: if settings.lg_auto_update {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        tone: if settings.lg_auto_update {
+            ReportTone::Ok
+        } else {
+            ReportTone::Muted
+        },
+        detail: if settings.lg_auto_update {
+            format!(
+                "checks GitHub Releases every {}m when no sessions are active (`{bin_hint} auto-update`)",
+                settings.auto_update_interval_mins.get()
+            )
+        } else {
+            format!("disabled (manage via `{bin_hint} auto-update`)")
+        },
+    });
 
     checks.push(DoctorCheckItem {
         name: "AGY Auto-Update",
@@ -2350,6 +2393,7 @@ mod tests {
             acp_cwd: None,
             ui_dir: None,
             agy_proxy: None,
+            lg_auto_update: true,
             agy_auto_update: true,
             vision_offload: false,
             mcp_tool_bridge: true,
@@ -2396,6 +2440,7 @@ mod tests {
             acp_cwd: Some(PathBuf::from("/tmp/acp-work")),
             ui_dir: Some(PathBuf::from("/srv/ui")),
             agy_proxy: None,
+            lg_auto_update: true,
             agy_auto_update: false,
             vision_offload: false,
             mcp_tool_bridge: false,
@@ -2521,6 +2566,7 @@ mod tests {
             acp_cwd: None,
             ui_dir: None,
             agy_proxy: None,
+            lg_auto_update: true,
             agy_auto_update: true,
             vision_offload: false,
             mcp_tool_bridge: true,
@@ -2668,6 +2714,7 @@ mod tests {
                             context_capture:
                                 liftgate_types::telemetry::ContextCaptureSummary::default(),
                             usage: liftgate_types::pricing::UsageSummary::default(),
+                            auto_update: None,
                             active_tasks: Vec::new(),
                             recent_tasks: Vec::new(),
                             available_models: Vec::new(),

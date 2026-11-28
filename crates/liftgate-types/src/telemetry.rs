@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::{AcpUsage, AvailableModel};
 use crate::canonical::{AuxiliaryTaskKind, ReasoningEffort};
+use crate::config::AutoUpdateTarget;
 use crate::pricing::UsageSummary;
 
 /// Single bounded stderr diagnostic line captured from `agy acp`.
@@ -787,6 +788,63 @@ const fn default_true() -> bool {
     true
 }
 
+/// Outcome recorded by the most recent idle auto-update check or upgrade attempt for a target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpdateLastOutcome {
+    #[default]
+    NeverChecked,
+    UpToDate,
+    UpdateAvailable,
+    Updated,
+    DeferredBusy,
+    NotInstalled,
+    Skipped,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Per-component status entry inside [`AutoUpdateTelemetrySummary`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoUpdateTargetTelemetry {
+    pub target: AutoUpdateTarget,
+    pub enabled: bool,
+    #[serde(default)]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub latest_seen_version: Option<String>,
+    #[serde(default)]
+    pub last_check_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_update_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_updated_from: Option<String>,
+    #[serde(default)]
+    pub last_updated_to: Option<String>,
+    #[serde(default)]
+    pub last_status: AutoUpdateLastOutcome,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Fleet-wide idle auto-update configuration and status published by the gateway daemon.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoUpdateTelemetrySummary {
+    pub interval_mins: u64,
+    pub idle_ready: bool,
+    #[serde(default)]
+    pub busy_reason: Option<String>,
+    #[serde(default)]
+    pub sweep_in_progress: bool,
+    #[serde(default)]
+    pub active_target: Option<AutoUpdateTarget>,
+    #[serde(default)]
+    pub targets: Vec<AutoUpdateTargetTelemetry>,
+}
+
 /// Top-level observability payload served over `GET /api/telemetry/snapshot` and SSE.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GatewayTelemetrySnapshot {
@@ -810,6 +868,9 @@ pub struct GatewayTelemetrySnapshot {
     /// Recorded token usage and its cost.
     #[serde(default)]
     pub usage: UsageSummary,
+    /// Fleet idle auto-update configuration and latest check/update status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<AutoUpdateTelemetrySummary>,
     pub active_tasks: Vec<TaskSnapshot>,
     pub recent_tasks: Vec<TaskSnapshot>,
     pub available_models: Vec<AvailableModel>,

@@ -4011,6 +4011,7 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
         tool_call_telemetry: state.telemetry.tool_call_summary(),
         context_capture: state.telemetry.context_capture_summary(),
         usage: state.telemetry.usage_summary(),
+        auto_update: state.telemetry.auto_update_summary(),
         active_tasks,
         recent_tasks,
         available_models,

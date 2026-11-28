@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.23] - 2026-11-28
+
+### Added
+- **Idle self-update for `lg` (`liftgate`), harness fleet auto-updates, and dedicated Auto-Update Manager TUI**:
+  - Added periodic idle self-upgrade support for `lg` & `liftgate` (`lg_auto_update = true` by default in `~/.liftgate/settings.json`, overridable via `--lg-auto-update` / `--no-lg-auto-update` / `LG_AUTO_UPDATE`), verifying GitHub Releases `SHA256SUMS` + `--version` smoke checks and seamlessly respawning the managed background daemon onto the newly installed binary via `__daemon-respawn`.
+  - Extended periodic idle auto-update management to all supported coding harnesses (`codex`, `claude`, `opencode`, and `omp` under `harness_auto_update`, all `false` by default) with supervised process-group / Win32 Job Object execution, bounded non-interactive I/O, and Homebrew / npm package-manager fallbacks.
+  - Strictly gated both periodic update checks and binary installations on zero active sessions (`evaluate_idle_gate`): background checks pause whenever HTTP turns, ACP prompt streams, active/suspended `SessionPool` leases, open CLI harness wrappers (`lg cx`, `lg cc`, `lg oc`, `lg omp`), or desktop GUI sessions (`lg cxa`, `lg cd`) are active, or while session quiet cooldown is in effect.
+  - Added a dedicated interactive **Auto-Update Manager TUI** (`lg auto-update` / `lg au`, Cockpit `[v]`, and `lg top` `[u]`), full non-interactive CLI subcommands (`status`, `on`/`enable`, `off`/`disable`, `interval`, `reset`, `run`), persistent `~/.liftgate/auto-update-state.json` history, and live SSE/Web dashboard fleet status (`auto_update` on `GatewayTelemetrySnapshot`).
+
 ## [0.2.22] - 2026-11-28
 
 ### Added

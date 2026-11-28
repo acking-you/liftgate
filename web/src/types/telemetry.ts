@@ -383,6 +383,48 @@ export interface AvailableModel {
   name: string;
 }
 
+export type AutoUpdateTarget =
+  | "liftgate"
+  | "agy"
+  | "codex"
+  | "claude"
+  | "opencode"
+  | "omp";
+
+export type AutoUpdateLastOutcome =
+  | "never_checked"
+  | "up_to_date"
+  | "update_available"
+  | "updated"
+  | "deferred_busy"
+  | "not_installed"
+  | "skipped"
+  | "failed"
+  | "unknown";
+
+export interface AutoUpdateTargetTelemetry {
+  target: AutoUpdateTarget;
+  enabled: boolean;
+  installed_version?: string | null;
+  binary_path?: string | null;
+  latest_seen_version?: string | null;
+  last_check_unix_ms?: number | null;
+  last_update_unix_ms?: number | null;
+  last_updated_from?: string | null;
+  last_updated_to?: string | null;
+  last_status: AutoUpdateLastOutcome;
+  note?: string | null;
+}
+
+export interface AutoUpdateTelemetrySummary {
+  interval_mins: number;
+  idle_ready: boolean;
+  busy_reason?: string | null;
+  sweep_in_progress?: boolean;
+  active_target?: AutoUpdateTarget | null;
+  targets: AutoUpdateTargetTelemetry[];
+}
+
 export interface GatewayTelemetrySnapshot {
   generated_at_unix_ms: number;
   gateway_version: string;
@@ -399,6 +441,8 @@ export interface GatewayTelemetrySnapshot {
   context_capture?: ContextCaptureSummary;
   /** Recorded usage and cost (absent on gateways that predate pricing). */
   usage?: UsageSummary;
+  /** Fleet idle auto-update configuration and status across lg, agy, and coding harnesses. */
+  auto_update?: AutoUpdateTelemetrySummary | null;
   active_tasks: TaskSnapshot[];
   recent_tasks: TaskSnapshot[];
   available_models: AvailableModel[];

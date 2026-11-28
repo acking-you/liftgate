@@ -11,12 +11,12 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory as _, FromArgMatches as _};
 use liftgate_core::{
-    agy_manager,
+    agy_manager, auto_update,
     cli::{
-        AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, ClaudeArgs,
-        ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs, DoctorArgs,
-        ModelsArgs, OmpArgs, OpencodeArgs, RestartArgs, ServeArgs, StartArgs, TopArgs, UiArgs,
-        UpgradeArgs, invoked_bin_name, normalize_harness_args,
+        AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AutoUpdateArgs,
+        ClaudeArgs, ClaudeDesktopArgs, Cli, CodexAppArgs, CodexArgs, Commands, ConfigArgs,
+        DoctorArgs, ModelsArgs, OmpArgs, OpencodeArgs, RestartArgs, ServeArgs, StartArgs, TopArgs,
+        UiArgs, UpgradeArgs, invoked_bin_name, normalize_harness_args,
     },
     daemon, desktop,
     error::CliError,
@@ -94,7 +94,11 @@ async fn dispatch(
     agy_manager::sweep_stale_agy_backups(&state_paths);
     if !matches!(
         cli.command,
-        Some(Commands::InternalDesktopWatch(_) | Commands::InternalDesktopMsixLaunch(_))
+        Some(
+            Commands::InternalDesktopWatch(_)
+                | Commands::InternalDesktopMsixLaunch(_)
+                | Commands::InternalDaemonRespawn(_)
+        )
     ) {
         desktop::sweep_stale_desktop_sessions(&state_paths);
     }
@@ -162,6 +166,10 @@ async fn dispatch(
             desktop::run_desktop_msix_launch(args)?;
             Ok(0)
         }
+        Some(Commands::InternalDaemonRespawn(args)) => {
+            auto_update::execute_daemon_respawn(&state_paths, args).await?;
+            Ok(0)
+        }
         Some(Commands::Config(args)) => {
             render::run_config(&state_paths, args).await?;
             Ok(0)
@@ -172,6 +180,10 @@ async fn dispatch(
         }
         Some(Commands::Upgrade(args)) => {
             render::run_upgrade(&state_paths, args).await?;
+            Ok(0)
+        }
+        Some(Commands::AutoUpdate(args)) => {
+            render::run_auto_update(&state_paths, args).await?;
             Ok(0)
         }
         Some(Commands::Agy(args)) => render::run_agy(&state_paths, args).await,
@@ -206,6 +218,7 @@ async fn run_foreground_serve(state_paths: &StatePaths, args: ServeArgs) -> Resu
             info.auth_enabled,
             info.full_ui_embedded,
             info.agy_proxy_display.as_deref(),
+            info.lg_auto_update,
             info.agy_auto_update,
             info.vision_offload,
             info.mcp_tool_bridge,
@@ -346,6 +359,10 @@ async fn dispatch_cockpit_action(
                 },
             )
             .await?;
+            Ok(0)
+        }
+        CockpitAction::AutoUpdateManage => {
+            render::run_auto_update(state_paths, AutoUpdateArgs::default()).await?;
             Ok(0)
         }
         CockpitAction::Upgrade => {

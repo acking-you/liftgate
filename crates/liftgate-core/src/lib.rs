@@ -6,6 +6,7 @@
 //! environment diagnostics, and SHA-256 verified self-upgrade.
 
 pub mod agy_manager;
+pub mod auto_update;
 pub mod cli;
 pub mod client;
 pub mod config_sync;

@@ -531,3 +531,51 @@ fn remote_subcommand_and_harness_remote_flag_normalize_without_codex_collision()
         other => panic!("unexpected command: {other:?}"),
     }
 }
+
+#[test]
+fn auto_update_cli_commands_and_lg_auto_update_flags_parse_cleanly() {
+    use super::{AutoUpdateCommand, Commands};
+
+    let bare = parse_strs(&["lg", "auto-update"]);
+    assert!(matches!(bare.command, Some(Commands::AutoUpdate(a)) if a.action.is_none() && !a.json));
+
+    let alias_tui = parse_strs(&["lg", "au", "tui"]);
+    assert!(matches!(
+        alias_tui.command,
+        Some(Commands::AutoUpdate(a)) if matches!(a.action, Some(AutoUpdateCommand::Tui))
+    ));
+
+    let enable = parse_strs(&["lg", "au", "on", "codex", "omp"]);
+    match enable.command {
+        Some(Commands::AutoUpdate(a)) => match a.action {
+            Some(AutoUpdateCommand::Enable(t)) => {
+                assert_eq!(t.targets, vec!["codex", "omp"]);
+                assert!(!t.all);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        },
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let interval = parse_strs(&["lg", "auto-update", "interval", "60"]);
+    assert!(matches!(
+        interval.command,
+        Some(Commands::AutoUpdate(a))
+            if matches!(a.action, Some(AutoUpdateCommand::Interval(iv)) if iv.minutes == 60)
+    ));
+
+    let restart = parse_strs(&["lg", "restart", "--no-lg-auto-update"]);
+    assert!(matches!(
+        restart.command,
+        Some(Commands::Restart(r)) if r.no_lg_auto_update && r.lg_auto_update.is_none()
+    ));
+
+    let cx_after_flag = parse_strs(&["lg", "--lg-auto-update", "false", "cx", "resume"]);
+    match cx_after_flag.command {
+        Some(Commands::Codex(c)) => {
+            assert_eq!(cx_after_flag.serve.lg_auto_update, Some(false));
+            assert_eq!(c.passthrough_args, vec!["resume"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}

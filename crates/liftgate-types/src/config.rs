@@ -22,6 +22,9 @@ pub const MAX_ALLOWED_CONTEXT_CAPTURES: usize = 10_000;
 pub const DEFAULT_CONTEXT_CAPTURE_DISK_MIB: usize = 512;
 pub const MIN_CONTEXT_CAPTURE_DISK_MIB: usize = 16;
 pub const MAX_CONTEXT_CAPTURE_DISK_MIB: usize = 64 * 1024;
+pub const DEFAULT_AUTO_UPDATE_INTERVAL_MINS: u64 = 30;
+pub const MIN_AUTO_UPDATE_INTERVAL_MINS: u64 = 5;
+pub const MAX_AUTO_UPDATE_INTERVAL_MINS: u64 = 24 * 60;
 pub const DEFAULT_GATEWAY_PORT: u16 = 8787;
 
 const _: () = assert!(
@@ -687,6 +690,211 @@ impl From<ContextCaptureDiskMib> for usize {
     }
 }
 
+const _: () = assert!(
+    DEFAULT_AUTO_UPDATE_INTERVAL_MINS >= MIN_AUTO_UPDATE_INTERVAL_MINS
+        && DEFAULT_AUTO_UPDATE_INTERVAL_MINS <= MAX_AUTO_UPDATE_INTERVAL_MINS
+        && MIN_AUTO_UPDATE_INTERVAL_MINS >= 1,
+    "default auto-update check interval must lie inside its validated range"
+);
+
+/// Closed set of components managed by Liftgate's idle auto-update scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpdateTarget {
+    /// Liftgate CLI & managed background daemon (`lg` + `liftgate`); enabled by default.
+    Liftgate,
+    /// Official Antigravity ACP CLI (`agy`); enabled by default.
+    Agy,
+    /// OpenAI Codex CLI (`codex`); disabled by default.
+    Codex,
+    /// Anthropic Claude Code CLI (`claude`); disabled by default.
+    Claude,
+    /// OpenCode CLI (`opencode`); disabled by default.
+    Opencode,
+    /// Oh My Pi CLI (`omp`); disabled by default.
+    Omp,
+}
+
+impl AutoUpdateTarget {
+    /// Canonical display order shown in TUI tables, status reports, and JSON payloads.
+    pub const ALL: [Self; 6] = [
+        Self::Liftgate,
+        Self::Agy,
+        Self::Codex,
+        Self::Claude,
+        Self::Opencode,
+        Self::Omp,
+    ];
+
+    /// Safe execution order for an idle update sweep (`Liftgate` runs last because a
+    /// self-upgrade hands off to a freshly spawned daemon process).
+    pub const SWEEP_ORDER: [Self; 6] = [
+        Self::Agy,
+        Self::Codex,
+        Self::Claude,
+        Self::Opencode,
+        Self::Omp,
+        Self::Liftgate,
+    ];
+
+    /// Canonical CLI/wire identifier (`lg`, `agy`, `codex`, `claude`, `opencode`, `omp`).
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Liftgate => "lg",
+            Self::Agy => "agy",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+            Self::Omp => "omp",
+        }
+    }
+
+    /// Human-readable title used in TUI and status tables.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Liftgate => "Liftgate (lg)",
+            Self::Agy => "Antigravity CLI (agy)",
+            Self::Codex => "Codex CLI (codex)",
+            Self::Claude => "Claude Code (claude)",
+            Self::Opencode => "OpenCode (opencode)",
+            Self::Omp => "Oh My Pi (omp)",
+        }
+    }
+
+    /// Concise update strategy summary shown in the Auto-Update Manager TUI inspector.
+    #[must_use]
+    pub const fn strategy_summary(self) -> &'static str {
+        match self {
+            Self::Liftgate => "GitHub Releases + SHA256SUMS + atomic daemon respawn",
+            Self::Agy => "Official manifest + SHA-512 idle hot-swap",
+            Self::Codex => "codex update (with brew / npm package-manager fallback)",
+            Self::Claude => "claude update (native & package-manager aware)",
+            Self::Opencode => "opencode upgrade (curl / brew / npm / bun / pnpm aware)",
+            Self::Omp => "omp update (built-in release updater)",
+        }
+    }
+
+    /// Whether idle auto-update is enabled out of the box (`true` for `lg` and `agy`,
+    /// `false` for third-party coding harnesses).
+    #[must_use]
+    pub const fn default_enabled(self) -> bool {
+        match self {
+            Self::Liftgate | Self::Agy => true,
+            Self::Codex | Self::Claude | Self::Opencode | Self::Omp => false,
+        }
+    }
+
+    /// Parses a CLI target name or common shorthand alias (`lg`, `liftgate`, `cx`, `cc`, `oc`, `omp`).
+    #[must_use]
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "lg" | "liftgate" | "self" => Some(Self::Liftgate),
+            "agy" | "antigravity" => Some(Self::Agy),
+            "codex" | "cx" | "codex-cli" => Some(Self::Codex),
+            "claude" | "cc" | "claude-code" => Some(Self::Claude),
+            "opencode" | "oc" | "open-code" => Some(Self::Opencode),
+            "omp" | "oh-my-pi" => Some(Self::Omp),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AutoUpdateTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.slug())
+    }
+}
+
+/// Validated periodic idle check interval in minutes (`5..=1440`, `30` by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct AutoUpdateIntervalMins(NonZeroU64);
+
+impl AutoUpdateIntervalMins {
+    /// Interactive presets cycled by `-`/`+` or `[`/`]` inside the Auto-Update Manager TUI.
+    pub const PRESETS: [u64; 8] = [5, 15, 30, 60, 120, 360, 720, 1_440];
+
+    /// Validates that `mins` lies inside `MIN_AUTO_UPDATE_INTERVAL_MINS..=MAX_AUTO_UPDATE_INTERVAL_MINS`.
+    pub fn try_new(mins: u64) -> Result<Self, ValidationError> {
+        let Some(nz) = NonZeroU64::new(mins) else {
+            return Err(ValidationError::ZeroLimit {
+                field: "auto_update_interval_mins",
+            });
+        };
+        if !(MIN_AUTO_UPDATE_INTERVAL_MINS..=MAX_AUTO_UPDATE_INTERVAL_MINS).contains(&mins) {
+            return Err(ValidationError::LimitOutOfRange {
+                field: "auto_update_interval_mins",
+                value: usize::try_from(mins).unwrap_or(usize::MAX),
+                min: MIN_AUTO_UPDATE_INTERVAL_MINS as usize,
+                max: MAX_AUTO_UPDATE_INTERVAL_MINS as usize,
+            });
+        }
+        Ok(Self(nz))
+    }
+
+    /// Interval in minutes (`>= 5`).
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Interval converted to seconds (`mins * 60`).
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0.get().saturating_mul(60)
+    }
+
+    /// Steps down to the previous preset interval (clamped at minimum preset).
+    #[must_use]
+    pub fn step_prev(self) -> Self {
+        let cur = self.get();
+        let chosen = Self::PRESETS
+            .iter()
+            .copied()
+            .rev()
+            .find(|&p| p < cur)
+            .unwrap_or(MIN_AUTO_UPDATE_INTERVAL_MINS);
+        Self(NonZeroU64::new(chosen).expect("preset >= MIN_AUTO_UPDATE_INTERVAL_MINS"))
+    }
+
+    /// Steps up to the next preset interval (clamped at maximum preset).
+    #[must_use]
+    pub fn step_next(self) -> Self {
+        let cur = self.get();
+        let chosen = Self::PRESETS
+            .iter()
+            .copied()
+            .find(|&p| p > cur)
+            .unwrap_or(MAX_AUTO_UPDATE_INTERVAL_MINS);
+        Self(NonZeroU64::new(chosen).expect("preset >= MIN_AUTO_UPDATE_INTERVAL_MINS"))
+    }
+}
+
+impl Default for AutoUpdateIntervalMins {
+    fn default() -> Self {
+        Self(
+            NonZeroU64::new(DEFAULT_AUTO_UPDATE_INTERVAL_MINS)
+                .expect("DEFAULT_AUTO_UPDATE_INTERVAL_MINS is non-zero"),
+        )
+    }
+}
+
+impl TryFrom<u64> for AutoUpdateIntervalMins {
+    type Error = ValidationError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<AutoUpdateIntervalMins> for u64 {
+    fn from(value: AutoUpdateIntervalMins) -> Self {
+        value.get()
+    }
+}
+
 /// Returns `true` when `raw` is a keyword switching target mode back to the local managed daemon.
 #[must_use]
 pub fn is_endpoint_local_keyword(raw: &str) -> bool {
@@ -1039,6 +1247,47 @@ mod tests {
         assert!(ProxyUrl::try_new("http://").is_err());
         assert!(ProxyUrl::try_new("http://127.0.0.1:7890/bad/path").is_err());
         assert!(ProxyUrl::try_new("http://127.0.0.1:7890 bad").is_err());
+    }
+
+    #[test]
+    fn auto_update_target_and_interval_invariants_hold() {
+        assert!(AutoUpdateTarget::Liftgate.default_enabled());
+        assert!(AutoUpdateTarget::Agy.default_enabled());
+        assert!(!AutoUpdateTarget::Codex.default_enabled());
+        assert!(!AutoUpdateTarget::Claude.default_enabled());
+        assert!(!AutoUpdateTarget::Opencode.default_enabled());
+        assert!(!AutoUpdateTarget::Omp.default_enabled());
+        assert_eq!(
+            AutoUpdateTarget::from_slug("LG"),
+            Some(AutoUpdateTarget::Liftgate)
+        );
+        assert_eq!(
+            AutoUpdateTarget::from_slug("cx"),
+            Some(AutoUpdateTarget::Codex)
+        );
+        assert_eq!(
+            AutoUpdateTarget::from_slug("cc"),
+            Some(AutoUpdateTarget::Claude)
+        );
+        assert_eq!(
+            AutoUpdateTarget::from_slug("oc"),
+            Some(AutoUpdateTarget::Opencode)
+        );
+        assert_eq!(
+            AutoUpdateTarget::from_slug("oh-my-pi"),
+            Some(AutoUpdateTarget::Omp)
+        );
+        assert_eq!(AutoUpdateTarget::from_slug("unknown"), None);
+
+        let def = AutoUpdateIntervalMins::default();
+        assert_eq!(def.get(), 30);
+        assert_eq!(def.step_prev().get(), 15);
+        assert_eq!(def.step_next().get(), 60);
+        assert!(AutoUpdateIntervalMins::try_new(0).is_err());
+        assert!(AutoUpdateIntervalMins::try_new(4).is_err());
+        assert!(AutoUpdateIntervalMins::try_new(1_441).is_err());
+        assert_eq!(AutoUpdateIntervalMins::try_new(5).unwrap().get(), 5);
+        assert_eq!(AutoUpdateIntervalMins::try_new(1_440).unwrap().get(), 1_440);
     }
 
     #[test]
