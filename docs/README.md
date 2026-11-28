@@ -19,7 +19,7 @@ must keep. Start with the [usage guide](usage.md); contributor rules are in
 | [Architecture](architecture.md) | why ACP, the request path, session reuse, model routing, process supervision, workspace layout |
 | [MCP tool virtualization](mcp-tool-virtualization.md) | `agy acp` Eager tool budget adaptation, namespace action hubs, 0-RTT gateway-local `search_client_tools`, preflight self-healing |
 | [`agy acp` 1.5.18 verification & elastic I/O plan](agy-acp-optimization-plan.md) | empirical `agy acp 1.5.18` protocol benchmarks, budget recalibration, and Bash-first / orchestrator-first read-write design |
-| [Harness readability evolution (中文)](harness-readability-evolution.zh-CN.md) | evolution of process readability across Codex CLI stages, implementation comparisons with Antigravity, `omp`, and Claude Code, and how Code Mode reduces `update_plan` overhead to ~0 RTT |
+| [Harness readability evolution (中文)](harness-readability-evolution.zh-CN.md) | stage-by-stage system prompt & wire protocol evolution across Codex CLI, Stage-2 comparisons (`Antigravity`, `omp`), Claude Code, Code Mode `~0-RTT` `update_plan`, and gateway streaming/hash optimizations (with animated GIFs) |
 
 ## Project
 
