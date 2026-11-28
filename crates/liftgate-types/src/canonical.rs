@@ -372,6 +372,16 @@ impl NormalizedTurnRequest {
         );
         std::borrow::Cow::Owned(rendered)
     }
+
+    /// Harness whose developer slots [`Self::render_messages_for_outbound`] distills, or `None`
+    /// when this turn forwards every developer slot verbatim.
+    #[must_use]
+    pub fn distillation_harness(&self) -> Option<crate::harness_prompt::DetectedHarness> {
+        if !self.allow_prompt_distillation || self.auxiliary_task.is_some() {
+            return None;
+        }
+        self.detected_harness
+    }
 }
 
 /// Detects whether an incoming normalized turn is a harness-internal classifier or background

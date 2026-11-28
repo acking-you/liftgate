@@ -21,6 +21,7 @@ import type {
   ContextCaptureConfigUpdate,
   ContextCaptureDetailResponse,
   ContextCaptureRecord,
+  ContextRewrite,
   ContextCaptureSummary,
   ContextCapturesResponse,
   ContextSegment,
@@ -1004,6 +1005,20 @@ function buildCatalog(session: DemoSession): SessionToolCatalog {
 
 /* ---------- full-context payloads ---------- */
 
+/** What a harness ships before lg distills it: persona and tool tutorials around the project rules. */
+const HARNESS_PROMPT = `<developer_instructions>
+You are Codex, a coding agent based on GPT. You and the user share the same workspace.
+## How you work
+- Prefer \`rg\` over \`grep\`; read files in chunks of at most 250 lines.
+- Use the apply_patch tool to edit files; never write files with cat or echo.
+- Before each tool call, send a one-sentence preamble describing what you are about to do.
+## Project rules
+You are a coding agent working in the user's repository. Follow AGENTS.md.
+- Never introduce unwrap()/expect() on fallible paths.
+- Keep commits short and imperative.
+- Run cargo fmt, clippy and the test suite before declaring the work done.
+</developer_instructions>`;
+
 const DEV_INSTRUCTIONS = `<developer_instructions>
 You are a coding agent working in the user's repository. Follow AGENTS.md.
 - Never introduce unwrap()/expect() on fallible paths.
@@ -1018,7 +1033,7 @@ function buildPayload(session: DemoSession, turn: number, taskId: string): FullC
     messages.push({ index: messages.length, role, in_delta: inDelta, total_bytes: total, parts });
   };
   push("user", turn === 1, [
-    { kind: "text", is_developer_instructions: true, bytes: bytes(DEV_INSTRUCTIONS), text: DEV_INSTRUCTIONS },
+    { kind: "text", is_developer_instructions: true, bytes: bytes(HARNESS_PROMPT), text: HARNESS_PROMPT },
     { kind: "text", is_developer_instructions: false, bytes: bytes(session.prompt), text: session.prompt },
   ]);
   for (let t = 1; t <= turn; t += 1) {
@@ -1049,6 +1064,38 @@ function buildPayload(session: DemoSession, turn: number, taskId: string): FullC
       push("assistant", false, [{ kind: "text", is_developer_instructions: false, bytes: bytes(reply), text: reply }]);
     }
   }
+  const rewrites: ContextRewrite[] = [
+    {
+      kind: "prompt_distilled",
+      message_index: 0,
+      part_index: 0,
+      slot: "primary_base",
+      original_bytes: bytes(HARNESS_PROMPT),
+      rewritten_bytes: bytes(DEV_INSTRUCTIONS),
+      original: HARNESS_PROMPT,
+      rewritten: DEV_INSTRUCTIONS,
+    },
+  ];
+  // The first tool result of the turn arrived with terminal colors that lg stripped.
+  for (const msg of messages) {
+    const partIndex = msg.in_delta ? msg.parts.findIndex((p) => p.kind === "tool_result") : -1;
+    const part = msg.parts[partIndex];
+    if (part?.kind !== "tool_result") continue;
+    const original = `\u001b[32m${part.output}\u001b[0m`;
+    part.output = original;
+    rewrites.push({
+      kind: "tool_result_sanitized",
+      message_index: msg.index,
+      part_index: partIndex,
+      call_id: part.call_id,
+      tool_name: details.get(part.call_id)?.client_tool_name ?? null,
+      original_bytes: bytes(original),
+      rewritten_bytes: part.bytes,
+      original,
+      rewritten: original.slice(5, -4),
+    });
+    break;
+  }
   const catalog = buildCatalog(session);
   const delta = messages.filter((m) => m.in_delta);
   const promptText = delta
@@ -1074,6 +1121,7 @@ function buildPayload(session: DemoSession, turn: number, taskId: string): FullC
     payload_truncated: false,
     assistant_reasoning: "需要先看遥测存储的结构，再决定工具调用记录放在哪一层。环形缓冲要同时限制条数和总字节数。",
     assistant_output: "已完成这一步，接下来继续校验编译并补充测试。\n\n- 新增 `tool_calls.rs`，实现有界环形缓冲\n- `telemetry.rs` 接入淘汰逻辑\n- 下一步：补上 `/api/telemetry/tool-calls` 路由",
+    rewrites,
   };
 }
 
@@ -1354,6 +1402,7 @@ export function createDemoClient(): GatewayClient {
     .map((task) => {
       const turn = Number.parseInt([...turnTask.entries()].find(([, id]) => id === task.task_id)?.[0].split(":")[1] ?? "1", 10);
       const prompt = (task.usage?.inputTokens ?? 0) + (task.usage?.cachedReadTokens ?? 0);
+      const session = sessionOf(task.session_id);
       return {
         task_id: task.task_id,
         recorded_at_unix_ms: task.finished_at_unix_ms ?? task.started_at_unix_ms,
@@ -1368,6 +1417,7 @@ export function createDemoClient(): GatewayClient {
         delta_message_count: 4,
         payload_bytes: prompt * 4 + 20_000,
         prompt_preview: task.prompt_preview,
+        rewrite_count: session ? buildPayload(session, turn, task.task_id).rewrites?.length : 0,
       };
     });
   const refreshContextSummary = (): void => {

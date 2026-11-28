@@ -636,6 +636,28 @@ export interface ContextCaptureRecord {
   delta_message_count: number;
   payload_bytes: number;
   prompt_preview: string;
+  /** Places lg rewrote the harness context before forwarding; absent on older captures. */
+  rewrite_count?: number;
+}
+
+export type ContextRewriteKind = "prompt_distilled" | "prompt_dropped" | "tool_result_sanitized";
+
+/** One gateway change to the harness context: what the harness sent and what went upstream. */
+export interface ContextRewrite {
+  kind: ContextRewriteKind | (string & {});
+  /** Index into `messages` of the rewritten message. */
+  message_index?: number | null;
+  part_index?: number | null;
+  /** Wire slot of a rewritten prompt: `primary_base`, `anthropic_system`, or `developer_item`. */
+  slot?: string | null;
+  call_id?: string | null;
+  tool_name?: string | null;
+  /** Sizes before any capture cap. */
+  original_bytes: number;
+  rewritten_bytes: number;
+  original: string;
+  /** Absent when the gateway dropped the part entirely. */
+  rewritten?: string | null;
 }
 
 export interface ContextCapturesResponse {
@@ -652,6 +674,8 @@ export interface FullContextPayload extends LowCacheFullRequestPayload {
   assistant_reasoning_truncated?: boolean;
   /** Output beyond the per-field capture cap was dropped. */
   assistant_output_truncated?: boolean;
+  /** Every place lg changed the harness context before forwarding it, in message order. */
+  rewrites?: ContextRewrite[];
 }
 
 /** `GET /api/telemetry/context-captures/{task_id}`. */

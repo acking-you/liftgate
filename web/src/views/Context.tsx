@@ -1,7 +1,8 @@
 import * as React from "react";
-import { useEffect, useState } from "react";
-import { CircleAlert, CircleCheck, ScrollText, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { CircleAlert, CircleCheck, FilterX, GitCompare, ScrollText, Trash2, TrendingDown } from "lucide-react";
 import { ProseBlock } from "@/components/CodeBlock";
+import { ContextRewritesView } from "@/components/ContextRewrites";
 import { CopyButton } from "@/components/CopyButton";
 import { MessageTimeline } from "@/components/MessageTimeline";
 import { AcpRequestView, ClientToolsView } from "@/components/PayloadViews";
@@ -18,6 +19,9 @@ import {
   Loading,
   Meter,
   Note,
+  Pill,
+  SearchInput,
+  Select,
   SwitchRow,
   Tabs,
   Unsupported,
@@ -26,7 +30,9 @@ import { useGateway } from "@/hooks/gateway";
 import { useResource, useRevisionResource } from "@/hooks/useResource";
 import { errorMessage } from "@/lib/api";
 import { formatBytes, formatDateTime, formatNumber, formatSmartTime, shortId } from "@/lib/format";
+import { harnessMeta, sortHarnessIds } from "@/lib/harness";
 import { useI18n } from "@/lib/i18n";
+import { UNKNOWN_HARNESS } from "@/lib/taskfilter";
 import type { ContextCaptureRecord, ContextCaptureSummary } from "@/types/telemetry";
 
 const MB = 1024 * 1024;
@@ -36,7 +42,61 @@ interface Banner {
   text: string;
 }
 
-type TabId = "timeline" | "request" | "output" | "tools";
+type TabId = "timeline" | "rewrites" | "request" | "output" | "tools";
+
+interface CaptureFilter {
+  /** Harness profile id, {@link UNKNOWN_HARNESS}, or `"all"`. */
+  harness: string;
+  session: string;
+  model: string;
+  rewrittenOnly: boolean;
+  lowCacheOnly: boolean;
+  /** Case-insensitive substring over ids, model, and prompt preview. */
+  query: string;
+}
+
+const EMPTY_CAPTURE_FILTER: CaptureFilter = {
+  harness: "all",
+  session: "all",
+  model: "all",
+  rewrittenOnly: false,
+  lowCacheOnly: false,
+  query: "",
+};
+
+function captureHarness(rec: ContextCaptureRecord): string {
+  return rec.harness_profile || UNKNOWN_HARNESS;
+}
+
+function matchesCapture(rec: ContextCaptureRecord, filter: CaptureFilter, thresholdBps: number): boolean {
+  if (filter.harness !== "all" && captureHarness(rec) !== filter.harness) return false;
+  if (filter.session !== "all" && rec.session_id !== filter.session) return false;
+  if (filter.model !== "all" && rec.resolved_model !== filter.model) return false;
+  if (filter.rewrittenOnly && (rec.rewrite_count ?? 0) === 0) return false;
+  if (filter.lowCacheOnly && !(typeof rec.cache_hit_rate_bps === "number" && rec.cache_hit_rate_bps < thresholdBps)) {
+    return false;
+  }
+  const query = filter.query.trim().toLowerCase();
+  return (
+    query === "" ||
+    [rec.task_id, rec.session_id, rec.resolved_model, rec.prompt_preview].some(
+      (field) => typeof field === "string" && field.toLowerCase().includes(query),
+    )
+  );
+}
+
+/** Counts per key in first-seen order (records arrive newest first). */
+function tally(
+  records: readonly ContextCaptureRecord[],
+  key: (rec: ContextCaptureRecord) => string | null | undefined,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const rec of records) {
+    const k = key(rec);
+    if (k) out.set(k, (out.get(k) ?? 0) + 1);
+  }
+  return out;
+}
 
 function ContextSheet({
   record,
@@ -51,6 +111,9 @@ function ContextSheet({
   const { m } = useI18n();
   const t = m.context.sheet;
   const [tab, setTab] = useState<TabId>("timeline");
+  // Cross-links between the timeline and the rewrite comparisons.
+  const [focusMessage, setFocusMessage] = useState<number | null>(null);
+  const [focusRewrite, setFocusRewrite] = useState<number | null>(null);
   const taskId = record?.task_id ?? null;
   const detail = useResource(
     taskId !== null ? () => client.contextCaptureDetail(taskId) : null,
@@ -58,8 +121,12 @@ function ContextSheet({
   );
   useEffect(() => {
     setTab("timeline");
+    setFocusMessage(null);
+    setFocusRewrite(null);
   }, [taskId]);
   const payload = detail.data?.payload ?? null;
+  const rewrites = payload?.rewrites ?? [];
+  const tracksRewrites = payload?.rewrites !== undefined || record?.rewrite_count !== undefined;
 
   return (
     <Sheet
@@ -114,9 +181,22 @@ function ContextSheet({
               <Tabs<TabId>
                 ariaLabel={t.tabsAria}
                 value={tab}
-                onChange={setTab}
+                onChange={(next) => {
+                  setTab(next);
+                  setFocusMessage(null);
+                  setFocusRewrite(null);
+                }}
                 tabs={[
                   { value: "timeline", label: t.tabTimeline, count: payload?.messages.length ?? record.message_count },
+                  ...(tracksRewrites
+                    ? [
+                        {
+                          value: "rewrites" as const,
+                          label: t.tabRewrites,
+                          count: payload?.rewrites?.length ?? record.rewrite_count,
+                        },
+                      ]
+                    : []),
                   { value: "request", label: t.tabRequest },
                   { value: "output", label: t.tabOutput },
                   { value: "tools", label: t.tabTools, count: payload?.client_tools.length },
@@ -134,7 +214,28 @@ function ContextSheet({
           )}
           {detail.status === "unsupported" && <Note icon={<CircleAlert />}>{t.reclaimed}</Note>}
 
-          {payload && tab === "timeline" && <MessageTimeline key={record.task_id} messages={payload.messages} />}
+          {payload && tab === "timeline" && (
+            <MessageTimeline
+              key={record.task_id}
+              messages={payload.messages}
+              rewrites={rewrites}
+              focus={focusMessage}
+              onShowRewrite={(idx) => {
+                setFocusRewrite(idx);
+                setTab("rewrites");
+              }}
+            />
+          )}
+          {payload && tab === "rewrites" && (
+            <ContextRewritesView
+              rewrites={rewrites}
+              focus={focusRewrite}
+              onLocate={(messageIndex) => {
+                setFocusMessage(messageIndex);
+                setTab("timeline");
+              }}
+            />
+          )}
           {payload && tab === "request" && (
             <AcpRequestView
               systemAppend={payload.acp_system_append}
@@ -342,7 +443,65 @@ export function ContextView(): React.JSX.Element {
   const [banner, setBanner] = useState<Banner | null>(null);
   const thresholdBps = snapshot?.cache_telemetry?.low_cache_threshold_bps ?? 5000;
   const summary = live ?? captures.data?.summary;
-  const records = captures.data?.records ?? [];
+  const records = useMemo(() => captures.data?.records ?? [], [captures.data]);
+  const fo = m.overview.filters;
+  const fv = t.filters;
+  const [filter, setFilter] = useState<CaptureFilter>(EMPTY_CAPTURE_FILTER);
+  const patchFilter = (patch: Partial<CaptureFilter>): void => setFilter((prev) => ({ ...prev, ...patch }));
+  const filterActive =
+    filter.harness !== "all" ||
+    filter.session !== "all" ||
+    filter.model !== "all" ||
+    filter.rewrittenOnly ||
+    filter.lowCacheOnly ||
+    filter.query.trim() !== "";
+  const filtered = useMemo(
+    () => records.filter((rec) => matchesCapture(rec, filter, thresholdBps)),
+    [records, filter, thresholdBps],
+  );
+  // Facet counts ignore their own facet, so every option shows what picking it would yield.
+  const facets = useMemo(() => {
+    const without = (patch: Partial<CaptureFilter>): ContextCaptureRecord[] =>
+      records.filter((rec) => matchesCapture(rec, { ...filter, ...patch }, thresholdBps));
+    return {
+      byHarness: tally(without({ harness: "all" }), captureHarness),
+      bySession: tally(without({ session: "all" }), (rec) => rec.session_id),
+      byModel: tally(without({ model: "all" }), (rec) => rec.resolved_model),
+      rewritten: without({ rewrittenOnly: false }).filter((rec) => (rec.rewrite_count ?? 0) > 0).length,
+      lowCache: without({ lowCacheOnly: false }).filter(
+        (rec) => typeof rec.cache_hit_rate_bps === "number" && rec.cache_hit_rate_bps < thresholdBps,
+      ).length,
+    };
+  }, [records, filter, thresholdBps]);
+  const harnessIds = useMemo(() => {
+    const ids = new Set(records.map(captureHarness));
+    if (filter.harness !== "all") ids.add(filter.harness);
+    const known = sortHarnessIds([...ids].filter((id) => id !== UNKNOWN_HARNESS));
+    return ids.has(UNKNOWN_HARNESS) ? [...known, UNKNOWN_HARNESS] : known;
+  }, [records, filter.harness]);
+  const sessionOptions = useMemo(() => {
+    const harnessOf = new Map<string, string | null | undefined>();
+    for (const rec of records) {
+      if (rec.session_id && !harnessOf.has(rec.session_id)) harnessOf.set(rec.session_id, rec.harness_profile);
+    }
+    const counts = new Map(facets.bySession);
+    if (filter.session !== "all" && !counts.has(filter.session)) counts.set(filter.session, 0);
+    return [
+      { value: "all", label: fo.allSessions },
+      ...[...counts].map(([id, count]) => ({
+        value: id,
+        label: `${harnessMeta(harnessOf.get(id)).label} · ${shortId(id)} (${count})`,
+      })),
+    ];
+  }, [records, facets.bySession, filter.session, fo.allSessions]);
+  const modelOptions = useMemo(() => {
+    const counts = new Map(facets.byModel);
+    if (filter.model !== "all" && !counts.has(filter.model)) counts.set(filter.model, 0);
+    return [
+      { value: "all", label: fo.allModels },
+      ...[...counts].map(([id, count]) => ({ value: id, label: `${id} (${count})` })),
+    ];
+  }, [facets.byModel, filter.model, fo.allModels]);
 
   if (advertised === null) {
     return (
@@ -380,8 +539,83 @@ export function ContextView(): React.JSX.Element {
       <Card
         flush
         title={t.saved(records.length)}
-        sub={t.savedSub}
+        sub={filterActive ? fv.matched(formatNumber(filtered.length), formatNumber(records.length)) : t.savedSub}
       >
+        {records.length > 0 && (
+          <>
+            <div className="lg-toolbar lg-chiprow" role="group" aria-label={fo.harness}>
+              {harnessIds.map((id) => {
+                const meta = harnessMeta(id === UNKNOWN_HARNESS ? null : id);
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    className="lg-chip lg-chip-plain"
+                    aria-pressed={filter.harness === id}
+                    title={fo.harnessHint(meta.label)}
+                    onClick={() => patchFilter({ harness: filter.harness === id ? "all" : id })}
+                  >
+                    <span className="lg-swatch" style={{ background: meta.color }} aria-hidden="true" />
+                    {meta.label}
+                    <span className="lg-seg-count">{facets.byHarness.get(id) ?? 0}</span>
+                  </button>
+                );
+              })}
+              {(facets.rewritten > 0 || filter.rewrittenOnly) && (
+                <button
+                  type="button"
+                  className="lg-chip"
+                  aria-pressed={filter.rewrittenOnly}
+                  title={fv.rewrittenHint}
+                  onClick={() => patchFilter({ rewrittenOnly: !filter.rewrittenOnly })}
+                >
+                  <GitCompare />
+                  {fv.rewritten}
+                  <span className="lg-seg-count">{facets.rewritten}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className="lg-chip"
+                aria-pressed={filter.lowCacheOnly}
+                title={fo.lowCacheHint}
+                onClick={() => patchFilter({ lowCacheOnly: !filter.lowCacheOnly })}
+              >
+                <TrendingDown />
+                {fo.lowCache(Math.round(thresholdBps / 100))}
+                <span className="lg-seg-count">{facets.lowCache}</span>
+              </button>
+            </div>
+            <div className="lg-toolbar">
+              <SearchInput
+                className="min-w-[200px] flex-[1.4]"
+                value={filter.query}
+                onChange={(query) => patchFilter({ query })}
+                placeholder={fv.search}
+              />
+              <Select
+                ariaLabel={fo.session}
+                className="min-w-[180px] flex-1"
+                value={filter.session}
+                onChange={(session) => patchFilter({ session })}
+                options={sessionOptions}
+              />
+              <Select
+                ariaLabel={fo.model}
+                className="min-w-[180px] flex-1"
+                value={filter.model}
+                onChange={(model) => patchFilter({ model })}
+                options={modelOptions}
+              />
+              {filterActive && (
+                <Button size="sm" variant="ghost" onClick={() => setFilter(EMPTY_CAPTURE_FILTER)}>
+                  <FilterX />
+                  {fo.clear}
+                </Button>
+              )}
+            </div>
+          </>
+        )}
         {captures.status === "loading" ? (
           <Loading />
         ) : captures.status === "error" && captures.data === null ? (
@@ -396,6 +630,8 @@ export function ContextView(): React.JSX.Element {
             title={summary?.enabled ? t.noneYet : t.off}
             hint={summary?.enabled ? t.noneYetHint : t.offHint}
           />
+        ) : filtered.length === 0 ? (
+          <EmptyState icon={<ScrollText />} title={fv.noMatch} />
         ) : (
           <div className="lg-table-wrap">
             <table className="lg-table">
@@ -408,12 +644,13 @@ export function ContextView(): React.JSX.Element {
                   <th className="num">{t.col.hitRate}</th>
                   <th className="num hide-sm">{t.col.io}</th>
                   <th className="num hide-sm">{t.col.messages}</th>
+                  <th className="num hide-sm">{t.col.rewrites}</th>
                   <th className="num">{t.col.payload}</th>
                   <th className="hide-sm">Prompt</th>
                 </tr>
               </thead>
               <tbody>
-                {records.map((rec) => (
+                {filtered.map((rec) => (
                   <tr
                     key={rec.task_id}
                     data-clickable="true"
@@ -427,10 +664,36 @@ export function ContextView(): React.JSX.Element {
                       {formatSmartTime(rec.recorded_at_unix_ms)}
                     </td>
                     <td className="whitespace-nowrap">
-                      <HarnessBadge id={rec.harness_profile} className="text-fg" />
-                      <span className="lg-num ml-2 text-[11.5px] text-fg-4 max-md:hidden">
-                        {shortId(rec.session_id)}
-                      </span>
+                      <button
+                        type="button"
+                        className="lg-cellfilter"
+                        aria-pressed={filter.harness === captureHarness(rec)}
+                        title={fo.harnessHint(harnessMeta(rec.harness_profile).label)}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          const id = captureHarness(rec);
+                          patchFilter({ harness: filter.harness === id ? "all" : id });
+                        }}
+                        onKeyDown={(ev) => ev.stopPropagation()}
+                      >
+                        <HarnessBadge id={rec.harness_profile} className="text-fg" />
+                      </button>
+                      {rec.session_id && (
+                        <button
+                          type="button"
+                          className="lg-cellfilter lg-num ml-3 text-[11.5px] text-fg-4 max-md:hidden"
+                          aria-pressed={filter.session === rec.session_id}
+                          title={fo.sessionHint}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            const id = rec.session_id ?? "all";
+                            patchFilter({ session: filter.session === id ? "all" : id });
+                          }}
+                          onKeyDown={(ev) => ev.stopPropagation()}
+                        >
+                          {shortId(rec.session_id)}
+                        </button>
+                      )}
                     </td>
                     <td className="lg-num hide-sm whitespace-nowrap text-[12px]">{rec.resolved_model}</td>
                     <td className="num hide-sm">{rec.session_turn_index}</td>
@@ -445,6 +708,13 @@ export function ContextView(): React.JSX.Element {
                     <td className="num hide-sm whitespace-nowrap">
                       {rec.message_count}
                       <span className="text-fg-4">{t.delta(rec.delta_message_count)}</span>
+                    </td>
+                    <td className="num hide-sm">
+                      {rec.rewrite_count ? (
+                        <Pill tone="warn">{rec.rewrite_count}</Pill>
+                      ) : (
+                        <span className="text-fg-4">—</span>
+                      )}
                     </td>
                     <td className="num whitespace-nowrap">{formatBytes(rec.payload_bytes)}</td>
                     <td className="hide-sm max-w-[260px]">

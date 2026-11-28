@@ -13,11 +13,12 @@ use liftgate_types::{
     acp::{AcpPromptBlock, AcpUsage, AvailableModel, compute_cache_hit_bps},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
-        CanonicalToolSpec, ReasoningEffort,
+        CanonicalToolSpec, ProtocolDeveloperSlot, ReasoningEffort,
     },
     config::{
         CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit, LowCacheRecordLimit,
     },
+    harness_prompt::{DetectedHarness, explain_developer_slot_rewrites},
     pricing::{
         ModelPrice, PricingResponse, UsageResponse, UsageSeriesResponse, UsageSummary, UsageTokens,
     },
@@ -25,12 +26,13 @@ use liftgate_types::{
     telemetry::{
         CacheTelemetrySummary, CapturedAcpPromptBlock, CapturedFullMessage, CapturedFullPart,
         CapturedMessageSummary, CapturedToolSpec, ContextCaptureDetailResponse,
-        ContextCaptureRecord, ContextCaptureSummary, ContextCapturesResponse, ContextSegment,
-        ContextSegmentKey, ElasticIoTelemetry, FullContextPayload, GatewayMetricsSummary,
-        LowCacheDiagnosticCause, LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord,
-        LowCacheHitsResponse, LowCachePayloadDetailResponse, LowCacheRequestCapture,
-        LowCacheRequestMetrics, LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
-        ToolCallDetail, ToolCallTelemetrySummary, ToolCallsResponse,
+        ContextCaptureRecord, ContextCaptureSummary, ContextCapturesResponse, ContextRewrite,
+        ContextRewriteKind, ContextSegment, ContextSegmentKey, ElasticIoTelemetry,
+        FullContextPayload, GatewayMetricsSummary, LowCacheDiagnosticCause,
+        LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord, LowCacheHitsResponse,
+        LowCachePayloadDetailResponse, LowCacheRequestCapture, LowCacheRequestMetrics,
+        LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot, ToolCallDetail,
+        ToolCallTelemetrySummary, ToolCallsResponse,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,11 @@ const CONTEXT_CAPTURE_PAYLOAD_BUDGET: PayloadBudget = PayloadBudget {
     per_part: 1024 * 1024,
     total: 16 * 1024 * 1024,
 };
+/// Bounds for the before / after texts kept per gateway context rewrite.
+const CONTEXT_REWRITE_BUDGET: PayloadBudget = PayloadBudget {
+    per_part: 256 * 1024,
+    total: 4 * 1024 * 1024,
+};
 /// Reasoning / output text retained per turn for full-context capture.
 const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 1024 * 1024;
 /// Sessions whose latest context composition is kept for the tool catalog view.
@@ -80,7 +87,8 @@ const IMAGE_TOKENS_ESTIMATE: u64 = 1_000;
 
 const _: () = assert!(
     LOW_CACHE_PAYLOAD_BUDGET.per_part <= LOW_CACHE_PAYLOAD_BUDGET.total
-        && CONTEXT_CAPTURE_PAYLOAD_BUDGET.per_part <= CONTEXT_CAPTURE_PAYLOAD_BUDGET.total,
+        && CONTEXT_CAPTURE_PAYLOAD_BUDGET.per_part <= CONTEXT_CAPTURE_PAYLOAD_BUDGET.total
+        && CONTEXT_REWRITE_BUDGET.per_part <= CONTEXT_REWRITE_BUDGET.total,
     "a single payload part must fit inside its payload budget"
 );
 
@@ -166,6 +174,10 @@ pub struct TurnCompletionDiagnostics<'a> {
     pub outbound_acp_blocks: &'a [AcpPromptBlock],
     pub messages: &'a [CanonicalMessage],
     pub client_tools: &'a [CanonicalToolSpec],
+    /// Harness whose developer slots were distilled on the way out; `None` forwards them verbatim.
+    pub distill_harness: Option<DetectedHarness>,
+    /// Protocol developer slots indexing into `messages`.
+    pub developer_slots: &'a [ProtocolDeveloperSlot],
 }
 
 impl TurnCompletionDiagnostics<'_> {
@@ -1691,6 +1703,110 @@ struct TurnTextCapture {
     output: String,
     reasoning_truncated: bool,
     output_truncated: bool,
+    tool_result_rewrites: Vec<PendingToolResultRewrite>,
+}
+
+/// A client tool result the gateway changed before handing it back to the model.
+#[derive(Debug)]
+struct PendingToolResultRewrite {
+    call_id: String,
+    nonce_suffix: String,
+    tool_name: String,
+    original_bytes: usize,
+    rewritten_bytes: usize,
+    /// Head/tail bounded to [`CONTEXT_REWRITE_BUDGET`]`.per_part`.
+    original: String,
+    rewritten: String,
+    truncated: bool,
+}
+
+/// Head/tail bounds `raw` to a single rewrite part, noting whether anything was cut.
+fn bound_rewrite_text(raw: &str, truncated: &mut bool) -> String {
+    let cap = CONTEXT_REWRITE_BUDGET.per_part;
+    if raw.len() <= cap {
+        return raw.to_owned();
+    }
+    *truncated = true;
+    truncate_head_tail_lines(raw, cap, "context rewrite")
+}
+
+/// Finds the `(message, part)` holding the tool result that answers `call_id`.
+fn locate_tool_result(
+    messages: &[CanonicalMessage],
+    call_id: &str,
+    nonce_suffix: &str,
+) -> Option<(usize, usize)> {
+    messages.iter().enumerate().find_map(|(msg_idx, msg)| {
+        msg.parts
+            .iter()
+            .position(|part| {
+                matches!(part, CanonicalPart::ToolResult { call_id: id, .. }
+                if id == call_id || id.strip_suffix(nonce_suffix).is_some_and(|p| p.ends_with('_')))
+            })
+            .map(|part_idx| (msg_idx, part_idx))
+    })
+}
+
+/// Lists every place the gateway changed the harness context of this turn, in message order:
+/// distilled or dropped developer slots plus sanitized client tool results.
+fn collect_context_rewrites(
+    diag: &TurnCompletionDiagnostics<'_>,
+    tool_results: Vec<PendingToolResultRewrite>,
+) -> (Vec<ContextRewrite>, bool) {
+    let per_part = CONTEXT_REWRITE_BUDGET.per_part;
+    let mut budget = CONTEXT_REWRITE_BUDGET.total;
+    let mut truncated = false;
+    let mut out = Vec::new();
+    if let Some(harness) = diag.distill_harness {
+        for rw in explain_developer_slot_rewrites(harness, diag.developer_slots, diag.messages) {
+            let original = bound_part_string(rw.original, &mut budget, per_part, &mut truncated);
+            let rewritten = rw
+                .rewritten
+                .as_deref()
+                .map(|text| bound_part_string(text, &mut budget, per_part, &mut truncated));
+            out.push(ContextRewrite {
+                kind: if rewritten.is_some() {
+                    ContextRewriteKind::PromptDistilled
+                } else {
+                    ContextRewriteKind::PromptDropped
+                },
+                message_index: Some(rw.msg_index),
+                part_index: Some(rw.part_index),
+                slot: Some(rw.slot.to_owned()),
+                call_id: None,
+                tool_name: None,
+                original_bytes: rw.original.len(),
+                rewritten_bytes: rw.rewritten.as_deref().map_or(0, str::len),
+                original,
+                rewritten,
+            });
+        }
+    }
+    for rw in tool_results {
+        truncated |= rw.truncated;
+        let coords = locate_tool_result(diag.messages, &rw.call_id, &rw.nonce_suffix);
+        let original = bound_part_string(&rw.original, &mut budget, per_part, &mut truncated);
+        let rewritten = bound_part_string(&rw.rewritten, &mut budget, per_part, &mut truncated);
+        out.push(ContextRewrite {
+            kind: ContextRewriteKind::ToolResultSanitized,
+            message_index: coords.map(|(msg_idx, _)| msg_idx),
+            part_index: coords.map(|(_, part_idx)| part_idx),
+            slot: None,
+            call_id: Some(rw.call_id),
+            tool_name: Some(rw.tool_name),
+            original_bytes: rw.original_bytes,
+            rewritten_bytes: rw.rewritten_bytes,
+            original,
+            rewritten: Some(rewritten),
+        });
+    }
+    out.sort_by_key(|rw| {
+        (
+            rw.message_index.unwrap_or(usize::MAX),
+            rw.part_index.unwrap_or(usize::MAX),
+        )
+    });
+    (out, truncated)
 }
 
 /// A completed turn's capture, waiting for its payload to be written off the async workers.
@@ -1831,6 +1947,36 @@ impl ActiveTaskGuard {
         self.hub.notify_change();
     }
 
+    /// Keeps a client tool result the gateway changed before forwarding, for full-context capture.
+    pub fn record_tool_result_rewrite(
+        &self,
+        call_id: &str,
+        nonce_suffix: &str,
+        tool_name: &str,
+        original: &str,
+        rewritten: &str,
+    ) {
+        let Some(capture) = self.text_capture.as_ref() else {
+            return;
+        };
+        let mut truncated = false;
+        let entry = PendingToolResultRewrite {
+            call_id: call_id.to_owned(),
+            nonce_suffix: nonce_suffix.to_owned(),
+            tool_name: tool_name.to_owned(),
+            original_bytes: original.len(),
+            rewritten_bytes: rewritten.len(),
+            original: bound_rewrite_text(original, &mut truncated),
+            rewritten: bound_rewrite_text(rewritten, &mut truncated),
+            truncated,
+        };
+        let mut buf = match capture.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        buf.tool_result_rewrites.push(entry);
+    }
+
     fn capture_text(&self, delta: &str, reasoning: bool) {
         let Some(capture) = self.text_capture.as_ref() else {
             return;
@@ -1844,6 +1990,7 @@ impl ActiveTaskGuard {
             output,
             reasoning_truncated,
             output_truncated,
+            ..
         } = &mut *buf;
         let (target, truncated) = if reasoning {
             (reasoning_text, reasoning_truncated)
@@ -2476,6 +2623,7 @@ impl ActiveTaskGuard {
             output,
             reasoning_truncated,
             output_truncated,
+            tool_result_rewrites,
         } = {
             let mut buf = match capture.lock() {
                 Ok(g) => g,
@@ -2491,7 +2639,7 @@ impl ActiveTaskGuard {
             &output_preview,
             CONTEXT_CAPTURE_PAYLOAD_BUDGET,
         );
-        let record = ContextCaptureRecord {
+        let mut record = ContextCaptureRecord {
             task_id: self.task_id.clone(),
             recorded_at_unix_ms: now_ms,
             session_id,
@@ -2505,16 +2653,21 @@ impl ActiveTaskGuard {
             delta_message_count: measure.map_or(0, |m| m.delta_message_count),
             payload_bytes: 0,
             prompt_preview,
+            rewrite_count: 0,
         };
+        let (rewrites, rewrites_truncated) = collect_context_rewrites(diag, tool_result_rewrites);
+        record.rewrite_count = rewrites.len();
         let mut payload = FullContextPayload {
             request,
             assistant_reasoning: (!reasoning.is_empty()).then_some(reasoning),
             assistant_output: (!output.is_empty()).then_some(output),
             assistant_reasoning_truncated: reasoning_truncated,
             assistant_output_truncated: output_truncated,
+            rewrites,
         };
         // One indicator for "this capture is incomplete", wherever the cut happened.
-        payload.request.payload_truncated |= reasoning_truncated || output_truncated;
+        payload.request.payload_truncated |=
+            reasoning_truncated || output_truncated || rewrites_truncated;
         Some(PendingContextCapture {
             slot,
             ticket,
@@ -3481,6 +3634,8 @@ mod tests {
             outbound_acp_blocks: &[],
             messages,
             client_tools: &[],
+            distill_harness: None,
+            developer_slots: &[],
         }
     }
 
@@ -3576,6 +3731,92 @@ mod tests {
         assert!(detail.payload.assistant_output_truncated);
         assert!(!detail.payload.assistant_reasoning_truncated);
         assert!(detail.payload.request.payload_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_context_capture_lists_gateway_context_rewrites() {
+        use liftgate_types::canonical::ProtocolDeveloperSlotKind;
+
+        let dir = std::env::temp_dir().join(format!("liftgate-ctx-rewrites-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let hub = Arc::new(TelemetryHub::with_telemetry_config(TelemetryConfig {
+            context_capture: ContextCaptureConfig {
+                enabled: true,
+                dir: Some(dir.clone()),
+                ..ContextCaptureConfig::default()
+            },
+            ..TelemetryConfig::default()
+        }));
+        let harness_prompt = format!(
+            "<developer_instructions>\nYou are Codex, a coding agent.\n{}\n</developer_instructions>",
+            "Follow the harness tutorial. ".repeat(200)
+        );
+        let messages = vec![
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text(harness_prompt.clone())],
+            },
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::ToolResult {
+                    call_id: "call_abc123".to_owned(),
+                    output: "\u{1b}[31mred\u{1b}[0m".to_owned(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let slots = [ProtocolDeveloperSlot {
+            msg_index: 0,
+            part_index: 0,
+            kind: ProtocolDeveloperSlotKind::PrimaryBase,
+        }];
+        let guard = hub.begin_task(
+            "task_rewrites".to_owned(),
+            TaskProtocol::OpenaiResponses,
+            false,
+            "gemini-4-carbon-high".to_owned(),
+            None,
+            &messages,
+        );
+        guard.bind_session("sess_rewrites", false, "gemini-4-carbon-high");
+        guard.record_tool_result_rewrite(
+            "call_abc123",
+            "abc123",
+            "exec",
+            "\u{1b}[31mred\u{1b}[0m",
+            "red",
+        );
+        let mut diag = capture_test_diagnostics(&messages);
+        diag.distill_harness = Some(DetectedHarness::Codex);
+        diag.developer_slots = &slots;
+        guard.complete_with_diagnostics("end_turn".to_owned(), AcpUsage::default(), Some(diag));
+
+        let detail = hub
+            .context_capture_detail("task_rewrites")
+            .expect("read capture")
+            .expect("captured");
+        assert_eq!(detail.record.rewrite_count, 2);
+        let rewrites = &detail.payload.rewrites;
+        assert_eq!(rewrites.len(), 2);
+        let prompt = rewrites.first().expect("prompt rewrite");
+        assert_eq!(prompt.kind, ContextRewriteKind::PromptDistilled);
+        assert_eq!(
+            (prompt.message_index, prompt.part_index),
+            (Some(0), Some(0))
+        );
+        assert_eq!(prompt.slot.as_deref(), Some("primary_base"));
+        assert_eq!(prompt.original, harness_prompt);
+        assert_eq!(prompt.original_bytes, harness_prompt.len());
+        let distilled = prompt.rewritten.as_deref().expect("distilled text");
+        assert_ne!(distilled, harness_prompt);
+        assert_eq!(prompt.rewritten_bytes, distilled.len());
+        let tool = rewrites.get(1).expect("tool rewrite");
+        assert_eq!(tool.kind, ContextRewriteKind::ToolResultSanitized);
+        assert_eq!((tool.message_index, tool.part_index), (Some(1), Some(0)));
+        assert_eq!(tool.tool_name.as_deref(), Some("exec"));
+        assert_eq!(tool.rewritten.as_deref(), Some("red"));
+        assert!(!detail.payload.request.payload_truncated);
         let _ = fs::remove_dir_all(&dir);
     }
 

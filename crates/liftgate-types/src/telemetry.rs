@@ -1202,6 +1202,51 @@ pub struct ContextCaptureRecord {
     pub payload_bytes: u64,
     #[serde(default)]
     pub prompt_preview: String,
+    /// Places where the gateway changed the harness's context before forwarding it
+    /// ([`FullContextPayload::rewrites`]); `0` on captures that predate rewrite tracking.
+    #[serde(default)]
+    pub rewrite_count: usize,
+}
+
+/// Why the gateway changed a piece of harness context before forwarding it upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRewriteKind {
+    /// A harness system / developer prompt replaced by its distilled ACP-aligned contract.
+    PromptDistilled,
+    /// A harness developer item dropped as redundant harness-internal boilerplate.
+    PromptDropped,
+    /// A client tool result cleaned (billing noise, terminal control sequences) or head/tail
+    /// truncated into a spill before being handed back to the model.
+    ToolResultSanitized,
+}
+
+/// One gateway change to the harness context: what the harness sent and what went upstream.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ContextRewrite {
+    pub kind: ContextRewriteKind,
+    /// Index into [`LowCacheFullRequestPayload::messages`] of the rewritten message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_index: Option<usize>,
+    /// Index of the rewritten part inside that message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<usize>,
+    /// Wire slot of a rewritten prompt: `primary_base`, `anthropic_system`, or `developer_item`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    /// Call answered by a rewritten tool result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Size of the harness's original text before any capture cap.
+    pub original_bytes: usize,
+    /// Size of the forwarded text before any capture cap (`0` when dropped).
+    pub rewritten_bytes: usize,
+    pub original: String,
+    /// Forwarded text; `None` when the gateway dropped the part entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten: Option<String>,
 }
 
 /// Response served by `GET /api/telemetry/context-captures` (newest first).
@@ -1228,6 +1273,9 @@ pub struct FullContextPayload {
     /// Output beyond the per-field capture cap was dropped.
     #[serde(default)]
     pub assistant_output_truncated: bool,
+    /// Every place the gateway changed the harness context before forwarding it, in message order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewrites: Vec<ContextRewrite>,
 }
 
 /// Response served by `GET /api/telemetry/context-captures/{task_id}`.

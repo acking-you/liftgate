@@ -2383,6 +2383,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 outbound_acp_blocks: &initial_acp_blocks,
                 messages: &full_messages,
                 client_tools: &req.client_tools,
+                distill_harness: req.distillation_harness(),
+                developer_slots: &req.developer_slots,
             };
             task_guard.complete_with_diagnostics(
                 complete_stop_reason,
@@ -2434,6 +2436,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     outbound_acp_blocks: &initial_acp_blocks,
                     messages: pre_reply_slice,
                     client_tools: &req.client_tools,
+                    distill_harness: req.distillation_harness(),
+                    developer_slots: &req.developer_slots,
                 };
                 task_guard.complete_with_diagnostics(
                     complete_stop_reason,
@@ -4459,7 +4463,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             &delta_for_reply,
             tools_delta.as_deref(),
             &mut spill_store,
-            task_guard.hub(),
+            &task_guard,
         );
         task_guard
             .record_mcp_tool_results(built_replies.total_results, built_replies.spilled_results);
@@ -4621,8 +4625,9 @@ fn build_mcp_tool_replies(
     delta_messages: &[CanonicalMessage],
     tools_delta_xml: Option<&str>,
     spill_store: &mut Option<SpillStore>,
-    telemetry: &TelemetryHub,
+    task_guard: &ActiveTaskGuard,
 ) -> BuiltMcpToolReplies {
+    let telemetry = task_guard.hub();
     let mut result_images: HashMap<String, Vec<crate::tool_calls::ToolOutputImage>> =
         trailing_tool_results(delta_messages)
             .into_iter()
@@ -4692,6 +4697,15 @@ fn build_mcp_tool_replies(
             .unwrap_or_else(|| (String::new(), false));
         let (sanitized, did_spill) =
             sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        if sanitized != raw_out {
+            task_guard.record_tool_result_rewrite(
+                &pending.call_id,
+                &pending.nonce_suffix,
+                &pending.client_name,
+                &raw_out,
+                &sanitized,
+            );
+        }
         telemetry.finish_client_tool_call(
             &pending.call_id,
             &raw_out,
@@ -6038,6 +6052,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     outbound_acp_blocks: &cur_outbound_blocks,
                     messages: pre_reply_slice,
                     client_tools: &cur_req.client_tools,
+                    distill_harness: cur_req.distillation_harness(),
+                    developer_slots: &cur_req.developer_slots,
                 };
                 cur_task_guard.complete_with_diagnostics(
                     "tool_use".to_owned(),
@@ -6486,6 +6502,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             outbound_acp_blocks: &cur_outbound_blocks,
                             messages: &cur_full_messages,
                             client_tools: &cur_req.client_tools,
+                            distill_harness: cur_req.distillation_harness(),
+                            developer_slots: &cur_req.developer_slots,
                         };
                         cur_task_guard.complete_with_diagnostics(
                             complete_stop,
@@ -6542,6 +6560,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 outbound_acp_blocks: &cur_outbound_blocks,
                                 messages: pre_reply_slice,
                                 client_tools: &cur_req.client_tools,
+                                distill_harness: cur_req.distillation_harness(),
+                                developer_slots: &cur_req.developer_slots,
                             };
                             cur_task_guard.complete_with_diagnostics(
                                 complete_stop,

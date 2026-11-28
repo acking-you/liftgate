@@ -464,6 +464,7 @@ mod tests {
             delta_message_count: 1,
             payload_bytes: bytes,
             prompt_preview: "hi".to_owned(),
+            rewrite_count: 0,
         }
     }
 
