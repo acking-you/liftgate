@@ -173,6 +173,15 @@ pub enum GatewayError {
         #[source]
         source: Arc<AcpError>,
     },
+
+    #[error("upstream provider HTTP error ({status}): {message}")]
+    UpstreamProviderHttp {
+        status: StatusCode,
+        openai_type: &'static str,
+        openai_code: &'static str,
+        anthropic_type: &'static str,
+        message: String,
+    },
 }
 
 impl GatewayError {
@@ -187,6 +196,7 @@ impl GatewayError {
             }
             Self::Acp { source } => Self::acp_status(source),
             Self::SharedAcp { source } => Self::acp_status(source),
+            Self::UpstreamProviderHttp { status, .. } => *status,
         }
     }
 
@@ -206,6 +216,7 @@ impl GatewayError {
             }
             Self::Acp { source } => Self::acp_anthropic_status(source),
             Self::SharedAcp { source } => Self::acp_anthropic_status(source),
+            Self::UpstreamProviderHttp { status, .. } => *status,
         }
     }
 
@@ -272,6 +283,11 @@ impl GatewayError {
             }
             Self::Acp { source } => Self::acp_kind(source),
             Self::SharedAcp { source } => Self::acp_kind(source),
+            Self::UpstreamProviderHttp {
+                openai_type,
+                openai_code,
+                ..
+            } => (*openai_type, *openai_code),
         }
     }
 
@@ -287,6 +303,7 @@ impl GatewayError {
             }
             Self::Acp { source } => Self::acp_anthropic_error_type(source),
             Self::SharedAcp { source } => Self::acp_anthropic_error_type(source),
+            Self::UpstreamProviderHttp { anthropic_type, .. } => anthropic_type,
         }
     }
 
@@ -355,7 +372,8 @@ impl GatewayError {
             | Self::PayloadTooLarge { .. }
             | Self::NotFound { .. }
             | Self::ProviderDisabled { .. }
-            | Self::InvalidBody { .. } => None,
+            | Self::InvalidBody { .. }
+            | Self::UpstreamProviderHttp { .. } => None,
         }
     }
 
@@ -417,6 +435,7 @@ impl GatewayError {
             Self::Protocol { source } => format_error_chain(source),
             Self::Acp { source } => format_error_chain(source),
             Self::SharedAcp { source } => format_error_chain(source.as_ref()),
+            Self::UpstreamProviderHttp { message, .. } => message.clone(),
         }
     }
 

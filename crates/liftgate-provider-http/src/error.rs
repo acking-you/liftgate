@@ -21,6 +21,9 @@ pub enum PlatformApiError {
         message: String,
     },
 
+    #[error("upstream quota exhausted (HTTP {status}): {message}")]
+    QuotaExhausted { status: u16, message: String },
+
     #[error("upstream rejected request (HTTP {status}): {message}")]
     InvalidRequest { status: u16, message: String },
 
@@ -52,6 +55,7 @@ impl PlatformApiError {
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::RateLimited { .. }
+            | Self::QuotaExhausted { .. }
             | Self::MissingCredentials { .. }
             | Self::InvalidUrl { .. }
             | Self::AuthenticationFailed { .. }
@@ -72,6 +76,10 @@ impl PlatformApiError {
                 status,
                 message: extracted,
             },
+            402 => Self::QuotaExhausted {
+                status,
+                message: extracted,
+            },
             404 => Self::NotFound {
                 status,
                 message: extracted,
@@ -81,10 +89,22 @@ impl PlatformApiError {
                 retry_after_ms,
                 message: extracted,
             },
-            400..=499 => Self::InvalidRequest {
-                status,
-                message: extracted,
-            },
+            400..=499 => {
+                let lower_msg = extracted.to_ascii_lowercase();
+                let lower_raw = raw_body.to_ascii_lowercase();
+                if lower_msg.contains("quota exceeded") || lower_raw.contains("insufficient_quota")
+                {
+                    Self::QuotaExhausted {
+                        status,
+                        message: extracted,
+                    }
+                } else {
+                    Self::InvalidRequest {
+                        status,
+                        message: extracted,
+                    }
+                }
+            }
             _ => Self::UpstreamServer {
                 status,
                 message: extracted,

@@ -78,6 +78,7 @@ mod tests {
             effort: None,
             system_instructions: Some("Be concise.".to_owned()),
             prompt_text: "hi".to_owned(),
+            images: Vec::new(),
             cwd: PathBuf::from("."),
             mcp_servers: Vec::new(),
             dynamic_tools: Vec::new(),
@@ -185,6 +186,7 @@ mod tests {
             effort: None,
             system_instructions: None,
             prompt_text: "ping".to_owned(),
+            images: Vec::new(),
             cwd: PathBuf::from("."),
             mcp_servers: Vec::new(),
             dynamic_tools: Vec::new(),
@@ -301,6 +303,7 @@ mod tests {
             effort: None,
             system_instructions: None,
             prompt_text: "read Cargo.toml".to_owned(),
+            images: Vec::new(),
             cwd: PathBuf::from("."),
             mcp_servers: Vec::new(),
             dynamic_tools: vec![
@@ -319,7 +322,7 @@ mod tests {
             ],
         };
 
-        run_turn_on_peer_with_handler(&peer, &input, &tx, |tool, _args| {
+        run_turn_on_peer_with_handler(&peer, &input, &tx, |tool, _args| async move {
             if tool == "search_client_tools" {
                 DynamicToolDisposition::LocalReply {
                     text: "found read_file".to_owned(),
@@ -410,6 +413,7 @@ mod tests {
                 cwd: PathBuf::from("."),
                 system_instructions: None,
                 prompt_text: "Hello".to_owned(),
+                images: Vec::new(),
                 mcp_servers: Vec::new(),
                 dynamic_tools: Vec::new(),
             },
@@ -427,5 +431,149 @@ mod tests {
             !saw_prompt.load(std::sync::atomic::Ordering::SeqCst),
             "must never dispatch session/prompt after session/set_model fails"
         );
+    }
+
+    #[tokio::test]
+    async fn stateful_dialects_serialize_multimodal_images() {
+        // 1. Codex app-server image serialization (`data:<mime>;base64,<data>`)
+        let (c_read, mut s_write) = tokio::io::duplex(16 * 1024);
+        let (s_read, c_write) = tokio::io::duplex(16 * 1024);
+        let seen_codex_input = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let seen_codex_clone = std::sync::Arc::clone(&seen_codex_input);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(s_read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let id = req.get("id").cloned();
+                match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => {
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"userAgent":"codex"}});
+                        s_write
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "thread/start" => {
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"t1"}}});
+                        s_write
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "turn/start" => {
+                        *seen_codex_clone.lock().unwrap() = req["params"]["input"].clone();
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"u1"}}});
+                        s_write
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        let done = json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"status":"completed"}}});
+                        s_write
+                            .write_all(format!("{done}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let peer = StdioRpcPeer::from_io(c_read, c_write, 1024 * 1024, None);
+        let (tx, _rx) = mpsc::channel(16);
+        run_turn_on_peer(
+            &peer,
+            &StatefulTurnInput {
+                dialect: StatefulDialect::CodexAppServer,
+                model: "gpt-5.4".to_owned(),
+                effort: None,
+                system_instructions: None,
+                prompt_text: "Describe image".to_owned(),
+                images: vec![crate::adapters::StatefulInputImage {
+                    media_type: "image/png".to_owned(),
+                    data: "iVBORw0KGgo=".to_owned(),
+                }],
+                cwd: PathBuf::from("."),
+                mcp_servers: Vec::new(),
+                dynamic_tools: Vec::new(),
+            },
+            &tx,
+        )
+        .await
+        .expect("codex multimodal turn");
+        let codex_items = seen_codex_input.lock().unwrap().clone();
+        assert_eq!(codex_items[1]["type"], "image");
+        assert_eq!(codex_items[1]["url"], "data:image/png;base64,iVBORw0KGgo=");
+
+        // 2. Grok ACP image serialization (`{"type":"image","data":...,"mimeType":...}`)
+        let (c_read2, mut s_write2) = tokio::io::duplex(16 * 1024);
+        let (s_read2, c_write2) = tokio::io::duplex(16 * 1024);
+        let seen_acp_prompt = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let seen_acp_clone = std::sync::Arc::clone(&seen_acp_prompt);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(s_read2).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let id = req.get("id").cloned();
+                match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => {
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}});
+                        s_write2
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "session/new" => {
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"s1"}});
+                        s_write2
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "session/set_model" => {
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{}});
+                        s_write2
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "session/prompt" => {
+                        *seen_acp_clone.lock().unwrap() = req["params"]["prompt"].clone();
+                        let r = json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}});
+                        s_write2
+                            .write_all(format!("{r}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let peer2 = StdioRpcPeer::from_io(c_read2, c_write2, 1024 * 1024, None);
+        let (tx2, _rx2) = mpsc::channel(16);
+        run_turn_on_peer(
+            &peer2,
+            &StatefulTurnInput {
+                dialect: StatefulDialect::GrokAcp,
+                model: "grok-4".to_owned(),
+                effort: None,
+                system_instructions: None,
+                prompt_text: "Describe image".to_owned(),
+                images: vec![crate::adapters::StatefulInputImage {
+                    media_type: "image/png".to_owned(),
+                    data: "iVBORw0KGgo=".to_owned(),
+                }],
+                cwd: PathBuf::from("."),
+                mcp_servers: Vec::new(),
+                dynamic_tools: Vec::new(),
+            },
+            &tx2,
+        )
+        .await
+        .expect("grok acp multimodal turn");
+        let acp_blocks = seen_acp_prompt.lock().unwrap().clone();
+        assert_eq!(acp_blocks[1]["type"], "image");
+        assert_eq!(acp_blocks[1]["mimeType"], "image/png");
+        assert_eq!(acp_blocks[1]["data"], "iVBORw0KGgo=");
     }
 }

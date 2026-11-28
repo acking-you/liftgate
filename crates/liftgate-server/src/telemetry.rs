@@ -3019,6 +3019,21 @@ fn measure_messages(messages: &[CanonicalMessage], delta_start_index: usize) -> 
                     m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
                     m.reasoning_bytes = m.reasoning_bytes.saturating_add(r.len());
                 }
+                CanonicalPart::SignedThinking {
+                    thinking,
+                    signature,
+                } => {
+                    has_conversational_part = true;
+                    m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
+                    m.reasoning_bytes = m
+                        .reasoning_bytes
+                        .saturating_add(thinking.len().saturating_add(signature.len()));
+                }
+                CanonicalPart::RedactedThinking { data } => {
+                    has_conversational_part = true;
+                    m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
+                    m.reasoning_bytes = m.reasoning_bytes.saturating_add(data.len());
+                }
                 CanonicalPart::ImageBase64 { media_type, data } => {
                     has_conversational_part = true;
                     m.image_part_count = m.image_part_count.saturating_add(1);
@@ -3335,6 +3350,12 @@ fn summarize_message_inline(
             CanonicalPart::Reasoning(r) => {
                 part_kinds.push(format!("reasoning({}B)", r.len()));
             }
+            CanonicalPart::SignedThinking { thinking, .. } => {
+                part_kinds.push(format!("signed_thinking({}B)", thinking.len()));
+            }
+            CanonicalPart::RedactedThinking { data } => {
+                part_kinds.push(format!("redacted_thinking({}B)", data.len()));
+            }
             CanonicalPart::ImageBase64 { media_type, data } => {
                 part_kinds.push(format!("image:{media_type}({}B)", data.len()));
             }
@@ -3495,6 +3516,18 @@ fn build_full_request_payload(
                     let bytes = r.len();
                     let text = bound_part_string(r, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::Reasoning { bytes, text });
+                }
+                CanonicalPart::SignedThinking { thinking, .. } => {
+                    let bytes = thinking.len();
+                    let text = bound_part_string(thinking, &mut budget, per_part, &mut truncated);
+                    parts.push(CapturedFullPart::Reasoning { bytes, text });
+                }
+                CanonicalPart::RedactedThinking { data } => {
+                    let bytes = data.len();
+                    parts.push(CapturedFullPart::Reasoning {
+                        bytes,
+                        text: "[redacted_thinking]".to_owned(),
+                    });
                 }
                 CanonicalPart::ImageBase64 { media_type, data } => {
                     parts.push(CapturedFullPart::Image {

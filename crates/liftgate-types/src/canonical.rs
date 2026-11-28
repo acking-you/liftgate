@@ -78,6 +78,13 @@ pub enum CanonicalPart {
         data: String,
     },
     Reasoning(String),
+    SignedThinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
     ToolCall {
         call_id: String,
         name: String,
@@ -97,6 +104,11 @@ impl CanonicalPart {
     pub fn estimated_heap_bytes(&self) -> usize {
         match self {
             Self::Text(s) | Self::Reasoning(s) => s.len(),
+            Self::SignedThinking {
+                thinking,
+                signature,
+            } => thinking.len().saturating_add(signature.len()),
+            Self::RedactedThinking { data } => data.len(),
             Self::ImageBase64 { media_type, data } => media_type.len().saturating_add(data.len()),
             Self::ToolCall {
                 call_id,

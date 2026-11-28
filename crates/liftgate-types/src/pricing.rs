@@ -322,35 +322,70 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
     PricingFamily {
         key: "gpt-5.4",
         label: "GPT-5.4",
-        aliases: &["gpt-5.3-codex", "gpt-5"],
+        aliases: &[],
         schedule: &[from_start(price(2.50, 0.25, 2.50, 15.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5.4-mini",
+        label: "GPT-5.4 Mini",
+        aliases: &[],
+        schedule: &[from_start(price(0.75, 0.075, 0.75, 4.50))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5.3-codex",
+        label: "GPT-5.3 Codex",
+        aliases: &[],
+        schedule: &[from_start(price(1.75, 0.175, 1.75, 14.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5",
+        label: "GPT-5",
+        aliases: &[],
+        schedule: &[from_start(price(1.25, 0.125, 1.25, 10.00))],
         source_url: OPENAI_PRICING_URL,
     },
     PricingFamily {
         key: "gpt-5-mini",
         label: "GPT-5 Mini",
-        aliases: &["o4-mini"],
+        aliases: &[],
         schedule: &[from_start(price(0.25, 0.025, 0.25, 2.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "o3",
+        label: "o3",
+        aliases: &[],
+        schedule: &[from_start(price(2.00, 0.50, 2.00, 8.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "o4-mini",
+        label: "o4-mini",
+        aliases: &[],
+        schedule: &[from_start(price(1.10, 0.275, 1.10, 4.40))],
         source_url: OPENAI_PRICING_URL,
     },
     PricingFamily {
         key: "claude-opus-4-6",
         label: "Claude Opus 4.6",
-        aliases: &["claude-opus-4-5"],
+        aliases: &["claude-opus-4-5", "claude-opus-4-5-20251101"],
         schedule: &[from_start(price(5.00, 0.50, 6.25, 25.00))],
         source_url: CLAUDE_PRICING_URL,
     },
     PricingFamily {
         key: "claude-sonnet-4-6",
         label: "Claude Sonnet 4.6",
-        aliases: &["claude-sonnet-4-5"],
+        aliases: &["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
         schedule: &[from_start(price(3.00, 0.30, 3.75, 15.00))],
         source_url: CLAUDE_PRICING_URL,
     },
     PricingFamily {
         key: "claude-haiku-4-5",
         label: "Claude Haiku 4.5",
-        aliases: &[],
+        aliases: &["claude-haiku-4-5-20251001"],
         schedule: &[from_start(price(1.00, 0.10, 1.25, 5.00))],
         source_url: CLAUDE_PRICING_URL,
     },
@@ -364,8 +399,15 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
     PricingFamily {
         key: "gemini-2.5-flash",
         label: "Gemini 2.5 Flash",
-        aliases: &["gemini-2.5-flash-lite"],
+        aliases: &[],
         schedule: &[from_start(price(0.30, 0.03, 0.30, 2.50))],
+        source_url: GEMINI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gemini-2.5-flash-lite",
+        label: "Gemini 2.5 Flash-Lite",
+        aliases: &[],
+        schedule: &[from_start(price(0.10, 0.01, 0.10, 0.40))],
         source_url: GEMINI_PRICING_URL,
     },
 ];
@@ -662,5 +704,42 @@ mod tests {
         assert!(p.validate().is_err());
         p.output = MAX_PRICE_PER_MTOK + 1.0;
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn differently_priced_models_have_independent_pricing_families() {
+        assert_eq!(pricing_key("gemini-2.5-flash"), "gemini-2.5-flash");
+        assert_eq!(
+            pricing_key("gemini-2.5-flash-lite"),
+            "gemini-2.5-flash-lite"
+        );
+        let flash = family_for_model("gemini-2.5-flash")
+            .and_then(|f| f.price_at(0))
+            .expect("flash price");
+        let flash_lite = family_for_model("gemini-2.5-flash-lite")
+            .and_then(|f| f.price_at(0))
+            .expect("flash-lite price");
+        assert!((flash.input - 0.30).abs() < 1e-9 && (flash.output - 2.50).abs() < 1e-9);
+        assert!(
+            (flash_lite.input - 0.10).abs() < 1e-9
+                && (flash_lite.cached_input - 0.01).abs() < 1e-9
+                && (flash_lite.output - 0.40).abs() < 1e-9
+        );
+
+        assert_eq!(pricing_key("gpt-5-mini"), "gpt-5-mini");
+        assert_eq!(pricing_key("o4-mini"), "o4-mini");
+        assert_eq!(pricing_key("o3-high"), "o3");
+        assert_eq!(pricing_key("gpt-5.4-mini"), "gpt-5.4-mini");
+        assert_eq!(pricing_key("gpt-5.3-codex"), "gpt-5.3-codex");
+        assert_eq!(pricing_key("gpt-5"), "gpt-5");
+
+        let gpt5_mini = family_for_model("gpt-5-mini")
+            .and_then(|f| f.price_at(0))
+            .expect("gpt-5-mini price");
+        let o4_mini = family_for_model("o4-mini")
+            .and_then(|f| f.price_at(0))
+            .expect("o4-mini price");
+        assert!((gpt5_mini.input - 0.25).abs() < 1e-9 && (gpt5_mini.output - 2.00).abs() < 1e-9);
+        assert!((o4_mini.input - 1.10).abs() < 1e-9 && (o4_mini.output - 4.40).abs() < 1e-9);
     }
 }

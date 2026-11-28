@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use liftgate_provider_http::{
     DefaultHttpTransport, NativeDriverInput, NativeStreamEvent, NativeWireTool, PlatformApiError,
-    execute_driver_sse_step, probe_http_provider,
+    open_driver_sse_step, probe_http_provider, pump_opened_driver_sse_step,
 };
 use liftgate_provider_stateful::{
     adapters::{
-        DynamicToolDisposition, StatefulClientToolSpec, StatefulDialect, StatefulStreamEvent,
-        StatefulTurnInput, run_turn_on_spawned_peer_with_handler,
+        DynamicToolDisposition, StatefulClientToolSpec, StatefulDialect, StatefulInputImage,
+        StatefulStreamEvent, StatefulTurnInput, run_turn_on_spawned_peer_with_handler,
     },
     stdio_rpc::{StatefulRpcError, StdioSpawnConfig},
 };
@@ -111,6 +111,25 @@ struct ThoughtSignatureCache {
     by_call_id: HashMap<String, String>,
 }
 
+fn normalize_tool_call_stem(call_id: &str) -> &str {
+    call_id
+        .strip_prefix("toolu_")
+        .or_else(|| call_id.strip_prefix("call_"))
+        .unwrap_or(call_id)
+}
+
+fn lookup_by_call_id_or_stem<'a, V>(map: &'a HashMap<String, V>, call_id: &str) -> Option<&'a V> {
+    if let Some(v) = map.get(call_id) {
+        return Some(v);
+    }
+    let stem = normalize_tool_call_stem(call_id);
+    if let Some(v) = map.get(stem) {
+        return Some(v);
+    }
+    map.get(&format!("call_{stem}"))
+        .or_else(|| map.get(&format!("toolu_{stem}")))
+}
+
 impl ThoughtSignatureCache {
     fn insert(&mut self, call_id: String, signature: String) {
         if call_id.is_empty() || signature.is_empty() {
@@ -132,13 +151,63 @@ impl ThoughtSignatureCache {
         for msg in messages {
             for part in &msg.parts {
                 if let CanonicalPart::ToolCall { call_id, .. } = part
-                    && let Some(sig) = self.by_call_id.get(call_id)
+                    && let Some(sig) = lookup_by_call_id_or_stem(&self.by_call_id, call_id)
                 {
                     out.insert(call_id.clone(), sig.clone());
                 }
             }
         }
         out
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnthropicThinkingCache {
+    order: VecDeque<String>,
+    by_call_id: HashMap<String, Vec<CanonicalPart>>,
+}
+
+impl AnthropicThinkingCache {
+    fn insert(&mut self, call_id: String, blocks: Vec<CanonicalPart>) {
+        if call_id.is_empty() || blocks.is_empty() {
+            return;
+        }
+        if !self.by_call_id.contains_key(&call_id) {
+            if self.order.len() >= MAX_CACHED_THOUGHT_SIGNATURES
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.by_call_id.remove(&evicted);
+            }
+            self.order.push_back(call_id.clone());
+        }
+        self.by_call_id.insert(call_id, blocks);
+    }
+
+    fn restore_into_messages(&self, messages: &mut [CanonicalMessage]) {
+        for msg in messages.iter_mut() {
+            if msg.role != CanonicalRole::Assistant {
+                continue;
+            }
+            let already_has_signed = msg.parts.iter().any(|p| {
+                matches!(
+                    p,
+                    CanonicalPart::SignedThinking { .. } | CanonicalPart::RedactedThinking { .. }
+                )
+            });
+            if already_has_signed {
+                continue;
+            }
+            let found = msg.parts.iter().find_map(|p| match p {
+                CanonicalPart::ToolCall { call_id, .. } => {
+                    lookup_by_call_id_or_stem(&self.by_call_id, call_id).cloned()
+                }
+                _ => None,
+            });
+            if let Some(mut blocks) = found {
+                blocks.append(&mut msg.parts);
+                msg.parts = blocks;
+            }
+        }
     }
 }
 
@@ -172,6 +241,7 @@ pub struct ProviderRuntimeRegistry {
     inner: RwLock<RegistryInner>,
     continuations: Mutex<ResponseContinuationCache>,
     thought_signatures: Mutex<ThoughtSignatureCache>,
+    anthropic_thinking: Mutex<AnthropicThinkingCache>,
 }
 
 impl std::fmt::Debug for ProviderRuntimeRegistry {
@@ -200,6 +270,7 @@ impl ProviderRuntimeRegistry {
             }),
             continuations: Mutex::new(ResponseContinuationCache::default()),
             thought_signatures: Mutex::new(ThoughtSignatureCache::default()),
+            anthropic_thinking: Mutex::new(AnthropicThinkingCache::default()),
         }
     }
 
@@ -234,6 +305,7 @@ impl ProviderRuntimeRegistry {
             }),
             continuations: Mutex::new(ResponseContinuationCache::default()),
             thought_signatures: Mutex::new(ThoughtSignatureCache::default()),
+            anthropic_thinking: Mutex::new(AnthropicThinkingCache::default()),
         }
     }
 
@@ -287,6 +359,20 @@ impl ProviderRuntimeRegistry {
         match self.thought_signatures.lock() {
             Ok(guard) => guard.collect_for_messages(messages),
             Err(poisoned) => poisoned.into_inner().collect_for_messages(messages),
+        }
+    }
+
+    fn save_anthropic_thinking(&self, call_id: String, blocks: Vec<CanonicalPart>) {
+        match self.anthropic_thinking.lock() {
+            Ok(mut guard) => guard.insert(call_id, blocks),
+            Err(poisoned) => poisoned.into_inner().insert(call_id, blocks),
+        }
+    }
+
+    fn restore_anthropic_thinking(&self, messages: &mut [CanonicalMessage]) {
+        match self.anthropic_thinking.lock() {
+            Ok(guard) => guard.restore_into_messages(messages),
+            Err(poisoned) => poisoned.into_inner().restore_into_messages(messages),
         }
     }
 
@@ -847,7 +933,7 @@ pub async fn execute_provider_aware_turn<B: AcpBackend>(
         ProviderDriverKind::OpenAiResponses
         | ProviderDriverKind::AnthropicMessages
         | ProviderDriverKind::GoogleGemini => {
-            execute_stateless_http_turn(telemetry, cfg, resolved, protocol, req, response_id)
+            execute_stateless_http_turn(telemetry, cfg, resolved, protocol, req, response_id).await
         }
         ProviderDriverKind::CodexAppServer | ProviderDriverKind::GrokAcp => {
             execute_stateful_dialect_turn(telemetry, cfg, resolved, protocol, req, response_id)
@@ -1036,6 +1122,10 @@ fn map_platform_error_to_acp(err: PlatformApiError, model: &str) -> AcpError {
             model: model.to_owned(),
             detail: message,
         },
+        PlatformApiError::QuotaExhausted { message, .. } => AcpError::UpstreamQuotaExhausted {
+            model: model.to_owned(),
+            detail: message,
+        },
         PlatformApiError::Timeout { elapsed_ms } => AcpError::TurnTimeout {
             seconds: (elapsed_ms / 1_000).max(1),
         },
@@ -1057,7 +1147,118 @@ fn map_platform_error_to_acp(err: PlatformApiError, model: &str) -> AcpError {
     }
 }
 
-fn execute_stateless_http_turn(
+fn map_platform_error_to_gateway(err: PlatformApiError, model: &str) -> GatewayError {
+    match err {
+        PlatformApiError::RateLimited { message, .. } => GatewayError::Acp {
+            source: AcpError::UpstreamRateLimited {
+                model: model.to_owned(),
+                detail: message,
+            },
+        },
+        PlatformApiError::QuotaExhausted { message, .. } => GatewayError::Acp {
+            source: AcpError::UpstreamQuotaExhausted {
+                model: model.to_owned(),
+                detail: message,
+            },
+        },
+        PlatformApiError::Timeout { elapsed_ms } => GatewayError::Acp {
+            source: AcpError::TurnTimeout {
+                seconds: (elapsed_ms / 1_000).max(1),
+            },
+        },
+        PlatformApiError::AuthenticationFailed { status, message } => {
+            let (http_status, oai_type, oai_code, anth_type) = if status == 403 {
+                (
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "permission_denied",
+                    "permission_error",
+                )
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "invalid_api_key",
+                    "authentication_error",
+                )
+            };
+            GatewayError::UpstreamProviderHttp {
+                status: http_status,
+                openai_type: oai_type,
+                openai_code: oai_code,
+                anthropic_type: anth_type,
+                message,
+            }
+        }
+        PlatformApiError::MissingCredentials { provider_id, hint } => {
+            GatewayError::UpstreamProviderHttp {
+                status: StatusCode::UNAUTHORIZED,
+                openai_type: "authentication_error",
+                openai_code: "missing_api_key",
+                anthropic_type: "authentication_error",
+                message: format!("missing credentials for provider `{provider_id}`: {hint}"),
+            }
+        }
+        PlatformApiError::NotFound { message, .. } => GatewayError::UpstreamProviderHttp {
+            status: StatusCode::NOT_FOUND,
+            openai_type: "not_found_error",
+            openai_code: "model_not_found",
+            anthropic_type: "not_found_error",
+            message,
+        },
+        PlatformApiError::InvalidUrl { url, reason } => GatewayError::UpstreamProviderHttp {
+            status: StatusCode::BAD_REQUEST,
+            openai_type: "invalid_request_error",
+            openai_code: "invalid_url",
+            anthropic_type: "invalid_request_error",
+            message: format!("invalid upstream URL `{url}`: {reason}"),
+        },
+        PlatformApiError::InvalidRequest { message, .. } => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("context") || lower.contains("too long") || lower.contains("maximum")
+            {
+                GatewayError::Acp {
+                    source: AcpError::ContextLengthExceeded {
+                        model: model.to_owned(),
+                        detail: message,
+                    },
+                }
+            } else {
+                GatewayError::UpstreamProviderHttp {
+                    status: StatusCode::BAD_REQUEST,
+                    openai_type: "invalid_request_error",
+                    openai_code: "invalid_request",
+                    anthropic_type: "invalid_request_error",
+                    message,
+                }
+            }
+        }
+        PlatformApiError::UpstreamServer { status, message } => {
+            GatewayError::UpstreamProviderHttp {
+                status: if status == 503 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                openai_type: "api_error",
+                openai_code: "upstream_error",
+                anthropic_type: "api_error",
+                message,
+            }
+        }
+        PlatformApiError::Transport { message, .. } | PlatformApiError::Protocol { message } => {
+            GatewayError::UpstreamProviderHttp {
+                status: StatusCode::BAD_GATEWAY,
+                openai_type: "api_error",
+                openai_code: "upstream_transport_error",
+                anthropic_type: "api_error",
+                message,
+            }
+        }
+    }
+}
+
+async fn execute_stateless_http_turn(
     telemetry: &Arc<TelemetryHub>,
     cfg: &GatewayRuntimeConfig,
     resolved: ResolvedRequestProvider,
@@ -1091,15 +1292,15 @@ fn execute_stateless_http_turn(
         || endpoint.starts_with("https://generativelanguage.googleapis.com");
     if is_official_https && resolved.api_key.is_none() {
         let hint = resolved.profile.auth.summary_label();
-        return Err(GatewayError::Acp {
-            source: AcpError::Rpc {
-                method: "auth",
-                code: 401,
-                message: format!(
-                    "missing API key for provider `{}` ({hint}); set environment variable or run `lg provider add {}`",
-                    resolved.profile.id, resolved.profile.id
-                ),
-            },
+        return Err(GatewayError::UpstreamProviderHttp {
+            status: StatusCode::UNAUTHORIZED,
+            openai_type: "authentication_error",
+            openai_code: "missing_api_key",
+            anthropic_type: "authentication_error",
+            message: format!(
+                "missing API key for provider `{}` ({hint}); set environment variable or run `lg provider add {}`",
+                resolved.profile.id, resolved.profile.id
+            ),
         });
     }
 
@@ -1282,8 +1483,11 @@ fn execute_stateless_http_turn(
     let resolved_model_for_worker = resolved_model.clone();
     let response_id_for_store = response_id.clone();
     let telemetry_for_worker = Arc::clone(telemetry);
+    let (step0_ready_tx, step0_ready_rx) =
+        tokio::sync::oneshot::channel::<Result<(), GatewayError>>();
 
     let worker = tokio::spawn(async move {
+        let mut step0_ready_tx = Some(step0_ready_tx);
         let turn_deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut total_usage = AcpUsage::default();
         let mut continuations: usize = 0;
@@ -1302,6 +1506,14 @@ fn execute_stateless_http_turn(
             }
             let remaining_timeout = turn_deadline.saturating_duration_since(Instant::now());
             if remaining_timeout.is_zero() {
+                if let Some(tx) = step0_ready_tx.take() {
+                    let acp_err = AcpError::TurnTimeout {
+                        seconds: timeout_secs,
+                    };
+                    task_guard.fail(acp_err.to_string());
+                    let _ = tx.send(Err(GatewayError::Acp { source: acp_err }));
+                    return;
+                }
                 let acp_err = AcpError::TurnTimeout {
                     seconds: timeout_secs,
                 };
@@ -1309,10 +1521,27 @@ fn execute_stateless_http_turn(
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(acp_err))).await;
                 return;
             }
+            if matches!(
+                resolved.profile.driver,
+                ProviderDriverKind::AnthropicMessages
+            ) {
+                telemetry_for_worker
+                    .provider_registry()
+                    .restore_anthropic_thinking(&mut working_messages);
+            }
             let mut step_thought_signatures = telemetry_for_worker
                 .provider_registry()
                 .collect_thought_signatures(&working_messages);
-            step_thought_signatures.extend(local_thought_signatures.clone());
+            for msg in &working_messages {
+                for part in &msg.parts {
+                    if let CanonicalPart::ToolCall { call_id, .. } = part
+                        && let Some(sig) =
+                            lookup_by_call_id_or_stem(&local_thought_signatures, call_id)
+                    {
+                        step_thought_signatures.insert(call_id.clone(), sig.clone());
+                    }
+                }
+            }
             let driver_input = NativeDriverInput {
                 provider_id: provider_id_str.clone(),
                 driver: resolved.profile.driver,
@@ -1338,16 +1567,46 @@ fn execute_stateless_http_turn(
                 total_timeout: remaining_timeout,
             };
 
+            let opened = tokio::select! {
+                biased;
+                () = cancel_child.cancelled() => return,
+                res = open_driver_sse_step(&DefaultHttpTransport, &driver_input) => match res {
+                    Ok(opened) => {
+                        if let Some(tx) = step0_ready_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                        opened
+                    }
+                    Err(err) => {
+                        if let Some(tx) = step0_ready_tx.take() {
+                            let gw_err = map_platform_error_to_gateway(
+                                err,
+                                resolved_model_for_worker.as_str(),
+                            );
+                            task_guard.fail(gw_err.client_message());
+                            let _ = tx.send(Err(gw_err));
+                            return;
+                        }
+                        let acp_err =
+                            map_platform_error_to_acp(err, resolved_model_for_worker.as_str());
+                        task_guard.fail(acp_err.to_string());
+                        let _ = events_tx.send(TurnEvent::Failed(Arc::new(acp_err))).await;
+                        return;
+                    }
+                }
+            };
+
             let (step_tx, mut step_rx) =
                 mpsc::channel::<Result<NativeStreamEvent, PlatformApiError>>(128);
             let step_fut = async {
                 let step_tx = step_tx;
-                execute_driver_sse_step(&DefaultHttpTransport, &driver_input, &step_tx).await
+                pump_opened_driver_sse_step(opened, &step_tx).await
             };
             tokio::pin!(step_fut);
 
             let mut step_done = false;
             let mut step_reasoning = String::new();
+            let mut step_signed_thinking_parts: Vec<CanonicalPart> = Vec::new();
             let mut step_text = String::new();
             let mut emitted_raw_calls: Vec<(String, String, String, bool)> = Vec::new();
             let mut stream_err: Option<PlatformApiError> = None;
@@ -1363,6 +1622,28 @@ fn execute_stateless_http_turn(
                                     step_reasoning.push_str(&d);
                                     task_guard.record_thought(&d);
                                     let _ = events_tx.send(TurnEvent::ThoughtDelta(d)).await;
+                                }
+                                NativeStreamEvent::ThinkingSignatureDelta(sig) => {
+                                    let _ = sig;
+                                }
+                                NativeStreamEvent::SignedThinkingBlock {
+                                    thinking,
+                                    signature,
+                                } => {
+                                    let _ = events_tx
+                                        .send(TurnEvent::ThoughtSignature(signature.clone()))
+                                        .await;
+                                    step_signed_thinking_parts.push(CanonicalPart::SignedThinking {
+                                        thinking,
+                                        signature,
+                                    });
+                                }
+                                NativeStreamEvent::RedactedThinkingBlock { data } => {
+                                    step_signed_thinking_parts.push(
+                                        CanonicalPart::RedactedThinking { data: data.clone() },
+                                    );
+                                    let _ =
+                                        events_tx.send(TurnEvent::RedactedThinking(data)).await;
                                 }
                                 NativeStreamEvent::TextDelta(d) => {
                                     step_text.push_str(&d);
@@ -1439,7 +1720,9 @@ fn execute_stateless_http_turn(
             }
 
             if emitted_raw_calls.is_empty() {
-                if !step_reasoning.is_empty() {
+                if !step_signed_thinking_parts.is_empty() {
+                    final_assistant_parts.extend(step_signed_thinking_parts);
+                } else if !step_reasoning.is_empty() {
                     final_assistant_parts.push(CanonicalPart::Reasoning(step_reasoning));
                 }
                 if !step_text.is_empty() {
@@ -1448,12 +1731,26 @@ fn execute_stateless_http_turn(
                 break;
             }
 
+            if !step_signed_thinking_parts.is_empty()
+                && let Some((first_call_id, ..)) = emitted_raw_calls.first()
+            {
+                telemetry_for_worker
+                    .provider_registry()
+                    .save_anthropic_thinking(
+                        first_call_id.clone(),
+                        step_signed_thinking_parts.clone(),
+                    );
+            }
+
             let mut local_continuation_parts: Vec<CanonicalPart> = Vec::new();
             let mut local_result_parts: Vec<CanonicalPart> = Vec::new();
             let mut client_forwarded_parts: Vec<CanonicalPart> = Vec::new();
             let mut forwarded_any_to_client = false;
 
-            if !step_reasoning.is_empty() {
+            if !step_signed_thinking_parts.is_empty() {
+                local_continuation_parts.extend(step_signed_thinking_parts.clone());
+                client_forwarded_parts.extend(step_signed_thinking_parts);
+            } else if !step_reasoning.is_empty() {
                 local_continuation_parts.push(CanonicalPart::Reasoning(step_reasoning.clone()));
                 client_forwarded_parts.push(CanonicalPart::Reasoning(step_reasoning));
             }
@@ -1837,13 +2134,23 @@ fn execute_stateless_http_turn(
             .await;
     });
 
-    Ok(ActiveTurnStream::from_parts(
-        resolved_model,
-        response_id,
-        events_rx,
-        cancel_guard,
-        worker,
-    ))
+    match step0_ready_rx.await {
+        Ok(Ok(())) => Ok(ActiveTurnStream::from_parts(
+            resolved_model,
+            response_id,
+            events_rx,
+            cancel_guard,
+            worker,
+        )),
+        Ok(Err(gw_err)) => Err(gw_err),
+        Err(_) => Err(GatewayError::UpstreamProviderHttp {
+            status: StatusCode::BAD_GATEWAY,
+            openai_type: "api_error",
+            openai_code: "upstream_cancelled",
+            anthropic_type: "api_error",
+            message: "upstream HTTP turn terminated before response headers".to_owned(),
+        }),
+    }
 }
 
 fn execute_stateful_dialect_turn(
@@ -1938,6 +2245,7 @@ fn execute_stateful_dialect_turn(
     );
 
     let mut prompt_buf = String::with_capacity(1024);
+    let mut turn_images: Vec<StatefulInputImage> = Vec::new();
     for m in &conv_msgs {
         let tag = match m.role {
             CanonicalRole::User => "user",
@@ -1948,11 +2256,12 @@ fn execute_stateful_dialect_turn(
                 CanonicalPart::Text(t) => {
                     prompt_buf.push_str(&format!("<{tag}>\n{t}\n</{tag}>\n"));
                 }
-                CanonicalPart::Reasoning(r) => {
+                CanonicalPart::Reasoning(r) | CanonicalPart::SignedThinking { thinking: r, .. } => {
                     prompt_buf.push_str(&format!(
                         "<{tag}>\n<thinking>\n{r}\n</thinking>\n</{tag}>\n"
                     ));
                 }
+                CanonicalPart::RedactedThinking { .. } => {}
                 CanonicalPart::ToolCall {
                     call_id,
                     name,
@@ -1972,9 +2281,15 @@ fn execute_stateful_dialect_turn(
                         "<user>\n<tool_result call_id=\"{call_id}\" is_error=\"{is_error}\">\n{output}\n</tool_result>\n</user>\n"
                     ));
                 }
-                CanonicalPart::ImageBase64 { media_type, .. } => {
-                    prompt_buf
-                        .push_str(&format!("<{tag}>[attached image: {media_type}]</{tag}>\n"));
+                CanonicalPart::ImageBase64 { media_type, data } => {
+                    let img_idx = turn_images.len() + 1;
+                    turn_images.push(StatefulInputImage {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    });
+                    prompt_buf.push_str(&format!(
+                        "<{tag}>[image #{img_idx}: {media_type}]</{tag}>\n"
+                    ));
                 }
             }
         }
@@ -2161,6 +2476,7 @@ fn execute_stateful_dialect_turn(
         effort: req.reasoning_effort,
         system_instructions: (!sys_blocks.is_empty()).then(|| sys_blocks.join("\n\n")),
         prompt_text: prompt_buf,
+        images: turn_images,
         cwd: spawn_cfg.cwd.clone(),
         mcp_servers,
         dynamic_tools,
@@ -2189,6 +2505,16 @@ fn execute_stateful_dialect_turn(
             mpsc::channel::<Result<StatefulStreamEvent, StatefulRpcError>>(128);
         let dyn_cat_for_peer = dynamic_catalog.clone();
         let tools_for_peer = req.client_tools.clone();
+        let allowed_for_peer = req.web_fetch_allowed_domains.clone();
+        let blocked_for_peer = req.web_fetch_blocked_domains.clone();
+        let proxy_for_peer = resolved.effective_proxy.clone();
+        let spill_for_peer = spill_dir.clone();
+        let dyn_searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dyn_heals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dyn_fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dyn_searches_c = Arc::clone(&dyn_searches);
+        let dyn_heals_c = Arc::clone(&dyn_heals);
+        let dyn_fetches_c = Arc::clone(&dyn_fetches);
         let run_fut = async {
             let st_tx = st_tx;
             tokio::time::timeout_at(
@@ -2198,14 +2524,78 @@ fn execute_stateful_dialect_turn(
                     &turn_input,
                     &st_tx,
                     |wire_name, args_val| {
-                        if let Some(ref cat) = dyn_cat_for_peer
-                            && let VirtualizedCallDecision::LocalReply { text, is_error, .. } = cat
-                                .routing_table
-                                .resolve_call(wire_name, args_val, &tools_for_peer)
-                        {
-                            return DynamicToolDisposition::LocalReply { text, is_error };
+                        let dyn_cat = dyn_cat_for_peer.clone();
+                        let tools = tools_for_peer.clone();
+                        let allowed = allowed_for_peer.clone();
+                        let blocked = blocked_for_peer.clone();
+                        let proxy = proxy_for_peer.clone();
+                        let spill = spill_for_peer.clone();
+                        let searches = Arc::clone(&dyn_searches_c);
+                        let heals = Arc::clone(&dyn_heals_c);
+                        let fetches = Arc::clone(&dyn_fetches_c);
+                        async move {
+                            if let Some(ref cat) = dyn_cat {
+                                match cat
+                                    .routing_table
+                                    .resolve_call(&wire_name, &args_val, &tools)
+                                {
+                                    VirtualizedCallDecision::LocalReply {
+                                        text,
+                                        is_error,
+                                        kind,
+                                    } => {
+                                        match kind {
+                                            LocalReplyKind::Search => {
+                                                searches.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            LocalReplyKind::PreflightError
+                                            | LocalReplyKind::DisabledTool => {
+                                                heals.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            LocalReplyKind::SpillRead => {}
+                                        }
+                                        return DynamicToolDisposition::LocalReply {
+                                            text,
+                                            is_error,
+                                        };
+                                    }
+                                    VirtualizedCallDecision::GatewayWebFetch { url, pattern } => {
+                                        fetches.fetch_add(1, Ordering::Relaxed);
+                                        let outcome = fetch_url_sanitized_with_options_and_pattern(
+                                            &url,
+                                            &allowed,
+                                            &blocked,
+                                            proxy.as_ref(),
+                                            spill.as_deref(),
+                                            pattern.as_deref(),
+                                        )
+                                        .await;
+                                        let (text, is_error) = match outcome {
+                                            WebFetchOutcome::Success { content, .. } => {
+                                                (content, false)
+                                            }
+                                            WebFetchOutcome::Error {
+                                                error_code,
+                                                message,
+                                                ..
+                                            } => (format!("[{error_code}] {message}"), true),
+                                        };
+                                        return DynamicToolDisposition::LocalReply {
+                                            text,
+                                            is_error,
+                                        };
+                                    }
+                                    VirtualizedCallDecision::ReadContextSpill { path, .. } => {
+                                        return DynamicToolDisposition::LocalReply {
+                                            text: format!("Spill file `{path}` unavailable."),
+                                            is_error: true,
+                                        };
+                                    }
+                                    VirtualizedCallDecision::ForwardToClient { .. } => {}
+                                }
+                            }
+                            DynamicToolDisposition::SuspendToClient
                         }
-                        DynamicToolDisposition::SuspendToClient
                     },
                 ),
             )
@@ -2423,6 +2813,15 @@ fn execute_stateful_dialect_turn(
         }
 
         if let Some(err) = rpc_err {
+            for _ in 0..dyn_searches.load(Ordering::Relaxed) {
+                task_guard.record_zero_rtt_search();
+            }
+            for _ in 0..dyn_heals.load(Ordering::Relaxed) {
+                task_guard.record_zero_rtt_preflight_heal();
+            }
+            for _ in 0..dyn_fetches.load(Ordering::Relaxed) {
+                task_guard.record_web_fetch();
+            }
             let acp_err = match err {
                 StatefulRpcError::RateLimited { message, .. } => AcpError::UpstreamRateLimited {
                     model: resolved_model_worker.as_str().to_owned(),
@@ -2468,6 +2867,20 @@ fn execute_stateful_dialect_turn(
                 },
             );
         }
+
+        let ds = dyn_searches.load(Ordering::Relaxed);
+        let dh = dyn_heals.load(Ordering::Relaxed);
+        let df = dyn_fetches.load(Ordering::Relaxed);
+        for _ in 0..ds {
+            task_guard.record_zero_rtt_search();
+        }
+        for _ in 0..dh {
+            task_guard.record_zero_rtt_preflight_heal();
+        }
+        for _ in 0..df {
+            task_guard.record_web_fetch();
+        }
+        zero_rtt_count = zero_rtt_count.saturating_add(ds + dh + df);
 
         task_guard.set_upstream_wire_summary(UpstreamWireSummary {
             provider_id: provider_id_str,

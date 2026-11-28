@@ -6,8 +6,9 @@ pub mod sse;
 pub mod transport;
 
 pub use codecs::{
-    NativeDriverInput, NativeStreamEvent, NativeWireTool, PreparedWireMetrics,
-    build_driver_http_request, execute_driver_sse_step, probe_http_provider,
+    NativeDriverInput, NativeStreamEvent, NativeWireTool, OpenedDriverSseStep, PreparedWireMetrics,
+    build_driver_http_request, execute_driver_sse_step, open_driver_sse_step, probe_http_provider,
+    pump_opened_driver_sse_step,
 };
 pub use error::PlatformApiError;
 pub use transport::{DefaultHttpTransport, HttpJsonResponse, HttpRequestSpec, HttpSseTransport};
@@ -642,5 +643,93 @@ mod tests {
         let model_part = &gem_json["contents"][1]["parts"][0];
         assert_eq!(model_part["functionCall"]["name"], "read_file");
         assert_eq!(model_part["thoughtSignature"], "sig_gemini3_opaque_xyz");
+    }
+
+    #[test]
+    fn anthropic_signed_and_redacted_thinking_blocks_roundtrip_and_quota_402_classified() {
+        let quota_err = crate::PlatformApiError::from_http_status(
+            402,
+            None,
+            r#"{"error":{"message":"Quota exceeded for model","type":"rate_limit_error"}}"#,
+        );
+        assert!(matches!(
+            quota_err,
+            crate::PlatformApiError::QuotaExhausted { status: 402, .. }
+        ));
+        assert!(!quota_err.is_retryable());
+
+        let rl_err = crate::PlatformApiError::from_http_status(
+            429,
+            Some(1_000),
+            r#"{"error":{"message":"Too many requests"}}"#,
+        );
+        assert!(matches!(
+            rl_err,
+            crate::PlatformApiError::RateLimited { status: 429, .. }
+        ));
+
+        let anth_in = crate::NativeDriverInput {
+            provider_id: "anthropic".to_owned(),
+            driver: ProviderDriverKind::AnthropicMessages,
+            endpoint: "https://api.anthropic.com".to_owned(),
+            api_key: Some("sk-ant-test".to_owned()),
+            proxy: None,
+            force_direct_proxy: true,
+            model: "claude-sonnet-4-6".to_owned(),
+            effort: Some(liftgate_types::canonical::ReasoningEffort::High),
+            max_output_tokens: None,
+            system_blocks: vec!["You are helpful.".to_owned()],
+            messages: vec![
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::Text("Inspect Cargo.toml".to_owned())],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    parts: vec![
+                        CanonicalPart::SignedThinking {
+                            thinking: "Let me read Cargo.toml first.".to_owned(),
+                            signature: "EqQB_real_signature_abc".to_owned(),
+                        },
+                        CanonicalPart::RedactedThinking {
+                            data: "EmwK_redacted_opaque_xyz".to_owned(),
+                        },
+                        CanonicalPart::ToolCall {
+                            call_id: "toolu_01xyz".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
+                            is_custom: false,
+                        },
+                    ],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::ToolResult {
+                        call_id: "toolu_01xyz".to_owned(),
+                        output: "[workspace]".to_owned(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
+            prompt_cache_key: None,
+            align_cache_breakpoints: false,
+            connect_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(10),
+        };
+        let (spec, _) = crate::build_driver_http_request(&anth_in).expect("anthropic build");
+        let body_json: Value =
+            serde_json::from_slice(spec.body.as_deref().expect("body")).expect("json");
+        assert_eq!(body_json["thinking"]["type"], "enabled");
+        let asst_content = body_json["messages"][1]["content"]
+            .as_array()
+            .expect("assistant content");
+        assert_eq!(asst_content[0]["type"], "thinking");
+        assert_eq!(asst_content[0]["signature"], "EqQB_real_signature_abc");
+        assert_eq!(asst_content[1]["type"], "redacted_thinking");
+        assert_eq!(asst_content[1]["data"], "EmwK_redacted_opaque_xyz");
+        assert_eq!(asst_content[2]["type"], "tool_use");
     }
 }

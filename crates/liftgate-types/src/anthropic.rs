@@ -369,9 +369,27 @@ pub fn normalize_anthropic_request_with_options(
                                 return Err(ProtocolError::UnsupportedImageUrl);
                             }
                         }
-                        AnthropicInputBlock::Thinking { thinking, .. } => {
+                        AnthropicInputBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
                             has_conversational_input = true;
-                            parts.push(CanonicalPart::Reasoning(thinking));
+                            if let Some(sig) = signature
+                                .filter(|s| !s.is_empty() && s != ANTHROPIC_THOUGHT_SIGNATURE)
+                            {
+                                parts.push(CanonicalPart::SignedThinking {
+                                    thinking,
+                                    signature: sig,
+                                });
+                            } else {
+                                parts.push(CanonicalPart::Reasoning(thinking));
+                            }
+                        }
+                        AnthropicInputBlock::RedactedThinking { data } => {
+                            has_conversational_input = true;
+                            if !data.is_empty() {
+                                parts.push(CanonicalPart::RedactedThinking { data });
+                            }
                         }
                         AnthropicInputBlock::ToolUse {
                             id,
@@ -433,8 +451,7 @@ pub fn normalize_anthropic_request_with_options(
                             });
                             parts.extend(image_parts);
                         }
-                        AnthropicInputBlock::RedactedThinking { .. }
-                        | AnthropicInputBlock::ServerToolUse { .. }
+                        AnthropicInputBlock::ServerToolUse { .. }
                         | AnthropicInputBlock::WebSearchToolResult { .. }
                         | AnthropicInputBlock::WebFetchToolResult { .. }
                         | AnthropicInputBlock::Unknown => {}
@@ -833,6 +850,9 @@ pub enum AnthropicOutputBlock {
     Thinking {
         thinking: String,
         signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
     ServerToolUse {
         id: String,

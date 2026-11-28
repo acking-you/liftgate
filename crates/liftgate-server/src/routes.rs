@@ -1004,6 +1004,8 @@ async fn collect_openai_response(
             }
             TurnEvent::TextDelta(delta) => msg_text.push_str(&delta),
             TurnEvent::CommentaryBoundary
+            | TurnEvent::ThoughtSignature(_)
+            | TurnEvent::RedactedThinking(_)
             | TurnEvent::ClientToolCallStart { .. }
             | TurnEvent::ClientToolCallDelta { .. } => {}
             TurnEvent::ClientToolCall {
@@ -1271,6 +1273,7 @@ fn stream_openai_responses(
                         return;
                     }
                 }
+                TurnEvent::ThoughtSignature(_) | TurnEvent::RedactedThinking(_) => {}
                 TurnEvent::CommentaryBoundary => {
                     leading_ws_buf.clear();
                     close_active_reasoning(
@@ -2862,10 +2865,30 @@ async fn collect_anthropic_messages(
     let mut web_search_requests: u64 = 0;
     let mut web_fetch_requests: u64 = 0;
     let mut final_usage = AcpUsage::default();
+    let mut thinking_blocks: Vec<AnthropicOutputBlock> = Vec::new();
 
     while let Some(ev) = turn.rx.recv().await {
         match ev {
             TurnEvent::ThoughtDelta(delta) => thinking_text.push_str(&delta),
+            TurnEvent::ThoughtSignature(sig) => {
+                if !sig.is_empty() {
+                    thinking_blocks.push(AnthropicOutputBlock::Thinking {
+                        thinking: std::mem::take(&mut thinking_text),
+                        signature: sig,
+                    });
+                }
+            }
+            TurnEvent::RedactedThinking(data) => {
+                if !thinking_text.is_empty() {
+                    thinking_blocks.push(AnthropicOutputBlock::Thinking {
+                        thinking: std::mem::take(&mut thinking_text),
+                        signature: ANTHROPIC_THOUGHT_SIGNATURE.to_owned(),
+                    });
+                }
+                if !data.is_empty() {
+                    thinking_blocks.push(AnthropicOutputBlock::RedactedThinking { data });
+                }
+            }
             TurnEvent::WebSearch {
                 call_id,
                 status,
@@ -2961,10 +2984,7 @@ async fn collect_anthropic_messages(
                 let input_val: Value = serde_json::from_str(&arguments)
                     .unwrap_or_else(|_| json!({ "raw": arguments }));
                 tool_uses.push(AnthropicOutputBlock::ToolUse {
-                    id: format!(
-                        "toolu_{}",
-                        call_id.strip_prefix("call_").unwrap_or(&call_id)
-                    ),
+                    id: ensure_toolu_id(&call_id),
                     name,
                     input: input_val,
                 });
@@ -3000,11 +3020,12 @@ async fn collect_anthropic_messages(
 
     let mut ordered_blocks = Vec::new();
     if !thinking_text.is_empty() {
-        ordered_blocks.push(AnthropicOutputBlock::Thinking {
+        thinking_blocks.push(AnthropicOutputBlock::Thinking {
             thinking: thinking_text,
             signature: ANTHROPIC_THOUGHT_SIGNATURE.to_owned(),
         });
     }
+    ordered_blocks.extend(thinking_blocks);
 
     if !search_order.is_empty() {
         let search_results = build_anthropic_web_search_results(&current_text);
@@ -3083,6 +3104,7 @@ fn stream_anthropic_messages(
         let mut next_block_idx: usize = 0;
         let mut active_thinking_idx: Option<usize> = None;
         let mut active_text_idx: Option<usize> = None;
+        let mut active_thinking_has_sig = false;
         let mut leading_ws = String::new();
         let mut emitted_any_block = false;
         let mut has_tool_use = false;
@@ -3156,6 +3178,109 @@ fn stream_anthropic_messages(
                         return;
                     }
                 }
+                TurnEvent::ThoughtSignature(sig) => {
+                    if sig.is_empty()
+                        || active_text_idx.is_some()
+                        || !pending_search_result_srv_ids.is_empty()
+                        || !post_search_text_buf.is_empty()
+                    {
+                        continue;
+                    }
+                    let idx = match active_thinking_idx {
+                        Some(idx) => idx,
+                        None => {
+                            if !ensure_anthropic_message_started(
+                                &sse_tx,
+                                &mut message_started,
+                                &msg_id,
+                                &model_name,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            let idx = next_block_idx;
+                            next_block_idx += 1;
+                            active_thinking_idx = Some(idx);
+                            emitted_any_block = true;
+                            let _ = send_sse_frame(
+                                &sse_tx,
+                                "content_block_start",
+                                &json!({
+                                    "type": "content_block_start",
+                                    "index": idx,
+                                    "content_block": { "type": "thinking", "thinking": "" }
+                                }),
+                            )
+                            .await;
+                            idx
+                        }
+                    };
+                    active_thinking_has_sig = true;
+                    if !send_sse_frame(
+                        &sse_tx,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": { "type": "signature_delta", "signature": sig }
+                        }),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
+                }
+                TurnEvent::RedactedThinking(data) => {
+                    if data.is_empty()
+                        || active_text_idx.is_some()
+                        || !pending_search_result_srv_ids.is_empty()
+                        || !post_search_text_buf.is_empty()
+                    {
+                        continue;
+                    }
+                    if !ensure_anthropic_message_started(
+                        &sse_tx,
+                        &mut message_started,
+                        &msg_id,
+                        &model_name,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
+                    let idx = next_block_idx;
+                    next_block_idx += 1;
+                    emitted_any_block = true;
+                    let _ = send_sse_frame(
+                        &sse_tx,
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": { "type": "redacted_thinking", "data": data }
+                        }),
+                    )
+                    .await;
+                    let _ = send_sse_frame(
+                        &sse_tx,
+                        "content_block_stop",
+                        &json!({ "type": "content_block_stop", "index": idx }),
+                    )
+                    .await;
+                }
                 TurnEvent::WebSearch {
                     call_id,
                     status,
@@ -3174,7 +3299,12 @@ fn stream_anthropic_messages(
                             {
                                 return;
                             }
-                            close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                            close_anthropic_thinking(
+                                &sse_tx,
+                                &mut active_thinking_idx,
+                                &mut active_thinking_has_sig,
+                            )
+                            .await;
                             close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
                             let resolved_q = query
@@ -3222,7 +3352,12 @@ fn stream_anthropic_messages(
                         &mut emitted_any_block,
                     )
                     .await;
-                    close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
                     close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
                     let srv_id = ensure_srvtoolu_id(&call_id);
@@ -3272,7 +3407,12 @@ fn stream_anthropic_messages(
                             &mut emitted_any_block,
                         )
                         .await;
-                        close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                        close_anthropic_thinking(
+                            &sse_tx,
+                            &mut active_thinking_idx,
+                            &mut active_thinking_has_sig,
+                        )
+                        .await;
                         close_anthropic_text(&sse_tx, &mut active_text_idx).await;
                         let outcome_url = match &outcome {
                             WebFetchOutcome::Success { url, .. }
@@ -3314,7 +3454,12 @@ fn stream_anthropic_messages(
                     .await;
                 }
                 TurnEvent::TextDelta(delta) => {
-                    close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
 
                     // If a forced web search turn produced grounded prose directly without a
                     // separate ACP `ToolCall` notification, synthesize the `server_tool_use`
@@ -3433,17 +3578,19 @@ fn stream_anthropic_messages(
                         &mut emitted_any_block,
                     )
                     .await;
-                    close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
                     close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
                     has_tool_use = true;
                     emitted_any_block = true;
                     let idx = next_block_idx;
                     next_block_idx += 1;
-                    let toolu_id = format!(
-                        "toolu_{}",
-                        call_id.strip_prefix("call_").unwrap_or(&call_id)
-                    );
+                    let toolu_id = ensure_toolu_id(&call_id);
                     if !send_sse_frame(
                         &sse_tx,
                         "content_block_start",
@@ -3490,7 +3637,12 @@ fn stream_anthropic_messages(
                         &mut emitted_any_block,
                     )
                     .await;
-                    close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+                    close_anthropic_thinking(
+                        &sse_tx,
+                        &mut active_thinking_idx,
+                        &mut active_thinking_has_sig,
+                    )
+                    .await;
                     close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
                     has_tool_use = true;
@@ -3500,10 +3652,7 @@ fn stream_anthropic_messages(
                     } else {
                         let idx = next_block_idx;
                         next_block_idx += 1;
-                        let toolu_id = format!(
-                            "toolu_{}",
-                            call_id.strip_prefix("call_").unwrap_or(&call_id)
-                        );
+                        let toolu_id = ensure_toolu_id(&call_id);
                         let _ = send_sse_frame(
                             &sse_tx,
                             "content_block_start",
@@ -3619,7 +3768,12 @@ fn stream_anthropic_messages(
         )
         .await;
         for (srv_id, url) in pending_fetch_srv_ids.drain(..) {
-            close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+            close_anthropic_thinking(
+                &sse_tx,
+                &mut active_thinking_idx,
+                &mut active_thinking_has_sig,
+            )
+            .await;
             close_anthropic_text(&sse_tx, &mut active_text_idx).await;
             let synth_outcome = WebFetchOutcome::Error {
                 url,
@@ -3651,7 +3805,12 @@ fn stream_anthropic_messages(
             )
             .await;
         }
-        close_anthropic_thinking(&sse_tx, &mut active_thinking_idx).await;
+        close_anthropic_thinking(
+            &sse_tx,
+            &mut active_thinking_idx,
+            &mut active_thinking_has_sig,
+        )
+        .await;
         close_anthropic_text(&sse_tx, &mut active_text_idx).await;
 
         if !emitted_any_block {
@@ -3933,6 +4092,14 @@ fn sanitize_call_suffix(raw: &str) -> String {
     }
 }
 
+fn ensure_toolu_id(raw: &str) -> String {
+    if raw.starts_with("toolu_") {
+        raw.to_owned()
+    } else {
+        format!("toolu_{}", raw.strip_prefix("call_").unwrap_or(raw))
+    }
+}
+
 fn ensure_srvtoolu_id(raw: &str) -> String {
     if raw.starts_with("srvtoolu_") {
         raw.to_owned()
@@ -3944,21 +4111,25 @@ fn ensure_srvtoolu_id(raw: &str) -> String {
 async fn close_anthropic_thinking(
     sse_tx: &mpsc::Sender<Result<Bytes, Infallible>>,
     active_thinking_idx: &mut Option<usize>,
+    active_thinking_has_sig: &mut bool,
 ) {
     if let Some(idx) = active_thinking_idx.take() {
-        let _ = send_sse_frame(
-            sse_tx,
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {
-                    "type": "signature_delta",
-                    "signature": ANTHROPIC_THOUGHT_SIGNATURE
-                }
-            }),
-        )
-        .await;
+        let had_sig = std::mem::replace(active_thinking_has_sig, false);
+        if !had_sig {
+            let _ = send_sse_frame(
+                sse_tx,
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": ANTHROPIC_THOUGHT_SIGNATURE
+                    }
+                }),
+            )
+            .await;
+        }
         let _ = send_sse_frame(
             sse_tx,
             "content_block_stop",

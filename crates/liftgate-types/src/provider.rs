@@ -391,7 +391,7 @@ impl ProviderDriverKind {
             Self::GrokAcp => "grok-4",
             Self::OpenAiResponses => "gpt-5.4",
             Self::AnthropicMessages => "claude-sonnet-4-6",
-            Self::GoogleGemini => "gemini-2.5-pro",
+            Self::GoogleGemini => "gemini-4-carbon",
         }
     }
 
@@ -403,7 +403,7 @@ impl ProviderDriverKind {
             Self::GrokAcp => "grok-code-fast-1",
             Self::OpenAiResponses => "gpt-5-mini",
             Self::AnthropicMessages => "claude-haiku-4-5",
-            Self::GoogleGemini => "gemini-2.5-flash",
+            Self::GoogleGemini => "gemini-3.8-flash",
         }
     }
 
@@ -849,6 +849,60 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
             },
         ],
         ProviderDriverKind::GoogleGemini => vec![
+            ProviderModelEntry {
+                id: "gemini-4-carbon".to_owned(),
+                display_name: "Gemini 4 Carbon".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-4-argon".to_owned(),
+                display_name: "Gemini 4 Argon".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-3.8-flash".to_owned(),
+                display_name: "Gemini 3.8 Flash".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-3.5-flash-lite".to_owned(),
+                display_name: "Gemini 3.5 Flash-Lite".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-3.1-pro-preview".to_owned(),
+                display_name: "Gemini 3.1 Pro Preview".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-3-flash-preview".to_owned(),
+                display_name: "Gemini 3 Flash Preview".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
             ProviderModelEntry {
                 id: "gemini-2.5-pro".to_owned(),
                 display_name: "Gemini 2.5 Pro".to_owned(),

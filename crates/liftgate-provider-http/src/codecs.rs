@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::{
     error::PlatformApiError,
     sse::SseFrame,
-    transport::{HttpRequestSpec, HttpSseTransport},
+    transport::{HttpRequestSpec, HttpSseStream, HttpSseTransport},
 };
 
 /// Outbound tool definition prepared for a stateless Platform HTTP API.
@@ -69,6 +69,14 @@ pub struct PreparedWireMetrics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeStreamEvent {
     ReasoningDelta(String),
+    ThinkingSignatureDelta(String),
+    SignedThinkingBlock {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinkingBlock {
+        data: String,
+    },
     TextDelta(String),
     ToolCall {
         id: String,
@@ -105,31 +113,58 @@ pub fn build_driver_http_request(
     }
 }
 
-/// Executes one streaming HTTP/SSE step and pumps normalized [`NativeStreamEvent`]s into tx.
-pub async fn execute_driver_sse_step<T: HttpSseTransport>(
+/// Pre-opened HTTP/SSE stream after status headers have been validated (`2xx`).
+pub struct OpenedDriverSseStep {
+    driver: ProviderDriverKind,
+    sse_stream: HttpSseStream,
+    pub metrics: PreparedWireMetrics,
+}
+
+/// Builds the outbound HTTP request and validates upstream response status headers before SSE streaming.
+pub async fn open_driver_sse_step<T: HttpSseTransport>(
     transport: &T,
     input: &NativeDriverInput,
+) -> Result<OpenedDriverSseStep, PlatformApiError> {
+    let (spec, metrics) = build_driver_http_request(input)?;
+    let sse_stream = transport.open_sse(spec).await?;
+    Ok(OpenedDriverSseStep {
+        driver: input.driver,
+        sse_stream,
+        metrics,
+    })
+}
+
+/// Pumps normalized [`NativeStreamEvent`]s from an already-opened [`OpenedDriverSseStep`] into `tx`.
+pub async fn pump_opened_driver_sse_step(
+    mut opened: OpenedDriverSseStep,
     tx: &mpsc::Sender<Result<NativeStreamEvent, PlatformApiError>>,
 ) -> Result<PreparedWireMetrics, PlatformApiError> {
-    let (spec, metrics) = build_driver_http_request(input)?;
-    let mut sse_stream = transport.open_sse(spec).await?;
-
-    match input.driver {
+    match opened.driver {
         ProviderDriverKind::OpenAiResponses => {
-            decode_openai_sse(&mut sse_stream.frames_rx, tx).await?;
+            decode_openai_sse(&mut opened.sse_stream.frames_rx, tx).await?;
         }
         ProviderDriverKind::AnthropicMessages => {
-            decode_anthropic_sse(&mut sse_stream.frames_rx, tx).await?;
+            decode_anthropic_sse(&mut opened.sse_stream.frames_rx, tx).await?;
         }
         ProviderDriverKind::GoogleGemini => {
-            decode_gemini_sse(&mut sse_stream.frames_rx, tx).await?;
+            decode_gemini_sse(&mut opened.sse_stream.frames_rx, tx).await?;
         }
         ProviderDriverKind::AgyAcp
         | ProviderDriverKind::CodexAppServer
         | ProviderDriverKind::GrokAcp => {}
     }
 
-    Ok(metrics)
+    Ok(opened.metrics)
+}
+
+/// Executes one streaming HTTP/SSE step and pumps normalized [`NativeStreamEvent`]s into tx.
+pub async fn execute_driver_sse_step<T: HttpSseTransport>(
+    transport: &T,
+    input: &NativeDriverInput,
+    tx: &mpsc::Sender<Result<NativeStreamEvent, PlatformApiError>>,
+) -> Result<PreparedWireMetrics, PlatformApiError> {
+    let opened = open_driver_sse_step(transport, input).await?;
+    pump_opened_driver_sse_step(opened, tx).await
 }
 
 /// Runs a lightweight connectivity & credential probe (GET /models) for lg provider test.
@@ -284,7 +319,9 @@ fn build_openai_responses_request(
                         "image_url": format!("data:{media_type};base64,{data}"),
                     }));
                 }
-                CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
                 CanonicalPart::ToolCall {
                     call_id,
                     name,
@@ -840,6 +877,34 @@ fn build_anthropic_messages_request(
                     );
                 }
                 CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::SignedThinking {
+                    thinking,
+                    signature,
+                } => {
+                    if !signature.is_empty() {
+                        push_block(
+                            CanonicalRole::Assistant,
+                            json!({
+                                "type": "thinking",
+                                "thinking": thinking,
+                                "signature": signature,
+                            }),
+                            &mut wire_messages,
+                        );
+                    }
+                }
+                CanonicalPart::RedactedThinking { data } => {
+                    if !data.is_empty() {
+                        push_block(
+                            CanonicalRole::Assistant,
+                            json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                            }),
+                            &mut wire_messages,
+                        );
+                    }
+                }
                 CanonicalPart::ToolCall {
                     call_id,
                     name,
@@ -897,6 +962,27 @@ fn build_anthropic_messages_request(
             ),
         );
     }
+    let has_unsigned_assistant_thinking_gap =
+        wire_messages
+            .iter()
+            .enumerate()
+            .any(|(idx, (role, blocks))| {
+                if *role != CanonicalRole::Assistant {
+                    return false;
+                }
+                let is_last = idx + 1 == wire_messages.len();
+                let has_tool_use = blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+                if !is_last && !has_tool_use {
+                    return false;
+                }
+                !blocks
+                    .first()
+                    .and_then(|b| b.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| matches!(t, "thinking" | "redacted_thinking"))
+            });
     if input.align_cache_breakpoints
         && let Some((_, blocks)) = wire_messages
             .iter_mut()
@@ -940,7 +1026,7 @@ fn build_anthropic_messages_request(
             ReasoningEffort::High => 16_384,
             ReasoningEffort::XHigh => 24_576,
         };
-        if max_tokens > budget + 1_024 {
+        if max_tokens > budget + 1_024 && !has_unsigned_assistant_thinking_gap {
             body.insert(
                 "thinking".to_owned(),
                 json!({
@@ -993,11 +1079,17 @@ struct PendingAnthropicTool {
     json_buf: String,
 }
 
+enum PendingAnthropicThinking {
+    Thinking { text: String, signature: String },
+    Redacted { data: String },
+}
+
 async fn decode_anthropic_sse(
     rx: &mut mpsc::Receiver<Result<SseFrame, PlatformApiError>>,
     tx: &mpsc::Sender<Result<NativeStreamEvent, PlatformApiError>>,
 ) -> Result<(), PlatformApiError> {
     let mut active_tools: HashMap<usize, PendingAnthropicTool> = HashMap::new();
+    let mut active_thinking: HashMap<usize, PendingAnthropicThinking> = HashMap::new();
     let mut prompt_tokens: u64 = 0;
     let mut cached_read: u64 = 0;
     let mut cached_write: u64 = 0;
@@ -1065,6 +1157,43 @@ async fn decode_anthropic_sse(
                                 json_buf: String::new(),
                             },
                         );
+                    } else if btype == "thinking" {
+                        let init_text = blk
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let init_sig = blk
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        if !init_text.is_empty() {
+                            let _ = tx
+                                .send(Ok(NativeStreamEvent::ReasoningDelta(init_text.clone())))
+                                .await;
+                        }
+                        if !init_sig.is_empty() {
+                            let _ = tx
+                                .send(Ok(NativeStreamEvent::ThinkingSignatureDelta(
+                                    init_sig.clone(),
+                                )))
+                                .await;
+                        }
+                        active_thinking.insert(
+                            idx,
+                            PendingAnthropicThinking::Thinking {
+                                text: init_text,
+                                signature: init_sig,
+                            },
+                        );
+                    } else if btype == "redacted_thinking" {
+                        let data = blk
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        active_thinking.insert(idx, PendingAnthropicThinking::Redacted { data });
                     } else if btype == "server_tool_use"
                         && blk.get("name").and_then(Value::as_str) == Some("web_search")
                     {
@@ -1098,8 +1227,30 @@ async fn decode_anthropic_sse(
                             if let Some(t) = delta.get("thinking").and_then(Value::as_str)
                                 && !t.is_empty()
                             {
+                                if let Some(PendingAnthropicThinking::Thinking { text, .. }) =
+                                    active_thinking.get_mut(&idx)
+                                {
+                                    text.push_str(t);
+                                }
                                 let _ = tx
                                     .send(Ok(NativeStreamEvent::ReasoningDelta(t.to_owned())))
+                                    .await;
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(sig) = delta.get("signature").and_then(Value::as_str)
+                                && !sig.is_empty()
+                            {
+                                if let Some(PendingAnthropicThinking::Thinking {
+                                    signature, ..
+                                }) = active_thinking.get_mut(&idx)
+                                {
+                                    signature.push_str(sig);
+                                }
+                                let _ = tx
+                                    .send(Ok(NativeStreamEvent::ThinkingSignatureDelta(
+                                        sig.to_owned(),
+                                    )))
                                     .await;
                             }
                         }
@@ -1136,6 +1287,27 @@ async fn decode_anthropic_sse(
                             thought_signature: None,
                         }))
                         .await;
+                }
+                if let Some(pending) = active_thinking.remove(&idx) {
+                    match pending {
+                        PendingAnthropicThinking::Thinking { text, signature } => {
+                            if !signature.is_empty() {
+                                let _ = tx
+                                    .send(Ok(NativeStreamEvent::SignedThinkingBlock {
+                                        thinking: text,
+                                        signature,
+                                    }))
+                                    .await;
+                            }
+                        }
+                        PendingAnthropicThinking::Redacted { data } => {
+                            if !data.is_empty() {
+                                let _ = tx
+                                    .send(Ok(NativeStreamEvent::RedactedThinkingBlock { data }))
+                                    .await;
+                            }
+                        }
+                    }
                 }
             }
             "message_delta" => {
@@ -1340,7 +1512,9 @@ fn build_google_gemini_request(
                         &mut contents,
                     );
                 }
-                CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
                 CanonicalPart::ToolCall {
                     call_id,
                     name,

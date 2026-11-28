@@ -785,7 +785,10 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                         call_id.len() + name.len() + encoded_args_len + tool_nonce.len() * 2 + 96,
                     );
                 }
-                CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::ImageBase64 { .. }
+                | CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
             }
         }
     }
@@ -849,7 +852,9 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                 }
                 CanonicalPart::ToolCall { .. }
                 | CanonicalPart::ImageBase64 { .. }
-                | CanonicalPart::Reasoning(_) => {}
+                | CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
             }
         }
     }
@@ -1243,6 +1248,8 @@ fn is_conversational_user_message(msg: &CanonicalMessage) -> bool {
                 return true;
             }
             CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. }
             | CanonicalPart::ToolCall { .. }
             | CanonicalPart::ToolResult { .. } => {}
         }
@@ -1270,7 +1277,9 @@ fn estimate_raw_prompt_bytes(
                     call_id, output, ..
                 } => call_id.len() + output.len() + 80,
                 CanonicalPart::ImageBase64 { media_type, .. } => media_type.len() + 48,
-                CanonicalPart::Reasoning(_) => 0,
+                CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => 0,
             };
             total = total.saturating_add(part_len);
         }
@@ -1338,7 +1347,9 @@ fn render_parts_into<S: TruncationSpillSink>(
                     text_acc.push_str(&format!("[Prior Image media_type={media_type}]\n"));
                 }
             }
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
             CanonicalPart::ToolCall {
                 call_id,
                 name,

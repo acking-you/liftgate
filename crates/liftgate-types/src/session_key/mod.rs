@@ -252,7 +252,9 @@ fn feed_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
                 hasher.update(data.as_bytes());
                 hasher.update(b"\x1d");
             }
-            CanonicalPart::Reasoning(_) => {
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {
                 // Intentionally omitted from cross-turn match key because some clients drop
                 // reasoning summaries when resending history.
             }
@@ -311,7 +313,9 @@ fn feed_dialogue_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
                 hasher.update(data.as_bytes());
                 hasher.update(b"\x1d");
             }
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
             CanonicalPart::ToolCall {
                 call_id: _,
                 name,
@@ -352,7 +356,9 @@ fn message_has_stable_hash_content(msg: &CanonicalMessage, skip_developer_wrappe
             CanonicalPart::ImageBase64 { .. }
             | CanonicalPart::ToolCall { .. }
             | CanonicalPart::ToolResult { .. } => return true,
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
         }
     }
     false

@@ -2210,9 +2210,9 @@ pub async fn run_provider(state_paths: &StatePaths, args: ProviderArgs) -> Resul
             ]);
             for p in &report.providers {
                 let active_cell = if p.active {
-                    ui::status_cell("★ ACTIVE", Tone::Ok)
+                    ui::status_cell("ACTIVE", Tone::Ok)
                 } else {
-                    ui::status_cell("·", Tone::Muted)
+                    ui::status_cell("standby", Tone::Muted)
                 };
                 let auth_tone = if p.auth_configured {
                     Tone::Ok
@@ -2220,9 +2220,9 @@ pub async fn run_provider(state_paths: &StatePaths, args: ProviderArgs) -> Resul
                     Tone::Warn
                 };
                 let auth_label = if p.auth_configured {
-                    format!("✓ {}", p.auth_source)
+                    p.auth_source.clone()
                 } else {
-                    format!("! missing ({})", p.auth_source)
+                    format!("missing ({})", p.auth_source)
                 };
                 let ep_note = match &p.endpoint {
                     Some(ep) => format!(
@@ -2272,12 +2272,14 @@ pub async fn run_provider(state_paths: &StatePaths, args: ProviderArgs) -> Resul
             }
             ui::headline(Tone::Ok, &report.headline);
             ui::kv("Active Provider", &report.active_provider);
+            let persisted_label =
+                format!("persisted to {}", state_paths.providers_file().display());
             ui::kv(
                 "Live Gateway",
                 if report.daemon_synced {
                     "reloaded in place"
                 } else {
-                    "persisted to ~/.liftgate/providers.json"
+                    &persisted_label
                 },
             );
         }

@@ -1287,3 +1287,548 @@ async fn disabled_provider_is_rejected_and_gemini_preserves_thought_signatures_a
         "Client continuation must replay both thoughtSignatures without collision: {req3_str}"
     );
 }
+
+#[tokio::test]
+async fn gemini_anthropic_ingress_preserves_thought_signature_across_toolu_id_rewrite() {
+    let gem_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gem_addr = gem_listener.local_addr().unwrap();
+    let seen_reqs: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen_reqs);
+    let step_idx = Arc::new(AtomicUsize::new(0));
+    let step_clone = Arc::clone(&step_idx);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = gem_listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen_clone);
+            let n = step_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let req_json = read_raw_http_body(&mut sock).await;
+                seen.lock().unwrap().push(req_json);
+                let sse = if n == 0 {
+                    concat!(
+                        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[",
+                        "{\"functionCall\":{\"id\":\"3650728205117214884\",\"name\":\"get_version\",\"args\":{}},\"thoughtSignature\":\"sig_gem3_numeric_id\"}",
+                        "]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":8,\"totalTokenCount\":28}}\n\n"
+                    )
+                } else {
+                    concat!(
+                        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[",
+                        "{\"text\":\"Version verified!\"}",
+                        "]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":40,\"candidatesTokenCount\":5,\"totalTokenCount\":45}}\n\n"
+                    )
+                };
+                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(sse.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut cfg = ProviderRegistryConfig::default();
+    let mut gem = ProviderProfileConfig::builtin(
+        ProviderId::try_new("gemini").unwrap(),
+        ProviderDriverKind::GoogleGemini,
+    );
+    gem.endpoint = Some(format!("http://{gem_addr}"));
+    gem.auth = ApiKeySource::None;
+    gem.force_direct_proxy = true;
+    cfg.upsert(gem);
+    let registry = ProviderRuntimeRegistry::in_memory(cfg, None);
+    let (router, _) = build_test_router(registry, None);
+
+    let r1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/gemini/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-3-flash-preview",
+                        "max_tokens": 1024,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "Check version"}],
+                        "tools": [{
+                            "name": "get_version",
+                            "description": "Get version",
+                            "input_schema": {"type": "object", "properties": {}}
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&to_bytes(r1.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let tool_id = b1["content"][0]["id"].as_str().expect("toolu id");
+    assert_eq!(tool_id, "toolu_3650728205117214884");
+
+    let r2 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/gemini/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-3-flash-preview",
+                        "max_tokens": 1024,
+                        "stream": false,
+                        "messages": [
+                            {"role": "user", "content": "Check version"},
+                            {"role": "assistant", "content": [{
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": "get_version",
+                                "input": {}
+                            }]},
+                            {"role": "user", "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": "0.2.24"
+                            }]}
+                        ],
+                        "tools": [{
+                            "name": "get_version",
+                            "description": "Get version",
+                            "input_schema": {"type": "object", "properties": {}}
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let reqs = seen_reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    let turn2_body = reqs[1]["contents"].to_string();
+    assert!(
+        turn2_body.contains("\"thoughtSignature\":\"sig_gem3_numeric_id\""),
+        "Turn 2 Gemini request must restore thoughtSignature after toolu_ rewrite: {turn2_body}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_extended_thinking_preserves_signed_blocks_across_continuations() {
+    let anth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let anth_addr = anth_listener.local_addr().unwrap();
+    let seen_reqs: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen_reqs);
+    let call_num = Arc::new(AtomicUsize::new(0));
+    let call_clone = Arc::clone(&call_num);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = anth_listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen_clone);
+            let n = call_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let req_json = read_raw_http_body(&mut sock).await;
+                seen.lock().unwrap().push(req_json);
+                let sse = match n {
+                    0 => concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"output_tokens\":1}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Need to search tools.\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQB_sig_step0\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EmwK_redacted_0\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_0rtt_1\",\"name\":\"search_client_tools\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"ping\\\"}\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                    ),
+                    1 => concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":80,\"output_tokens\":1}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Calling client tool.\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQB_sig_step1\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_client_1\",\"name\":\"mcp_ext__ping_0\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":25}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                    ),
+                    _ => concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":110,\"output_tokens\":1}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"All done!\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                    ),
+                };
+                let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(sse.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut cfg = ProviderRegistryConfig::default();
+    let mut anth = ProviderProfileConfig::builtin(
+        ProviderId::try_new("anthropic").unwrap(),
+        ProviderDriverKind::AnthropicMessages,
+    );
+    anth.endpoint = Some(format!("http://{anth_addr}"));
+    anth.auth = ApiKeySource::None;
+    anth.force_direct_proxy = true;
+    cfg.upsert(anth);
+    let registry = ProviderRuntimeRegistry::in_memory(cfg, None);
+    let (router, _) = build_test_router(registry, None);
+
+    let tools: Vec<Value> = (0..50)
+        .map(|i| {
+            json!({
+                "name": format!("mcp_ext__ping_{i}"),
+                "description": "Ping tool",
+                "input_schema": {"type": "object", "properties": {}}
+            })
+        })
+        .collect();
+
+    let r1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 32768,
+                        "stream": false,
+                        "thinking": {"type": "enabled", "budget_tokens": 16384},
+                        "messages": [{"role": "user", "content": "Run ping_0"}],
+                        "tools": tools,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&to_bytes(r1.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let content1 = b1["content"].as_array().expect("content blocks");
+    assert_eq!(content1[0]["type"], "thinking");
+    assert_eq!(content1[0]["signature"], "EqQB_sig_step0");
+    assert_eq!(content1[1]["type"], "redacted_thinking");
+    assert_eq!(content1[1]["data"], "EmwK_redacted_0");
+    assert_eq!(content1[2]["type"], "thinking");
+    assert_eq!(content1[2]["signature"], "EqQB_sig_step1");
+    let tool_blk = content1
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("tool_use");
+    let tool_id = tool_blk["id"].as_str().unwrap();
+    assert_eq!(tool_id, "toolu_client_1");
+
+    // Turn 2: replay exact content1 blocks back to /p/anthropic/v1/messages
+    let r2 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 32768,
+                        "stream": false,
+                        "thinking": {"type": "enabled", "budget_tokens": 16384},
+                        "messages": [
+                            {"role": "user", "content": "Run ping_0"},
+                            {"role": "assistant", "content": content1},
+                            {"role": "user", "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": "pong"
+                            }]}
+                        ],
+                        "tools": tools,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    let reqs = seen_reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    // Step 1 (local 0-RTT continuation) must keep thinking enabled and replay signed + redacted blocks!
+    assert_eq!(reqs[1]["thinking"]["type"], "enabled");
+    let step1_asst = &reqs[1]["messages"][1]["content"];
+    assert_eq!(step1_asst[0]["type"], "thinking");
+    assert_eq!(step1_asst[0]["signature"], "EqQB_sig_step0");
+    assert_eq!(step1_asst[1]["type"], "redacted_thinking");
+    assert_eq!(step1_asst[1]["data"], "EmwK_redacted_0");
+    assert_eq!(step1_asst[2]["type"], "tool_use");
+
+    // Step 2 (client Turn 2 continuation) must also keep thinking enabled and replay signed + redacted blocks!
+    assert_eq!(reqs[2]["thinking"]["type"], "enabled");
+    let step2_asst = &reqs[2]["messages"][1]["content"];
+    assert_eq!(step2_asst[0]["type"], "thinking");
+    assert_eq!(step2_asst[0]["signature"], "EqQB_sig_step0");
+    assert_eq!(step2_asst[1]["type"], "redacted_thinking");
+    assert_eq!(step2_asst[2]["type"], "thinking");
+    assert_eq!(step2_asst[2]["signature"], "EqQB_sig_step1");
+    assert_eq!(step2_asst[3]["type"], "tool_use");
+}
+
+#[tokio::test]
+async fn streaming_http_provider_propagates_pre_sse_401_402_and_429_status_codes() {
+    let err_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err_addr = err_listener.local_addr().unwrap();
+    let seq = Arc::new(AtomicUsize::new(0));
+    let seq_clone = Arc::clone(&seq);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = err_listener.accept().await else {
+                break;
+            };
+            let idx = seq_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = read_raw_http_body(&mut sock).await;
+                let resp = match idx {
+                    0 => concat!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        "{\"error\":{\"message\":\"Invalid API key\",\"type\":\"authentication_error\"}}"
+                    ),
+                    1 => concat!(
+                        "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        "{\"error\":{\"message\":\"Quota exceeded for account\",\"type\":\"rate_limit_error\"}}"
+                    ),
+                    _ => concat!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        "{\"error\":{\"message\":\"Rate limit exceeded\",\"type\":\"rate_limit_error\"}}"
+                    ),
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut cfg = ProviderRegistryConfig::default();
+    let mut kiro = ProviderProfileConfig::builtin(
+        ProviderId::try_new("kiro").unwrap(),
+        ProviderDriverKind::AnthropicMessages,
+    );
+    kiro.endpoint = Some(format!("http://{err_addr}"));
+    kiro.auth = ApiKeySource::None;
+    kiro.force_direct_proxy = true;
+    cfg.upsert(kiro);
+    let registry = ProviderRuntimeRegistry::in_memory(cfg, None);
+    let (router, _) = build_test_router(registry, None);
+
+    // 1. 401 with stream: true -> HTTP 401 (NOT 200 OK SSE!)
+    let r401 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/kiro/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r401.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. 402 Quota exceeded with stream: true on Anthropic ingress -> HTTP 400 invalid_request_error (halt retries)
+    let r402 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/kiro/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r402.status(), StatusCode::BAD_REQUEST);
+    let b402: Value =
+        serde_json::from_slice(&to_bytes(r402.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert!(
+        b402["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Quota exceeded"),
+        "unexpected 402 body: {b402}"
+    );
+
+    // 3. 429 with stream: true -> HTTP 429
+    let r429 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/kiro/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "stream": true,
+                        "input": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r429.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_app_server_handles_gateway_web_fetch_locally_and_forwards_images() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lg-codex-img-fetch-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let script_path = tmp_dir.join("mock_codex_multimodal.py");
+    let log_path = tmp_dir.join("events.log");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+log_file = {log_lit}
+it = iter(sys.stdin)
+for raw in it:
+    msg = json.loads(raw)
+    method = msg.get("method", "")
+    mid = msg.get("id")
+    if method == "initialize":
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"userAgent":"mock"}}}}) + "\n")
+        sys.stdout.flush()
+    elif method == "thread/start":
+        dyn_tools = [t["name"] for t in (msg["params"].get("dynamicTools") or [])]
+        with open(log_file, "a") as f:
+            f.write("DYN:" + ",".join(dyn_tools) + "\n")
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"thread":{{"id":"thr_img"}}}}}}) + "\n")
+        sys.stdout.flush()
+    elif method == "turn/start":
+        inp = msg["params"]["input"]
+        with open(log_file, "a") as f:
+            f.write("INPUT:" + json.dumps(inp) + "\n")
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"turn":{{"id":"t_img"}}}}}}) + "\n")
+        sys.stdout.flush()
+        call = {{"jsonrpc":"2.0","id":88,"method":"item/tool/call","params":{{"callId":"call_wf_1","threadId":"thr_img","turnId":"t_img","tool":"gateway_web_fetch","arguments":{{"url":"http://127.0.0.1:9/ssrf-blocked"}}}}}}
+        sys.stdout.write(json.dumps(call) + "\n")
+        sys.stdout.flush()
+        reply = json.loads(next(it))
+        with open(log_file, "a") as f:
+            f.write("WF_REPLY:" + json.dumps(reply) + "\n")
+        delta = {{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"delta":"Image inspected and web fetch handled locally."}}}}
+        done = {{"jsonrpc":"2.0","method":"turn/completed","params":{{"turn":{{"status":"completed"}}}}}}
+        sys.stdout.write(json.dumps(delta) + "\n" + json.dumps(done) + "\n")
+        sys.stdout.flush()
+        break
+"#,
+        log_lit = serde_json::to_string(&log_path.to_string_lossy().into_owned()).unwrap()
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = ProviderRegistryConfig::default();
+    let mut codex_prof = ProviderProfileConfig::builtin(
+        ProviderId::try_new("codex-cli").unwrap(),
+        ProviderDriverKind::CodexAppServer,
+    );
+    codex_prof.command = Some(script_path);
+    codex_prof.command_args = Vec::new();
+    cfg.upsert(codex_prof);
+
+    let (router, _) = build_test_router(ProviderRuntimeRegistry::in_memory(cfg, None), None);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/codex-cli/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "max_tokens": 512,
+                        "stream": false,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Inspect image and fetch URL"},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+                            ]
+                        }],
+                        "tools": [
+                            {"name": "read_file", "description": "Read", "input_schema": {"type": "object", "properties": {}}},
+                            {"type": "web_fetch_20250910", "name": "web_fetch"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_json: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body_json["stop_reason"], "end_turn");
+    assert!(
+        body_json["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("handled locally"),
+        "unexpected response body: {body_json}"
+    );
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        logged.contains("gateway_web_fetch"),
+        "expected gateway_web_fetch in dynamicTools: {logged}"
+    );
+    assert!(
+        logged.contains("data:image/png;base64,iVBORw0KGgo="),
+        "expected base64 data URI image in turn/start input: {logged}"
+    );
+    assert!(
+        logged.contains("WF_REPLY:") && logged.contains("\"id\": 88"),
+        "expected in-band local reply for gateway_web_fetch: {logged}"
+    );
+}

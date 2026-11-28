@@ -83,6 +83,8 @@ fn gateway_process_tool_nonce() -> Arc<str> {
 #[derive(Clone, Debug)]
 pub enum TurnEvent {
     ThoughtDelta(String),
+    ThoughtSignature(String),
+    RedactedThinking(String),
     WebSearch {
         call_id: String,
         status: String,
@@ -2418,6 +2420,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
         CanonicalPart::ToolCall { .. }
         | CanonicalPart::ImageBase64 { .. }
         | CanonicalPart::Reasoning(_)
+        | CanonicalPart::SignedThinking { .. }
+        | CanonicalPart::RedactedThinking { .. }
         | CanonicalPart::ToolResult { .. } => true,
     });
     let produced_any_output = has_non_ws_part
@@ -3134,7 +3138,8 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
         | GatewayError::NotFound { .. }
         | GatewayError::ProviderDisabled { .. }
         | GatewayError::InvalidBody { .. }
-        | GatewayError::Protocol { .. } => err,
+        | GatewayError::Protocol { .. }
+        | GatewayError::UpstreamProviderHttp { .. } => err,
     }
 }
 
@@ -4848,7 +4853,10 @@ fn build_mcp_tool_replies_with_policy(
                 CanonicalPart::ImageBase64 { media_type, data } => {
                     followup_images.push((media_type.clone(), data.clone()));
                 }
-                CanonicalPart::Reasoning(_) | CanonicalPart::ToolCall { .. } => {}
+                CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. }
+                | CanonicalPart::ToolCall { .. } => {}
             }
         }
     }
@@ -6561,6 +6569,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                         CanonicalPart::ToolCall { .. }
                         | CanonicalPart::ImageBase64 { .. }
                         | CanonicalPart::Reasoning(_)
+                        | CanonicalPart::SignedThinking { .. }
+                        | CanonicalPart::RedactedThinking { .. }
                         | CanonicalPart::ToolResult { .. } => true,
                     });
                     let produced_any_output = has_non_ws_part

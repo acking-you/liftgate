@@ -325,6 +325,8 @@ pub fn trailing_tool_results(messages: &[CanonicalMessage]) -> Vec<ObservedToolR
                 }
                 CanonicalPart::Text(_)
                 | CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. }
                 | CanonicalPart::ToolCall { .. } => {
                     attach_to = None;
                 }

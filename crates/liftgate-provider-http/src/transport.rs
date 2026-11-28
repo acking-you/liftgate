@@ -891,7 +891,9 @@ async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformAp
         Ok(Err(err)) => {
             let mut err_buf = String::new();
             if let Some(ref mut se) = stderr {
-                let _ = se.read_to_string(&mut err_buf).await;
+                let _ = tokio::io::AsyncReadExt::take(se, 16 * 1024)
+                    .read_to_string(&mut err_buf)
+                    .await;
             }
             if !err_buf.trim().is_empty() {
                 return Err(PlatformApiError::Transport {
@@ -1004,24 +1006,97 @@ async fn send_curl_buffered(req: HttpRequestSpec) -> Result<HttpJsonResponse, Pl
         let _ = stdin.write_all(config_text.as_bytes()).await;
         drop(stdin);
     }
-    let out = timeout(req.total_timeout, child.wait_with_output())
-        .await
-        .map_err(|_| PlatformApiError::Timeout {
-            elapsed_ms: u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX),
-        })?
-        .map_err(|e| PlatformApiError::Transport {
-            message: "curl execution failed".to_owned(),
-            source: Some(e),
-        })?;
+    const MAX_CURL_STDOUT_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+    const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let read_res = timeout(req.total_timeout, async {
+        let stdout_fut = async {
+            let mut buf = Vec::new();
+            if let Some(ref mut pipe) = stdout_pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = tokio::io::AsyncReadExt::read(pipe, &mut chunk)
+                        .await
+                        .map_err(|e| PlatformApiError::Transport {
+                            message: "curl stdout read failed".to_owned(),
+                            source: Some(e),
+                        })?;
+                    if n == 0 {
+                        break;
+                    }
+                    let Some(slice) = chunk.get(..n) else {
+                        break;
+                    };
+                    if buf.len().saturating_add(slice.len()) > MAX_CURL_STDOUT_BYTES {
+                        return Err(PlatformApiError::Protocol {
+                            message: format!(
+                                "upstream curl response exceeded {} byte limit",
+                                MAX_CURL_STDOUT_BYTES
+                            ),
+                        });
+                    }
+                    buf.extend_from_slice(slice);
+                }
+            }
+            Ok::<Vec<u8>, PlatformApiError>(buf)
+        };
+        let stderr_fut = async {
+            let mut buf = Vec::new();
+            if let Some(ref mut pipe) = stderr_pipe {
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(pipe, &mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Some(slice) = chunk.get(..n) {
+                        let remaining = MAX_CURL_STDERR_BYTES.saturating_sub(buf.len());
+                        let take = remaining.min(slice.len());
+                        if let Some(sub) = slice.get(..take) {
+                            buf.extend_from_slice(sub);
+                        }
+                    }
+                }
+            }
+            Ok::<Vec<u8>, PlatformApiError>(buf)
+        };
+        let (stdout_bytes, stderr_bytes) = tokio::try_join!(stdout_fut, stderr_fut)?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| PlatformApiError::Transport {
+                message: "curl wait failed".to_owned(),
+                source: Some(e),
+            })?;
+        Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), PlatformApiError>((
+            status,
+            stdout_bytes,
+            stderr_bytes,
+        ))
+    })
+    .await;
     drop(temp_body);
+    let (exit_status, stdout_bytes, stderr_bytes) = match read_res {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            return Err(PlatformApiError::Timeout {
+                elapsed_ms: u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+    };
 
-    if !out.status.success() && out.stdout.is_empty() {
+    if !exit_status.success() && stdout_bytes.is_empty() {
         return Err(PlatformApiError::Transport {
-            message: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            message: String::from_utf8_lossy(&stderr_bytes).trim().to_owned(),
             source: None,
         });
     }
-    let mut reader = BufReader::new(out.stdout.as_slice());
+    let mut reader = BufReader::new(stdout_bytes.as_slice());
     let mut headers = read_http_response_headers(&mut reader).await?;
     headers.chunked = false;
     let body = read_http_body_bounded(&mut reader, &headers, 4 * 1024 * 1024).await?;

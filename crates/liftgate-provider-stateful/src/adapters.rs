@@ -1,5 +1,6 @@
 //! Stateful JSON-RPC stdio dialect adapters for codex app-server and grok acp.
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use liftgate_types::{
@@ -38,6 +39,13 @@ pub enum DynamicToolDisposition {
     SuspendToClient,
 }
 
+/// Base64-encoded image attachment forwarded into a stateful stdio session turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatefulInputImage {
+    pub media_type: String,
+    pub data: String,
+}
+
 /// Normalized turn request passed into a stateful stdio dialect adapter.
 #[derive(Clone, Debug)]
 pub struct StatefulTurnInput {
@@ -46,6 +54,7 @@ pub struct StatefulTurnInput {
     pub effort: Option<ReasoningEffort>,
     pub system_instructions: Option<String>,
     pub prompt_text: String,
+    pub images: Vec<StatefulInputImage>,
     pub cwd: PathBuf,
     pub mcp_servers: Vec<McpServerConfig>,
     pub dynamic_tools: Vec<StatefulClientToolSpec>,
@@ -84,21 +93,22 @@ pub async fn run_turn_on_spawned_peer(
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
 ) -> Result<(), StatefulRpcError> {
-    run_turn_on_spawned_peer_with_handler(spawn_cfg, input, events_tx, |_, _| {
+    run_turn_on_spawned_peer_with_handler(spawn_cfg, input, events_tx, |_, _| async {
         DynamicToolDisposition::SuspendToClient
     })
     .await
 }
 
 /// Executes a single turn over a spawned stateful stdio peer with a custom in-band tool handler.
-pub async fn run_turn_on_spawned_peer_with_handler<F>(
+pub async fn run_turn_on_spawned_peer_with_handler<F, Fut>(
     spawn_cfg: &StdioSpawnConfig,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
     mut on_tool_call: F,
 ) -> Result<(), StatefulRpcError>
 where
-    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+    F: FnMut(String, Value) -> Fut + Send,
+    Fut: Future<Output = DynamicToolDisposition> + Send,
 {
     let peer = StdioRpcPeer::spawn(spawn_cfg)?;
     run_turn_on_peer_with_handler(&peer, input, events_tx, &mut on_tool_call).await
@@ -110,21 +120,22 @@ pub async fn run_turn_on_peer(
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
 ) -> Result<(), StatefulRpcError> {
-    run_turn_on_peer_with_handler(peer, input, events_tx, |_, _| {
+    run_turn_on_peer_with_handler(peer, input, events_tx, |_, _| async {
         DynamicToolDisposition::SuspendToClient
     })
     .await
 }
 
 /// Executes a single turn over an already-connected [`StdioRpcPeer`] with an in-band tool-call handler.
-pub async fn run_turn_on_peer_with_handler<F>(
+pub async fn run_turn_on_peer_with_handler<F, Fut>(
     peer: &StdioRpcPeer,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
     mut on_tool_call: F,
 ) -> Result<(), StatefulRpcError>
 where
-    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+    F: FnMut(String, Value) -> Fut + Send,
+    Fut: Future<Output = DynamicToolDisposition> + Send,
 {
     match input.dialect {
         StatefulDialect::CodexAppServer => {
@@ -174,14 +185,15 @@ fn serialize_tool_arguments(args_val: &Value, is_custom: bool) -> String {
     args_val.to_string()
 }
 
-async fn run_codex_app_server_turn<F>(
+async fn run_codex_app_server_turn<F, Fut>(
     peer: &StdioRpcPeer,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
     on_tool_call: &mut F,
 ) -> Result<(), StatefulRpcError>
 where
-    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+    F: FnMut(String, Value) -> Fut + Send,
+    Fut: Future<Output = DynamicToolDisposition> + Send,
 {
     let _: Value = peer
         .request(
@@ -254,12 +266,22 @@ where
         .unwrap_or("thread_default")
         .to_owned();
 
-    let mut turn_params = json!({
-        "threadId": thread_id,
-        "input": [{
+    let mut input_items: Vec<Value> = Vec::with_capacity(1 + input.images.len());
+    if !input.prompt_text.is_empty() || input.images.is_empty() {
+        input_items.push(json!({
             "type": "text",
             "text": input.prompt_text,
-        }],
+        }));
+    }
+    for img in &input.images {
+        input_items.push(json!({
+            "type": "image",
+            "url": format!("data:{};base64,{}", img.media_type, img.data),
+        }));
+    }
+    let mut turn_params = json!({
+        "threadId": thread_id,
+        "input": input_items,
     });
     if let Some(eff) = input.effort
         && let Some(obj) = turn_params.as_object_mut()
@@ -294,7 +316,7 @@ where
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                match on_tool_call(&tool_name, &args_val) {
+                match on_tool_call(tool_name.clone(), args_val.clone()).await {
                     DynamicToolDisposition::LocalReply { text, is_error } => {
                         let _ = peer
                             .respond(
@@ -435,14 +457,15 @@ where
     Err(StatefulRpcError::ChannelClosed)
 }
 
-async fn run_standard_acp_turn<F>(
+async fn run_standard_acp_turn<F, Fut>(
     peer: &StdioRpcPeer,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
     on_tool_call: &mut F,
 ) -> Result<(), StatefulRpcError>
 where
-    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+    F: FnMut(String, Value) -> Fut + Send,
+    Fut: Future<Output = DynamicToolDisposition> + Send,
 {
     let _: Value = peer
         .request(
@@ -520,12 +543,23 @@ where
         None => input.prompt_text.clone(),
     };
 
-    let prompt_params = json!({
-        "sessionId": session_id,
-        "prompt": [{
+    let mut prompt_blocks: Vec<Value> = Vec::with_capacity(1 + input.images.len());
+    if !full_prompt.is_empty() || input.images.is_empty() {
+        prompt_blocks.push(json!({
             "type": "text",
             "text": full_prompt,
-        }]
+        }));
+    }
+    for img in &input.images {
+        prompt_blocks.push(json!({
+            "type": "image",
+            "data": img.data,
+            "mimeType": img.media_type,
+        }));
+    }
+    let prompt_params = json!({
+        "sessionId": session_id,
+        "prompt": prompt_blocks,
     });
     let prompt_fut = peer.request::<_, Value>("session/prompt", &prompt_params);
     tokio::pin!(prompt_fut);
@@ -571,7 +605,7 @@ where
                             .or_else(|| msg.params.get("input"))
                             .cloned()
                             .unwrap_or_else(|| json!({}));
-                        match on_tool_call(&tool_name, &args_val) {
+                        match on_tool_call(tool_name.clone(), args_val.clone()).await {
                             DynamicToolDisposition::LocalReply { text, is_error } => {
                                 let _ = peer
                                     .respond(
