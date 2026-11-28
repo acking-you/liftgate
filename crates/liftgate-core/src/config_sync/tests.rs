@@ -345,6 +345,7 @@ fn codex_toml_merge_is_idempotent_keeps_root_before_tables_and_uninstalls_cleanl
     assert!(model_pos < first_table_pos);
     assert!(merged_twice.contains("suppress_unstable_features_warning = true"));
     assert!(merged_twice.contains("code_mode = true"));
+    assert!(merged_twice.contains("[tools.update_plan]\nenabled = true"));
     assert!(merged_twice.contains("fast_mode = true"));
     assert!(merged_twice.contains("C:/Users/alice/.codex/agy-models.json"));
     assert!(merged_twice.contains("[mcp_servers.demo]"));
@@ -357,9 +358,39 @@ fn codex_toml_merge_is_idempotent_keeps_root_before_tables_and_uninstalls_cleanl
     assert!(!stripped.contains("model_provider"));
     assert!(!stripped.contains("suppress_unstable_features_warning"));
     assert!(!stripped.contains("code_mode"));
+    assert!(!stripped.contains("update_plan"));
     assert!(stripped.contains("fast_mode = true"));
     assert!(stripped.contains("custom_flag = true"));
     assert!(stripped.contains("[mcp_servers.demo]"));
+
+    // Explicit user opt-out (`[tools.update_plan]\nenabled = false` or inline `[tools]`) is respected.
+    let user_disabled = "[tools.update_plan]\nenabled = false\n";
+    let merged_disabled = merge_codex_config_toml(
+        user_disabled,
+        "http://127.0.0.1:8787",
+        "gemini-4-carbon-high",
+        catalog,
+        true,
+        false,
+        false,
+    );
+    assert!(merged_disabled.contains("[tools.update_plan]\nenabled = false"));
+    assert!(!merged_disabled.contains("enabled = true"));
+    let stripped_disabled = strip_codex_config_toml(&merged_disabled);
+    assert!(stripped_disabled.contains("[tools.update_plan]\nenabled = false"));
+
+    let inline_tools = "[tools]\nupdate_plan = { enabled = false }\n";
+    let merged_inline = merge_codex_config_toml(
+        inline_tools,
+        "http://127.0.0.1:8787",
+        "gemini-4-carbon-high",
+        catalog,
+        true,
+        false,
+        false,
+    );
+    assert!(merged_inline.contains("update_plan = { enabled = false }"));
+    assert!(!merged_inline.contains("[tools.update_plan]"));
 }
 
 #[test]
@@ -432,6 +463,7 @@ command = \"npx\"
     assert!(rendered.contains("in_app_updates = false"));
     assert!(rendered.contains("remote_plugin = false"));
     assert!(rendered.contains("recommended_plugins = false"));
+    assert!(rendered.contains("[tools.update_plan]\nenabled = true"));
     assert!(rendered.contains("fast_mode = true"));
     assert!(rendered.contains("[marketplaces.openai-primary-runtime]"));
     assert!(rendered.contains("[mcp_servers.demo]"));
@@ -447,6 +479,25 @@ command = \"npx\"
     assert!(!rendered.contains("in_app_updates = true"));
     assert!(!rendered.contains("remote_plugin = true"));
     assert!(!rendered.contains("recommended_plugins = true"));
+
+    let catalog_json: Value = serde_json::from_slice(
+        &build_offline_codex_catalog_bytes_with_mode(
+            &[DiscoveredModel {
+                id: "gemini-4-carbon-high".to_owned(),
+                display_name: "Gemini 4 Carbon (High)".to_owned(),
+                context_window: 500_000,
+                auto_compact_token_limit: 425_000,
+            }],
+            "gemini-4-carbon-high",
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog_json["models"][0]["default_reasoning_summary"],
+        "auto"
+    );
 }
 
 #[test]

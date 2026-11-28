@@ -17,6 +17,8 @@ pub enum McpOrchestratorContract<'a> {
         mcp_name: &'a str,
         /// Whether top-level `apply_patch` (`mcp_lg_apply_patch`) is also declared on the session.
         has_apply_patch: bool,
+        /// Whether `update_plan` (`tools.update_plan` inside `exec` and/or `mcp_lg_update_plan`) is enabled on the session.
+        has_update_plan: bool,
     },
     /// Anthropic Claude Code Bash-first compound I/O (`Bash` alongside `Read`/`Edit`/`Write`).
     ClaudeBashFirst {

@@ -1784,9 +1784,35 @@ fn calibrated_budget_enables_30_tool_direct_passthrough_and_codex_claude_contrac
         Some(McpOrchestratorContract::CodexExec {
             mcp_name: "exec",
             has_apply_patch: true,
+            has_update_plan: false,
         })
     );
     assert!(codex_cat.wire_tool_bytes <= VirtualizerBudget::CODEX_AGY_ACP.max_eager_wire_bytes);
+
+    let mut codex_with_plan = medium_codex.clone();
+    codex_with_plan.pop();
+    codex_with_plan.push(fn_tool(
+        "update_plan",
+        "Updates the task plan.",
+        json!({"type": "object", "properties": {"plan": {"type": "array"}}}),
+    ));
+    let codex_plan_cat = partition_tools_for_mcp_session_with_options(
+        ProtocolHint::OpenAiResponses,
+        &codex_with_plan,
+        McpSessionOptions {
+            enable_gateway_web_fetch: true,
+            enable_context_spill_reader: true,
+        },
+        &mut spill,
+    );
+    assert_eq!(
+        codex_plan_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::CodexExec {
+            mcp_name: "exec",
+            has_apply_patch: true,
+            has_update_plan: true,
+        })
+    );
 
     // 2. Standard Claude Code session (no `REPL`, with `Bash` + 25 built-in/plugin tools = 28 tools)
     //    achieves 1:1 Direct Passthrough AND emits `ClaudeBashFirst { bash_mcp_name: "Bash" }`!

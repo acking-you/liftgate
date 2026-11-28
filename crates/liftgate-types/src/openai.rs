@@ -1346,6 +1346,7 @@ pub struct CodexModelCatalogEntry {
     pub priority: i32,
     pub base_instructions: &'static str,
     pub supports_reasoning_summaries: bool,
+    pub default_reasoning_summary: &'static str,
     pub support_verbosity: bool,
     pub truncation_policy: CodexTruncationPolicy,
     pub supports_parallel_tool_calls: bool,
@@ -1480,6 +1481,7 @@ pub fn build_codex_model_catalog_with_tool_mode(
                 priority,
                 base_instructions: CODEX_AGY_BASE_INSTRUCTIONS,
                 supports_reasoning_summaries: true,
+                default_reasoning_summary: "auto",
                 support_verbosity: false,
                 truncation_policy: CodexTruncationPolicy {
                     mode: "bytes",

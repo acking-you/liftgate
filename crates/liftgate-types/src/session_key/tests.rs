@@ -1475,6 +1475,7 @@ fn elastic_io_contracts_for_codex_and_claude_eliminate_serial_mcp_antipatterns()
         ("wait".to_owned(), "wait".to_owned()),
         ("exec_command".to_owned(), "exec_command".to_owned()),
         ("apply_patch".to_owned(), "apply_patch".to_owned()),
+        ("update_plan".to_owned(), "update_plan".to_owned()),
     ];
     let (codex_append, codex_spill) = build_session_system_append_for_mcp_with_spill_sink(
         Some(&format!(
@@ -1490,6 +1491,7 @@ fn elastic_io_contracts_for_codex_and_claude_eliminate_serial_mcp_antipatterns()
             orchestrator: Some(McpOrchestratorContract::CodexExec {
                 mcp_name: "exec",
                 has_apply_patch: true,
+                has_update_plan: true,
             }),
         },
         WebToolBridgeConfig::default(),
@@ -1503,10 +1505,21 @@ fn elastic_io_contracts_for_codex_and_claude_eliminate_serial_mcp_antipatterns()
     assert!(codex_append.contains("<example>"));
     assert!(codex_append.contains("Codex Code Mode & Elastic I/O (`mcp_lg_exec`)"));
     assert!(codex_append.contains("<= 8 KB"));
+    assert!(codex_append.contains("concise 1-sentence progress commentary"));
+    assert!(codex_append.contains("tools.update_plan"));
+    assert!(codex_append.contains("never in `Plan Mode`"));
     assert!(codex_append.contains("Coalesce surgical edits across 1-4 files"));
     assert!(codex_append.contains("Promise.allSettled(patches.map(p => tools.apply_patch(p)))"));
     assert!(!codex_append.contains("parallel `mcp_lg_*` calls"));
     assert!(!codex_append.contains("scope each `mcp_lg_apply_patch` call to a single target file"));
+    assert!(!codex_append.contains("without routine pre-tool preamble"));
+
+    let codex_no_plan_rules = orchestrator_contract_rules(McpOrchestratorContract::CodexExec {
+        mcp_name: "exec",
+        has_apply_patch: false,
+        has_update_plan: false,
+    });
+    assert!(!codex_no_plan_rules.contains("tools.update_plan"));
 
     // 2. Claude Code (`ClaudeBashFirst`): steers compound reads/checks into `mcp_lg_Bash` + `<= 8 KB`
     let claude_bridged = vec![

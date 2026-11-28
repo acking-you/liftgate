@@ -40,14 +40,15 @@ const BUILTIN_BASE_PROMPT_MIN_BYTES: usize = 1_500;
 /// Maximum UTF-8 bytes of trailing `gitStatus:` snapshot retained from a built-in system block.
 const MAX_PRESERVED_GIT_STATUS_BYTES: usize = 2_400;
 
-/// Compact Codex CLI & Codex App system contract (`< 760B`), delegating tool-routing rules to
-/// `<api_gateway_bridge_rules>` while overriding host `file://` and `<appDataDir>/brain` habits.
+/// Compact Codex CLI & Codex App system contract (`< 900B`), delegating tool-routing rules to
+/// `<api_gateway_bridge_rules>` while aligning live commentary + `update_plan` progress and
+/// overriding host `file://` and `<appDataDir>/brain` habits.
 pub const CODEX_DISTILLED_PROMPT: &str = "\
 You are a coding agent running in the Codex CLI. Be precise, safe, and concise.
 - Resolve the user's request end-to-end; inspect the workspace directly (`rg`, `rg --files`) rather than guessing, and validate changes with targeted checks.
 - Obey scoped `AGENTS.md` files (deeper overrides parent; user/developer instructions take precedence). Never commit or create git branches unless asked.
-- Call tools directly without routine pre-tool preamble chatter; reserve assistant text for findings, blockers, or the final answer.
-- Reply concisely in GitHub-flavored Markdown, wrap identifiers/paths/commands in backticks, and format file references as inline `path/to/file:line` (never emit `file://` URIs, `【F:...】` citations, or host `<appDataDir>/brain` artifacts).";
+- Share concise 1-sentence progress commentary before starting tool work and when shifting phases or uncovering key findings (skip pleasantries/filler and skip updates when nothing changed); for multi-step work when `update_plan` is available (never in `Plan Mode`), maintain a short 3-7 step plan with at most one `in_progress` step without repeating the checklist in prose.
+- Keep your final answer self-contained in GitHub-flavored Markdown (earlier commentary collapses once the final answer renders), wrap identifiers/paths/commands in backticks, and format file references as inline `path/to/file:line` (never emit `file://` URIs, `【F:...】` citations, or host `<appDataDir>/brain` artifacts).";
 
 /// Compact Claude Code (`claude`) system contract (`< 550B`).
 pub const CLAUDE_CODE_DISTILLED_PROMPT: &str = "\
@@ -1230,7 +1231,7 @@ fn compact_collaboration_mode(inner: &str) -> String {
     let lower_first = first_line.to_ascii_lowercase();
     if lower_first.contains("default") && !lower_first.contains("plan") {
         String::from(
-            "<collaboration_mode>Collaboration Mode: Default. Execute directly; ask one concise plain-text question only if blocked (never emit textual multiple-choice lists).</collaboration_mode>",
+            "<collaboration_mode>Collaboration Mode: Default. Execute end-to-end with brief milestone commentary; ask one concise plain-text question only if blocked (never emit textual multiple-choice lists).</collaboration_mode>",
         )
     } else {
         format!("<collaboration_mode>\n{trimmed}\n</collaboration_mode>")
@@ -1817,6 +1818,7 @@ fn demo() {}
         let extracted = extract_all_tag_blocks(user_env, "<INSTRUCTIONS>", "</INSTRUCTIONS>");
         assert_eq!(extracted.len(), 1);
         assert!(extracted[0].contains("# Project Rules"));
-        assert!(CODEX_DISTILLED_PROMPT.contains("without routine pre-tool preamble chatter"));
+        assert!(CODEX_DISTILLED_PROMPT.contains("concise 1-sentence progress commentary"));
+        assert!(CODEX_DISTILLED_PROMPT.contains("update_plan"));
     }
 }

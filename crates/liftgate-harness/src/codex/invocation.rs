@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use crate::args_util::slice_before_double_dash;
 
 pub const CODEX_STREAM_IDLE_TIMEOUT_KEY: &str = "model_providers.agy.stream_idle_timeout_ms";
+pub const CODEX_UPDATE_PLAN_ENABLED_KEY: &str = "tools.update_plan.enabled";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexInvocationKind {
@@ -169,6 +170,12 @@ pub fn has_explicit_codex_config_key(args: &[String], key: &str) -> bool {
         }
     }
     false
+}
+
+#[must_use]
+pub fn has_explicit_codex_update_plan_config(args: &[String]) -> bool {
+    has_explicit_codex_config_key(args, CODEX_UPDATE_PLAN_ENABLED_KEY)
+        || has_explicit_codex_config_key(args, "tools.update_plan")
 }
 
 #[must_use]

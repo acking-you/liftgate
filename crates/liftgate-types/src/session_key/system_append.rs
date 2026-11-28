@@ -113,10 +113,16 @@ pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> Str
         McpOrchestratorContract::CodexExec {
             mcp_name,
             has_apply_patch,
+            has_update_plan,
         } => {
             out.push_str(&format!(
-                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, call `mcp_lg_wait` on `cell_id`, and invoke `mcp_lg_*` tools directly without routine pre-tool preamble text. `tools.exec_command(...)` resolves to `{{ output, exit_code, session_id, wall_time_seconds }}` where `output` merges `stdout` + `stderr` and prepends truncation headers past `max_output_tokens`: before calling `JSON.parse(r.output)`, redirect `2>/dev/null` and emit a single JSON document (never NDJSON like `--jq '.[]'` or chained `&&` banners)."
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, call `mcp_lg_wait` on `cell_id`, and emit a concise 1-sentence progress commentary (ending with `.` / `。`, no pleasantries or filler) in the same turn right before calling `mcp_lg_*` when starting tool work, shifting phases, or reporting key findings. `tools.exec_command(...)` resolves to `{{ output, exit_code, session_id, wall_time_seconds }}` where `output` merges `stdout` + `stderr` and prepends truncation headers past `max_output_tokens`: before calling `JSON.parse(r.output)`, redirect `2>/dev/null` and emit a single JSON document (never NDJSON like `--jq '.[]'` or chained `&&` banners)."
             ));
+            if has_update_plan {
+                out.push_str(&format!(
+                    " For multi-step work (3+ steps, never in `Plan Mode`), maintain live step status at 0-RTT via `await tools.update_plan({{ explanation, plan }})` inside `mcp_lg_{mcp_name}` (or top-level `mcp_lg_update_plan` on non-`{mcp_name}` turns), keeping at most one `in_progress` step and marking all steps `completed` when done without repeating the checklist in prose."
+                ));
+            }
             if has_apply_patch {
                 out.push_str(&format!(
                     " Always call top-level `mcp_lg_apply_patch` directly for 1-4 file edits (never wrap 1-4 file patches in `tools.apply_patch` inside `mcp_lg_{mcp_name}`, avoiding JS template-literal backtick/`${{...}}` escaping errors and preserving 0-RTT V4A preflight). Only for 5+ file patches needing fault isolation after reading exact target lines, use `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` in `mcp_lg_{mcp_name}` (never `Promise.all` with `tools.apply_patch`, and escape inner backticks); when permissions allow non-interactive writes (never in `Plan Mode` or `read-only`), stream large new files + checks in one `exec_command`."

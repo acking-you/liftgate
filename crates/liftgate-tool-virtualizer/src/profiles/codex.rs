@@ -180,6 +180,13 @@ impl HarnessToolProfile for CodexToolProfile {
             has_apply_patch: client_tools
                 .iter()
                 .any(|t| t.name.eq_ignore_ascii_case("apply_patch")),
+            has_update_plan: client_tools
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case("update_plan"))
+                || spec
+                    .description
+                    .as_deref()
+                    .is_some_and(|d| d.contains("update_plan")),
         })
     }
 

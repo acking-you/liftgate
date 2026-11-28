@@ -91,7 +91,7 @@ pub fn resolve_codex_paths(
 }
 
 /// Non-destructively merges Liftgate's Codex provider (`[model_providers.agy]`), `[features]`
-/// Code Mode toggle, and root settings into an existing `config.toml` string, keeping top-level
+/// Code Mode toggle, `[tools.update_plan]`, and root settings into an existing `config.toml` string, keeping top-level
 /// keys before the first `[table]` header and preserving all unrelated `[mcp_servers.*]`,
 /// `[projects.*]`, `[profiles.*]`, and user `[features]` keys.
 #[must_use]
@@ -167,7 +167,15 @@ pub fn merge_codex_config_toml_with_mode(
         out.push_str("suppress_unstable_features_warning = true\n");
     }
 
-    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only, false);
+    let merged_tables = rewrite_codex_tables(
+        tables_part,
+        CodexTableRewriteOpts {
+            enable_code_mode: !no_code_mode,
+            enable_code_mode_only: code_mode_only,
+            isolate_desktop_features: false,
+            manage_update_plan: true,
+        },
+    );
     let trimmed_tables = merged_tables.trim();
     if !trimmed_tables.is_empty() {
         out.push('\n');
@@ -245,7 +253,15 @@ pub fn merge_isolated_codex_app_config_toml(
         out.push_str("suppress_unstable_features_warning = true\n");
     }
 
-    let merged_tables = rewrite_codex_tables(tables_part, !no_code_mode, code_mode_only, true);
+    let merged_tables = rewrite_codex_tables(
+        tables_part,
+        CodexTableRewriteOpts {
+            enable_code_mode: !no_code_mode,
+            enable_code_mode_only: code_mode_only,
+            isolate_desktop_features: true,
+            manage_update_plan: true,
+        },
+    );
     let trimmed_tables = merged_tables.trim();
     if !trimmed_tables.is_empty() {
         out.push('\n');
@@ -263,8 +279,8 @@ pub fn merge_isolated_codex_app_config_toml(
     out
 }
 
-/// Strips Liftgate's `[model_providers.agy]` section, managed `[features]` `code_mode` key, and
-/// managed root keys from `config.toml`.
+/// Strips Liftgate's `[model_providers.agy]` section, managed `[features]` `code_mode` key,
+/// managed `[tools.update_plan]` default, and managed root keys from `config.toml`.
 #[must_use]
 pub fn strip_codex_config_toml(existing: &str) -> String {
     let (root_part, tables_part) = split_toml_root_and_tables(existing);
@@ -281,7 +297,15 @@ pub fn strip_codex_config_toml(existing: &str) -> String {
         kept_root.pop();
     }
 
-    let stripped_tables = rewrite_codex_tables(tables_part, false, false, false);
+    let stripped_tables = rewrite_codex_tables(
+        tables_part,
+        CodexTableRewriteOpts {
+            enable_code_mode: false,
+            enable_code_mode_only: false,
+            isolate_desktop_features: false,
+            manage_update_plan: false,
+        },
+    );
     let trimmed_tables = stripped_tables.trim();
 
     let mut out = String::new();
@@ -415,6 +439,32 @@ pub fn parse_toml_assignment_key(line: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
+fn parse_toml_bool_assignment(line: &str) -> Option<(&str, bool)> {
+    let key = parse_toml_assignment_key(line)?;
+    let (_, rhs) = line.split_once('=')?;
+    let val = rhs.split('#').next().unwrap_or(rhs).trim();
+    match val {
+        "true" => Some((key, true)),
+        "false" => Some((key, false)),
+        _ => None,
+    }
+}
+
+fn is_tools_update_plan_section(sec_name: &str) -> bool {
+    matches!(
+        sec_name,
+        "tools.update_plan" | "tools.\"update_plan\"" | "tools.'update_plan'"
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CodexTableRewriteOpts {
+    enable_code_mode: bool,
+    enable_code_mode_only: bool,
+    isolate_desktop_features: bool,
+    manage_update_plan: bool,
+}
+
 fn is_ephemeral_bundled_marketplace_table(sec_name: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "marketplaces.openai-bundled",
@@ -429,12 +479,7 @@ fn is_ephemeral_bundled_marketplace_table(sec_name: &str) -> bool {
     })
 }
 
-fn rewrite_codex_tables(
-    tables_part: &str,
-    enable_code_mode: bool,
-    enable_code_mode_only: bool,
-    isolate_desktop_features: bool,
-) -> String {
+fn rewrite_codex_tables(tables_part: &str, opts: CodexTableRewriteOpts) -> String {
     let mut sections: Vec<(String, String, Vec<&str>)> = Vec::new();
     for line in tables_part.split_inclusive('\n') {
         if let Some(sec_name) = is_toml_section_header(line) {
@@ -446,6 +491,7 @@ fn rewrite_codex_tables(
 
     let mut rendered_sections: Vec<String> = Vec::new();
     let mut saw_features = false;
+    let mut saw_update_plan = false;
 
     for (sec_name, header, body) in sections {
         if sec_name == "model_providers.agy" || sec_name.starts_with("model_providers.agy.") {
@@ -455,7 +501,7 @@ fn rewrite_codex_tables(
         // `~/.codex/.tmp/bundled-marketplaces/openai-bundled`; copying that path into an
         // ephemeral `CODEX_HOME` makes Codex App reject its own ephemeral bundled marketplace
         // (`marketplace 'openai-bundled' is already added from a different source`).
-        if isolate_desktop_features && is_ephemeral_bundled_marketplace_table(&sec_name) {
+        if opts.isolate_desktop_features && is_ephemeral_bundled_marketplace_table(&sec_name) {
             continue;
         }
         if sec_name == "features" {
@@ -465,7 +511,7 @@ fn rewrite_codex_tables(
                 .filter(|l| {
                     let key = parse_toml_assignment_key(l);
                     !matches!(key, Some("code_mode" | "code_mode_only"))
-                        && !(isolate_desktop_features
+                        && !(opts.isolate_desktop_features
                             && key.is_some_and(|k| ISOLATED_DESKTOP_DISABLED_FEATURES.contains(&k)))
                 })
                 .collect();
@@ -473,16 +519,16 @@ fn rewrite_codex_tables(
                 kept.pop();
             }
             let mut managed_feature_lines: Vec<String> = Vec::new();
-            if enable_code_mode {
+            if opts.enable_code_mode {
                 managed_feature_lines.push("code_mode = true".to_owned());
-                if enable_code_mode_only {
+                if opts.enable_code_mode_only {
                     managed_feature_lines.push("code_mode_only = true".to_owned());
                 }
-            } else if isolate_desktop_features {
+            } else if opts.isolate_desktop_features {
                 managed_feature_lines.push("code_mode = false".to_owned());
                 managed_feature_lines.push("code_mode_only = false".to_owned());
             }
-            if isolate_desktop_features {
+            if opts.isolate_desktop_features {
                 for feat in ISOLATED_DESKTOP_DISABLED_FEATURES {
                     managed_feature_lines.push(format!("{feat} = false"));
                 }
@@ -505,6 +551,67 @@ fn rewrite_codex_tables(
             }
             continue;
         }
+        if is_tools_update_plan_section(&sec_name) {
+            saw_update_plan = true;
+            let explicitly_disabled = body
+                .iter()
+                .any(|l| parse_toml_bool_assignment(l) == Some(("enabled", false)));
+            if opts.manage_update_plan {
+                if explicitly_disabled {
+                    let mut block = String::new();
+                    block.push_str(&header);
+                    block.push('\n');
+                    for l in body {
+                        block.push_str(l);
+                    }
+                    rendered_sections.push(block.trim_end().to_owned());
+                } else {
+                    let mut kept: Vec<&str> = body
+                        .into_iter()
+                        .filter(|l| parse_toml_assignment_key(l) != Some("enabled"))
+                        .collect();
+                    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+                        kept.pop();
+                    }
+                    let mut block = String::new();
+                    block.push_str(&header);
+                    block.push_str("\nenabled = true");
+                    if !kept.is_empty() {
+                        block.push('\n');
+                        for l in kept {
+                            block.push_str(l);
+                        }
+                    }
+                    rendered_sections.push(block.trim_end().to_owned());
+                }
+            } else {
+                let mut kept: Vec<&str> = body
+                    .into_iter()
+                    .filter(|l| parse_toml_bool_assignment(l) != Some(("enabled", true)))
+                    .collect();
+                while kept.last().is_some_and(|l| l.trim().is_empty()) {
+                    kept.pop();
+                }
+                if kept.iter().any(|l| !l.trim().is_empty()) {
+                    let mut block = String::new();
+                    block.push_str(&header);
+                    block.push('\n');
+                    for l in kept {
+                        block.push_str(l);
+                    }
+                    rendered_sections.push(block.trim_end().to_owned());
+                }
+            }
+            continue;
+        }
+        if sec_name == "tools"
+            && body.iter().any(|l| {
+                parse_toml_assignment_key(l)
+                    .is_some_and(|k| k == "update_plan" || k.starts_with("update_plan."))
+            })
+        {
+            saw_update_plan = true;
+        }
 
         let mut block = String::new();
         block.push_str(&header);
@@ -515,22 +622,25 @@ fn rewrite_codex_tables(
         rendered_sections.push(block.trim_end().to_owned());
     }
 
-    if !saw_features && (enable_code_mode || isolate_desktop_features) {
+    if !saw_features && (opts.enable_code_mode || opts.isolate_desktop_features) {
         let mut block = String::from("[features]");
-        if enable_code_mode {
+        if opts.enable_code_mode {
             block.push_str("\ncode_mode = true");
-            if enable_code_mode_only {
+            if opts.enable_code_mode_only {
                 block.push_str("\ncode_mode_only = true");
             }
-        } else if isolate_desktop_features {
+        } else if opts.isolate_desktop_features {
             block.push_str("\ncode_mode = false\ncode_mode_only = false");
         }
-        if isolate_desktop_features {
+        if opts.isolate_desktop_features {
             for feat in ISOLATED_DESKTOP_DISABLED_FEATURES {
                 block.push_str(&format!("\n{feat} = false"));
             }
         }
         rendered_sections.push(block);
+    }
+    if !saw_update_plan && opts.manage_update_plan {
+        rendered_sections.push("[tools.update_plan]\nenabled = true".to_owned());
     }
 
     rendered_sections.join("\n\n")

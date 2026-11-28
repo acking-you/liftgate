@@ -12864,7 +12864,7 @@ async fn codex_sse_flushes_commentary_to_restore_working_indicator_and_preserves
         "description": "Run JavaScript code to orchestrate/compose tool calls"
     });
 
-    // --- Case 1: Idle commentary flush restores Codex TUI `Working` indicator in 800ms (not 15s) ---
+    // --- Case 1: Idle commentary flush restores Codex TUI `Working` indicator in 450ms (not 15s) ---
     let mut stream_fut = tokio::spawn({
         let app = app.clone();
         let tool = codex_exec_tool.clone();
@@ -12912,7 +12912,7 @@ async fn codex_sse_flushes_commentary_to_restore_working_indicator_and_preserves
         early_sse.contains("event: response.output_item.done")
             && early_sse.contains("\"phase\":\"commentary\"")
             && early_sse.contains("正在检查当前工作区的最近改动与状态。"),
-        "commentary message must finalize with phase=commentary within <2s (800ms idle boundary) before 15s tool generation finishes; got:\n{early_sse}"
+        "commentary message must finalize with phase=commentary within <2s (450ms idle boundary) before 15s tool generation finishes; got:\n{early_sse}"
     );
     assert!(
         !early_sse.contains("\"type\":\"custom_tool_call\""),
