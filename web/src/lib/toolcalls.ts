@@ -359,6 +359,7 @@ export interface ToolCallFilter {
   kind: ToolKind | "all";
   session: string;
   errorsOnly: boolean;
+  spilledOnly: boolean;
 }
 
 export const EMPTY_FILTER: ToolCallFilter = {
@@ -367,6 +368,7 @@ export const EMPTY_FILTER: ToolCallFilter = {
   kind: "all",
   session: "all",
   errorsOnly: false,
+  spilledOnly: false,
 };
 
 export function isFilterActive(f: ToolCallFilter): boolean {
@@ -375,7 +377,8 @@ export function isFilterActive(f: ToolCallFilter): boolean {
     f.harness !== "all" ||
     f.kind !== "all" ||
     f.session !== "all" ||
-    f.errorsOnly
+    f.errorsOnly ||
+    f.spilledOnly
   );
 }
 
@@ -383,6 +386,7 @@ export function filterToolCalls(records: ToolCallRecord[], f: ToolCallFilter): T
   const q = f.query.trim().toLowerCase();
   return records.filter((rec) => {
     if (f.errorsOnly && !isFailure(rec)) return false;
+    if (f.spilledOnly && !rec.output_spilled) return false;
     if (f.harness !== "all" && rec.harness_profile !== f.harness) return false;
     if (f.session !== "all" && rec.session_id !== f.session) return false;
     if (f.kind !== "all" && recordKind(rec) !== f.kind) return false;

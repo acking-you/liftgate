@@ -501,9 +501,13 @@ export interface ToolCallDetail extends ToolCallRecord {
   /** Arguments forwarded to the client after unwrapping or repair (null when unchanged). */
   client_arguments?: string | null;
   output_blocks: ToolOutputBlock[];
+  /** Output text handed back to the model after spill or gateway annotation. */
+  forwarded_output?: string | null;
+  forwarded_output_bytes?: number | null;
   /** True when the per-field byte cap clipped the stored input or output. */
   input_truncated?: boolean;
   output_truncated?: boolean;
+  forwarded_output_truncated?: boolean;
 }
 
 /** Ring-buffer status carried on the snapshot as `tool_call_telemetry`. */
@@ -636,6 +640,34 @@ export interface ContextCaptureRecord {
   delta_message_count: number;
   payload_bytes: number;
   prompt_preview: string;
+  /** Places lg rewrote the harness context before forwarding; absent on older captures. */
+  rewrite_count?: number;
+}
+
+export type ContextRewriteKind =
+  | "prompt_distilled"
+  | "prompt_dropped"
+  | "tool_result_sanitized"
+  | "tool_result_spilled";
+
+/** One gateway change to the harness context: what the harness sent and what went upstream. */
+export interface ContextRewrite {
+  kind: ContextRewriteKind | (string & {});
+  /** Index into `messages` of the rewritten message. */
+  message_index?: number | null;
+  part_index?: number | null;
+  /** Wire slot of a rewritten prompt: `primary_base`, `anthropic_system`, or `developer_item`. */
+  slot?: string | null;
+  call_id?: string | null;
+  tool_name?: string | null;
+  /** Sizes before any capture cap. */
+  original_bytes: number;
+  rewritten_bytes: number;
+  original: string;
+  /** Absent when the gateway dropped the part entirely. */
+  rewritten?: string | null;
+  /** `true` when `original` or `rewritten` hit the per-part or total capture cap. */
+  truncated?: boolean;
 }
 
 export interface ContextCapturesResponse {
@@ -652,6 +684,8 @@ export interface FullContextPayload extends LowCacheFullRequestPayload {
   assistant_reasoning_truncated?: boolean;
   /** Output beyond the per-field capture cap was dropped. */
   assistant_output_truncated?: boolean;
+  /** Every place lg changed the harness context before forwarding it, in message order. */
+  rewrites?: ContextRewrite[];
 }
 
 /** `GET /api/telemetry/context-captures/{task_id}`. */

@@ -625,6 +625,87 @@ pub fn distill_anthropic_system_prompt(
     Some(out_parts.join("\n\n"))
 }
 
+/// Result of distilling one protocol developer slot's text.
+enum SlotDistillation {
+    /// The slot does not apply to this text (not a wrapped developer block); keep it verbatim.
+    Keep,
+    /// Forward this text instead.
+    Replace(String),
+    /// Forward nothing for this part.
+    Drop,
+}
+
+/// Marks the base prompt as consumed by a slot lying before the rendered range.
+fn note_slot_outside_range(kind: &ProtocolDeveloperSlotKind, consumed_base_slot: &mut bool) {
+    match kind {
+        ProtocolDeveloperSlotKind::PrimaryBase
+        | ProtocolDeveloperSlotKind::AnthropicSystem { .. } => {
+            *consumed_base_slot = true;
+        }
+        ProtocolDeveloperSlotKind::DeveloperItem {
+            allow_standalone_base,
+        } => {
+            if *allow_standalone_base {
+                *consumed_base_slot = true;
+            }
+        }
+    }
+}
+
+/// Distills the text of one protocol developer slot; the single source of truth shared by
+/// [`apply_developer_slots_to_slice`] and [`explain_developer_slot_rewrites`].
+fn distill_slot_text(
+    harness: DetectedHarness,
+    kind: &ProtocolDeveloperSlotKind,
+    text: &str,
+    consumed_base_slot: &mut bool,
+) -> SlotDistillation {
+    let wrapped_or_drop = |body: &str| {
+        wrap_developer_instructions_block(body)
+            .map_or(SlotDistillation::Drop, SlotDistillation::Replace)
+    };
+    match kind {
+        ProtocolDeveloperSlotKind::PrimaryBase => {
+            *consumed_base_slot = true;
+            let Some(inner) = unwrap_developer_instructions(text) else {
+                return SlotDistillation::Keep;
+            };
+            wrapped_or_drop(&distill_harness_base_prompt(harness, inner))
+        }
+        ProtocolDeveloperSlotKind::AnthropicSystem {
+            segments,
+            json_schema_directive,
+        } => {
+            *consumed_base_slot = true;
+            let mut distilled_parts = Vec::new();
+            if let Some(distilled) = distill_anthropic_system_prompt(harness, segments) {
+                distilled_parts.push(distilled);
+            }
+            if let Some(directive) = json_schema_directive {
+                distilled_parts.push(directive.clone());
+            }
+            wrapped_or_drop(&distilled_parts.join("\n\n"))
+        }
+        ProtocolDeveloperSlotKind::DeveloperItem {
+            allow_standalone_base,
+        } => {
+            let Some(inner) = unwrap_developer_instructions(text) else {
+                return SlotDistillation::Keep;
+            };
+            if !*consumed_base_slot
+                && *allow_standalone_base
+                && looks_like_standalone_base_prompt(inner)
+            {
+                *consumed_base_slot = true;
+                wrapped_or_drop(&distill_harness_base_prompt(harness, inner))
+            } else {
+                distill_harness_developer_item(harness, inner)
+                    .map_or(SlotDistillation::Drop, |item| wrapped_or_drop(&item))
+            }
+        }
+    }
+}
+
 /// Applies outbound prompt distillation strictly to protocol-originated developer/system slots in
 /// `slice` (representing `messages[range_start..]`).
 ///
@@ -646,89 +727,21 @@ pub fn apply_developer_slots_to_slice(
 
     for slot in slots {
         let Some(rel_msg_idx) = slot.msg_index.checked_sub(range_start) else {
-            match &slot.kind {
-                ProtocolDeveloperSlotKind::PrimaryBase
-                | ProtocolDeveloperSlotKind::AnthropicSystem { .. } => {
-                    consumed_base_slot = true;
-                }
-                ProtocolDeveloperSlotKind::DeveloperItem {
-                    allow_standalone_base,
-                } => {
-                    if *allow_standalone_base {
-                        consumed_base_slot = true;
-                    }
-                }
-            }
+            note_slot_outside_range(&slot.kind, &mut consumed_base_slot);
             continue;
         };
-
         let Some(msg) = slice.get_mut(rel_msg_idx) else {
             continue;
         };
         let Some(CanonicalPart::Text(text)) = msg.parts.get_mut(slot.part_index) else {
             continue;
         };
-
-        match &slot.kind {
-            ProtocolDeveloperSlotKind::PrimaryBase => {
-                consumed_base_slot = true;
-                let Some(inner) = unwrap_developer_instructions(text) else {
-                    continue;
-                };
-                let distilled = distill_harness_base_prompt(harness, inner);
-                if let Some(wrapped) = wrap_developer_instructions_block(&distilled) {
-                    *text = wrapped;
-                } else {
-                    dropped_coords.insert((rel_msg_idx, slot.part_index));
-                    touched_msgs.insert(rel_msg_idx);
-                }
-            }
-            ProtocolDeveloperSlotKind::AnthropicSystem {
-                segments,
-                json_schema_directive,
-            } => {
-                consumed_base_slot = true;
-                let mut distilled_parts = Vec::new();
-                if let Some(distilled) = distill_anthropic_system_prompt(harness, segments) {
-                    distilled_parts.push(distilled);
-                }
-                if let Some(directive) = json_schema_directive {
-                    distilled_parts.push(directive.clone());
-                }
-                let joined = distilled_parts.join("\n\n");
-                if let Some(wrapped) = wrap_developer_instructions_block(&joined) {
-                    *text = wrapped;
-                } else {
-                    dropped_coords.insert((rel_msg_idx, slot.part_index));
-                    touched_msgs.insert(rel_msg_idx);
-                }
-            }
-            ProtocolDeveloperSlotKind::DeveloperItem {
-                allow_standalone_base,
-            } => {
-                let Some(inner) = unwrap_developer_instructions(text) else {
-                    continue;
-                };
-                if !consumed_base_slot
-                    && *allow_standalone_base
-                    && looks_like_standalone_base_prompt(inner)
-                {
-                    consumed_base_slot = true;
-                    let distilled = distill_harness_base_prompt(harness, inner);
-                    if let Some(wrapped) = wrap_developer_instructions_block(&distilled) {
-                        *text = wrapped;
-                    } else {
-                        dropped_coords.insert((rel_msg_idx, slot.part_index));
-                        touched_msgs.insert(rel_msg_idx);
-                    }
-                } else if let Some(distilled_item) = distill_harness_developer_item(harness, inner)
-                    && let Some(wrapped) = wrap_developer_instructions_block(&distilled_item)
-                {
-                    *text = wrapped;
-                } else {
-                    dropped_coords.insert((rel_msg_idx, slot.part_index));
-                    touched_msgs.insert(rel_msg_idx);
-                }
+        match distill_slot_text(harness, &slot.kind, text, &mut consumed_base_slot) {
+            SlotDistillation::Keep => {}
+            SlotDistillation::Replace(next) => *text = next,
+            SlotDistillation::Drop => {
+                dropped_coords.insert((rel_msg_idx, slot.part_index));
+                touched_msgs.insert(rel_msg_idx);
             }
         }
     }
@@ -751,6 +764,67 @@ pub fn apply_developer_slots_to_slice(
             !drop_empty
         });
     }
+}
+
+/// One protocol developer slot whose forwarded text differs from what the harness sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeveloperSlotRewrite<'a> {
+    pub msg_index: usize,
+    pub part_index: usize,
+    pub slot: &'static str,
+    /// The harness's text as held in `messages`.
+    pub original: &'a str,
+    /// The forwarded text; `None` when the part was dropped.
+    pub rewritten: Option<String>,
+}
+
+/// Stable wire label of a developer slot kind.
+#[must_use]
+pub const fn developer_slot_label(kind: &ProtocolDeveloperSlotKind) -> &'static str {
+    match kind {
+        ProtocolDeveloperSlotKind::PrimaryBase => "primary_base",
+        ProtocolDeveloperSlotKind::AnthropicSystem { .. } => "anthropic_system",
+        ProtocolDeveloperSlotKind::DeveloperItem { .. } => "developer_item",
+    }
+}
+
+/// Lists, for the whole of `messages`, every developer slot that outbound distillation rewrites
+/// or drops, using the exact per-slot logic of [`apply_developer_slots_to_slice`] (rendering from
+/// any `range_start` distills each slot identically, so this also describes earlier turns).
+#[must_use]
+pub fn explain_developer_slot_rewrites<'a>(
+    harness: DetectedHarness,
+    slots: &[ProtocolDeveloperSlot],
+    messages: &'a [CanonicalMessage],
+) -> Vec<DeveloperSlotRewrite<'a>> {
+    if distilled_harness_system_prompt(harness).is_none() {
+        return Vec::new();
+    }
+    let mut consumed_base_slot = false;
+    let mut out = Vec::new();
+    for slot in slots {
+        let Some(CanonicalPart::Text(text)) = messages
+            .get(slot.msg_index)
+            .and_then(|msg| msg.parts.get(slot.part_index))
+        else {
+            continue;
+        };
+        let rewritten = match distill_slot_text(harness, &slot.kind, text, &mut consumed_base_slot)
+        {
+            SlotDistillation::Keep => continue,
+            SlotDistillation::Replace(next) if next == *text => continue,
+            SlotDistillation::Replace(next) => Some(next),
+            SlotDistillation::Drop => None,
+        };
+        out.push(DeveloperSlotRewrite {
+            msg_index: slot.msg_index,
+            part_index: slot.part_index,
+            slot: developer_slot_label(&slot.kind),
+            original: text,
+            rewritten,
+        });
+    }
+    out
 }
 
 /// Distills a single `role: "developer" | "system"` message item (outside the primary
@@ -1427,6 +1501,53 @@ mod tests {
                 parameters_json: schema.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn explained_slot_rewrites_match_the_forwarded_render() {
+        use crate::canonical::CanonicalRole;
+
+        let base = format!(
+            "<developer_instructions>\nYou are Codex, a coding agent.\n{}\n</developer_instructions>",
+            "Follow the harness tutorial. ".repeat(200)
+        );
+        let messages = vec![
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text(base.clone())],
+            },
+            CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("hello".to_owned())],
+            },
+        ];
+        let slots = vec![ProtocolDeveloperSlot {
+            msg_index: 0,
+            part_index: 0,
+            kind: ProtocolDeveloperSlotKind::PrimaryBase,
+        }];
+        let explained = explain_developer_slot_rewrites(DetectedHarness::Codex, &slots, &messages);
+        assert_eq!(explained.len(), 1);
+        let rewrite = explained.first().expect("one rewrite");
+        assert_eq!(
+            (rewrite.msg_index, rewrite.part_index, rewrite.slot),
+            (0, 0, "primary_base")
+        );
+        assert_eq!(rewrite.original, base);
+
+        let mut rendered = messages.clone();
+        apply_developer_slots_to_slice(DetectedHarness::Codex, &slots, 0, &mut rendered);
+        let forwarded = rendered
+            .first()
+            .and_then(|msg| msg.parts.first())
+            .and_then(|part| match part {
+                CanonicalPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            });
+        assert_eq!(rewrite.rewritten.as_deref(), forwarded);
+        assert!(
+            explain_developer_slot_rewrites(DetectedHarness::Generic, &slots, &messages).is_empty()
+        );
     }
 
     #[test]

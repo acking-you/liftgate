@@ -115,7 +115,7 @@ export function partBytes(part: CapturedFullMessage["parts"][number]): number {
   return part.kind === "image" ? part.base64_bytes : part.bytes;
 }
 
-const PART_KIND_ORDER: readonly PartKindId[] = [
+export const PART_KIND_ORDER: readonly PartKindId[] = [
   "instructions",
   "text",
   "reasoning",

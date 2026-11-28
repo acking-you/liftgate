@@ -160,6 +160,7 @@ pub(crate) struct TurnRoutingMetadata {
     base_state_hash_hex: String,
     acp_system_append: Option<String>,
     tools_delta_xml: Option<String>,
+    distill_harness: Option<liftgate_types::harness_prompt::DetectedHarness>,
 }
 
 /// Shared gateway runtime configuration.
@@ -627,6 +628,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         base_state_hash_hex,
                         acp_system_append: None,
                         tools_delta_xml: tools_delta,
+                        distill_harness: req.distillation_harness_with(outbound_harness),
                     };
                     return Ok((guard, true, false, prompt_blocks, combined, route_meta));
                 }
@@ -751,6 +753,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                         ),
                         acp_system_append: None,
                         tools_delta_xml: tools_delta,
+                        distill_harness: req.distillation_harness_with(outbound_harness),
                     };
                     return Ok((
                         guard,
@@ -834,6 +837,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                     ),
                     acp_system_append: None,
                     tools_delta_xml: directive,
+                    distill_harness: None,
                 };
                 return Ok((
                     guard,
@@ -966,6 +970,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 base_state_hash_hex: String::new(),
                 acp_system_append: None,
                 tools_delta_xml: None,
+                distill_harness: None,
             }
         } else {
             let cold_routing = compute_routing_plan(
@@ -999,6 +1004,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
                 ),
                 acp_system_append: Some(system_append),
                 tools_delta_xml: initial_tools_spill,
+                distill_harness: req.distillation_harness(),
             }
         };
 
@@ -2383,6 +2389,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                 outbound_acp_blocks: &initial_acp_blocks,
                 messages: &full_messages,
                 client_tools: &req.client_tools,
+                distill_harness: route_meta.distill_harness,
+                developer_slots: &req.developer_slots,
             };
             task_guard.complete_with_diagnostics(
                 complete_stop_reason,
@@ -2434,6 +2442,8 @@ async fn run_turn_pipeline<B: AcpBackend>(
                     outbound_acp_blocks: &initial_acp_blocks,
                     messages: pre_reply_slice,
                     client_tools: &req.client_tools,
+                    distill_harness: route_meta.distill_harness,
+                    developer_slots: &req.developer_slots,
                 };
                 task_guard.complete_with_diagnostics(
                     complete_stop_reason,
@@ -4356,6 +4366,8 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
     channel_cap: usize,
     mut spill_store: Option<SpillStore>,
 ) -> ActiveTurnStream {
+    let distill_harness =
+        req.distillation_harness_with(detect_harness_by_tools(&promoted.declared_tools));
     let tools_delta = sync_and_build_warm_tools_delta(
         step_lease.mcp_handle(),
         &promoted.declared_tools,
@@ -4402,6 +4414,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
         base_state_hash_hex: format_conversation_hash_hex(&base_state_hash),
         acp_system_append: None,
         tools_delta_xml: tools_delta.clone(),
+        distill_harness,
     };
 
     let turn_cancel = CancellationToken::new();
@@ -4459,7 +4472,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             &delta_for_reply,
             tools_delta.as_deref(),
             &mut spill_store,
-            task_guard.hub(),
+            &task_guard,
         );
         task_guard
             .record_mcp_tool_results(built_replies.total_results, built_replies.spilled_results);
@@ -4605,6 +4618,22 @@ fn sanitize_mcp_tool_result_text(
         sanitized.push_str(
             "\n[Hint: re-read the failed file's exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated), then retry `mcp_lg_apply_patch` for only the failed file with 1-3 exact unchanged context lines.]",
         );
+    } else if matches!(client_tool_name, "exec" | "execute")
+        && crate::tool_calls::reports_script_failure(&sanitized)
+    {
+        if sanitized.contains("SyntaxError:") && sanitized.contains("JSON.parse") {
+            sanitized.push_str(
+                "\n[Hint: `tools.exec_command(...).output` merges `stdout` + `stderr` (e.g. CLI `hint:` / `warning:` lines) and prepends truncation headers past `max_output_tokens`; redirect `2>/dev/null` and emit a single JSON document (or parse NDJSON line-by-line) before calling `JSON.parse`.]",
+            );
+        } else if sanitized.contains("apply_patch verification failed:") {
+            sanitized.push_str(
+                "\n[Hint: re-read the failed file's exact target line range verbatim first, then invoke top-level `mcp_lg_apply_patch` directly for 1-4 files (which runs 0-RTT V4A preflight without JS string escaping) or wrap 5+ file patches in `await Promise.allSettled(...)` so one hunk mismatch does not abort the script.]",
+            );
+        } else if sanitized.contains("SyntaxError:") {
+            sanitized.push_str(
+                "\n[Hint: JavaScript syntax error in Code Mode script — check for unescaped backticks (`` ` ``) or `${...}` interpolations inside template literals; use JSON-quoted strings or invoke top-level `mcp_lg_apply_patch` directly instead of embedding raw patch/markdown text in JS backticks.]",
+            );
+        }
     }
     (sanitized, spilled)
 }
@@ -4621,8 +4650,9 @@ fn build_mcp_tool_replies(
     delta_messages: &[CanonicalMessage],
     tools_delta_xml: Option<&str>,
     spill_store: &mut Option<SpillStore>,
-    telemetry: &TelemetryHub,
+    task_guard: &ActiveTaskGuard,
 ) -> BuiltMcpToolReplies {
+    let telemetry = task_guard.hub();
     let mut result_images: HashMap<String, Vec<crate::tool_calls::ToolOutputImage>> =
         trailing_tool_results(delta_messages)
             .into_iter()
@@ -4692,9 +4722,20 @@ fn build_mcp_tool_replies(
             .unwrap_or_else(|| (String::new(), false));
         let (sanitized, did_spill) =
             sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        if sanitized != raw_out {
+            task_guard.record_tool_result_rewrite(
+                &pending.call_id,
+                &pending.nonce_suffix,
+                &pending.client_name,
+                &raw_out,
+                &sanitized,
+                did_spill,
+            );
+        }
         telemetry.finish_client_tool_call(
             &pending.call_id,
             &raw_out,
+            Some(&sanitized),
             is_error,
             did_spill,
             result_images
@@ -6038,6 +6079,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                     outbound_acp_blocks: &cur_outbound_blocks,
                     messages: pre_reply_slice,
                     client_tools: &cur_req.client_tools,
+                    distill_harness: cur_route_meta.distill_harness,
+                    developer_slots: &cur_req.developer_slots,
                 };
                 cur_task_guard.complete_with_diagnostics(
                     "tool_use".to_owned(),
@@ -6486,6 +6529,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                             outbound_acp_blocks: &cur_outbound_blocks,
                             messages: &cur_full_messages,
                             client_tools: &cur_req.client_tools,
+                            distill_harness: cur_route_meta.distill_harness,
+                            developer_slots: &cur_req.developer_slots,
                         };
                         cur_task_guard.complete_with_diagnostics(
                             complete_stop,
@@ -6542,6 +6587,8 @@ async fn run_mcp_session_driver<B: AcpBackend>(
                                 outbound_acp_blocks: &cur_outbound_blocks,
                                 messages: pre_reply_slice,
                                 client_tools: &cur_req.client_tools,
+                                distill_harness: cur_route_meta.distill_harness,
+                                developer_slots: &cur_req.developer_slots,
                             };
                             cur_task_guard.complete_with_diagnostics(
                                 complete_stop,
@@ -6926,5 +6973,25 @@ mod tests {
             cache_summary.total_cached_read_tokens,
             auth_total.cached_read_tokens
         );
+    }
+
+    #[test]
+    fn sanitize_mcp_tool_result_appends_exec_json_parse_hint() {
+        let err_out = "Script failed\nWall time 0.8 seconds\nOutput:\n\nScript error:\nSyntaxError: Unexpected non-whitespace character after JSON at position 26635 (line 1 column 26636)\n    at JSON.parse (<anonymous>)\n    at exec_main.mjs:21:23";
+        let mut spill = None;
+        let (sanitized, did_spill) = sanitize_mcp_tool_result_text(err_out, "exec", &mut spill);
+        assert!(!did_spill);
+        assert!(sanitized.contains("tools.exec_command(...).output"));
+        assert!(sanitized.contains("2>/dev/null"));
+
+        let syntax_out = "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nSyntaxError: missing ) after argument list";
+        let (sanitized_syn, _) = sanitize_mcp_tool_result_text(syntax_out, "exec", &mut spill);
+        assert!(sanitized_syn.contains("unescaped backticks"));
+        assert!(sanitized_syn.contains("mcp_lg_apply_patch"));
+
+        let patch_out = "Script failed\nWall time 0.1 seconds\nOutput:\n\nScript error:\napply_patch verification failed: Failed to find expected lines in src/lib.rs:";
+        let (sanitized_patch, _) = sanitize_mcp_tool_result_text(patch_out, "exec", &mut spill);
+        assert!(sanitized_patch.contains("re-read the failed file's exact target line range"));
+        assert!(sanitized_patch.contains("Promise.allSettled"));
     }
 }

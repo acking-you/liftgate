@@ -520,6 +520,9 @@ export function Disclosure({
   children: React.ReactNode;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(defaultOpen);
+  React.useEffect(() => {
+    if (defaultOpen) setOpen(true);
+  }, [defaultOpen]);
   return (
     <div className="lg-part" data-tone={tone}>
       <button
