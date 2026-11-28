@@ -762,6 +762,8 @@ dependencies = [
  "clap_complete",
  "comfy-table",
  "crossterm",
+ "liftgate-auto-update",
+ "liftgate-auto-update-tui",
  "liftgate-core",
  "liftgate-server",
  "liftgate-types",
@@ -775,6 +777,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "liftgate-auto-update"
+version = "0.2.23"
+dependencies = [
+ "liftgate-harness",
+ "liftgate-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "liftgate-auto-update-tui"
+version = "0.2.23"
+dependencies = [
+ "crossterm",
+ "liftgate-auto-update",
+ "liftgate-types",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
+name = "liftgate-codemode-js"
+version = "0.2.23"
+
+[[package]]
 name = "liftgate-core"
 version = "0.2.23"
 dependencies = [
@@ -783,6 +814,7 @@ dependencies = [
  "dunce",
  "flate2",
  "libc",
+ "liftgate-auto-update",
  "liftgate-harness",
  "liftgate-server",
  "liftgate-types",
@@ -846,6 +878,7 @@ dependencies = [
 name = "liftgate-types"
 version = "0.2.23"
 dependencies = [
+ "liftgate-codemode-js",
  "serde",
  "serde_json",
  "sha2",

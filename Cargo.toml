@@ -1,9 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/liftgate-codemode-js",
     "crates/liftgate-types",
     "crates/liftgate-tool-virtualizer",
     "crates/liftgate-harness",
+    "crates/liftgate-auto-update",
+    "crates/liftgate-auto-update-tui",
     "crates/liftgate-server",
     "crates/liftgate-core",
     "crates/liftgate",
@@ -17,9 +20,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/acking-you/liftgate"
 
 [workspace.dependencies]
+liftgate-codemode-js = { path = "crates/liftgate-codemode-js", default-features = false }
 liftgate-types = { path = "crates/liftgate-types", default-features = false }
 liftgate-tool-virtualizer = { path = "crates/liftgate-tool-virtualizer", default-features = false }
 liftgate-harness = { path = "crates/liftgate-harness", default-features = false }
+liftgate-auto-update = { path = "crates/liftgate-auto-update", default-features = false }
+liftgate-auto-update-tui = { path = "crates/liftgate-auto-update-tui", default-features = false }
 liftgate-server = { path = "crates/liftgate-server", default-features = false }
 liftgate-core = { path = "crates/liftgate-core", default-features = false }
 

@@ -65,7 +65,7 @@ pub fn code_mode_exec_input_schema() -> Value {
         "properties": {
             "code": {
                 "type": "string",
-                "description": "Raw JavaScript source code to execute in the Code Mode runtime (do not wrap in markdown code fences). `tools.exec_command(...)` returns `{ output, exit_code, session_id, wall_time_seconds }` with `stdout` + `stderr` merged in `output` (redirect `2>/dev/null` and emit one JSON document before `JSON.parse(r.output)`). Prefer top-level `mcp_lg_apply_patch` for 1-4 file edits; if passing strings inside JS template literals, escape inner backticks (`\\``) and `${...}`."
+                "description": "Raw JavaScript source code to execute in the bare-V8 Code Mode runtime (do not wrap in markdown code fences; no Node `Buffer`/`require`/`fs`/`process`/`console`, while `btoa`/`atob` are available). `tools.exec_command(...)` returns `{ output, exit_code, session_id, wall_time_seconds }` with `stdout` + `stderr` merged in `output` (redirect `2>/dev/null` and emit one JSON document before `JSON.parse(r.output)`). Prefer top-level `mcp_lg_apply_patch` for 1-4 file edits; if passing strings inside JS template literals, escape inner backticks (`\\``) and `${...}`."
             }
         },
         "required": ["code"]

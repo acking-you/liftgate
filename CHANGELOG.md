@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
   - Extended periodic idle auto-update management to all supported coding harnesses (`codex`, `claude`, `opencode`, and `omp` under `harness_auto_update`, all `false` by default) with supervised process-group / Win32 Job Object execution, bounded non-interactive I/O, and Homebrew / npm package-manager fallbacks.
   - Strictly gated both periodic update checks and binary installations on zero active sessions (`evaluate_idle_gate`): background checks pause whenever HTTP turns, ACP prompt streams, active/suspended `SessionPool` leases, open CLI harness wrappers (`lg cx`, `lg cc`, `lg oc`, `lg omp`), or desktop GUI sessions (`lg cxa`, `lg cd`) are active, or while session quiet cooldown is in effect.
   - Added a dedicated interactive **Auto-Update Manager TUI** (`lg auto-update` / `lg au`, Cockpit `[v]`, and `lg top` `[u]`), full non-interactive CLI subcommands (`status`, `on`/`enable`, `off`/`disable`, `interval`, `reset`, `run`), persistent `~/.liftgate/auto-update-state.json` history, and live SSE/Web dashboard fleet status (`auto_update` on `GatewayTelemetrySnapshot`).
+  - Extracted the auto-update subsystem into two dedicated workspace crates — `liftgate-auto-update` (zero-session-gated scheduler, `auto-update-state.json` ledger, cached binary probes & supervised harness runners with zero HTTP/server/TUI dependencies) and `liftgate-auto-update-tui` (standalone Ratatui UI compiled once in parallel with `liftgate-server` and `liftgate-core`) — and codified the crate-first over `mod` rule in `docs/2026-11-09-RUST.md` and `AGENTS.md`.
+
+### Fixed
+- **Code Mode `mcp_lg_exec` general template-literal backtick healing & bare-V8 `btoa`/`atob` polyfill (`liftgate-codemode-js`)**:
+  - Extracted `normalize_code_mode_exec_js` into a zero-dependency `liftgate-codemode-js` crate and extended it beyond V4A patches to repair unescaped inner backticks inside general JS template literals (such as Python heredocs or Rust/Markdown comments containing `` `lg` `` spans that previously failed in V8 with `SyntaxError: Unexpected identifier 'lg'`), while leaving all lexically valid JS programs untouched (`Cow::Borrowed`).
+  - Lazily injects a pure-ECMAScript `globalThis.btoa` / `globalThis.atob` polyfill (preserving any first-line `// @exec:` pragma) whenever `btoa` or `atob` is referenced as an identifier in Codex's bare V8 isolate (eliminating `ReferenceError: btoa is not defined`), and added bare-V8 `ReferenceError:` recovery hints in `turn_runner`.
 
 ## [0.2.22] - 2026-11-28
 

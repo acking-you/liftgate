@@ -1,10 +1,13 @@
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use liftgate_auto_update::{
+    AutoUpdateLedger, FleetSwitchSnapshot, HarnessAutoUpdateSettings, TargetAutoUpdateRecord,
+};
+use liftgate_auto_update::{LedgerError, read_ledger_file, write_ledger_file_atomic};
 use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
 use liftgate_types::config::{
     AutoUpdateIntervalMins, AutoUpdateTarget, CacheHitThresholdBps, ContextCaptureDiskMib,
@@ -13,7 +16,6 @@ use liftgate_types::config::{
     DEFAULT_TURN_TIMEOUT_SECS, GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl,
     is_endpoint_local_keyword, is_proxy_disable_keyword,
 };
-use liftgate_types::telemetry::AutoUpdateLastOutcome;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -287,28 +289,12 @@ impl StatePaths {
     }
 
     pub fn read_auto_update_ledger(&self) -> Result<AutoUpdateLedger, CliError> {
-        let path = self.auto_update_state_file();
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AutoUpdateLedger::default());
-            }
-            Err(source) => return Err(CliError::StateIo { path, source }),
-        };
-        let parsed = serde_json::from_slice(&bytes)
-            .map_err(|source| CliError::StateJson { path, source })?;
-        Ok(parsed)
+        read_ledger_file(&self.auto_update_state_file()).map_err(map_ledger_error)
     }
 
     pub fn write_auto_update_ledger(&self, ledger: &AutoUpdateLedger) -> Result<(), CliError> {
         self.ensure_root_dir()?;
-        let path = self.auto_update_state_file();
-        let mut json = serde_json::to_vec_pretty(ledger).map_err(|source| CliError::StateJson {
-            path: path.clone(),
-            source,
-        })?;
-        json.push(b'\n');
-        write_file_atomic(&path, &json, true)
+        write_ledger_file_atomic(&self.auto_update_state_file(), ledger).map_err(map_ledger_error)
     }
 
     /// Registers a live CLI harness wrapper session (`lg cx`, `lg cc`, `lg oc`, `lg omp`)
@@ -371,45 +357,11 @@ impl StatePaths {
     }
 }
 
-/// Per-harness idle auto-update switches stored under `settings.json` (all `false` by default).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HarnessAutoUpdateSettings {
-    #[serde(default)]
-    pub codex: bool,
-    #[serde(default)]
-    pub claude: bool,
-    #[serde(default)]
-    pub opencode: bool,
-    #[serde(default)]
-    pub omp: bool,
-}
-
-/// Persisted per-target auto-update check and upgrade state stored in `auto-update-state.json`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetAutoUpdateRecord {
-    #[serde(default)]
-    pub last_check_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub latest_seen_version: Option<String>,
-    #[serde(default)]
-    pub last_update_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub last_updated_from: Option<String>,
-    #[serde(default)]
-    pub last_updated_to: Option<String>,
-    #[serde(default)]
-    pub last_status: AutoUpdateLastOutcome,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// Persisted fleet auto-update ledger stored at `~/.liftgate/auto-update-state.json`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct AutoUpdateLedger {
-    #[serde(default)]
-    pub targets: BTreeMap<AutoUpdateTarget, TargetAutoUpdateRecord>,
-    #[serde(default, flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+fn map_ledger_error(err: LedgerError) -> CliError {
+    match err {
+        LedgerError::Io { path, source } => CliError::StateIo { path, source },
+        LedgerError::Json { path, source } => CliError::StateJson { path, source },
+    }
 }
 
 /// Persistent user-level preferences stored at `~/.liftgate/settings.json`.
@@ -533,6 +485,17 @@ impl LiftgateSettings {
             opencode: false,
             omp: false,
         };
+    }
+
+    /// Snapshots all 6 auto-update switches plus the periodic check interval.
+    #[must_use]
+    pub const fn auto_update_switches(&self) -> FleetSwitchSnapshot {
+        FleetSwitchSnapshot {
+            lg_auto_update: self.lg_auto_update,
+            agy_auto_update: self.agy_auto_update,
+            harness_auto_update: self.harness_auto_update,
+            interval_mins: self.auto_update_interval_mins,
+        }
     }
 }
 

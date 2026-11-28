@@ -3417,13 +3417,19 @@ fn normalize_emitted_tool_arguments(
 ) -> String {
     if is_custom {
         let is_apply_patch = matched_spec.is_some_and(|s| s.name == "apply_patch");
+        let is_code_mode = matched_spec.is_some_and(|s| {
+            liftgate_types::session_key::is_codex_exec_orchestrator_tool(s)
+                || liftgate_types::session_key::is_opencode_execute_orchestrator_tool(s)
+        });
         if !is_raw_input
             && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&arguments)
         {
-            for key in ["input", "patch", "diff"] {
+            for key in ["code", "input", "patch", "diff"] {
                 if let Some(serde_json::Value::String(inner)) = map.get(key) {
                     return if is_apply_patch {
                         liftgate_types::parser::normalize_apply_patch_text(inner)
+                    } else if is_code_mode {
+                        liftgate_types::parser::normalize_code_mode_exec_js(inner).into_owned()
                     } else {
                         inner.clone()
                     };
@@ -3432,6 +3438,8 @@ fn normalize_emitted_tool_arguments(
         }
         return if is_apply_patch {
             liftgate_types::parser::normalize_apply_patch_text(&arguments)
+        } else if is_code_mode {
+            liftgate_types::parser::normalize_code_mode_exec_js(&arguments).into_owned()
         } else {
             arguments
         };
@@ -4632,6 +4640,10 @@ fn sanitize_mcp_tool_result_text(
         } else if sanitized.contains("SyntaxError:") {
             sanitized.push_str(
                 "\n[Hint: JavaScript syntax error in Code Mode script — check for unescaped backticks (`` ` ``) or `${...}` interpolations inside template literals; use JSON-quoted strings or invoke top-level `mcp_lg_apply_patch` directly instead of embedding raw patch/markdown text in JS backticks.]",
+            );
+        } else if sanitized.contains("ReferenceError:") {
+            sanitized.push_str(
+                "\n[Hint: Code Mode `exec` runs in a bare V8 isolate without Node/DOM globals (`Buffer`, `require`, `fs`, `process`, `console`); use `text(...)` for output, `btoa(...)`/`atob(...)` or `Uint8Array` for base64/binary data, and `tools.exec_command(...)` for shell/Python/file operations.]",
             );
         }
     }
