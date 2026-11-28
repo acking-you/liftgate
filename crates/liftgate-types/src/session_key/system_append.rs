@@ -120,7 +120,7 @@ pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> Str
             ));
             if has_update_plan {
                 out.push_str(&format!(
-                    " For multi-step work (3+ steps, never in `Plan Mode`), maintain live step status at 0-RTT via `await tools.update_plan({{ explanation, plan }})` inside `mcp_lg_{mcp_name}` (or top-level `mcp_lg_update_plan` on non-`{mcp_name}` turns), keeping at most one `in_progress` step and marking all steps `completed` when done without repeating the checklist in prose."
+                    " For multi-step work (3+ steps, never in `Plan Mode`), maintain live step status at 0-RTT via `await tools.update_plan({{ explanation, plan }})` inside `mcp_lg_{mcp_name}` (or top-level `mcp_lg_update_plan` when mounted on non-`{mcp_name}` turns), keeping at most one `in_progress` step and marking all steps `completed` when done without repeating the checklist in prose."
                 ));
             }
             if has_apply_patch {

@@ -391,6 +391,43 @@ fn codex_toml_merge_is_idempotent_keeps_root_before_tables_and_uninstalls_cleanl
     );
     assert!(merged_inline.contains("update_plan = { enabled = false }"));
     assert!(!merged_inline.contains("[tools.update_plan]"));
+
+    // Root-level dotted `tools.update_plan.enabled = false` and inline `tools = { ... }`
+    // must never append a conflicting `[tools.update_plan]` table.
+    for root_tools in [
+        "tools.update_plan.enabled = false\n",
+        "\"tools\".\"update_plan\".enabled = false\n",
+        "tools = { update_plan = { enabled = false } }\n",
+        "tools = { web_search = true }\n",
+    ] {
+        let merged_root = merge_codex_config_toml(
+            root_tools,
+            "http://127.0.0.1:8787",
+            "gemini-4-carbon-high",
+            catalog,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            !merged_root.contains("[tools.update_plan]"),
+            "root tools declaration must suppress [tools.update_plan] table:\n{merged_root}"
+        );
+        let isolated_root = merge_isolated_codex_app_config_toml(
+            root_tools,
+            "http://127.0.0.1:8787",
+            "gemini-4-carbon-high",
+            catalog,
+            "local-agy",
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !isolated_root.contains("[tools.update_plan]"),
+            "isolated app config must suppress [tools.update_plan] table:\n{isolated_root}"
+        );
+    }
 }
 
 #[test]

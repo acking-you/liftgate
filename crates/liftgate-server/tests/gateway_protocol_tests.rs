@@ -11783,7 +11783,7 @@ async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn resumed_mcp_continuation_without_tools_preserves_distill_harness_and_records_spill_diff() {
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
         steps: vec![

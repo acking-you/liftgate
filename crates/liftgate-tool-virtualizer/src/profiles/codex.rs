@@ -186,7 +186,7 @@ impl HarnessToolProfile for CodexToolProfile {
                 || spec
                     .description
                     .as_deref()
-                    .is_some_and(|d| d.contains("update_plan")),
+                    .is_some_and(description_declares_builtin_update_plan),
         })
     }
 
@@ -201,4 +201,22 @@ impl HarnessToolProfile for CodexToolProfile {
             _ => "",
         }
     }
+}
+
+fn description_declares_builtin_update_plan(desc: &str) -> bool {
+    let bytes = desc.as_bytes();
+    for (idx, _) in desc.match_indices("update_plan") {
+        let prev_ok = idx == 0
+            || bytes
+                .get(idx - 1)
+                .is_none_or(|&b| !b.is_ascii_alphanumeric() && b != b'_');
+        let end = idx + "update_plan".len();
+        let next_ok = bytes
+            .get(end)
+            .is_none_or(|&b| !b.is_ascii_alphanumeric() && b != b'_');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
 }

@@ -1814,6 +1814,46 @@ fn calibrated_budget_enables_30_tool_direct_passthrough_and_codex_claude_contrac
         })
     );
 
+    // An unrelated MCP tool like `mcp__pm__update_plan` inside `exec`'s description must NOT
+    // falsely set `has_update_plan = true`, whereas `tools.update_plan` in `code_mode_only` does.
+    let mut codex_mcp_substring = medium_codex.clone();
+    codex_mcp_substring[0].description =
+        Some("Run JS. Nested: await tools.mcp__pm__update_plan({})".to_owned());
+    let mcp_sub_cat = partition_tools_for_mcp_session_with_options(
+        ProtocolHint::OpenAiResponses,
+        &codex_mcp_substring,
+        McpSessionOptions::default(),
+        &mut spill,
+    );
+    assert_eq!(
+        mcp_sub_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::CodexExec {
+            mcp_name: "exec",
+            has_apply_patch: true,
+            has_update_plan: false,
+        })
+    );
+    let mut codex_code_mode_only = vec![CanonicalToolSpec {
+        name: "exec".to_owned(),
+        description: Some("Run JS. Nested: await tools.update_plan({ plan: [] })".to_owned()),
+        kind: CanonicalToolKind::Custom { format_json: None },
+    }];
+    codex_code_mode_only.push(fn_tool("wait", "Wait", json!({"type": "object"})));
+    let cmo_cat = partition_tools_for_mcp_session_with_options(
+        ProtocolHint::OpenAiResponses,
+        &codex_code_mode_only,
+        McpSessionOptions::default(),
+        &mut spill,
+    );
+    assert_eq!(
+        cmo_cat.orchestrator_contract(),
+        Some(McpOrchestratorContract::CodexExec {
+            mcp_name: "exec",
+            has_apply_patch: false,
+            has_update_plan: true,
+        })
+    );
+
     // 2. Standard Claude Code session (no `REPL`, with `Bash` + 25 built-in/plugin tools = 28 tools)
     //    achieves 1:1 Direct Passthrough AND emits `ClaudeBashFirst { bash_mcp_name: "Bash" }`!
     let mut claude_std = Vec::new();

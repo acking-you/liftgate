@@ -174,6 +174,7 @@ pub fn merge_codex_config_toml_with_mode(
             enable_code_mode_only: code_mode_only,
             isolate_desktop_features: false,
             manage_update_plan: true,
+            preexisting_update_plan: root_defines_update_plan_or_inline_tools(&kept_root_lines),
         },
     );
     let trimmed_tables = merged_tables.trim();
@@ -260,6 +261,7 @@ pub fn merge_isolated_codex_app_config_toml(
             enable_code_mode_only: code_mode_only,
             isolate_desktop_features: true,
             manage_update_plan: true,
+            preexisting_update_plan: root_defines_update_plan_or_inline_tools(&kept_root_lines),
         },
     );
     let trimmed_tables = merged_tables.trim();
@@ -304,6 +306,7 @@ pub fn strip_codex_config_toml(existing: &str) -> String {
             enable_code_mode_only: false,
             isolate_desktop_features: false,
             manage_update_plan: false,
+            preexisting_update_plan: false,
         },
     );
     let trimmed_tables = stripped_tables.trim();
@@ -430,13 +433,29 @@ fn is_toml_section_header(line: &str) -> Option<&str> {
 }
 
 pub fn parse_toml_assignment_key(line: &str) -> Option<&str> {
+    let lhs = parse_toml_lhs(line)?;
+    let key = lhs.trim_matches('"').trim_matches('\'');
+    (!key.is_empty()).then_some(key)
+}
+
+fn parse_toml_lhs(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
         return None;
     }
     let (lhs, _) = trimmed.split_once('=')?;
-    let key = lhs.trim().trim_matches('"').trim_matches('\'');
-    (!key.is_empty()).then_some(key)
+    let lhs = lhs.trim();
+    (!lhs.is_empty()).then_some(lhs)
+}
+
+fn root_defines_update_plan_or_inline_tools(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let Some(lhs) = parse_toml_lhs(line) else {
+            return false;
+        };
+        let segs = split_toml_key_segments(lhs);
+        segs.as_slice() == ["tools"] || matches!(segs.as_slice(), ["tools", "update_plan", ..])
+    })
 }
 
 fn parse_toml_bool_assignment(line: &str) -> Option<(&str, bool)> {
@@ -451,10 +470,11 @@ fn parse_toml_bool_assignment(line: &str) -> Option<(&str, bool)> {
 }
 
 fn is_tools_update_plan_section(sec_name: &str) -> bool {
-    matches!(
-        sec_name,
-        "tools.update_plan" | "tools.\"update_plan\"" | "tools.'update_plan'"
-    )
+    split_toml_key_segments(sec_name).as_slice() == ["tools", "update_plan"]
+}
+
+fn is_tools_section(sec_name: &str) -> bool {
+    split_toml_key_segments(sec_name).as_slice() == ["tools"]
 }
 
 #[derive(Clone, Copy)]
@@ -463,6 +483,7 @@ struct CodexTableRewriteOpts {
     enable_code_mode_only: bool,
     isolate_desktop_features: bool,
     manage_update_plan: bool,
+    preexisting_update_plan: bool,
 }
 
 fn is_ephemeral_bundled_marketplace_table(sec_name: &str) -> bool {
@@ -491,7 +512,7 @@ fn rewrite_codex_tables(tables_part: &str, opts: CodexTableRewriteOpts) -> Strin
 
     let mut rendered_sections: Vec<String> = Vec::new();
     let mut saw_features = false;
-    let mut saw_update_plan = false;
+    let mut saw_update_plan = opts.preexisting_update_plan;
 
     for (sec_name, header, body) in sections {
         if sec_name == "model_providers.agy" || sec_name.starts_with("model_providers.agy.") {
@@ -604,10 +625,11 @@ fn rewrite_codex_tables(tables_part: &str, opts: CodexTableRewriteOpts) -> Strin
             }
             continue;
         }
-        if sec_name == "tools"
+        if is_tools_section(&sec_name)
             && body.iter().any(|l| {
-                parse_toml_assignment_key(l)
-                    .is_some_and(|k| k == "update_plan" || k.starts_with("update_plan."))
+                parse_toml_lhs(l).is_some_and(|lhs| {
+                    matches!(split_toml_key_segments(lhs).as_slice(), ["update_plan", ..])
+                })
             })
         {
             saw_update_plan = true;

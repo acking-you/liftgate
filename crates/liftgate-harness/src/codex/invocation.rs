@@ -174,8 +174,93 @@ pub fn has_explicit_codex_config_key(args: &[String], key: &str) -> bool {
 
 #[must_use]
 pub fn has_explicit_codex_update_plan_config(args: &[String]) -> bool {
-    has_explicit_codex_config_key(args, CODEX_UPDATE_PLAN_ENABLED_KEY)
-        || has_explicit_codex_config_key(args, "tools.update_plan")
+    let pre_dd = slice_before_double_dash(args);
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        let s = tok.as_str();
+        let expr = if matches!(s, "-c" | "--config") {
+            idx += 2;
+            pre_dd.get(idx - 1).map(String::as_str)
+        } else if let Some(rest) = s
+            .strip_prefix("--config=")
+            .or_else(|| s.strip_prefix("-c="))
+        {
+            idx += 1;
+            Some(rest)
+        } else {
+            idx += 1;
+            None
+        };
+        if let Some(kv) = expr
+            && let Some((lhs, _)) = kv.split_once('=')
+        {
+            let segs = split_toml_key_segments(lhs);
+            if segs.as_slice() == ["tools"]
+                || matches!(segs.as_slice(), ["tools", "update_plan", ..])
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn split_toml_key_segments(raw_key: &str) -> Vec<&str> {
+    let bytes = raw_key.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    while let Some(&b) = bytes.get(idx) {
+        if in_double {
+            if b == b'\\' {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else {
+            match b {
+                b'"' => in_double = true,
+                b'\'' => in_single = true,
+                b'.' => {
+                    if let Some(seg) = raw_key.get(start..idx).map(unquote_toml_segment)
+                        && !seg.is_empty()
+                    {
+                        segments.push(seg);
+                    }
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    if let Some(seg) = raw_key.get(start..).map(unquote_toml_segment)
+        && !seg.is_empty()
+    {
+        segments.push(seg);
+    }
+    segments
+}
+
+fn unquote_toml_segment(seg: &str) -> &str {
+    let trimmed = seg.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed)
 }
 
 #[must_use]

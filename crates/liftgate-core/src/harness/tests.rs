@@ -237,6 +237,18 @@ fn classifies_codex_invocations_and_root_options_accurately() {
     assert!(has_explicit_codex_update_plan_config(&strs(&[
         "--config=tools.update_plan={enabled=false}"
     ])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "tools={update_plan={enabled=false}}"
+    ])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "\"tools\".\"update_plan\".enabled=false"
+    ])));
+    assert!(!has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "tools.web_search=true"
+    ])));
 }
 
 #[tokio::test]
