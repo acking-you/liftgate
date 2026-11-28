@@ -1670,128 +1670,185 @@ fn try_skip_js_regex_literal(src: &str, slash_pos: usize) -> Option<usize> {
     None
 }
 
-/// Advances past a `${ ... }` interpolation body starting right after `${`, handling strings,
-/// comments, regex literals, nested templates, and nested braces.
-fn skip_js_brace_expr_checked(src: &str, after_open_brace: usize) -> (usize, bool) {
-    let mut pos = after_open_brace;
-    let mut brace_depth = 1_usize;
-    let mut regex_allowed = true;
+/// Maximum nested template / `${...}` interpolation frames tracked before leaving JS untouched.
+const MAX_JS_TEMPLATE_NESTING: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsTemplateFrame {
+    TemplateBody,
+    BraceExpr {
+        brace_depth: usize,
+        regex_allowed: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsScanOutcome {
+    Closed(usize),
+    Unclosed(usize),
+    DepthExceeded,
+}
+
+/// Iteratively scans nested JS template literals and `${ ... }` interpolation expressions without
+/// call-stack recursion, enforcing [`MAX_JS_TEMPLATE_NESTING`].
+fn run_js_template_scanner(
+    src: &str,
+    start_pos: usize,
+    initial_frame: JsTemplateFrame,
+) -> JsScanOutcome {
+    let mut frames = Vec::with_capacity(4);
+    frames.push(initial_frame);
+    let mut pos = start_pos;
+    let mut escaped = false;
+
     while let Some(tail) = src.get(pos..)
         && let Some(ch) = tail.chars().next()
     {
-        match ch {
-            ' ' | '\t' | '\r' | '\n' | '\u{2028}' | '\u{2029}' => {
+        let Some(top) = frames.last_mut() else {
+            return JsScanOutcome::Closed(pos);
+        };
+        match top {
+            JsTemplateFrame::TemplateBody => {
                 pos = pos.saturating_add(ch.len_utf8());
-            }
-            '\'' | '"' => {
-                let (end, closed) = skip_js_quoted_string_checked(src, pos, ch);
-                if !closed {
-                    return (end, false);
+                if escaped {
+                    escaped = false;
+                    continue;
                 }
-                pos = end;
-                regex_allowed = false;
-            }
-            '`' => {
-                let (end, closed) = skip_js_template_literal_checked(src, pos);
-                if !closed {
-                    return (end, false);
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '`' {
+                    frames.pop();
+                    if frames.is_empty() {
+                        return JsScanOutcome::Closed(pos);
+                    }
+                } else if ch == '$' && src.get(pos..).is_some_and(|r| r.starts_with('{')) {
+                    if frames.len() >= MAX_JS_TEMPLATE_NESTING {
+                        return JsScanOutcome::DepthExceeded;
+                    }
+                    pos = pos.saturating_add(1);
+                    frames.push(JsTemplateFrame::BraceExpr {
+                        brace_depth: 1,
+                        regex_allowed: true,
+                    });
                 }
-                pos = end;
-                regex_allowed = false;
             }
-            '/' if tail.starts_with("//") => {
-                pos = tail
-                    .find('\n')
-                    .map_or(src.len(), |nl| pos.saturating_add(nl + 1));
-            }
-            '/' if tail.starts_with("/*") => {
-                let Some(end) = src
-                    .get(pos.saturating_add(2)..)
-                    .and_then(|r| r.find("*/").map(|rel| pos.saturating_add(rel + 4)))
-                else {
-                    return (src.len(), false);
-                };
-                pos = end;
-            }
-            '/' if regex_allowed => {
-                if let Some(end) = try_skip_js_regex_literal(src, pos) {
+            JsTemplateFrame::BraceExpr {
+                brace_depth,
+                regex_allowed,
+            } => match ch {
+                ' ' | '\t' | '\r' | '\n' | '\u{2028}' | '\u{2029}' => {
+                    pos = pos.saturating_add(ch.len_utf8());
+                }
+                '\'' | '"' => {
+                    let (end, closed) = skip_js_quoted_string_checked(src, pos, ch);
+                    if !closed {
+                        return JsScanOutcome::Unclosed(end);
+                    }
                     pos = end;
-                    regex_allowed = false;
-                } else {
+                    *regex_allowed = false;
+                }
+                '`' => {
+                    *regex_allowed = false;
+                    if frames.len() >= MAX_JS_TEMPLATE_NESTING {
+                        return JsScanOutcome::DepthExceeded;
+                    }
                     pos = pos.saturating_add(1);
-                    regex_allowed = true;
+                    escaped = false;
+                    frames.push(JsTemplateFrame::TemplateBody);
                 }
-            }
-            '{' => {
-                brace_depth = brace_depth.saturating_add(1);
-                pos = pos.saturating_add(1);
-                regex_allowed = true;
-            }
-            '}' => {
-                brace_depth = brace_depth.saturating_sub(1);
-                pos = pos.saturating_add(1);
-                if brace_depth == 0 {
-                    return (pos, true);
+                '/' if tail.starts_with("//") => {
+                    pos = tail
+                        .find('\n')
+                        .map_or(src.len(), |nl| pos.saturating_add(nl + 1));
                 }
-                regex_allowed = true;
-            }
-            ')' | ']' => {
-                pos = pos.saturating_add(1);
-                regex_allowed = false;
-            }
-            '+' | '-' if tail.starts_with("++") || tail.starts_with("--") => {
-                pos = pos.saturating_add(2);
-            }
-            _ if is_js_ident_start(ch) => {
-                let (word, end) = scan_js_ident(src, pos);
-                pos = end;
-                regex_allowed = js_keyword_allows_regex(word);
-            }
-            _ if ch.is_ascii_digit() => {
-                pos = pos.saturating_add(1);
-                while let Some(num_tail) = src.get(pos..)
-                    && let Some(nc) = num_tail.chars().next()
-                    && (nc.is_ascii_alphanumeric() || nc == '_' || nc == '.')
-                {
+                '/' if tail.starts_with("/*") => {
+                    let Some(end) = src
+                        .get(pos.saturating_add(2)..)
+                        .and_then(|r| r.find("*/").map(|rel| pos.saturating_add(rel + 4)))
+                    else {
+                        return JsScanOutcome::Unclosed(src.len());
+                    };
+                    pos = end;
+                }
+                '/' if *regex_allowed => {
+                    if let Some(end) = try_skip_js_regex_literal(src, pos) {
+                        pos = end;
+                        *regex_allowed = false;
+                    } else {
+                        pos = pos.saturating_add(1);
+                        *regex_allowed = true;
+                    }
+                }
+                '{' => {
+                    *brace_depth = brace_depth.saturating_add(1);
                     pos = pos.saturating_add(1);
+                    *regex_allowed = true;
                 }
-                regex_allowed = false;
-            }
-            _ => {
-                pos = pos.saturating_add(ch.len_utf8());
-                regex_allowed = true;
-            }
+                '}' => {
+                    *brace_depth = brace_depth.saturating_sub(1);
+                    pos = pos.saturating_add(1);
+                    if *brace_depth == 0 {
+                        frames.pop();
+                        if frames.is_empty() {
+                            return JsScanOutcome::Closed(pos);
+                        }
+                    } else {
+                        *regex_allowed = true;
+                    }
+                }
+                ')' | ']' => {
+                    pos = pos.saturating_add(1);
+                    *regex_allowed = false;
+                }
+                '+' | '-' if tail.starts_with("++") || tail.starts_with("--") => {
+                    pos = pos.saturating_add(2);
+                }
+                _ if is_js_ident_start(ch) => {
+                    let (word, end) = scan_js_ident(src, pos);
+                    pos = end;
+                    *regex_allowed = js_keyword_allows_regex(word);
+                }
+                _ if ch.is_ascii_digit() => {
+                    pos = pos.saturating_add(1);
+                    while let Some(num_tail) = src.get(pos..)
+                        && let Some(nc) = num_tail.chars().next()
+                        && (nc.is_ascii_alphanumeric() || nc == '_' || nc == '.')
+                    {
+                        pos = pos.saturating_add(1);
+                    }
+                    *regex_allowed = false;
+                }
+                _ => {
+                    pos = pos.saturating_add(ch.len_utf8());
+                    *regex_allowed = true;
+                }
+            },
         }
     }
-    (pos, false)
+    JsScanOutcome::Unclosed(pos)
+}
+
+/// Advances past a `${ ... }` interpolation body starting right after `${`, handling strings,
+/// comments, regex literals, nested templates, and nested braces iteratively.
+fn skip_js_brace_expr_checked(src: &str, after_open_brace: usize) -> JsScanOutcome {
+    run_js_template_scanner(
+        src,
+        after_open_brace,
+        JsTemplateFrame::BraceExpr {
+            brace_depth: 1,
+            regex_allowed: true,
+        },
+    )
 }
 
 /// Advances past an ordinary JS template literal starting at `open_tick_pos`, handling `\` escapes
-/// and nested `${ ... }` expressions.
-fn skip_js_template_literal_checked(src: &str, open_tick_pos: usize) -> (usize, bool) {
-    let mut pos = open_tick_pos.saturating_add(1);
-    let mut escaped = false;
-    while let Some(tail) = src.get(pos..)
-        && let Some(ch) = tail.chars().next()
-    {
-        pos = pos.saturating_add(ch.len_utf8());
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-        } else if ch == '`' {
-            return (pos, true);
-        } else if ch == '$' && src.get(pos..).is_some_and(|r| r.starts_with('{')) {
-            let (after_brace, closed) = skip_js_brace_expr_checked(src, pos.saturating_add(1));
-            if !closed {
-                return (after_brace, false);
-            }
-            pos = after_brace;
-        }
-    }
-    (pos, false)
+/// and nested `${ ... }` expressions iteratively.
+fn skip_js_template_literal_checked(src: &str, open_tick_pos: usize) -> JsScanOutcome {
+    run_js_template_scanner(
+        src,
+        open_tick_pos.saturating_add(1),
+        JsTemplateFrame::TemplateBody,
+    )
 }
 
 /// Strips optional leading whitespace/`\r`/`\n` escapes after an opening `` ` `` and returns the
@@ -1826,6 +1883,14 @@ fn skip_v4a_begin_patch_header(src: &str, open_tick_pos: usize) -> Option<usize>
     Some(src.len().saturating_sub(rest.len()))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V4aTemplateProbe {
+    NotSingleV4a,
+    NoEndPatchInRemainder,
+    DepthExceeded,
+    BrokenV4a(usize),
+}
+
 /// Checks whether the template literal opening at `open_tick_pos` begins with `*** Begin Patch`
 /// and, if so, locates the matching closing `` ` `` right after the nearest line-leading
 /// `*** End Patch`, provided every intermediate line conforms to V4A patch structure and the span
@@ -1834,12 +1899,16 @@ fn find_v4a_template_bounds(
     src: &str,
     open_tick_pos: usize,
     outer_delims: &[char],
-) -> Option<usize> {
-    let content_after_header = skip_v4a_begin_patch_header(src, open_tick_pos)?;
+) -> V4aTemplateProbe {
+    let Some(content_after_header) = skip_v4a_begin_patch_header(src, open_tick_pos) else {
+        return V4aTemplateProbe::NotSingleV4a;
+    };
 
     let mut search_from = content_after_header;
     while let Some(rem) = src.get(search_from..) {
-        let rel = rem.find("*** End Patch")?;
+        let Some(rel) = rem.find("*** End Patch") else {
+            return V4aTemplateProbe::NoEndPatchInRemainder;
+        };
         let marker_pos = search_from.saturating_add(rel);
         let marker_end = marker_pos.saturating_add("*** End Patch".len());
         let line_leading = src
@@ -1865,24 +1934,41 @@ fn find_v4a_template_bounds(
             }
             if tail.starts_with('`') {
                 let close_tick_pos = marker_end.saturating_add(consumed);
-                let mid = src.get(content_after_header..marker_pos)?;
-                let candidate_slice = src.get(open_tick_pos..=close_tick_pos)?;
-                if !v4a_mid_has_only_patch_lines(mid)
-                    || is_valid_js_patch_expression(candidate_slice, outer_delims)
-                {
-                    return None;
+                let (Some(mid), Some(candidate_slice)) = (
+                    src.get(content_after_header..marker_pos),
+                    src.get(open_tick_pos..=close_tick_pos),
+                ) else {
+                    return V4aTemplateProbe::NotSingleV4a;
+                };
+                match v4a_mid_has_only_patch_lines(mid) {
+                    MidPatchCheck::DepthExceeded => return V4aTemplateProbe::DepthExceeded,
+                    MidPatchCheck::Invalid => return V4aTemplateProbe::NotSingleV4a,
+                    MidPatchCheck::Valid => {}
                 }
-                return Some(close_tick_pos);
+                match is_valid_js_patch_expression(candidate_slice, outer_delims) {
+                    PatchExprValidity::DepthExceeded => return V4aTemplateProbe::DepthExceeded,
+                    PatchExprValidity::Valid => return V4aTemplateProbe::NotSingleV4a,
+                    PatchExprValidity::Invalid => {
+                        return V4aTemplateProbe::BrokenV4a(close_tick_pos);
+                    }
+                }
             }
         }
         search_from = marker_end;
     }
-    None
+    V4aTemplateProbe::NoEndPatchInRemainder
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MidPatchCheck {
+    Valid,
+    Invalid,
+    DepthExceeded,
 }
 
 /// Verifies that every line between `*** Begin Patch\n` and `*** End Patch` (outside `${...}`
 /// interpolations) starts with a V4A patch marker and contains no nested `` `*** Begin Patch ``.
-fn v4a_mid_has_only_patch_lines(mid: &str) -> bool {
+fn v4a_mid_has_only_patch_lines(mid: &str) -> MidPatchCheck {
     let mut pos = 0_usize;
     let mut at_line_start = true;
 
@@ -1917,7 +2003,7 @@ fn v4a_mid_has_only_patch_lines(mid: &str) -> bool {
                 || rem.starts_with(' ')
                 || rem.starts_with("${");
             if !valid_start {
-                return false;
+                return MidPatchCheck::Invalid;
             }
             at_line_start = false;
         }
@@ -1943,20 +2029,20 @@ fn v4a_mid_has_only_patch_lines(mid: &str) -> bool {
                 .map_or(1, |c| 1 + c.len_utf8());
             pos = pos.saturating_add(step);
         } else if rem.starts_with("${") {
-            let (after_brace, closed) = skip_js_brace_expr_checked(mid, pos.saturating_add(2));
-            if !closed {
-                return false;
+            match skip_js_brace_expr_checked(mid, pos.saturating_add(2)) {
+                JsScanOutcome::Closed(after_brace) => pos = after_brace,
+                JsScanOutcome::Unclosed(_) => return MidPatchCheck::Invalid,
+                JsScanOutcome::DepthExceeded => return MidPatchCheck::DepthExceeded,
             }
-            pos = after_brace;
         } else if rem.starts_with('`') && skip_v4a_begin_patch_header(mid, pos).is_some() {
-            return false;
+            return MidPatchCheck::Invalid;
         } else if let Some(ch) = rem.chars().next() {
             pos = pos.saturating_add(ch.len_utf8());
         } else {
             break;
         }
     }
-    true
+    MidPatchCheck::Valid
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1975,10 +2061,17 @@ enum PatchSliceToken {
     Operator,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchExprValidity {
+    Valid,
+    Invalid,
+    DepthExceeded,
+}
+
 /// Returns `true` when `slice` (`&src[open_tick_pos..=close_tick_pos]`) is already a valid JS
 /// single-template or multi-template patch expression (for example `` `*** Begin Patch\n` + `...` ``
 /// or `` [`*** Begin Patch\n...`, `...`] ``) and therefore must not be rewritten.
-fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
+fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> PatchExprValidity {
     let mut pos = 0_usize;
     let mut prev = PatchSliceToken::Start;
     let mut saw_newline = false;
@@ -2009,7 +2102,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                 .get(pos.saturating_add(2)..)
                 .and_then(|r| r.find("*/"))
             else {
-                return false;
+                return PatchExprValidity::Invalid;
             };
             let comment_body = slice
                 .get(pos.saturating_add(2)..pos.saturating_add(2 + rel_end))
@@ -2024,7 +2117,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
         if prev == PatchSliceToken::UntaggedTemplate
             && !is_allowed_after_patch_template(tail, saw_newline)
         {
-            return false;
+            return PatchExprValidity::Invalid;
         }
 
         match ch {
@@ -2034,17 +2127,19 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                     | PatchSliceToken::QuotedString
                     | PatchSliceToken::Number
                     | PatchSliceToken::CloseGroup
-                    | PatchSliceToken::Dot => return false,
-                    PatchSliceToken::Ident { is_raw: false, .. } => return false,
+                    | PatchSliceToken::Dot => return PatchExprValidity::Invalid,
+                    PatchSliceToken::Ident { is_raw: false, .. } => {
+                        return PatchExprValidity::Invalid;
+                    }
                     PatchSliceToken::Start
                     | PatchSliceToken::Operator
                     | PatchSliceToken::Ident { is_raw: true, .. } => {}
                 }
-                let (end, closed) = skip_js_template_literal_checked(slice, pos);
-                if !closed {
-                    return false;
+                match skip_js_template_literal_checked(slice, pos) {
+                    JsScanOutcome::Closed(end) => pos = end,
+                    JsScanOutcome::Unclosed(_) => return PatchExprValidity::Invalid,
+                    JsScanOutcome::DepthExceeded => return PatchExprValidity::DepthExceeded,
                 }
-                pos = end;
                 prev = PatchSliceToken::UntaggedTemplate;
                 saw_newline = false;
             }
@@ -2060,11 +2155,11 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                             | PatchSliceToken::CloseGroup
                     )
                 {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 }
                 let (end, closed) = skip_js_quoted_string_checked(slice, pos, ch);
                 if !closed {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 }
                 pos = end;
                 prev = PatchSliceToken::QuotedString;
@@ -2088,7 +2183,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                     prev,
                     PatchSliceToken::Start | PatchSliceToken::Operator | PatchSliceToken::Dot
                 ) {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 } else {
                     pos = pos.saturating_add(if tail.starts_with("/=") { 2 } else { 1 });
                     prev = PatchSliceToken::Operator;
@@ -2108,7 +2203,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                     _ => '{',
                 };
                 if delim_stack.pop() != Some(expected) {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 }
                 min_delim_depth = min_delim_depth.min(delim_stack.len());
                 pos = pos.saturating_add(1);
@@ -2133,7 +2228,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                             | PatchSliceToken::CloseGroup
                     )
                 {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 }
                 let is_raw = prev == PatchSliceToken::Dot && word == "raw";
                 prev = PatchSliceToken::Ident {
@@ -2156,7 +2251,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                             | PatchSliceToken::CloseGroup
                     )
                 {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 }
                 pos = pos.saturating_add(1);
                 while let Some(num_tail) = slice.get(pos..)
@@ -2169,7 +2264,7 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                 saw_newline = false;
             }
             _ if tail.starts_with("***") => {
-                return false;
+                return PatchExprValidity::Invalid;
             }
             '?' if tail.starts_with("?.")
                 && !tail
@@ -2245,11 +2340,11 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
                         | ';'
                 ) {
                     if ch == ';' && matches!(delim_stack.last(), Some('(' | '[')) {
-                        return false;
+                        return PatchExprValidity::Invalid;
                     }
                     1
                 } else {
-                    return false;
+                    return PatchExprValidity::Invalid;
                 };
                 pos = pos.saturating_add(op_len);
                 prev = PatchSliceToken::Operator;
@@ -2258,12 +2353,17 @@ fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
         }
     }
 
-    prev == PatchSliceToken::UntaggedTemplate
+    if prev == PatchSliceToken::UntaggedTemplate
         && delim_stack
             .get(min_delim_depth..)
             .unwrap_or_default()
             .iter()
             .all(|&d| d == '(' || d == '[')
+    {
+        PatchExprValidity::Valid
+    } else {
+        PatchExprValidity::Invalid
+    }
 }
 
 fn src_tail(src: &str, pos: usize) -> Option<&str> {
@@ -2295,6 +2395,7 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
     let mut regex_allowed = true;
     let mut prev_can_tag_template = false;
     let mut outer_delims: Vec<char> = Vec::new();
+    let mut end_patch_exhausted = false;
 
     while let Some(tail) = src.get(pos..)
         && let Some(ch) = tail.chars().next()
@@ -2331,24 +2432,50 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
                 }
             }
             '`' => {
-                if !prev_can_tag_template
-                    && let Some(close_tick_pos) = find_v4a_template_bounds(src, pos, &outer_delims)
-                {
-                    let body_start = pos.saturating_add(1);
-                    if let Some(body) = src.get(body_start..close_tick_pos)
-                        && let Some(healed_body) = escape_unescaped_template_backticks(body)
-                    {
-                        let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 16));
-                        if let Some(prefix) = src.get(copied_until..body_start) {
-                            buf.push_str(prefix);
-                        }
-                        buf.push_str(&healed_body);
-                        buf.push('`');
-                        copied_until = close_tick_pos.saturating_add(1);
-                    }
-                    pos = close_tick_pos.saturating_add(1);
+                let probe = if !prev_can_tag_template && !end_patch_exhausted {
+                    find_v4a_template_bounds(src, pos, &outer_delims)
                 } else {
-                    pos = skip_js_template_literal_checked(src, pos).0;
+                    V4aTemplateProbe::NotSingleV4a
+                };
+                match probe {
+                    V4aTemplateProbe::DepthExceeded => return std::borrow::Cow::Borrowed(src),
+                    V4aTemplateProbe::BrokenV4a(close_tick_pos) => {
+                        let body_start = pos.saturating_add(1);
+                        if let Some(body) = src.get(body_start..close_tick_pos) {
+                            match escape_unescaped_template_backticks(body) {
+                                TemplateHealOutcome::DepthExceeded => {
+                                    return std::borrow::Cow::Borrowed(src);
+                                }
+                                TemplateHealOutcome::Healed(healed_body) => {
+                                    let buf = out.get_or_insert_with(|| {
+                                        String::with_capacity(src.len() + 16)
+                                    });
+                                    if let Some(prefix) = src.get(copied_until..body_start) {
+                                        buf.push_str(prefix);
+                                    }
+                                    buf.push_str(&healed_body);
+                                    buf.push('`');
+                                    copied_until = close_tick_pos.saturating_add(1);
+                                }
+                                TemplateHealOutcome::Unchanged => {}
+                            }
+                        }
+                        pos = close_tick_pos.saturating_add(1);
+                    }
+                    V4aTemplateProbe::NoEndPatchInRemainder | V4aTemplateProbe::NotSingleV4a => {
+                        if probe == V4aTemplateProbe::NoEndPatchInRemainder {
+                            end_patch_exhausted = true;
+                            if out.is_none() {
+                                break;
+                            }
+                        }
+                        match skip_js_template_literal_checked(src, pos) {
+                            JsScanOutcome::Closed(end) | JsScanOutcome::Unclosed(end) => pos = end,
+                            JsScanOutcome::DepthExceeded => {
+                                return std::borrow::Cow::Borrowed(src);
+                            }
+                        }
+                    }
                 }
                 regex_allowed = false;
                 prev_can_tag_template = false;
@@ -2415,9 +2542,15 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+enum TemplateHealOutcome {
+    Unchanged,
+    Healed(String),
+    DepthExceeded,
+}
+
 /// Escapes unescaped `` ` `` characters at `${...}` depth 0 within a single V4A template body,
-/// returning `None` if every backtick was already escaped or inside `${...}`.
-fn escape_unescaped_template_backticks(body: &str) -> Option<String> {
+/// returning [`TemplateHealOutcome::Unchanged`] if every backtick was already escaped or inside `${...}`.
+fn escape_unescaped_template_backticks(body: &str) -> TemplateHealOutcome {
     let mut out: Option<String> = None;
     let mut copied_until = 0_usize;
     let mut pos = 0_usize;
@@ -2441,8 +2574,12 @@ fn escape_unescaped_template_backticks(body: &str) -> Option<String> {
                 .get(pos.saturating_add(1)..)
                 .is_some_and(|r| r.starts_with('{'))
         {
-            let (after_brace, _) = skip_js_brace_expr_checked(body, pos.saturating_add(2));
-            pos = after_brace;
+            match skip_js_brace_expr_checked(body, pos.saturating_add(2)) {
+                JsScanOutcome::Closed(after_brace) | JsScanOutcome::Unclosed(after_brace) => {
+                    pos = after_brace;
+                }
+                JsScanOutcome::DepthExceeded => return TemplateHealOutcome::DepthExceeded,
+            }
             continue;
         }
         if ch == '`' {
@@ -2458,12 +2595,14 @@ fn escape_unescaped_template_backticks(body: &str) -> Option<String> {
         pos = pos.saturating_add(ch.len_utf8());
     }
 
-    out.map(|mut buf| {
+    if let Some(mut buf) = out {
         if let Some(rest) = body.get(copied_until..) {
             buf.push_str(rest);
         }
-        buf
-    })
+        TemplateHealOutcome::Healed(buf)
+    } else {
+        TemplateHealOutcome::Unchanged
+    }
 }
 
 /// Structured 0-RTT structural preflight failure for V4A `apply_patch` payloads.
@@ -3848,5 +3987,24 @@ mod tests {
         let mixed = "const clean = s.replace(/`/g, '\\\\`');\nconst hdr = `*** Begin Patch\\n`;\nconst ok = `*** Begin Patch\\n` + `*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch`;\nawait tools.apply_patch(`*** Begin Patch\n*** Update File: b.md\n@@\n+- Path `/api/v1` and\n+```rust\n+fn f() {}\n+```\n*** End Patch`);";
         let mixed_expected = "const clean = s.replace(/`/g, '\\\\`');\nconst hdr = `*** Begin Patch\\n`;\nconst ok = `*** Begin Patch\\n` + `*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch`;\nawait tools.apply_patch(`*** Begin Patch\n*** Update File: b.md\n@@\n+- Path \\`/api/v1\\` and\n+\\`\\`\\`rust\n+fn f() {}\n+\\`\\`\\`\n*** End Patch`);";
         assert_eq!(normalize_code_mode_exec_js(mixed).as_ref(), mixed_expected);
+
+        // 6. Pathologically deep nested `${`${...}`}` template interpolations never recurse on
+        //    the call stack and return the input unchanged (`Cow::Borrowed`) once depth exceeds
+        //    `MAX_JS_TEMPLATE_NESTING`.
+        let depth = 5_000_usize;
+        let mut deep = String::with_capacity(depth * 5 + 64);
+        deep.push_str("// *** Begin Patch\nconst x = ");
+        for _ in 0..depth {
+            deep.push_str("`${");
+        }
+        deep.push('1');
+        for _ in 0..depth {
+            deep.push_str("}`");
+        }
+        deep.push(';');
+        assert!(matches!(
+            normalize_code_mode_exec_js(&deep),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
