@@ -17,11 +17,15 @@ use liftgate_core::{
         execute_agy_update_with_progress, execute_proxy, inspect_agy_status, probe_agy_auth,
         run_agy_passthrough, spawn_interactive_agy,
     },
+    auto_update::{
+        apply_interval_change, apply_targets_toggle, execute_manual_auto_update_run,
+        inspect_auto_update_status, reset_to_defaults,
+    },
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
-        ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs, ConfigArgs, DoctorArgs, LogsArgs,
-        ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RemoteArgs, RestartArgs, ServeArgs,
-        StartArgs, StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
+        AutoUpdateArgs, AutoUpdateCommand, ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs,
+        ConfigArgs, DoctorArgs, LogsArgs, ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RemoteArgs,
+        RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
     },
     client::GatewayClient,
     config_sync::execute_config_sync,
@@ -1938,5 +1942,234 @@ pub fn run_alias(args: AliasArgs) -> Result<(), CliError> {
             );
         }
     }
+    Ok(())
+}
+
+pub async fn run_auto_update(
+    state_paths: &StatePaths,
+    args: AutoUpdateArgs,
+) -> Result<(), CliError> {
+    use liftgate_types::telemetry::AutoUpdateLastOutcome;
+    use std::io::{IsTerminal as _, stdin, stdout};
+
+    match args.action {
+        None if !args.json && stdin().is_terminal() && stdout().is_terminal() => {
+            crate::tui::run_auto_update_manager(state_paths).await
+        }
+        Some(AutoUpdateCommand::Tui) => crate::tui::run_auto_update_manager(state_paths).await,
+        None => render_auto_update_status(state_paths, args.json).await,
+        Some(AutoUpdateCommand::Status(st)) => {
+            render_auto_update_status(state_paths, st.json || args.json).await
+        }
+        Some(AutoUpdateCommand::Enable(t_args)) => {
+            let updated = apply_targets_toggle(state_paths, &t_args, true)?;
+            if t_args.json || args.json {
+                let report = inspect_auto_update_status(state_paths).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            let names: Vec<&str> = updated.iter().map(|t| t.display_name()).collect();
+            ui::headline(
+                Tone::Ok,
+                &format!("Enabled idle auto-update for {}", names.join(", ")),
+            );
+            ui::kv(
+                "Settings File",
+                &state_paths.settings_file().display().to_string(),
+            );
+            Ok(())
+        }
+        Some(AutoUpdateCommand::Disable(t_args)) => {
+            let updated = apply_targets_toggle(state_paths, &t_args, false)?;
+            if t_args.json || args.json {
+                let report = inspect_auto_update_status(state_paths).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            let names: Vec<&str> = updated.iter().map(|t| t.display_name()).collect();
+            ui::headline(
+                Tone::Info,
+                &format!("Disabled idle auto-update for {}", names.join(", ")),
+            );
+            ui::kv(
+                "Settings File",
+                &state_paths.settings_file().display().to_string(),
+            );
+            Ok(())
+        }
+        Some(AutoUpdateCommand::Interval(iv_args)) => {
+            let interval = apply_interval_change(state_paths, &iv_args)?;
+            if iv_args.json || args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "interval_mins": interval.get(),
+                        "settings_file": state_paths.settings_file(),
+                    }))
+                    .unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(
+                Tone::Ok,
+                &format!(
+                    "Set idle auto-update check interval to every {}m",
+                    interval.get()
+                ),
+            );
+            Ok(())
+        }
+        Some(AutoUpdateCommand::Reset(st)) => {
+            reset_to_defaults(state_paths)?;
+            if st.json || args.json {
+                let report = inspect_auto_update_status(state_paths).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(
+                Tone::Ok,
+                "Reset auto-update switches to defaults (lg & agy ON; harnesses OFF)",
+            );
+            Ok(())
+        }
+        Some(AutoUpdateCommand::Run(run_args)) => {
+            let sp =
+                (!run_args.json && !args.json).then(|| Spinner::start("Running auto-update pass…"));
+            let results_res = execute_manual_auto_update_run(state_paths, &run_args).await;
+            if let Some(s) = sp {
+                s.finish_and_clear().await;
+            }
+            let results = results_res?;
+            if run_args.json || args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(
+                Tone::Ok,
+                &format!("Completed auto-update pass ({} target(s))", results.len()),
+            );
+            let mut table = ui::new_table(&["Target", "Outcome", "Version", "Detail"]);
+            for r in &results {
+                let tone = match r.status {
+                    AutoUpdateLastOutcome::Updated | AutoUpdateLastOutcome::UpToDate => Tone::Ok,
+                    AutoUpdateLastOutcome::UpdateAvailable
+                    | AutoUpdateLastOutcome::DeferredBusy => Tone::Warn,
+                    AutoUpdateLastOutcome::Failed => Tone::Err,
+                    AutoUpdateLastOutcome::NotInstalled
+                    | AutoUpdateLastOutcome::Skipped
+                    | AutoUpdateLastOutcome::NeverChecked
+                    | AutoUpdateLastOutcome::Unknown => Tone::Muted,
+                };
+                let ver_col = r
+                    .current_version
+                    .as_deref()
+                    .map_or_else(|| "—".to_owned(), |v| format!("v{v}"));
+                table.add_row(vec![
+                    Cell::new(r.target.display_name()),
+                    ui::status_cell(&format!("{:?}", r.status), tone),
+                    Cell::new(ver_col),
+                    Cell::new(&r.note),
+                ]);
+            }
+            println!("{table}");
+            Ok(())
+        }
+    }
+}
+
+async fn render_auto_update_status(
+    state_paths: &StatePaths,
+    json_output: bool,
+) -> Result<(), CliError> {
+    use liftgate_types::telemetry::AutoUpdateLastOutcome;
+
+    let sp = (!json_output).then(|| Spinner::start("Inspecting fleet auto-update status…"));
+    let report_res = inspect_auto_update_status(state_paths).await;
+    if let Some(s) = sp {
+        s.finish_and_clear().await;
+    }
+    let report = report_res?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+        );
+        return Ok(());
+    }
+
+    ui::headline(
+        if report.daemon_running {
+            Tone::Ok
+        } else {
+            Tone::Info
+        },
+        &format!(
+            "Liftgate Fleet Auto-Update · Every {}m · {}",
+            report.interval_mins,
+            if report.idle_ready {
+                "IDLE (eligible for checks)"
+            } else {
+                "SESSION ACTIVE (checks paused)"
+            }
+        ),
+    );
+    if let Some(reason) = &report.busy_reason {
+        ui::kv("Busy Reason", reason);
+    }
+    let mut table = ui::new_table(&[
+        "Component",
+        "Auto-Update",
+        "Installed",
+        "Last Check",
+        "Status / Note",
+    ]);
+    let now = liftgate_core::state::now_unix_ms();
+    for row in &report.targets {
+        let toggle_tone = if row.enabled { Tone::Ok } else { Tone::Muted };
+        let toggle_str = if row.enabled { "ON" } else { "OFF" };
+        let ver_str = row
+            .installed_version
+            .as_deref()
+            .map_or_else(|| "missing".to_owned(), |v| format!("v{v}"));
+        let last_chk = row
+            .last_check_unix_ms
+            .map_or_else(|| "never".to_owned(), |ts| ui::format_relative_ms(ts, now));
+        let status_note = row.note.clone().unwrap_or_else(|| match row.last_status {
+            AutoUpdateLastOutcome::NeverChecked => "not checked yet".to_owned(),
+            AutoUpdateLastOutcome::NotInstalled => "not installed".to_owned(),
+            AutoUpdateLastOutcome::UpToDate => "up to date".to_owned(),
+            AutoUpdateLastOutcome::UpdateAvailable => "update available".to_owned(),
+            AutoUpdateLastOutcome::Updated => "updated".to_owned(),
+            AutoUpdateLastOutcome::DeferredBusy => "deferred (session active)".to_owned(),
+            AutoUpdateLastOutcome::Skipped => "skipped".to_owned(),
+            AutoUpdateLastOutcome::Failed => "failed".to_owned(),
+            AutoUpdateLastOutcome::Unknown => "unknown".to_owned(),
+        });
+        table.add_row(vec![
+            Cell::new(row.target.display_name()),
+            ui::status_cell(toggle_str, toggle_tone),
+            Cell::new(ver_str),
+            Cell::new(last_chk),
+            Cell::new(status_note),
+        ]);
+    }
+    println!("{table}");
+    println!();
+    ui::cmd_hint(
+        "Open interactive Auto-Update Manager TUI",
+        &format!("{} auto-update", invoked_bin_name()),
+    );
     Ok(())
 }

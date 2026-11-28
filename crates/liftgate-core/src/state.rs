@@ -4,13 +4,17 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use liftgate_auto_update::{
+    AutoUpdateLedger, FleetSwitchSnapshot, HarnessAutoUpdateSettings, TargetAutoUpdateRecord,
+};
+use liftgate_auto_update::{LedgerError, read_ledger_file, write_ledger_file_atomic};
 use liftgate_server::platform::{canonicalize_clean, is_executable_file, resolve_agy_binary};
 use liftgate_types::config::{
-    CacheHitThresholdBps, ContextCaptureDiskMib, ContextCaptureRecordLimit,
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IDLE_SESSIONS,
-    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES, DEFAULT_TURN_TIMEOUT_SECS,
-    GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl, is_endpoint_local_keyword,
-    is_proxy_disable_keyword,
+    AutoUpdateIntervalMins, AutoUpdateTarget, CacheHitThresholdBps, ContextCaptureDiskMib,
+    ContextCaptureRecordLimit, DEFAULT_CHANNEL_CAPACITY, DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_IDLE_SESSIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STORED_RESPONSES,
+    DEFAULT_TURN_TIMEOUT_SECS, GatewayEndpoint, GatewayTargetMode, LowCacheRecordLimit, ProxyUrl,
+    is_endpoint_local_keyword, is_proxy_disable_keyword,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -105,6 +109,18 @@ impl StatePaths {
         self.root.join("config-sync-ledger.json")
     }
 
+    /// Persistent fleet auto-update check and upgrade history (`~/.liftgate/auto-update-state.json`).
+    #[must_use]
+    pub fn auto_update_state_file(&self) -> PathBuf {
+        self.root.join("auto-update-state.json")
+    }
+
+    /// Directory holding PID-tagged active CLI harness session markers (`~/.liftgate/ephemeral/active-clients`).
+    #[must_use]
+    pub fn active_clients_dir(&self) -> PathBuf {
+        self.ephemeral_dir().join("active-clients")
+    }
+
     #[must_use]
     pub fn log_file(&self) -> PathBuf {
         self.root.join("gateway.log")
@@ -151,6 +167,13 @@ impl StatePaths {
 
     pub fn ensure_ephemeral_dir(&self) -> Result<PathBuf, CliError> {
         let dir = self.ephemeral_dir();
+        ensure_private_dir(&dir)?;
+        Ok(canonicalize_clean(&dir))
+    }
+
+    pub fn ensure_active_clients_dir(&self) -> Result<PathBuf, CliError> {
+        let _ = self.ensure_ephemeral_dir()?;
+        let dir = self.active_clients_dir();
         ensure_private_dir(&dir)?;
         Ok(canonicalize_clean(&dir))
     }
@@ -264,6 +287,81 @@ impl StatePaths {
         json.push(b'\n');
         write_file_atomic(&path, &json, true)
     }
+
+    pub fn read_auto_update_ledger(&self) -> Result<AutoUpdateLedger, CliError> {
+        read_ledger_file(&self.auto_update_state_file()).map_err(map_ledger_error)
+    }
+
+    pub fn write_auto_update_ledger(&self, ledger: &AutoUpdateLedger) -> Result<(), CliError> {
+        self.ensure_root_dir()?;
+        write_ledger_file_atomic(&self.auto_update_state_file(), ledger).map_err(map_ledger_error)
+    }
+
+    /// Registers a live CLI harness wrapper session (`lg cx`, `lg cc`, `lg oc`, `lg omp`)
+    /// so background auto-updates defer while the user has an interactive session open.
+    pub fn register_active_client_session(&self, tool: &'static str) -> Option<EphemeralFileGuard> {
+        let dir = self.ensure_active_clients_dir().ok()?;
+        sweep_dead_ephemeral_files(&dir);
+        let filename = format!(
+            "{tool}-{}-{}.lock",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        );
+        let path = dir.join(filename);
+        let payload = format!(
+            "{{\"tool\":\"{tool}\",\"pid\":{},\"started_unix_ms\":{}}}\n",
+            std::process::id(),
+            now_unix_ms()
+        );
+        write_file_atomic(&path, payload.as_bytes(), true).ok()?;
+        Some(EphemeralFileGuard { path, armed: true })
+    }
+
+    /// Sweeps dead markers and returns the tool names of any currently running CLI harness wrappers.
+    #[must_use]
+    pub fn active_client_session_tools(&self) -> Vec<String> {
+        let dir = self.active_clients_dir();
+        sweep_dead_ephemeral_files(&dir);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut tools = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let mut parts = stem.rsplitn(3, '-');
+            let _uuid_part = parts.next();
+            let Some(pid_part) = parts.next() else {
+                continue;
+            };
+            let Some(tool_part) = parts.next() else {
+                continue;
+            };
+            if let Ok(pid) = pid_part.parse::<u32>()
+                && crate::daemon::is_pid_alive(pid)
+            {
+                tools.push(tool_part.to_owned());
+            }
+        }
+        tools.sort();
+        tools.dedup();
+        tools
+    }
+
+    /// Returns `true` when at least one CLI harness wrapper session is currently running.
+    #[must_use]
+    pub fn has_active_client_sessions(&self) -> bool {
+        !self.active_client_session_tools().is_empty()
+    }
+}
+
+fn map_ledger_error(err: LedgerError) -> CliError {
+    match err {
+        LedgerError::Io { path, source } => CliError::StateIo { path, source },
+        LedgerError::Json { path, source } => CliError::StateJson { path, source },
+    }
 }
 
 /// Persistent user-level preferences stored at `~/.liftgate/settings.json`.
@@ -272,9 +370,18 @@ pub struct LiftgateSettings {
     /// Forced outbound proxy URL injected into `agy` subprocesses (`None` = no proxy by default).
     #[serde(default)]
     pub agy_proxy: Option<ProxyUrl>,
+    /// Automatically check and self-upgrade `lg` & `liftgate` when no sessions are active (`true` by default).
+    #[serde(default = "default_true")]
+    pub lg_auto_update: bool,
     /// Automatically check and update `agy` CLI when the gateway is idle (`true` by default).
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
+    /// Optional idle auto-update toggles for supported third-party coding harnesses (`false` by default).
+    #[serde(default)]
+    pub harness_auto_update: HarnessAutoUpdateSettings,
+    /// Periodic idle auto-update check interval in minutes (`30` by default).
+    #[serde(default)]
+    pub auto_update_interval_mins: AutoUpdateIntervalMins,
     /// Offload incoming `Image` blocks on `>=300k`-token warm sessions to an ephemeral sub-session (`false` by default).
     #[serde(default)]
     pub vision_offload: bool,
@@ -320,7 +427,10 @@ impl Default for LiftgateSettings {
     fn default() -> Self {
         Self {
             agy_proxy: None,
+            lg_auto_update: true,
             agy_auto_update: true,
+            harness_auto_update: HarnessAutoUpdateSettings::default(),
+            auto_update_interval_mins: AutoUpdateIntervalMins::default(),
             vision_offload: false,
             mcp_tool_bridge: true,
             max_low_cache_records: LowCacheRecordLimit::default(),
@@ -334,6 +444,57 @@ impl Default for LiftgateSettings {
             remote_endpoint: None,
             remote_api_key: None,
             extra: serde_json::Map::new(),
+        }
+    }
+}
+
+impl LiftgateSettings {
+    /// Returns whether idle auto-update is enabled for `target`.
+    #[must_use]
+    pub const fn is_auto_update_enabled(&self, target: AutoUpdateTarget) -> bool {
+        match target {
+            AutoUpdateTarget::Liftgate => self.lg_auto_update,
+            AutoUpdateTarget::Agy => self.agy_auto_update,
+            AutoUpdateTarget::Codex => self.harness_auto_update.codex,
+            AutoUpdateTarget::Claude => self.harness_auto_update.claude,
+            AutoUpdateTarget::Opencode => self.harness_auto_update.opencode,
+            AutoUpdateTarget::Omp => self.harness_auto_update.omp,
+        }
+    }
+
+    /// Sets the idle auto-update toggle for `target`.
+    pub const fn set_auto_update_enabled(&mut self, target: AutoUpdateTarget, enabled: bool) {
+        match target {
+            AutoUpdateTarget::Liftgate => self.lg_auto_update = enabled,
+            AutoUpdateTarget::Agy => self.agy_auto_update = enabled,
+            AutoUpdateTarget::Codex => self.harness_auto_update.codex = enabled,
+            AutoUpdateTarget::Claude => self.harness_auto_update.claude = enabled,
+            AutoUpdateTarget::Opencode => self.harness_auto_update.opencode = enabled,
+            AutoUpdateTarget::Omp => self.harness_auto_update.omp = enabled,
+        }
+    }
+
+    /// Resets all 6 auto-update switches back to their out-of-the-box defaults
+    /// (`lg` & `agy` enabled; third-party harnesses disabled).
+    pub const fn reset_auto_update_defaults(&mut self) {
+        self.lg_auto_update = true;
+        self.agy_auto_update = true;
+        self.harness_auto_update = HarnessAutoUpdateSettings {
+            codex: false,
+            claude: false,
+            opencode: false,
+            omp: false,
+        };
+    }
+
+    /// Snapshots all 6 auto-update switches plus the periodic check interval.
+    #[must_use]
+    pub const fn auto_update_switches(&self) -> FleetSwitchSnapshot {
+        FleetSwitchSnapshot {
+            lg_auto_update: self.lg_auto_update,
+            agy_auto_update: self.agy_auto_update,
+            harness_auto_update: self.harness_auto_update,
+            interval_mins: self.auto_update_interval_mins,
         }
     }
 }
@@ -451,6 +612,22 @@ pub const fn resolve_effective_agy_auto_update(
         explicit
     } else {
         settings.agy_auto_update
+    }
+}
+
+/// Resolves the effective `lg` idle self-update toggle (`true` by default).
+#[must_use]
+pub const fn resolve_effective_lg_auto_update(
+    cli_override: Option<bool>,
+    cli_disable_flag: bool,
+    settings: &LiftgateSettings,
+) -> bool {
+    if cli_disable_flag {
+        false
+    } else if let Some(explicit) = cli_override {
+        explicit
+    } else {
+        settings.lg_auto_update
     }
 }
 
@@ -601,6 +778,8 @@ pub struct DaemonState {
     pub ui_dir: Option<PathBuf>,
     #[serde(default)]
     pub agy_proxy: Option<String>,
+    #[serde(default = "default_true")]
+    pub lg_auto_update: bool,
     #[serde(default = "default_true")]
     pub agy_auto_update: bool,
     #[serde(default)]
@@ -895,6 +1074,7 @@ mod tests {
             acp_cwd: None,
             ui_dir: None,
             agy_proxy: None,
+            lg_auto_update: true,
             agy_auto_update: true,
             vision_offload: true,
             mcp_tool_bridge: true,

@@ -31,6 +31,8 @@ pkg-fmt = "zip"
 pkg-fmt = "zip"
 
 [dependencies]
+liftgate-auto-update = { workspace = true }
+liftgate-auto-update-tui = { workspace = true }
 liftgate-core = { workspace = true }
 liftgate-server = { workspace = true }
 liftgate-types = { workspace = true }

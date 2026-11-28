@@ -1,0 +1,21 @@
+[package]
+name = "liftgate-auto-update-tui"
+description = "Standalone Ratatui Auto-Update Manager UI for Liftgate (`lg`, `agy`, and coding harnesses)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+liftgate-auto-update = { workspace = true }
+liftgate-types = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

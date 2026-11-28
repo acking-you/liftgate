@@ -263,6 +263,7 @@ impl Drop for BinarySwapGuard {
 /// Self-healing supervised `agy acp --process-per-session --dangerously-skip-permissions` client over stdio.
 pub struct LiveAcpClient {
     cfg: LiveAcpConfig,
+    auto_update_enabled: std::sync::atomic::AtomicBool,
     next_gen_id: AtomicU64,
     generation: std::sync::RwLock<Arc<LiveAcpGeneration>>,
     respawn_lock: tokio::sync::Mutex<()>,
@@ -605,9 +606,11 @@ impl LiveAcpClient {
     pub async fn spawn_and_init(cfg: LiveAcpConfig) -> Result<Self, AcpError> {
         let initial_gen = Arc::new(LiveAcpGeneration::spawn_and_handshake(1, &cfg).await?);
         let (models_tx, models_rx) = watch::channel::<Arc<[AvailableModel]>>(Arc::from([]));
+        let initial_auto_update = cfg.auto_update_enabled;
 
         let client = Self {
             cfg,
+            auto_update_enabled: std::sync::atomic::AtomicBool::new(initial_auto_update),
             next_gen_id: AtomicU64::new(2),
             generation: std::sync::RwLock::new(initial_gen),
             respawn_lock: tokio::sync::Mutex::new(()),
@@ -645,6 +648,18 @@ impl LiveAcpClient {
     #[must_use]
     pub fn agy_proxy(&self) -> Option<&ProxyUrl> {
         self.cfg.agy_proxy.as_ref()
+    }
+
+    /// Dynamically updates the advertised `agy` idle auto-update toggle without restarting `agy acp`.
+    pub fn set_auto_update_enabled(&self, enabled: bool) {
+        self.auto_update_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_auto_update_enabled(&self) -> bool {
+        self.auto_update_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the `agentInfo.version` reported by the active `agy acp` handshake, if available.
@@ -1139,7 +1154,7 @@ impl LiveAcpClient {
                 .agy_proxy
                 .as_ref()
                 .map(|p| p.redacted_display().into_owned()),
-            auto_update_enabled: self.cfg.auto_update_enabled,
+            auto_update_enabled: self.is_auto_update_enabled(),
             latest_known_version: auto_meta.latest_known_version,
             last_update_check_unix_ms: auto_meta.last_update_check_unix_ms,
             last_auto_update_unix_ms: auto_meta.last_auto_update_unix_ms,

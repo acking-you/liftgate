@@ -159,7 +159,7 @@ pub fn sweep_stale_agy_backups(state_paths: &StatePaths) {
     }
 }
 
-fn sweep_agy_backups_in_dir(dir: &Path) {
+pub(crate) fn sweep_agy_backups_in_dir(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -873,6 +873,7 @@ pub async fn execute_proxy(
 
     if mutated {
         state_paths.write_settings(&settings)?;
+        crate::auto_update::sync_daemon_state_toggles(state_paths, &settings);
     }
 
     let env_override_raw = std::env::var("AGY_PROXY")
@@ -1839,15 +1840,37 @@ async fn apply_idle_agy_hot_update(
     manifest: &AgyManifest,
     opts: &IdleAutoUpdateOptions,
 ) -> Result<bool, CliError> {
+    let client_ref = Arc::clone(live_client);
+    let pool_ref = Arc::clone(pool);
+    let telemetry_ref = Arc::clone(telemetry);
+    let opts_ref = opts.clone();
+    apply_idle_agy_hot_update_if_idle(
+        state_paths,
+        live_client,
+        pool,
+        previous_version,
+        manifest,
+        move || is_gateway_idle_for_update(&client_ref, &pool_ref, &telemetry_ref, &opts_ref),
+    )
+    .await
+}
+
+pub(crate) async fn apply_idle_agy_hot_update_if_idle<F>(
+    state_paths: &StatePaths,
+    live_client: &Arc<LiveAcpClient>,
+    pool: &Arc<SessionPool>,
+    previous_version: &str,
+    manifest: &AgyManifest,
+    is_idle: F,
+) -> Result<bool, CliError>
+where
+    F: Fn() -> bool,
+{
     let stage = StageDirGuard::create(state_paths, "agy-auto-stage")?;
     let proxy = live_client.agy_proxy().cloned();
     let staged_bin =
         download_and_verify_agy_staged(manifest, &stage.path, proxy.as_ref(), None).await?;
 
-    let client_ref = Arc::clone(live_client);
-    let pool_ref = Arc::clone(pool);
-    let telemetry_ref = Arc::clone(telemetry);
-    let opts_ref = opts.clone();
     let auto_update_record = Some((
         previous_version.to_owned(),
         manifest.version.clone(),
@@ -1857,12 +1880,9 @@ async fn apply_idle_agy_hot_update(
         )),
     ));
     let swapped = live_client
-        .hot_swap_binary_when_idle(
-            pool,
-            auto_update_record,
-            || is_gateway_idle_for_update(&client_ref, &pool_ref, &telemetry_ref, &opts_ref),
-            move |target_bin| install_staged_agy_binary(&staged_bin, target_bin),
-        )
+        .hot_swap_binary_when_idle(pool, auto_update_record, is_idle, move |target_bin| {
+            install_staged_agy_binary(&staged_bin, target_bin)
+        })
         .await
         .map_err(|err| match err {
             liftgate_server::error::AcpError::SpawnProcess { path, source }

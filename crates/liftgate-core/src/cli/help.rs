@@ -22,6 +22,7 @@ Quick Examples (both `lg` and `liftgate` work identically):
   lg up --open            Start background gateway and open Web UI
   lg m -i                 Interactively pick & switch default Antigravity model
   lg st                   Inspect gateway health, session pool & token metrics
+  lg auto-update          Open Auto-Update Manager TUI for `lg`, `agy` & harnesses (alias: `lg au`)
   lg upgrade              Check GitHub Releases & self-upgrade `lg` + `liftgate`";
 
 pub(super) const CLAUDE_AFTER_HELP: &str = "\

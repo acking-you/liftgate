@@ -69,6 +69,7 @@ export function SessionsView({ navigate }: ViewProps): React.JSX.Element {
   const [busy, setBusy] = useState<string | null>(null);
   const acp = snapshot?.acp_process;
   const pool = snapshot?.session_pool;
+  const fleetAutoUpdate = snapshot?.auto_update;
   const sessions = pool?.sessions ?? [];
   const mcpBridge = snapshot?.mcp_tool_bridge_enabled ?? true;
   const visionOffload = snapshot?.vision_offload_enabled ?? false;
@@ -173,6 +174,34 @@ export function SessionsView({ navigate }: ViewProps): React.JSX.Element {
           </div>
         </Card>
       </div>
+
+      {fleetAutoUpdate && fleetAutoUpdate.targets.length > 0 && (
+        <Card
+          title={t.fleetAutoUpdate}
+          sub={t.fleetAutoUpdateSub(fleetAutoUpdate.interval_mins, fleetAutoUpdate.idle_ready)}
+        >
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            {fleetAutoUpdate.targets.map((item) => (
+              <div
+                key={item.target}
+                className="flex flex-col gap-1 rounded-lg border border-line px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[13px] font-medium capitalize">
+                    {item.target === "liftgate" ? "lg" : item.target}
+                  </span>
+                  <Pill tone={item.enabled ? "ok" : "neutral"}>
+                    {item.enabled ? t.on : t.off}
+                  </Pill>
+                </div>
+                <span className="lg-num text-[12px] text-ink-muted">
+                  {item.installed_version ? `v${item.installed_version}` : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       <Card
         flush

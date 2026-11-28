@@ -22,10 +22,10 @@ use crate::error::CliError;
 use crate::state::{
     StatePaths, format_connect_url, resolve_effective_agy_auto_update, resolve_effective_agy_bin,
     resolve_effective_agy_proxy, resolve_effective_capture_full_context,
-    resolve_effective_low_cache_capture_payload, resolve_effective_low_cache_threshold_bps,
-    resolve_effective_max_context_capture_mib, resolve_effective_max_context_captures,
-    resolve_effective_max_low_cache_records, resolve_effective_mcp_tool_bridge,
-    resolve_effective_vision_offload,
+    resolve_effective_lg_auto_update, resolve_effective_low_cache_capture_payload,
+    resolve_effective_low_cache_threshold_bps, resolve_effective_max_context_capture_mib,
+    resolve_effective_max_context_captures, resolve_effective_max_low_cache_records,
+    resolve_effective_mcp_tool_bridge, resolve_effective_vision_offload,
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
@@ -45,6 +45,7 @@ pub struct ServeReadyInfo {
     pub auth_enabled: bool,
     pub full_ui_embedded: bool,
     pub agy_proxy_display: Option<String>,
+    pub lg_auto_update: bool,
     pub agy_auto_update: bool,
     pub vision_offload: bool,
     pub mcp_tool_bridge: bool,
@@ -140,6 +141,8 @@ pub async fn run_serve_with_hook(
 
     let settings = state_paths.read_settings()?;
     let agy_proxy = resolve_effective_agy_proxy(args.agy_proxy.as_deref(), &settings)?;
+    let lg_auto_update_enabled =
+        resolve_effective_lg_auto_update(args.lg_auto_update, args.no_lg_auto_update, &settings);
     let auto_update_enabled =
         resolve_effective_agy_auto_update(args.agy_auto_update, args.no_agy_auto_update, &settings);
     let vision_offload_enabled =
@@ -204,6 +207,7 @@ pub async fn run_serve_with_hook(
             .map(liftgate_types::config::ProxyUrl::redacted_display)
             .as_deref()
             .unwrap_or("none"),
+        lg_auto_update = lg_auto_update_enabled,
         agy_auto_update = auto_update_enabled,
         vision_offload = vision_offload_enabled,
         mcp_tool_bridge = mcp_tool_bridge_enabled,
@@ -310,6 +314,7 @@ pub async fn run_serve_with_hook(
     let mut bg_tasks = JoinSet::new();
 
     let shutdown_telemetry = Arc::clone(&telemetry);
+    let shutdown_stop_tx = stop_tx.clone();
     bg_tasks.spawn(async move {
         tokio::select! {
             biased;
@@ -319,7 +324,7 @@ pub async fn run_serve_with_hook(
             () = wait_for_shutdown_signal() => {}
         }
         shutdown_telemetry.signal_shutdown();
-        let _ = stop_tx.send_replace(true);
+        let _ = shutdown_stop_tx.send_replace(true);
     });
 
     {
@@ -354,18 +359,33 @@ pub async fn run_serve_with_hook(
         });
     }
 
-    if auto_update_enabled {
+    {
         let updater_paths = state_paths.clone();
         let updater_client = Arc::clone(&live_client);
         let updater_pool = Arc::clone(&pool);
         let updater_telemetry = Arc::clone(&telemetry);
+        let updater_stop_tx = stop_tx.clone();
         let updater_stop_rx = stop_rx.clone();
+        let cli_overrides = crate::auto_update::AutoUpdateCliOverrides {
+            lg: if args.no_lg_auto_update {
+                Some(false)
+            } else {
+                args.lg_auto_update
+            },
+            agy: if args.no_agy_auto_update {
+                Some(false)
+            } else {
+                args.agy_auto_update
+            },
+        };
         bg_tasks.spawn(async move {
-            crate::agy_manager::run_idle_agy_auto_updater(
+            crate::auto_update::run_idle_fleet_auto_updater(
                 updater_paths,
                 updater_client,
                 updater_pool,
                 updater_telemetry,
+                cli_overrides,
+                updater_stop_tx,
                 updater_stop_rx,
             )
             .await;
@@ -398,6 +418,7 @@ pub async fn run_serve_with_hook(
         auth_enabled,
         full_ui_embedded: full_bundle_embedded,
         agy_proxy_display: proxy_banner,
+        lg_auto_update: lg_auto_update_enabled,
         agy_auto_update: auto_update_enabled,
         vision_offload: vision_offload_enabled,
         mcp_tool_bridge: mcp_tool_bridge_enabled,

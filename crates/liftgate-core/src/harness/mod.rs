@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::error::CliError;
+use crate::state::StatePaths;
 use crate::terminal::TerminalLaunchSpec;
 
 pub use claude::{prepare_claude_terminal_spec, run_claude};
@@ -60,10 +61,12 @@ pub(super) fn command_from_terminal_spec(spec: &TerminalLaunchSpec) -> Command {
 }
 
 pub(super) async fn spawn_and_wait_interactive(
+    state_paths: &StatePaths,
     tool: &'static str,
     program_path: &Path,
     mut cmd: Command,
 ) -> Result<i32, CliError> {
+    let _active_session_guard = state_paths.register_active_client_session(tool);
     if let Ok(cwd) = std::env::current_dir() {
         cmd.current_dir(cwd);
     }

@@ -50,7 +50,7 @@ use liftgate_core::state::{
     resolve_effective_target_mode, write_file_atomic,
 };
 use liftgate_server::title_model::title_model;
-use liftgate_types::config::ModelId;
+use liftgate_types::config::{AutoUpdateTarget, ModelId};
 use liftgate_types::error::format_error_chain;
 
 #[derive(Debug, Error)]
@@ -152,6 +152,7 @@ pub enum CockpitAction {
     AgyLogin,
     SyncConfig,
     Doctor,
+    AutoUpdateManage,
     Upgrade,
     StopGateway,
 }
@@ -249,6 +250,12 @@ const COCKPIT_ITEMS: &[CockpitItem] = &[
         action: CockpitAction::Doctor,
     },
     CockpitItem {
+        hotkey: 'v',
+        label: "Auto-Update Manager",
+        desc: "Toggle idle auto-updates for lg (on), agy (on), codex, claude, opencode & omp",
+        action: CockpitAction::AutoUpdateManage,
+    },
+    CockpitItem {
         hotkey: 'p',
         label: "Check & Upgrade CLI",
         desc: "Verify SHA256SUMS and self-upgrade lg & liftgate from GitHub Releases",
@@ -277,7 +284,9 @@ struct CockpitSummary {
     agy_installed: bool,
     agy_version: Option<String>,
     agy_proxy: Option<String>,
+    lg_auto_update: bool,
     agy_auto_update: bool,
+    enabled_harness_updates: usize,
     cwd_display: String,
 }
 
@@ -341,6 +350,16 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
     let agy_auto_update = snap.as_ref().map_or(local_agy.auto_update_enabled, |s| {
         s.acp_process.auto_update_enabled
     });
+    let lg_auto_update = settings.lg_auto_update;
+    let enabled_harness_updates = [
+        AutoUpdateTarget::Codex,
+        AutoUpdateTarget::Claude,
+        AutoUpdateTarget::Opencode,
+        AutoUpdateTarget::Omp,
+    ]
+    .into_iter()
+    .filter(|&t| settings.is_auto_update_enabled(t))
+    .count();
 
     CockpitSummary {
         healthy,
@@ -371,7 +390,9 @@ async fn probe_cockpit_summary(state_paths: &StatePaths) -> CockpitSummary {
         agy_installed: local_agy.binary_path.is_some() || (is_remote && healthy),
         agy_version,
         agy_proxy,
+        lg_auto_update,
         agy_auto_update,
+        enabled_harness_updates,
         cwd_display,
     }
 }
@@ -448,7 +469,7 @@ fn poll_cockpit_input(selected: &mut usize) -> Result<Option<Option<CockpitActio
 }
 
 fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mut ListState) {
-    let area = centered_rect(88, 28, frame.area());
+    let area = centered_rect(88, 30, frame.area());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -575,8 +596,17 @@ fn draw_cockpit(frame: &mut Frame<'_>, summary: &CockpitSummary, list_state: &mu
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            if summary.agy_auto_update { "on" } else { "off" },
-            Style::default().fg(if summary.agy_auto_update {
+            format!(
+                "lg:{} · agy:{}{}",
+                if summary.lg_auto_update { "on" } else { "off" },
+                if summary.agy_auto_update { "on" } else { "off" },
+                if summary.enabled_harness_updates > 0 {
+                    format!(" · +{} harness", summary.enabled_harness_updates)
+                } else {
+                    String::new()
+                }
+            ),
+            Style::default().fg(if summary.lg_auto_update || summary.agy_auto_update {
                 Color::Green
             } else {
                 Color::DarkGray
@@ -1033,6 +1063,7 @@ struct TopApp {
     log_scroll: u16,
     log_source: LogSourceTab,
     show_help: bool,
+    open_auto_update: bool,
     anim_tick: usize,
     toast: Option<(String, bool, u64)>,
     data: PolledData,
@@ -1048,6 +1079,7 @@ impl TopApp {
             log_scroll: 0,
             log_source: LogSourceTab::AcpStderr,
             show_help: false,
+            open_auto_update: false,
             anim_tick: 0,
             toast: None,
             data: initial,
@@ -1556,6 +1588,13 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
         if handle_top_events(&mut app, &refresh_tx, &cmd_tx)? {
             break;
         }
+        if app.open_auto_update {
+            app.open_auto_update = false;
+            run_auto_update_loop(&mut session, state_paths).await?;
+            let next = refresh_tx.borrow().wrapping_add(1);
+            let _ = refresh_tx.send_replace(next);
+            continue;
+        }
 
         tokio::time::sleep(Duration::from_millis(45)).await;
     }
@@ -1638,6 +1677,9 @@ fn handle_top_key(
         }
         KeyCode::Char('o') => {
             let _ = cmd_tx.try_send(TuiCommand::OpenBrowser);
+        }
+        KeyCode::Char('u') => {
+            app.open_auto_update = true;
         }
         KeyCode::Char('l') if app.tab_idx == 3 => {
             app.log_source = match app.log_source {
@@ -2721,6 +2763,13 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         ),
         Span::styled("Select  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
+            "u ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Auto-Update  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
             "s/S ",
             Style::default()
                 .fg(Color::Green)
@@ -2898,6 +2947,15 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  u                      ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Open Auto-Update Manager (lg, agy & coding harnesses)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  r                      ",
                 Style::default()
                     .fg(Color::Cyan)
@@ -2973,4 +3031,164 @@ fn centered_rect(max_width: u16, max_height: u16, area: Rect) -> Rect {
         .y
         .saturating_add(area.height.saturating_sub(height) / 2);
     Rect::new(x, y, width, height)
+}
+
+// ============================================================================
+// Dedicated Auto-Update Manager TUI (lg auto-update / Cockpit [v] / Top [u])
+// ============================================================================
+
+#[derive(Clone)]
+struct CoreAutoUpdateTuiController {
+    state_paths: StatePaths,
+}
+
+impl liftgate_auto_update_tui::AutoUpdateTuiController for CoreAutoUpdateTuiController {
+    fn initial_view(&self) -> liftgate_auto_update_tui::AutoUpdateInitialView {
+        let settings = self.state_paths.read_settings().unwrap_or_default();
+        let ledger = self
+            .state_paths
+            .read_auto_update_ledger()
+            .unwrap_or_default();
+        let daemon = self
+            .state_paths
+            .read_daemon()
+            .ok()
+            .flatten()
+            .filter(|d| is_pid_alive(d.pid));
+        let local_idle = liftgate_core::auto_update::evaluate_local_client_idle(&self.state_paths);
+        liftgate_auto_update_tui::AutoUpdateInitialView {
+            switches: settings.auto_update_switches(),
+            ledger,
+            daemon_running: daemon.is_some(),
+            daemon_pid: daemon.map(|d| d.pid),
+            local_idle,
+            lg_version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    fn current_switches(&self) -> liftgate_auto_update::FleetSwitchSnapshot {
+        self.state_paths
+            .read_settings()
+            .unwrap_or_default()
+            .auto_update_switches()
+    }
+
+    fn toggle_target(
+        &self,
+        target: AutoUpdateTarget,
+    ) -> Result<(liftgate_auto_update::FleetSwitchSnapshot, bool), String> {
+        let mut settings = self
+            .state_paths
+            .read_settings()
+            .map_err(|e| e.display_chain())?;
+        let next_val = !settings.is_auto_update_enabled(target);
+        settings.set_auto_update_enabled(target, next_val);
+        self.state_paths
+            .write_settings(&settings)
+            .map_err(|e| e.display_chain())?;
+        liftgate_core::auto_update::sync_daemon_state_toggles(&self.state_paths, &settings);
+        Ok((settings.auto_update_switches(), next_val))
+    }
+
+    fn step_interval(
+        &self,
+        forward: bool,
+    ) -> Result<liftgate_auto_update::FleetSwitchSnapshot, String> {
+        let mut settings = self
+            .state_paths
+            .read_settings()
+            .map_err(|e| e.display_chain())?;
+        settings.auto_update_interval_mins = if forward {
+            settings.auto_update_interval_mins.step_next()
+        } else {
+            settings.auto_update_interval_mins.step_prev()
+        };
+        self.state_paths
+            .write_settings(&settings)
+            .map_err(|e| e.display_chain())?;
+        Ok(settings.auto_update_switches())
+    }
+
+    fn enable_all(&self) -> Result<liftgate_auto_update::FleetSwitchSnapshot, String> {
+        let mut settings = self
+            .state_paths
+            .read_settings()
+            .map_err(|e| e.display_chain())?;
+        for t in AutoUpdateTarget::ALL {
+            settings.set_auto_update_enabled(t, true);
+        }
+        self.state_paths
+            .write_settings(&settings)
+            .map_err(|e| e.display_chain())?;
+        liftgate_core::auto_update::sync_daemon_state_toggles(&self.state_paths, &settings);
+        Ok(settings.auto_update_switches())
+    }
+
+    fn reset_defaults(&self) -> Result<liftgate_auto_update::FleetSwitchSnapshot, String> {
+        liftgate_core::auto_update::reset_to_defaults(&self.state_paths)
+            .map_err(|e| e.display_chain())?;
+        let settings = self
+            .state_paths
+            .read_settings()
+            .map_err(|e| e.display_chain())?;
+        Ok(settings.auto_update_switches())
+    }
+
+    async fn inspect_cached(
+        &self,
+        cache: &mut liftgate_auto_update::AutoUpdateProbeCache,
+        force_reprobe: bool,
+    ) -> Result<liftgate_auto_update::AutoUpdateStatusReport, String> {
+        liftgate_core::auto_update::inspect_auto_update_status_cached(
+            &self.state_paths,
+            cache,
+            force_reprobe,
+        )
+        .await
+        .map_err(|e| e.display_chain())
+    }
+
+    async fn run_single_target(
+        &self,
+        target: AutoUpdateTarget,
+        check_only: bool,
+    ) -> liftgate_auto_update::SingleTargetRunResult {
+        let settings = self.state_paths.read_settings().unwrap_or_default();
+        liftgate_core::auto_update::run_manual_single_target(
+            &self.state_paths,
+            &settings,
+            target,
+            check_only,
+        )
+        .await
+    }
+
+    async fn run_all_enabled(
+        &self,
+    ) -> Result<Vec<liftgate_auto_update::SingleTargetRunResult>, String> {
+        let run_args = liftgate_core::cli::AutoUpdateRunArgs::default();
+        liftgate_core::auto_update::execute_manual_auto_update_run(&self.state_paths, &run_args)
+            .await
+            .map_err(|e| e.display_chain())
+    }
+}
+
+/// Opens the full-screen dedicated Auto-Update Manager TUI.
+pub async fn run_auto_update_manager(state_paths: &StatePaths) -> Result<(), CliError> {
+    let mut session = TerminalSession::enter("auto-update manager")?;
+    let res = run_auto_update_loop(&mut session, state_paths).await;
+    drop(session);
+    res
+}
+
+async fn run_auto_update_loop(
+    session: &mut TerminalSession,
+    state_paths: &StatePaths,
+) -> Result<(), CliError> {
+    let controller = CoreAutoUpdateTuiController {
+        state_paths: state_paths.clone(),
+    };
+    liftgate_auto_update_tui::run_auto_update_loop(&mut session.terminal, controller)
+        .await
+        .map_err(|source| CliError::TuiIo { source })
 }

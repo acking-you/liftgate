@@ -25,15 +25,15 @@ use liftgate_types::{
     },
     session_key::{WebToolBridgeConfig, truncate_head_tail_lines},
     telemetry::{
-        CacheTelemetrySummary, CapturedAcpPromptBlock, CapturedFullMessage, CapturedFullPart,
-        CapturedMessageSummary, CapturedToolSpec, ContextCaptureDetailResponse,
-        ContextCaptureRecord, ContextCaptureSummary, ContextCapturesResponse, ContextRewrite,
-        ContextRewriteKind, ContextSegment, ContextSegmentKey, ElasticIoTelemetry,
-        FullContextPayload, GatewayMetricsSummary, LowCacheDiagnosticCause,
-        LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord, LowCacheHitsResponse,
-        LowCachePayloadDetailResponse, LowCacheRequestCapture, LowCacheRequestMetrics,
-        LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot, ToolCallDetail,
-        ToolCallTelemetrySummary, ToolCallsResponse,
+        AutoUpdateTelemetrySummary, CacheTelemetrySummary, CapturedAcpPromptBlock,
+        CapturedFullMessage, CapturedFullPart, CapturedMessageSummary, CapturedToolSpec,
+        ContextCaptureDetailResponse, ContextCaptureRecord, ContextCaptureSummary,
+        ContextCapturesResponse, ContextRewrite, ContextRewriteKind, ContextSegment,
+        ContextSegmentKey, ElasticIoTelemetry, FullContextPayload, GatewayMetricsSummary,
+        LowCacheDiagnosticCause, LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord,
+        LowCacheHitsResponse, LowCachePayloadDetailResponse, LowCacheRequestCapture,
+        LowCacheRequestMetrics, LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
+        ToolCallDetail, ToolCallTelemetrySummary, ToolCallsResponse,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -739,6 +739,7 @@ struct TelemetryInner {
     context_store: ContextCaptureStore,
     pricing: PriceBook,
     usage: UsageLedger,
+    auto_update: Option<AutoUpdateTelemetrySummary>,
     session_contexts: HashMap<String, SessionContextSample>,
     active_tasks: BTreeMap<String, TaskSnapshot>,
     recent_tasks: VecDeque<TaskSnapshot>,
@@ -798,6 +799,7 @@ impl TelemetryHub {
                 context_store: ContextCaptureStore::load(config.context_capture),
                 pricing: PriceBook::load(config.pricing_path),
                 usage: UsageLedger::load(config.usage_path, unix_timestamp_ms()),
+                auto_update: None,
                 session_contexts: HashMap::new(),
                 active_tasks: BTreeMap::new(),
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
@@ -818,6 +820,18 @@ impl TelemetryHub {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    /// Publishes the latest idle auto-update fleet summary and notifies SSE subscribers.
+    pub fn set_auto_update_summary(&self, summary: AutoUpdateTelemetrySummary) {
+        self.lock_inner().auto_update = Some(summary);
+        self.notify_change();
+    }
+
+    /// Returns the most recently published idle auto-update fleet summary, if available.
+    #[must_use]
+    pub fn auto_update_summary(&self) -> Option<AutoUpdateTelemetrySummary> {
+        self.lock_inner().auto_update.clone()
     }
 
     fn flush_prepared_persist(

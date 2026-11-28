@@ -549,6 +549,185 @@ pub async fn execute_upgrade(
     execute_upgrade_with_progress(state_paths, args, current_exe, None).await
 }
 
+pub(crate) enum IdleSelfUpgradeOutcome {
+    UpToDate {
+        current_version: String,
+        latest_version: String,
+    },
+    SkippedPackagedBundle {
+        current_version: String,
+        bundle_kind: &'static str,
+    },
+    DeferredBusy {
+        current_version: String,
+        target_version: String,
+    },
+    Installed {
+        from_version: String,
+        to_version: String,
+        liftgate_exe: PathBuf,
+    },
+}
+
+/// Checks GitHub Releases while idle, stages and verifies `SHA256SUMS` + `--version`, re-checks
+/// `is_idle` right before modifying disk binaries, and atomically replaces `liftgate` and `lg`
+/// without stopping the caller process (allowing a managed daemon to spawn a detached respawn helper).
+pub(crate) async fn stage_and_install_upgrade_if_idle<F>(
+    state_paths: &StatePaths,
+    args: &UpgradeArgs,
+    current_exe: &Path,
+    mut is_idle: F,
+) -> Result<IdleSelfUpgradeOutcome, CliError>
+where
+    F: FnMut() -> bool,
+{
+    validate_repo_slug(&args.repo)?;
+    if let Some(bundle_kind) = detect_packaged_bundle_kind(current_exe) {
+        return Ok(IdleSelfUpgradeOutcome::SkippedPackagedBundle {
+            current_version: CURRENT_VERSION_RAW.to_owned(),
+            bundle_kind,
+        });
+    }
+    let desired_target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(COMPILE_TARGET);
+    validate_target_triple(desired_target)?;
+
+    let plan = resolve_release_plan(
+        &args.repo,
+        None,
+        desired_target,
+        args.proxy.as_deref(),
+        args.base_url.as_deref(),
+    )
+    .await?;
+
+    let target_ver_str = plan
+        .tag
+        .strip_prefix('v')
+        .or_else(|| plan.tag.strip_prefix('V'))
+        .unwrap_or(&plan.tag)
+        .to_owned();
+    let current_sem = SemVer::parse(CURRENT_VERSION_RAW);
+    let target_sem = SemVer::parse(&plan.tag);
+    let cmp = match (&current_sem, &target_sem) {
+        (Some(cur), Some(tgt)) => cur.cmp(tgt),
+        _ if CURRENT_VERSION_RAW == target_ver_str => Ordering::Equal,
+        _ => Ordering::Less,
+    };
+    if cmp != Ordering::Less {
+        return Ok(IdleSelfUpgradeOutcome::UpToDate {
+            current_version: CURRENT_VERSION_RAW.to_owned(),
+            latest_version: target_ver_str,
+        });
+    }
+    if !is_idle() {
+        return Ok(IdleSelfUpgradeOutcome::DeferredBusy {
+            current_version: CURRENT_VERSION_RAW.to_owned(),
+            target_version: target_ver_str,
+        });
+    }
+
+    let stage = StageDirGuard::create(state_paths)?;
+    let sums_bytes = fetch_bytes_bounded(
+        &plan.checksums_url,
+        MAX_METADATA_BYTES,
+        FETCH_METADATA_TIMEOUT,
+        args.proxy.as_deref(),
+        false,
+    )
+    .await?;
+    let sums_text = String::from_utf8_lossy(&sums_bytes);
+    let expected_sha256 =
+        lookup_sha256_in_sums(&sums_text, &plan.archive_name).ok_or_else(|| {
+            CliError::UpgradeArchive {
+                asset: plan.archive_name.clone(),
+                source: ArchiveError::MissingChecksumEntry {
+                    tag: plan.tag.clone(),
+                    asset: plan.archive_name.clone(),
+                },
+            }
+        })?;
+    if let Some(api_digest) = &plan.api_sha256
+        && !api_digest.eq_ignore_ascii_case(&expected_sha256)
+    {
+        return Err(CliError::UpgradeChecksumMismatch {
+            asset: plan.archive_name.clone(),
+            expected: expected_sha256,
+            actual: api_digest.clone(),
+        });
+    }
+
+    let archive_path = stage.path.join(&plan.archive_name);
+    download_url_to_path_with_progress(
+        &plan.archive_url,
+        &archive_path,
+        MAX_ARCHIVE_BYTES,
+        FETCH_ARCHIVE_TIMEOUT,
+        args.proxy.as_deref(),
+        None,
+    )
+    .await?;
+
+    let actual_sha256 = compute_file_sha256(&archive_path)?;
+    if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        return Err(CliError::UpgradeChecksumMismatch {
+            asset: plan.archive_name.clone(),
+            expected: expected_sha256,
+            actual: actual_sha256,
+        });
+    }
+
+    let staged = unpack_release_binaries(&archive_path, &plan.archive_name, &stage.path)?;
+    if plan.target_triple == COMPILE_TARGET {
+        smoke_check_staged_binary(&staged.liftgate_bin).await?;
+    }
+    let install_targets = plan_install_targets(current_exe, &staged, &plan.target_triple);
+    verify_install_targets_writable(&install_targets)?;
+
+    if !is_idle() {
+        return Ok(IdleSelfUpgradeOutcome::DeferredBusy {
+            current_version: CURRENT_VERSION_RAW.to_owned(),
+            target_version: target_ver_str,
+        });
+    }
+
+    let mut rollback_copies: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(install_targets.len());
+    for (idx, (staged_src, dest_path)) in install_targets.iter().enumerate() {
+        let prev_copy = stage.path.join(format!("rollback-{idx}.bin"));
+        let had_prev =
+            dest_path.is_file() && copy_executable_with_sync(dest_path, &prev_copy).is_ok();
+        if let Err(err) = replace_executable_atomic(staged_src, dest_path) {
+            for (saved_src, orig_dest) in rollback_copies.iter().rev() {
+                let _ = replace_executable_atomic(saved_src, orig_dest);
+            }
+            return Err(err);
+        }
+        if had_prev {
+            rollback_copies.push((prev_copy, dest_path.clone()));
+        }
+    }
+
+    let liftgate_exe = install_targets
+        .iter()
+        .find(|(_, dest)| {
+            dest.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("liftgate"))
+        })
+        .or_else(|| install_targets.first())
+        .map_or_else(|| current_exe.to_path_buf(), |(_, dest)| dest.clone());
+
+    Ok(IdleSelfUpgradeOutcome::Installed {
+        from_version: CURRENT_VERSION_RAW.to_owned(),
+        to_version: target_ver_str,
+        liftgate_exe,
+    })
+}
+
 pub async fn execute_upgrade_with_progress(
     state_paths: &StatePaths,
     args: &UpgradeArgs,

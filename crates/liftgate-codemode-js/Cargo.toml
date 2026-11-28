@@ -1,0 +1,13 @@
+[package]
+name = "liftgate-codemode-js"
+description = "Zero-dependency JavaScript source normalizer, template-literal backtick healer, and bare-V8 btoa/atob polyfill injector for Code Mode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]

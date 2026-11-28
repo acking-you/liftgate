@@ -480,6 +480,7 @@ fn find_subcommand_index(args: &[OsString]) -> Option<usize> {
         "--ui-dir",
         "--agy-proxy",
         "--agy-auto-update",
+        "--lg-auto-update",
         "--vision-offload",
         "--mcp-tool-bridge",
         "--low-cache-capture-payload",

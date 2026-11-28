@@ -25,7 +25,7 @@ use super::{command_from_terminal_spec, resolve_omp_command, spawn_and_wait_inte
 pub async fn run_omp(state_paths: &StatePaths, args: OmpArgs) -> Result<i32, CliError> {
     let (spec, ephemeral_guards) = build_omp_invocation(state_paths, &args, None, false).await?;
     let cmd = command_from_terminal_spec(&spec);
-    let exit_code = spawn_and_wait_interactive("omp", &spec.program, cmd).await?;
+    let exit_code = spawn_and_wait_interactive(state_paths, "omp", &spec.program, cmd).await?;
     drop(ephemeral_guards);
     Ok(exit_code)
 }

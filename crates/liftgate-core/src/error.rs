@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use liftgate_harness::HarnessError;
 use liftgate_server::{error::AcpError, platform::SessionCwdError};
+use liftgate_types::config::AutoUpdateTarget;
 use liftgate_types::error::{ValidationError, format_error_chain};
 use thiserror::Error;
 
@@ -526,6 +527,17 @@ pub enum CliError {
         exe_path: PathBuf,
         release_url: String,
     },
+
+    #[error(
+        "unknown auto-update target `{value}` (expected one of: `lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `all`)"
+    )]
+    UnknownAutoUpdateTarget { value: String },
+
+    #[error("`{target}` update command failed: {detail}")]
+    HarnessAutoUpdateFailed {
+        target: AutoUpdateTarget,
+        detail: String,
+    },
 }
 
 impl CliError {
@@ -627,6 +639,9 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         CliError::UnsupportedYamlLayout { path, .. } => Some(format!(
             "Convert `{}` to standard space-indented YAML mappings/lists before re-running `lg config omp`.",
             path.display()
+        )),
+        CliError::UnknownAutoUpdateTarget { .. } => Some(format!(
+            "Open `{bin} auto-update` for the interactive manager, or pass `lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `--all`."
         )),
         _ => None,
     }

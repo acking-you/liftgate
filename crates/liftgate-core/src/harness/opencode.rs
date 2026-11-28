@@ -31,7 +31,7 @@ use super::{
 pub async fn run_opencode(state_paths: &StatePaths, args: OpencodeArgs) -> Result<i32, CliError> {
     let spec = build_opencode_invocation(state_paths, &args, None, false).await?;
     let cmd = command_from_terminal_spec(&spec);
-    spawn_and_wait_interactive("opencode", &spec.program, cmd).await
+    spawn_and_wait_interactive(state_paths, "opencode", &spec.program, cmd).await
 }
 
 /// Prepares an isolated [`TerminalLaunchSpec`] for launching OpenCode in a native terminal

@@ -806,6 +806,7 @@ impl McpRoutingTable {
             let (serialized, patch_repaired) = match format_direct_tool_arguments(
                 arguments,
                 &live_bridged,
+                active_spec,
                 self.budget.max_single_schema_in_search_bytes,
             ) {
                 Ok(formatted) => formatted,
@@ -1381,6 +1382,7 @@ fn refresh_bridged_tool_if_changed<'a>(
 fn format_direct_tool_arguments(
     raw_args: &Value,
     bridged: &McpBridgedTool,
+    active_spec: &CanonicalToolSpec,
     max_schema_bytes: usize,
 ) -> Result<(String, bool), String> {
     if bridged.is_custom {
@@ -1402,7 +1404,19 @@ fn format_direct_tool_arguments(
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
-        patch_repaired = heal_and_validate_json_patch_field(bridged.v4a_patch, map)
+        if (liftgate_types::session_key::is_codex_exec_orchestrator_tool(active_spec)
+            || liftgate_types::session_key::is_opencode_execute_orchestrator_tool(active_spec))
+            && let Some(Value::String(raw_code)) = map.get_mut("code")
+        {
+            let normalized = normalize_code_mode_exec_js(raw_code);
+            if let std::borrow::Cow::Owned(healed_code) = normalized {
+                if raw_code.contains("*** Begin Patch") {
+                    patch_repaired = true;
+                }
+                *raw_code = healed_code;
+            }
+        }
+        patch_repaired |= heal_and_validate_json_patch_field(bridged.v4a_patch, map)
             .map_err(|err| err.to_string())?;
         if !bridged.has_root_combinator {
             check_missing_non_nullable_required(

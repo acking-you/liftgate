@@ -28,6 +28,9 @@ const zh = {
     proxy: "出站代理",
     direct: "直连",
     autoUpdate: "空闲自动更新",
+    fleetAutoUpdate: "全组件空闲自动更新",
+    fleetAutoUpdateSub: (mins: number, idle: boolean) =>
+      `每 ${mins} 分钟 · ${idle ? "当前无活跃会话（可检测）" : "存在活跃会话（暂停检测）"} · 在终端运行 lg auto-update 管理`,
     on: "开",
     off: "关",
     upstream: (v: string) => ` · 上游 ${v}`,
@@ -134,6 +137,9 @@ const en: InfraMessages = {
     proxy: "Outbound proxy",
     direct: "Direct",
     autoUpdate: "Auto-update when idle",
+    fleetAutoUpdate: "Fleet idle auto-update",
+    fleetAutoUpdateSub: (mins, idle) =>
+      `Every ${mins}m · ${idle ? "Idle (ready for checks)" : "Session active (checks paused)"} · Manage via lg auto-update`,
     on: "On",
     off: "Off",
     upstream: (v) => ` · upstream ${v}`,
