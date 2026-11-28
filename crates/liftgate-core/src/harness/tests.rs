@@ -6,8 +6,8 @@ use liftgate_harness::claude::{
     ClaudeInvocationKind, classify_claude_invocation, default_claude_effort_level,
 };
 use liftgate_harness::codex::{
-    CodexInvocationKind, classify_codex_invocation, has_explicit_codex_config_key,
-    toml_inline_string,
+    CODEX_UPDATE_PLAN_ENABLED_KEY, CodexInvocationKind, classify_codex_invocation,
+    has_explicit_codex_config_key, has_explicit_codex_update_plan_config, toml_inline_string,
 };
 use liftgate_harness::omp::merge_omp_config_files_env;
 use liftgate_harness::opencode::{
@@ -229,6 +229,26 @@ fn classifies_codex_invocations_and_root_options_accurately() {
         &strs(&["-c", "model = 'gemini-3.8-flash-low'", "resume"]),
         "model"
     ));
+    assert!(!has_explicit_codex_update_plan_config(&strs(&["resume"])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "tools.update_plan.enabled=false"
+    ])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "--config=tools.update_plan={enabled=false}"
+    ])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "tools={update_plan={enabled=false}}"
+    ])));
+    assert!(has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "\"tools\".\"update_plan\".enabled=false"
+    ])));
+    assert!(!has_explicit_codex_update_plan_config(&strs(&[
+        "-c",
+        "tools.web_search=true"
+    ])));
 }
 
 #[tokio::test]
@@ -296,6 +316,7 @@ async fn codex_terminal_session_disables_updates_after_passthrough_overrides()
         )
     );
     for expected_flag in [
+        "tools.update_plan.enabled=true",
         "features.apps=false",
         "features.remote_plugin=false",
         "features.recommended_plugins=false",
@@ -308,6 +329,7 @@ async fn codex_terminal_session_disables_updates_after_passthrough_overrides()
     assert!(command.get_envs().any(|(key, value)| {
         key == "AGY_GATEWAY_API_KEY" && value == Some(std::ffi::OsStr::new("test-gateway-key"))
     }));
+    assert_eq!(CODEX_UPDATE_PLAN_ENABLED_KEY, "tools.update_plan.enabled");
     Ok(())
 }
 

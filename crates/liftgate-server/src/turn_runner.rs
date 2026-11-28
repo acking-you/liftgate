@@ -1450,7 +1450,7 @@ const TRANSCRIPT_RUNAWAY_MARKERS: [&str; 8] = [
 ];
 
 const MAX_POST_TOOL_BRIDGE_NON_WS_CHARS: usize = 120;
-const COMMENTARY_IDLE_FLUSH_DELAY: Duration = Duration::from_millis(800);
+const COMMENTARY_IDLE_FLUSH_DELAY: Duration = Duration::from_millis(450);
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
     match deadline {

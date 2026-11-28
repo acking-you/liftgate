@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use liftgate_harness::args_util::{extract_explicit_model_arg, slice_before_double_dash};
 use liftgate_harness::codex::{
-    CODEX_STREAM_IDLE_TIMEOUT_KEY, CodexInvocationKind, classify_codex_invocation,
-    has_explicit_codex_config_key, toml_inline_string,
+    CODEX_STREAM_IDLE_TIMEOUT_KEY, CODEX_UPDATE_PLAN_ENABLED_KEY, CodexInvocationKind,
+    classify_codex_invocation, has_explicit_codex_config_key,
+    has_explicit_codex_update_plan_config, toml_inline_string,
 };
 use liftgate_harness::merge_endpoint_no_proxy;
 
@@ -253,6 +254,12 @@ pub(super) async fn build_codex_invocation(
         push_cfg(
             &mut full_args,
             format!("{CODEX_STREAM_IDLE_TIMEOUT_KEY}={DEFAULT_REQUEST_TIMEOUT_MS}"),
+        );
+    }
+    if !has_explicit_codex_update_plan_config(&args.passthrough_args) {
+        push_cfg(
+            &mut full_args,
+            format!("{CODEX_UPDATE_PLAN_ENABLED_KEY}=true"),
         );
     }
     for remote_feature in [

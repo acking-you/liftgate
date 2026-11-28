@@ -41,6 +41,7 @@ enum OwnedOrchestratorContract {
     CodexExec {
         mcp_name: String,
         has_apply_patch: bool,
+        has_update_plan: bool,
     },
     ClaudeBashFirst {
         bash_mcp_name: String,
@@ -61,9 +62,11 @@ impl OwnedOrchestratorContract {
             McpOrchestratorContract::CodexExec {
                 mcp_name,
                 has_apply_patch,
+                has_update_plan,
             } => Self::CodexExec {
                 mcp_name: mcp_name.to_owned(),
                 has_apply_patch,
+                has_update_plan,
             },
             McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name } => Self::ClaudeBashFirst {
                 bash_mcp_name: bash_mcp_name.to_owned(),
@@ -90,9 +93,11 @@ impl OwnedOrchestratorContract {
             Self::CodexExec {
                 mcp_name,
                 has_apply_patch,
+                has_update_plan,
             } => McpOrchestratorContract::CodexExec {
                 mcp_name,
                 has_apply_patch: *has_apply_patch,
+                has_update_plan: *has_update_plan,
             },
             Self::ClaudeBashFirst { bash_mcp_name } => {
                 McpOrchestratorContract::ClaudeBashFirst { bash_mcp_name }

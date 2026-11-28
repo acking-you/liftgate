@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.22] - 2026-11-28
+
+### Added
+- **Codex `update_plan` checklist & live milestone commentary**:
+  - Enabled `tools.update_plan.enabled = true` by default across `lg cx` (`-c` ephemeral flag without mutating `~/.codex/config.toml`), isolated `lg cxa`, and `lg config` (`[tools.update_plan]`, cleanly removed on `lg config` uninstall while preserving explicit `enabled = false` or inline `[tools]` overrides).
+  - Extended `McpOrchestratorContract::CodexExec` with `has_update_plan` detection (`update_plan` tool or `code_mode_only` `exec` declaration) so `<api_gateway_bridge_rules>` steers multi-step work into 0-RTT `await tools.update_plan({ explanation, plan })` inside `mcp_lg_exec` (or top-level `mcp_lg_update_plan` on non-`exec` turns, never in `Plan Mode`).
+  - Updated `CODEX_DISTILLED_PROMPT`, compacted Default `<collaboration_mode>`, and `CodexExec` bridge rules to pair tool work and phase transitions with concise 1-sentence `commentary` updates (collapsing in Codex TUI once `final_answer` completes), added explicit `default_reasoning_summary = "auto"` on `/v1/codex-models` entries, and tightened `COMMENTARY_IDLE_FLUSH_DELAY` from `800ms` to `450ms`.
+
 ## [0.2.21] - 2026-11-28
 
 ### Added
