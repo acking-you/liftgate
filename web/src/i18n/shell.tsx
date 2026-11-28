@@ -35,6 +35,16 @@ const zh = {
   probe: "拨测",
   connection: "连接",
   connectionSettings: "连接设置",
+  providerSelectAria: "切换全局默认上游 Provider",
+  optMode: {
+    optimized: "智能优化",
+    passthrough: "纯透传观测",
+    custom: "自定义优化",
+    toggleHintOptimized:
+      "当前启用上下文蒸馏与工具虚拟化。点击切换为「纯透传观测 (Passthrough)」以无损采集 Harness 原始行为。",
+    toggleHintPassthrough:
+      "当前为「纯透传观测 (Passthrough)」：保留原始 System Prompt 与全量工具 Schema。点击恢复「智能优化」。",
+  },
   demoNote: (code: React.ReactNode): React.ReactNode => (
     <>演示数据，未连接网关。去掉地址里的 {code} 即连接真实网关。</>
   ),
@@ -103,6 +113,16 @@ const en: ShellMessages = {
   probe: "Probe",
   connection: "Connection",
   connectionSettings: "Connection settings",
+  providerSelectAria: "Switch active default upstream provider",
+  optMode: {
+    optimized: "Optimized",
+    passthrough: "Passthrough",
+    custom: "Custom Opt",
+    toggleHintOptimized:
+      "Prompt distillation & 0-RTT tool virtualization active. Click to switch to Passthrough (Observe-Only) to capture raw harness prompts & schemas verbatim.",
+    toggleHintPassthrough:
+      "Passthrough (Observe-Only) active: raw harness prompts & tool schemas forwarded verbatim. Click to re-enable Gateway Optimization.",
+  },
   demoNote: (code) => <>Demo data; no gateway connected. Remove {code} from the address to connect to a real gateway.</>,
   unreachable: (error, start) => (
     <>

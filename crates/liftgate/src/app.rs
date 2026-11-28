@@ -186,6 +186,10 @@ async fn dispatch(
             render::run_auto_update(&state_paths, args).await?;
             Ok(0)
         }
+        Some(Commands::Provider(args)) => {
+            render::run_provider(&state_paths, args).await?;
+            Ok(0)
+        }
         Some(Commands::Agy(args)) => render::run_agy(&state_paths, args).await,
         Some(Commands::Proxy(args)) => {
             render::run_proxy(&state_paths, args).await?;

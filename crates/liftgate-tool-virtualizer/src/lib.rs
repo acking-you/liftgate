@@ -13,11 +13,13 @@ pub mod profiles;
 pub mod router;
 pub mod schema;
 
-pub use budget::VirtualizerBudget;
+pub use budget::{VirtualizationTargetMode, VirtualizerBudget};
 pub use planner::{
-    McpSessionCatalog, McpSessionOptions, partition_tools_for_harness, partition_tools_for_mcp,
-    partition_tools_for_mcp_session, partition_tools_for_mcp_session_with_options,
-    partition_tools_for_mcp_with_hint, plan_virtualization, plan_virtualization_with_options,
+    McpSessionCatalog, McpSessionOptions, VirtualizerPlanConfig, partition_tools_for_harness,
+    partition_tools_for_mcp, partition_tools_for_mcp_session,
+    partition_tools_for_mcp_session_with_options, partition_tools_for_mcp_with_hint,
+    partition_tools_for_native_api, partition_tools_with_config, plan_virtualization,
+    plan_virtualization_with_config, plan_virtualization_with_options,
     plan_virtualization_with_session_options,
 };
 pub use profile::{

@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, READ_CONTEXT_SPILL_MCP_NAME,
     SEARCH_CLIENT_TOOLS_MCP_NAME,
-    budget::VirtualizerBudget,
+    budget::{VirtualizationTargetMode, VirtualizerBudget},
     planner::McpSessionCatalog,
     profile::{HarnessToolProfile, ToolPlacement, V4aPatchContract},
     schema::{
@@ -145,6 +145,8 @@ type RebuildRoutingFn = fn(
     bool,
     bool,
     bool,
+    VirtualizationTargetMode,
+    VirtualizerBudget,
 ) -> McpRoutingTable;
 
 /// Live routing and 0-RTT search snapshot for an ACP session's active client tools.
@@ -164,6 +166,7 @@ pub struct McpRoutingTable {
     has_virtualized_dispatch: bool,
     has_gateway_web_fetch: bool,
     has_context_spill_reader: bool,
+    target_mode: VirtualizationTargetMode,
     rebuild_fn: RebuildRoutingFn,
 }
 
@@ -180,11 +183,16 @@ impl Default for McpRoutingTable {
             has_virtualized_dispatch: false,
             has_gateway_web_fetch: false,
             has_context_spill_reader: false,
+            target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
             rebuild_fn: build_routing_table_for_profile::<crate::profiles::GenericToolProfile>,
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal monomorphized rebuild callback signature"
+)]
 pub(crate) fn build_routing_table_for_profile<P: HarnessToolProfile>(
     client_tools: &[CanonicalToolSpec],
     direct_by_mcp: HashMap<String, McpBridgedTool>,
@@ -192,15 +200,22 @@ pub(crate) fn build_routing_table_for_profile<P: HarnessToolProfile>(
     has_virtualized_dispatch: bool,
     has_gateway_web_fetch: bool,
     has_context_spill_reader: bool,
+    target_mode: VirtualizationTargetMode,
+    budget: VirtualizerBudget,
 ) -> McpRoutingTable {
-    McpRoutingTable::build_with_profile_and_session_options(
-        P::default(),
+    let profile = P::default();
+    let prepass = profile.build_prepass(client_tools);
+    McpRoutingTable::build_with_prepass_and_target_mode(
+        profile,
+        &prepass,
         client_tools,
         direct_by_mcp,
         hub_names_by_namespace,
         has_virtualized_dispatch,
         has_gateway_web_fetch,
         has_context_spill_reader,
+        target_mode,
+        budget,
     )
 }
 
@@ -302,11 +317,43 @@ impl McpRoutingTable {
         profile: P,
         prepass: &P::Prepass,
         client_tools: &[CanonicalToolSpec],
+        direct_by_mcp: HashMap<String, McpBridgedTool>,
+        hub_names_by_namespace: HashMap<String, String>,
+        has_virtualized_dispatch: bool,
+        has_gateway_web_fetch: bool,
+        has_context_spill_reader: bool,
+    ) -> Self {
+        Self::build_with_prepass_and_target_mode(
+            profile,
+            prepass,
+            client_tools,
+            direct_by_mcp,
+            hub_names_by_namespace,
+            has_virtualized_dispatch,
+            has_gateway_web_fetch,
+            has_context_spill_reader,
+            VirtualizationTargetMode::AcpLoopbackMcp,
+            P::BUDGET,
+        )
+    }
+
+    /// Builds a routing table reusing an already-computed profile prepass, target wire mode, and budget.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal zero-cost monomorphized builder passes prepass, mode, and budget directly"
+    )]
+    pub fn build_with_prepass_and_target_mode<P: HarnessToolProfile>(
+        profile: P,
+        prepass: &P::Prepass,
+        client_tools: &[CanonicalToolSpec],
         mut direct_by_mcp: HashMap<String, McpBridgedTool>,
         hub_names_by_namespace: HashMap<String, String>,
         has_virtualized_dispatch: bool,
         has_gateway_web_fetch: bool,
         has_context_spill_reader: bool,
+        target_mode: VirtualizationTargetMode,
+        budget: VirtualizerBudget,
     ) -> Self {
         assert_eq!(
             std::mem::size_of::<P>(),
@@ -477,7 +524,7 @@ impl McpRoutingTable {
 
         Self {
             profile_id: P::ID,
-            budget: P::BUDGET,
+            budget,
             source_tools: client_tools.to_vec(),
             direct_by_mcp,
             hub_names_by_namespace,
@@ -486,6 +533,7 @@ impl McpRoutingTable {
             has_virtualized_dispatch,
             has_gateway_web_fetch,
             has_context_spill_reader,
+            target_mode,
             rebuild_fn: build_routing_table_for_profile::<P>,
         }
     }
@@ -502,6 +550,12 @@ impl McpRoutingTable {
         self.has_virtualized_dispatch
     }
 
+    /// Target wire mode (`AcpLoopbackMcp` vs `NativeApiTools`) of this routing table.
+    #[must_use]
+    pub const fn target_mode(&self) -> VirtualizationTargetMode {
+        self.target_mode
+    }
+
     /// Returns `Some(rebuilt)` when `client_tools` differs from the indexed tool snapshot,
     /// preserving the exact monomorphized [`HarnessToolProfile`] `P` via `rebuild_fn`.
     #[must_use]
@@ -516,6 +570,8 @@ impl McpRoutingTable {
             self.has_virtualized_dispatch,
             self.has_gateway_web_fetch,
             self.has_context_spill_reader,
+            self.target_mode,
+            self.budget,
         ))
     }
 
@@ -714,15 +770,16 @@ impl McpRoutingTable {
         active_tools: &[CanonicalToolSpec],
     ) -> VirtualizedCallDecision {
         if self.has_gateway_web_fetch && mcp_name == GATEWAY_WEB_FETCH_MCP_NAME {
+            let pfx = self.target_mode.wire_prefix();
             let url = arguments
                 .get("url")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or("");
             if url.is_empty() {
-                return preflight_error_decision(
-                    "Missing non-empty `url` string for `mcp_lg_gateway_web_fetch`.".to_owned(),
-                );
+                return preflight_error_decision(format!(
+                    "Missing non-empty `url` string for `{pfx}gateway_web_fetch`."
+                ));
             }
             let pattern = arguments
                 .get("pattern")
@@ -738,15 +795,16 @@ impl McpRoutingTable {
         }
 
         if self.has_context_spill_reader && mcp_name == READ_CONTEXT_SPILL_MCP_NAME {
+            let pfx = self.target_mode.wire_prefix();
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or("");
             if path.is_empty() {
-                return preflight_error_decision(
-                    "Missing non-empty `path` string for `mcp_lg_read_context_spill`.".to_owned(),
-                );
+                return preflight_error_decision(format!(
+                    "Missing non-empty `path` string for `{pfx}read_context_spill`."
+                ));
             }
             let start_line = arguments
                 .get("start_line")
@@ -867,8 +925,9 @@ impl McpRoutingTable {
                 .filter_map(|a| a.short_action.as_deref())
                 .take(10)
                 .collect();
+            let pfx = self.target_mode.wire_prefix();
             return preflight_error_decision(format!(
-                "Missing `action` string for `mcp_lg_{}`. Available `{}` actions include: [{}]. Call `mcp_lg_{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `namespace: \"{}\"` to inspect schemas.",
+                "Missing `action` string for `{pfx}{}`. Available `{}` actions include: [{}]. Call `{pfx}{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `namespace: \"{}\"` to inspect schemas.",
                 hub.hub_mcp_name,
                 hub.namespace,
                 sample.join(", "),
@@ -884,8 +943,9 @@ impl McpRoutingTable {
 
         let Some(indexed) = matched else {
             let suggestions = suggest_closest_actions(&hub.actions, requested_action, 8);
+            let pfx = self.target_mode.wire_prefix();
             return preflight_error_decision(format!(
-                "Unknown action `{requested_action}` on `mcp_lg_{}`. Closest `{}` actions: [{}]. Call `mcp_lg_{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `namespace: \"{}\"` and `query` to inspect exact action names and schemas.",
+                "Unknown action `{requested_action}` on `{pfx}{}`. Closest `{}` actions: [{}]. Call `{pfx}{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `namespace: \"{}\"` and `query` to inspect exact action names and schemas.",
                 hub.hub_mcp_name,
                 hub.namespace,
                 suggestions.join(", "),
@@ -930,8 +990,9 @@ impl McpRoutingTable {
             .unwrap_or("");
 
         if requested_name.is_empty() {
+            let pfx = self.target_mode.wire_prefix();
             return preflight_error_decision(format!(
-                "Missing `name` string for `mcp_lg_{CALL_CLIENT_TOOL_MCP_NAME}`. Call `mcp_lg_{SEARCH_CLIENT_TOOLS_MCP_NAME}` first to discover active tool names."
+                "Missing `name` string for `{pfx}{CALL_CLIENT_TOOL_MCP_NAME}`. Call `{pfx}{SEARCH_CLIENT_TOOLS_MCP_NAME}` first to discover active tool names."
             ));
         }
 
@@ -960,8 +1021,9 @@ impl McpRoutingTable {
 
         let Some(indexed) = matched else {
             let suggestions = suggest_closest_tools(&self.all_indexed_tools, requested_name, 8);
+            let pfx = self.target_mode.wire_prefix();
             return preflight_error_decision(format!(
-                "Unknown client tool `{requested_name}`. Closest active tools: [{}]. Call `mcp_lg_{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `query` to inspect exact tool names and parameter schemas.",
+                "Unknown client tool `{requested_name}`. Closest active tools: [{}]. Call `{pfx}{SEARCH_CLIENT_TOOLS_MCP_NAME}` with `query` to inspect exact tool names and parameter schemas.",
                 suggestions.join(", ")
             ));
         };
@@ -1084,6 +1146,7 @@ impl McpRoutingTable {
         }
 
         let mut out = String::with_capacity(2048);
+        let pfx = self.target_mode.wire_prefix();
         out.push_str(&format!(
             "Matched {total_matches} active client tool(s) (showing top {}):\n",
             total_matches.min(limit)
@@ -1098,12 +1161,12 @@ impl McpRoutingTable {
             }
             let invoke_hint = if item.folded_into_orchestrator {
                 format!(
-                    "`mcp_lg_eval` cell via `await tool.{}({{ ... }})`",
+                    "`{pfx}eval` cell via `await tool.{}({{ ... }})`",
                     item.client_name
                 )
             } else if item.invoke_via_mcp_name == CALL_CLIENT_TOOL_MCP_NAME {
                 format!(
-                    "`mcp_lg_{CALL_CLIENT_TOOL_MCP_NAME}` with `{{\"name\": \"{}\", \"arguments\": {{ ... }}}}`",
+                    "`{pfx}{CALL_CLIENT_TOOL_MCP_NAME}` with `{{\"name\": \"{}\", \"arguments\": {{ ... }}}}`",
                     item.client_name
                 )
             } else if item.invoke_via_mcp_name.starts_with("ns__") {
@@ -1112,11 +1175,11 @@ impl McpRoutingTable {
                     .as_deref()
                     .unwrap_or(item.client_name.as_str());
                 format!(
-                    "`mcp_lg_{}` with `{{\"action\": \"{act}\", \"args\": {{ ... }}}}`",
+                    "`{pfx}{}` with `{{\"action\": \"{act}\", \"args\": {{ ... }}}}`",
                     item.invoke_via_mcp_name
                 )
             } else {
-                format!("`mcp_lg_{}` directly", item.invoke_via_mcp_name)
+                format!("`{pfx}{}` directly", item.invoke_via_mcp_name)
             };
 
             let desc_short = truncate_utf8_prefix(&item.prose_description, 520);

@@ -1172,6 +1172,22 @@ function buildPayload(session: DemoSession, turn: number, taskId: string): FullC
   return {
     task_id: taskId,
     recorded_at_unix_ms: NOW,
+    upstream_wire: {
+      provider_id: "agy",
+      driver: "agy-acp",
+      wire_protocol: "stateful_rpc",
+      optimization_mode: "optimized",
+      isomorphic_wire: false,
+      raw_system_bytes: bytes(HARNESS_PROMPT),
+      forwarded_system_bytes: bytes(DEV_INSTRUCTIONS),
+      raw_tool_count: catalog.tools.length,
+      raw_tool_bytes: catalog.client_tools_bytes,
+      forwarded_tool_count: catalog.wire_tools.length,
+      forwarded_tool_bytes: catalog.wire_budget_bytes,
+      spill_enabled: true,
+      cache_breakpoints_aligned: 0,
+      zero_rtt_continuations: 1,
+    },
     acp_system_append: turn === 1 ? [catalog.bridge_rules_prompt, catalog.orchestrator_contract_prompt].filter(Boolean).join("\n\n") : null,
     tools_delta_xml: null,
     outbound_acp_prompt_blocks: [{ type: "text", bytes: bytes(promptText), text: promptText || session.prompt }],
@@ -1300,6 +1316,15 @@ export function createDemoClient(): GatewayClient {
   let usageSince = 0;
   let visionOffload = false;
   let mcpBridge = true;
+  let activeProvider = "agy";
+  let optPolicy = {
+    prompt_distillation: true,
+    tool_virtualization: true,
+    code_mode_enhancements: true,
+    strip_billing_noise: true,
+    spill_truncation: null as boolean | null,
+  };
+  let optMode: "optimized" | "passthrough" | "custom" = "optimized";
   let closed = new Set<string>();
   let pendingId: string | null = null;
   let pendingDraft: Draft | null = null;
@@ -1625,7 +1650,19 @@ export function createDemoClient(): GatewayClient {
       if (row.cost_usd === null) summary.unpriced_calls += row.calls;
       else summary.cost_usd += row.cost_usd;
     }
-    return { summary, models };
+    const providers = [
+      {
+        provider_id: "agy",
+        calls: summary.calls,
+        auxiliary_calls: 0,
+        tokens: summary.tokens,
+        cost_usd: summary.cost_usd,
+        cache_savings_usd: savings,
+        unpriced_calls: summary.unpriced_calls,
+      },
+    ];
+    summary.by_provider = providers;
+    return { summary, models, providers };
   };
 
   const usageSeries = (bounds: readonly number[]): UsageSeriesResponse => {
@@ -1701,6 +1738,62 @@ export function createDemoClient(): GatewayClient {
     return {
       generated_at_unix_ms: Date.now(),
       gateway_version: "0.3.0-demo",
+      active_provider: activeProvider,
+      optimization_mode: optMode,
+      optimization_policy: { ...optPolicy },
+      providers: [
+        {
+          id: "agy",
+          display_name: "Google Antigravity (agy acp)",
+          driver: "agy-acp",
+          family: "stateful_session",
+          wire_protocol: "stateful_rpc",
+          tool_wire_mode: "acp_loopback_mcp",
+          enabled: true,
+          active: activeProvider === "agy",
+          auth_configured: true,
+          auth_source: "none",
+          endpoint: null,
+          default_model: "gemini-4-carbon-high",
+          fast_model: "gemini-4-hydrogen-low",
+          title_model: "gemini-4-hydrogen-low",
+          spill_enabled: true,
+        },
+        {
+          id: "openai",
+          display_name: "OpenAI Platform API",
+          driver: "openai",
+          family: "stateless_http",
+          wire_protocol: "openai_responses",
+          tool_wire_mode: "native_api_tools",
+          enabled: true,
+          active: activeProvider === "openai",
+          auth_configured: true,
+          auth_source: "env:OPENAI_API_KEY",
+          endpoint: "https://api.openai.com/v1",
+          default_model: "gpt-5.4",
+          fast_model: "gpt-5-mini",
+          title_model: "gpt-5-mini",
+          spill_enabled: false,
+        },
+        {
+          id: "anthropic",
+          display_name: "Anthropic Platform API",
+          driver: "anthropic",
+          family: "stateless_http",
+          wire_protocol: "anthropic_messages",
+          tool_wire_mode: "native_api_tools",
+          enabled: true,
+          active: activeProvider === "anthropic",
+          auth_configured: true,
+          auth_source: "env:ANTHROPIC_API_KEY",
+          endpoint: "https://api.anthropic.com",
+          default_model: "claude-sonnet-4-6",
+          fast_model: "claude-haiku-4-5",
+          title_model: "claude-haiku-4-5",
+          spill_enabled: false,
+        },
+      ],
       vision_offload_enabled: visionOffload,
       mcp_tool_bridge_enabled: mcpBridge,
       acp_process: {
@@ -1887,6 +1980,35 @@ export function createDemoClient(): GatewayClient {
     setMcpToolBridge(enabled: boolean): Promise<void> {
       mcpBridge = enabled;
       return wait(undefined);
+    },
+    setActiveProvider(providerId: string) {
+      activeProvider = providerId;
+      return wait({ ok: true, active_provider: activeProvider });
+    },
+    setOptimizationPolicy(update) {
+      if (update.mode === "passthrough") {
+        optMode = "passthrough";
+        optPolicy = {
+          prompt_distillation: false,
+          tool_virtualization: false,
+          code_mode_enhancements: false,
+          strip_billing_noise: false,
+          spill_truncation: false,
+        };
+      } else if (update.mode === "optimized") {
+        optMode = "optimized";
+        optPolicy = {
+          prompt_distillation: true,
+          tool_virtualization: true,
+          code_mode_enhancements: true,
+          strip_billing_noise: true,
+          spill_truncation: null,
+        };
+      }
+      return wait({ ok: true, mode: optMode, policy: { ...optPolicy } });
+    },
+    testProvider(providerId: string) {
+      return wait({ ok: true, provider_id: providerId, latency_ms: 42, models_discovered: 3 });
     },
 
     toolCalls: (since?: number): Promise<ToolCallsResponse> =>

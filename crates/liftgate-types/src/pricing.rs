@@ -235,6 +235,7 @@ const GEMINI_3_8_FLASH_STANDARD_PRICING_FROM: u64 = 1_798_790_400_000;
 
 const GEMINI_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 const CLAUDE_PRICING_URL: &str = "https://docs.anthropic.com/en/docs/about-claude/pricing";
+const OPENAI_PRICING_URL: &str = "https://openai.com/api/pricing";
 const VERTEX_PARTNER_PRICING_URL: &str =
     "https://cloud.google.com/model-garden/partner-models/pricing";
 
@@ -317,6 +318,55 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
         aliases: &[],
         schedule: &[from_start(price(0.09, 0.09, 0.09, 0.36))],
         source_url: VERTEX_PARTNER_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5.4",
+        label: "GPT-5.4",
+        aliases: &["gpt-5.3-codex", "gpt-5"],
+        schedule: &[from_start(price(2.50, 0.25, 2.50, 15.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5-mini",
+        label: "GPT-5 Mini",
+        aliases: &["o4-mini"],
+        schedule: &[from_start(price(0.25, 0.025, 0.25, 2.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "claude-opus-4-6",
+        label: "Claude Opus 4.6",
+        aliases: &["claude-opus-4-5"],
+        schedule: &[from_start(price(5.00, 0.50, 6.25, 25.00))],
+        source_url: CLAUDE_PRICING_URL,
+    },
+    PricingFamily {
+        key: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        aliases: &["claude-sonnet-4-5"],
+        schedule: &[from_start(price(3.00, 0.30, 3.75, 15.00))],
+        source_url: CLAUDE_PRICING_URL,
+    },
+    PricingFamily {
+        key: "claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+        aliases: &[],
+        schedule: &[from_start(price(1.00, 0.10, 1.25, 5.00))],
+        source_url: CLAUDE_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gemini-2.5-pro",
+        label: "Gemini 2.5 Pro",
+        aliases: &[],
+        schedule: &[from_start(price(1.25, 0.125, 1.25, 10.00))],
+        source_url: GEMINI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gemini-2.5-flash",
+        label: "Gemini 2.5 Flash",
+        aliases: &["gemini-2.5-flash-lite"],
+        schedule: &[from_start(price(0.30, 0.03, 0.30, 2.50))],
+        source_url: GEMINI_PRICING_URL,
     },
 ];
 
@@ -408,6 +458,24 @@ pub struct ModelUsage {
     pub last_used_at_unix_ms: u64,
 }
 
+/// Recorded token usage and USD cost attributed to one upstream provider.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProviderUsage {
+    pub provider_id: String,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub auxiliary_calls: u64,
+    #[serde(default)]
+    pub tokens: UsageTokens,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub cache_savings_usd: f64,
+    #[serde(default)]
+    pub unpriced_calls: u64,
+}
+
 /// Usage totals carried on the snapshot as `usage` (everything recorded) and served for a time
 /// range by `GET /api/telemetry/usage?from=&to=`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -439,6 +507,9 @@ pub struct UsageSummary {
     /// Calls on models without a price, left out of `cost_usd`.
     #[serde(default)]
     pub unpriced_calls: u64,
+    /// Per-provider breakdown across the same covered range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_provider: Vec<ProviderUsage>,
 }
 
 /// Usage within one interval of `GET /api/telemetry/usage/series`.
@@ -460,6 +531,8 @@ pub struct UsageInterval {
     /// Calls on models without a price, left out of `cost_usd`.
     #[serde(default)]
     pub unpriced_calls: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_provider: Vec<ProviderUsage>,
 }
 
 /// Response served by `GET /api/telemetry/usage/series?bounds=<t0,t1,…>`: one interval per
@@ -487,6 +560,9 @@ pub struct UsageResponse {
     /// Per-model usage, costliest first.
     #[serde(default)]
     pub models: Vec<ModelUsage>,
+    /// Per-provider usage, costliest first.
+    #[serde(default)]
+    pub providers: Vec<ProviderUsage>,
 }
 
 #[cfg(test)]

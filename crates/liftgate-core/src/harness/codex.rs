@@ -13,7 +13,7 @@ use liftgate_harness::merge_endpoint_no_proxy;
 
 use crate::cli::{CodexAppArgs, CodexArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::config_sync::build_offline_codex_catalog_bytes_with_mode;
-use crate::daemon::ensure_gateway_ready_for_target;
+use crate::daemon::ensure_gateway_ready_for_provider_target;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths};
 use crate::terminal::TerminalLaunchSpec;
@@ -31,6 +31,8 @@ pub async fn run_codex(state_paths: &StatePaths, args: CodexArgs) -> Result<i32,
                 listen: args.listen,
                 remote: args.remote,
                 api_key: args.api_key,
+                provider: args.provider,
+                opt: args.opt,
                 model: args.model,
                 no_bypass: args.no_bypass,
                 code_mode: args.code_mode,
@@ -123,16 +125,19 @@ pub(super) async fn build_codex_invocation(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let target = ensure_gateway_ready_for_target(
+    let target = ensure_gateway_ready_for_provider_target(
         state_paths,
         args.listen,
         args.remote.as_deref(),
         args.api_key.clone(),
         requested_model,
+        args.provider.as_deref(),
+        args.opt.as_deref(),
         true,
     )
     .await?;
 
+    let scoped_base_url = target.scoped_base_url();
     let no_proxy =
         merge_endpoint_no_proxy(existing_no_proxy.as_deref(), Some(target.client.base_url()));
 
@@ -151,12 +156,20 @@ pub(super) async fn build_codex_invocation(
 
     let catalog_bytes = match target
         .client
-        .fetch_codex_catalog_json_with_mode(&primary_model, requested_tool_mode)
+        .fetch_codex_catalog_json_for_route(
+            target.route_spec.as_deref(),
+            &primary_model,
+            requested_tool_mode,
+        )
         .await
     {
         Ok(bytes) => bytes,
         Err(_) => {
-            let discovered = target.client.fetch_models().await.unwrap_or_default();
+            let discovered = target
+                .client
+                .fetch_models_for_route(target.route_spec.as_deref())
+                .await
+                .unwrap_or_default();
             build_offline_codex_catalog_bytes_with_mode(
                 &discovered,
                 &primary_model,
@@ -221,7 +234,7 @@ pub(super) async fn build_codex_invocation(
     }
     let toml_primary = toml_inline_string(&primary_model);
     let toml_catalog = toml_inline_string(&catalog_slash);
-    let toml_base_v1 = toml_inline_string(&format!("{}/v1", target.client.base_url()));
+    let toml_base_v1 = toml_inline_string(&format!("{scoped_base_url}/v1"));
     push_cfg(&mut full_args, "model_provider='agy'".to_owned());
     if !has_explicit_model {
         push_cfg(&mut full_args, format!("model={toml_primary}"));

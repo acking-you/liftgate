@@ -453,6 +453,8 @@ mod tests {
         ContextCaptureRecord {
             task_id: task_id.to_owned(),
             recorded_at_unix_ms: 1,
+            provider_id: "agy".to_owned(),
+            optimization_mode: None,
             session_id: Some("s".to_owned()),
             harness_profile: Some("codex".to_owned()),
             resolved_model: "gemini-4-carbon-high".to_owned(),

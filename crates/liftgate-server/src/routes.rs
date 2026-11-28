@@ -45,13 +45,11 @@ use crate::{
     acp_client::AcpBackend,
     context_capture::ContextCaptureIoError,
     error::{AcpError, GatewayError, RequestBodyError},
+    provider_runtime::execute_provider_aware_turn,
     session_pool::SessionPool,
     telemetry::{TelemetryHub, unix_timestamp_ms},
     tool_catalog::build_session_tool_catalog,
-    turn_runner::{
-        ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, execute_normalized_turn,
-        generate_short_nonce,
-    },
+    turn_runner::{ActiveTurnStream, GatewayRuntimeConfig, TurnEvent, generate_short_nonce},
     usage_ledger::{MAX_SERIES_BOUNDS, PriceUpdate},
     web_fetch::WebFetchOutcome,
 };
@@ -134,14 +132,38 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
     let turn_routes = Router::new()
         .route("/v1/responses", post(handle_create_response::<B>))
         .route("/responses", post(handle_create_response::<B>))
+        .route(
+            "/p/{provider_spec}/v1/responses",
+            post(handle_create_response::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/responses",
+            post(handle_create_response::<B>),
+        )
         .route("/v1/messages", post(handle_anthropic_messages::<B>))
         .route("/messages", post(handle_anthropic_messages::<B>))
+        .route(
+            "/p/{provider_spec}/v1/messages",
+            post(handle_anthropic_messages::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/messages",
+            post(handle_anthropic_messages::<B>),
+        )
         .route(
             "/v1/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
         )
         .route(
             "/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/v1/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
         )
         .route(
@@ -153,6 +175,14 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             post(handle_anthropic_messages::<B>),
         )
         .route(
+            "/p/{provider_spec}/claude-desktop/v1/messages",
+            post(handle_anthropic_messages::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/messages",
+            post(handle_anthropic_messages::<B>),
+        )
+        .route(
             "/claude-desktop/v1/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
         )
@@ -160,24 +190,67 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             "/claude-desktop/messages/count_tokens",
             post(handle_anthropic_count_tokens::<B>),
         )
+        .route(
+            "/p/{provider_spec}/claude-desktop/v1/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/messages/count_tokens",
+            post(handle_anthropic_count_tokens::<B>),
+        )
         .layer(DefaultBodyLimit::disable());
 
     let control_routes = Router::new()
         .route("/healthz", get(handle_healthz))
+        .route("/p/{provider_spec}/healthz", get(handle_healthz))
         .route("/v1/models", get(handle_list_models::<B>))
         .route("/models", get(handle_list_models::<B>))
+        .route("/p/{provider_spec}/v1/models", get(handle_list_models::<B>))
+        .route("/p/{provider_spec}/models", get(handle_list_models::<B>))
         .route("/v1/codex-models", get(handle_codex_model_catalog::<B>))
         .route("/codex-models", get(handle_codex_model_catalog::<B>))
+        .route(
+            "/p/{provider_spec}/v1/codex-models",
+            get(handle_codex_model_catalog::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/codex-models",
+            get(handle_codex_model_catalog::<B>),
+        )
         .route("/v1/models/{model_id}", get(handle_get_model::<B>))
         .route("/models/{model_id}", get(handle_get_model::<B>))
+        .route(
+            "/p/{provider_spec}/v1/models/{model_id}",
+            get(handle_get_provider_model::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/models/{model_id}",
+            get(handle_get_provider_model::<B>),
+        )
         .route("/v1/responses/{response_id}", get(handle_get_response::<B>))
         .route("/responses/{response_id}", get(handle_get_response::<B>))
+        .route(
+            "/p/{provider_spec}/v1/responses/{response_id}",
+            get(handle_get_provider_response::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/responses/{response_id}",
+            get(handle_get_provider_response::<B>),
+        )
         .route(
             "/claude-desktop/v1/models",
             get(handle_claude_desktop_models::<B>),
         )
         .route(
             "/claude-desktop/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/v1/models",
+            get(handle_claude_desktop_models::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/models",
             get(handle_claude_desktop_models::<B>),
         )
         .route(
@@ -189,15 +262,39 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             get(handle_get_model::<B>),
         )
         .route(
+            "/p/{provider_spec}/claude-desktop/v1/models/{model_id}",
+            get(handle_get_provider_model::<B>),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/models/{model_id}",
+            get(handle_get_provider_model::<B>),
+        )
+        .route(
             "/claude-desktop/api/event_logging/batch",
+            post(handle_event_logging_noop),
+        )
+        .route(
+            "/p/{provider_spec}/claude-desktop/api/event_logging/batch",
             post(handle_event_logging_noop),
         )
         .route(
             "/claude-desktop/user/bootstrap",
             get(handle_claude_desktop_bootstrap::<B>),
         )
+        .route(
+            "/p/{provider_spec}/claude-desktop/user/bootstrap",
+            get(handle_claude_desktop_bootstrap::<B>),
+        )
         .route("/user/bootstrap", get(handle_claude_desktop_bootstrap::<B>))
+        .route(
+            "/p/{provider_spec}/user/bootstrap",
+            get(handle_claude_desktop_bootstrap::<B>),
+        )
         .route("/api/event_logging/batch", post(handle_event_logging_noop))
+        .route(
+            "/p/{provider_spec}/api/event_logging/batch",
+            post(handle_event_logging_noop),
+        )
         .route(
             "/api/telemetry/snapshot",
             get(handle_telemetry_snapshot::<B>),
@@ -266,6 +363,23 @@ pub fn build_router<B: AcpBackend>(state: AppState<B>) -> Router {
             "/api/telemetry/pricing",
             get(handle_get_pricing::<B>).post(handle_set_model_price::<B>),
         )
+        .route("/api/telemetry/providers", get(handle_get_providers::<B>))
+        .route(
+            "/api/telemetry/providers/active",
+            post(handle_set_active_provider::<B>),
+        )
+        .route(
+            "/api/telemetry/providers/test",
+            post(handle_test_provider::<B>),
+        )
+        .route(
+            "/api/telemetry/optimization",
+            post(handle_set_optimization_policy::<B>),
+        )
+        .route(
+            "/api/admin/providers/reload",
+            post(handle_reload_providers::<B>),
+        )
         .route("/api/admin/shutdown", post(handle_admin_shutdown::<B>))
         .fallback(handle_ui_static::<B>)
         .layer(DefaultBodyLimit::max(CONTROL_ROUTE_BODY_LIMIT_BYTES));
@@ -312,6 +426,7 @@ async fn handle_claude_desktop_bootstrap<B: AcpBackend>(
 async fn handle_claude_desktop_models<B: AcpBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     const MAX_DESKTOP_MODELS: usize = 200;
     const MAX_DESCRIPTION_CHARS: usize = 100;
@@ -319,8 +434,28 @@ async fn handle_claude_desktop_models<B: AcpBackend>(
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_anthropic_response();
     }
-    let available = state.backend.refresh_models_if_empty().await;
-    let default_id = state.config.default_model.as_str();
+    let resolved_prov = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(uri.path(), &headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_anthropic_response(),
+    };
+    let agy_models = if matches!(
+        resolved_prov.profile.driver,
+        liftgate_types::provider::ProviderDriverKind::AgyAcp
+    ) {
+        state.backend.refresh_models_if_empty().await
+    } else {
+        Vec::new()
+    };
+    let (default_model_id, available) = state.telemetry.provider_registry().models_for_provider(
+        &resolved_prov.profile.id,
+        &agy_models,
+        &state.config.default_model,
+    );
+    let default_id = default_model_id.as_str();
 
     let mut ordered: Vec<(String, String)> = Vec::with_capacity(available.len().max(1));
     if let Some(primary) = available
@@ -432,12 +567,33 @@ fn build_model_card(id: String, display_name: String, created: u64) -> ModelCard
 async fn handle_list_models<B: AcpBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
+    let resolved_prov = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(uri.path(), &headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_openai_response(),
+    };
     let now = unix_timestamp_secs();
-    let models = state.backend.refresh_models_if_empty().await;
+    let agy_models = if matches!(
+        resolved_prov.profile.driver,
+        liftgate_types::provider::ProviderDriverKind::AgyAcp
+    ) {
+        state.backend.refresh_models_if_empty().await
+    } else {
+        Vec::new()
+    };
+    let (default_model_id, models) = state.telemetry.provider_registry().models_for_provider(
+        &resolved_prov.profile.id,
+        &agy_models,
+        &state.config.default_model,
+    );
     let mut data: Vec<ModelCard> = models
         .into_iter()
         .map(|m| {
@@ -451,7 +607,7 @@ async fn handle_list_models<B: AcpBackend>(
         .collect();
 
     if data.is_empty() {
-        let fallback_id = state.config.default_model.as_str().to_owned();
+        let fallback_id = default_model_id.as_str().to_owned();
         data.push(build_model_card(fallback_id.clone(), fallback_id, now));
     }
 
@@ -484,25 +640,84 @@ async fn handle_codex_model_catalog<B: AcpBackend>(
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
-    let available = state.backend.refresh_models_if_empty().await;
+    let resolved_prov = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(uri.path(), &headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_openai_response(),
+    };
+    let agy_models = if matches!(
+        resolved_prov.profile.driver,
+        liftgate_types::provider::ProviderDriverKind::AgyAcp
+    ) {
+        state.backend.refresh_models_if_empty().await
+    } else {
+        Vec::new()
+    };
+    let (prov_default, available) = state.telemetry.provider_registry().models_for_provider(
+        &resolved_prov.profile.id,
+        &agy_models,
+        &state.config.default_model,
+    );
     let preferred_default =
-        query_param(&uri, "default_model").unwrap_or_else(|| state.config.default_model.as_str());
+        query_param(&uri, "default_model").unwrap_or_else(|| prov_default.as_str());
     let tool_mode = query_param(&uri, "tool_mode");
     let catalog =
         build_codex_model_catalog_with_tool_mode(&available, preferred_default, tool_mode);
     Json(catalog).into_response()
 }
 
+async fn handle_get_provider_model<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((_provider_spec, model_id)): Path<(String, String)>,
+) -> Response {
+    handle_get_model_for_uri(state, headers, uri, model_id).await
+}
+
 async fn handle_get_model<B: AcpBackend>(
     State(state): State<AppState<B>>,
     headers: HeaderMap,
+    uri: Uri,
     Path(model_id): Path<String>,
+) -> Response {
+    handle_get_model_for_uri(state, headers, uri, model_id).await
+}
+
+async fn handle_get_model_for_uri<B: AcpBackend>(
+    state: AppState<B>,
+    headers: HeaderMap,
+    uri: Uri,
+    model_id: String,
 ) -> Response {
     if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
         return err.into_openai_response();
     }
+    let resolved_prov = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(uri.path(), &headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_openai_response(),
+    };
     let now = unix_timestamp_secs();
-    let available = state.backend.refresh_models_if_empty().await;
+    let agy_models = if matches!(
+        resolved_prov.profile.driver,
+        liftgate_types::provider::ProviderDriverKind::AgyAcp
+    ) {
+        state.backend.refresh_models_if_empty().await
+    } else {
+        Vec::new()
+    };
+    let (prov_default, available) = state.telemetry.provider_registry().models_for_provider(
+        &resolved_prov.profile.id,
+        &agy_models,
+        &state.config.default_model,
+    );
     if let Some(exact) = available
         .iter()
         .find(|m| m.model_id.eq_ignore_ascii_case(&model_id))
@@ -515,12 +730,8 @@ async fn handle_get_model<B: AcpBackend>(
         return Json(build_model_card(exact.model_id.clone(), display, now)).into_response();
     }
 
-    let resolved = liftgate_types::model::resolve_model_id(
-        Some(&model_id),
-        None,
-        &available,
-        &state.config.default_model,
-    );
+    let resolved =
+        liftgate_types::model::resolve_model_id(Some(&model_id), None, &available, &prov_default);
     let display = available
         .iter()
         .find(|m| m.model_id == resolved.as_str())
@@ -530,6 +741,14 @@ async fn handle_get_model<B: AcpBackend>(
     let mut card = build_model_card(resolved.as_str().to_owned(), display, now);
     card.id = model_id;
     Json(card).into_response()
+}
+
+async fn handle_get_provider_response<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    Path((_provider_spec, response_id)): Path<(String, String)>,
+) -> Response {
+    handle_get_response(State(state), headers, Path(response_id)).await
 }
 
 async fn handle_get_response<B: AcpBackend>(
@@ -571,6 +790,17 @@ async fn handle_create_response<B: AcpBackend>(
     State(state): State<AppState<B>>,
     http_req: Request,
 ) -> Response {
+    let req_uri_path = http_req.uri().path().to_owned();
+    let req_headers = http_req.headers().clone();
+    let resolved_provider = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(&req_uri_path, &req_headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_openai_response(),
+    };
+
     let req: CreateResponseRequest = match read_authenticated_json_body(&state, http_req).await {
         Ok(parsed) => parsed,
         Err(err) => return err.into_openai_response(),
@@ -634,11 +864,12 @@ async fn handle_create_response<B: AcpBackend>(
         metadata: metadata.unwrap_or_default(),
     };
 
-    let turn_stream = match execute_normalized_turn(
+    let turn_stream = match execute_provider_aware_turn(
         Arc::clone(&state.backend),
         Arc::clone(&state.pool),
         &state.telemetry,
         &state.config,
+        resolved_provider,
         TaskProtocol::OpenaiResponses,
         normalized,
         resp_id,
@@ -2542,6 +2773,17 @@ async fn handle_anthropic_messages<B: AcpBackend>(
     State(state): State<AppState<B>>,
     http_req: Request,
 ) -> Response {
+    let req_uri_path = http_req.uri().path().to_owned();
+    let req_headers = http_req.headers().clone();
+    let resolved_provider = match state
+        .telemetry
+        .provider_registry()
+        .resolve_for_request(&req_uri_path, &req_headers)
+    {
+        Ok(r) => r,
+        Err(err) => return err.into_anthropic_response(),
+    };
+
     let req: AnthropicMessagesRequest = match read_authenticated_json_body(&state, http_req).await {
         Ok(parsed) => parsed,
         Err(err) => return err.into_anthropic_response(),
@@ -2562,11 +2804,12 @@ async fn handle_anthropic_messages<B: AcpBackend>(
     };
     let msg_id = format!("msg_{}", generate_short_nonce());
 
-    let turn_stream = match execute_normalized_turn(
+    let turn_stream = match execute_provider_aware_turn(
         Arc::clone(&state.backend),
         Arc::clone(&state.pool),
         &state.telemetry,
         &state.config,
+        resolved_provider,
         TaskProtocol::AnthropicMessages,
         normalized,
         msg_id.clone(),
@@ -3996,11 +4239,22 @@ fn build_telemetry_snapshot<B: AcpBackend>(state: &AppState<B>) -> GatewayTeleme
     let session_pool = state.pool.snapshot();
     let (metrics, cache_telemetry, active_tasks, recent_tasks) = state.telemetry.snapshot_tasks();
     let elastic_io = state.telemetry.elastic_io_snapshot();
-    let available_models = state.backend.available_models();
+    let registry = state.telemetry.provider_registry();
+    let (active_provider, optimization_mode, optimization_policy, providers) =
+        registry.snapshot_fields();
+    let agy_models = state.backend.available_models();
+    let active_prov_id =
+        liftgate_types::provider::ProviderId::try_new(&active_provider).unwrap_or_default();
+    let (_, available_models) =
+        registry.models_for_provider(&active_prov_id, &agy_models, &state.config.default_model);
 
     GatewayTelemetrySnapshot {
         generated_at_unix_ms: unix_timestamp_ms(),
         gateway_version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
+        active_provider,
+        optimization_mode,
+        optimization_policy,
+        providers,
         vision_offload_enabled: state.config.vision_offload.load(Ordering::Relaxed),
         mcp_tool_bridge_enabled: state.config.mcp_tool_bridge.load(Ordering::Relaxed),
         acp_process,
@@ -4986,8 +5240,157 @@ fn append_cors_headers(headers: &mut HeaderMap, requested_headers: Option<Header
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         requested_headers.unwrap_or_else(|| {
             HeaderValue::from_static(
-                "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Anthropic-Dangerous-Direct-Browser-Access, Accept, Cache-Control",
+                "Content-Type, Authorization, X-Api-Key, X-Liftgate-Provider, X-Liftgate-Optimization, Anthropic-Version, Anthropic-Beta, Anthropic-Dangerous-Direct-Browser-Access, Accept, Cache-Control",
             )
         }),
     );
+}
+
+#[derive(Deserialize)]
+struct SetActiveProviderPayload {
+    provider_id: String,
+}
+
+#[derive(Deserialize)]
+struct TestProviderPayload {
+    provider_id: String,
+}
+
+#[derive(Deserialize)]
+struct SetOptimizationPayload {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    policy: Option<liftgate_types::provider::OptimizationPolicy>,
+}
+
+async fn handle_get_providers<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if let Err(err) = check_auth_with_query(&headers, &uri, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let (active_provider, optimization_mode, optimization_policy, providers) =
+        state.telemetry.provider_registry().snapshot_fields();
+    Json(json!({
+        "active_provider": active_provider,
+        "optimization_mode": optimization_mode,
+        "optimization_policy": optimization_policy,
+        "providers": providers,
+    }))
+    .into_response()
+}
+
+async fn handle_set_active_provider<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    http_req: Request,
+) -> Response {
+    let payload: SetActiveProviderPayload =
+        match read_authenticated_json_body(&state, http_req).await {
+            Ok(p) => p,
+            Err(err) => return err.into_openai_response(),
+        };
+    let Ok(id) = liftgate_types::provider::ProviderId::try_new(&payload.provider_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "invalid provider_id" } })),
+        )
+            .into_response();
+    };
+    if let Err(msg) = state
+        .telemetry
+        .provider_registry()
+        .set_active_provider(id.clone())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": msg } })),
+        )
+            .into_response();
+    }
+    state.telemetry.notify_change();
+    Json(json!({ "ok": true, "active_provider": id.as_str() })).into_response()
+}
+
+async fn handle_set_optimization_policy<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    http_req: Request,
+) -> Response {
+    let payload: SetOptimizationPayload = match read_authenticated_json_body(&state, http_req).await
+    {
+        Ok(p) => p,
+        Err(err) => return err.into_openai_response(),
+    };
+    let next_policy = if let Some(pol) = payload.policy {
+        pol
+    } else if let Some(ref slug) = payload.mode
+        && let Some(pol) = liftgate_types::provider::OptimizationPolicy::from_slug(slug)
+    {
+        pol
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "expected `mode` (`optimized` | `passthrough`) or `policy`" } })),
+        )
+            .into_response();
+    };
+    let mode = next_policy.mode();
+    if let Err(msg) = state
+        .telemetry
+        .provider_registry()
+        .set_optimization_policy(next_policy.clone())
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": msg } })),
+        )
+            .into_response();
+    }
+    state.telemetry.notify_change();
+    Json(json!({
+        "ok": true,
+        "optimization_mode": mode,
+        "optimization_policy": next_policy,
+    }))
+    .into_response()
+}
+
+async fn handle_test_provider<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    http_req: Request,
+) -> Response {
+    let payload: TestProviderPayload = match read_authenticated_json_body(&state, http_req).await {
+        Ok(p) => p,
+        Err(err) => return err.into_openai_response(),
+    };
+    let Ok(id) = liftgate_types::provider::ProviderId::try_new(&payload.provider_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "invalid provider_id" } })),
+        )
+            .into_response();
+    };
+    let registry = state.telemetry.provider_registry();
+    match registry.probe_provider(&id, state.backend.as_ref()).await {
+        Ok(report) => Json(report).into_response(),
+        Err(msg) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "provider_id": id.as_str(), "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_reload_providers<B: AcpBackend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = check_auth(&headers, state.config.api_key.as_deref()) {
+        return err.into_openai_response();
+    }
+    let reloaded = state.telemetry.provider_registry().reload_from_disk();
+    state.telemetry.notify_change();
+    Json(json!({ "ok": true, "reloaded": reloaded })).into_response()
 }

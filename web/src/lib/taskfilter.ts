@@ -7,6 +7,8 @@ export const UNKNOWN_HARNESS = "unknown";
 
 export interface TaskFilter {
   protocol: "all" | TaskProtocol;
+  /** Upstream provider id (`agy`, `openai`, `anthropic`, …) or `"all"`. */
+  provider: string;
   /** Harness profile id, {@link UNKNOWN_HARNESS}, or `"all"`. */
   harness: string;
   /** ACP session id or `"all"`. */
@@ -23,6 +25,7 @@ export interface TaskFilter {
 
 export const EMPTY_TASK_FILTER: TaskFilter = {
   protocol: "all",
+  provider: "all",
   harness: "all",
   session: "all",
   model: "all",
@@ -40,6 +43,10 @@ export function taskHarness(task: TaskSnapshot): string {
   return task.harness_profile ?? UNKNOWN_HARNESS;
 }
 
+export function taskProvider(task: TaskSnapshot): string {
+  return task.provider_id || "agy";
+}
+
 export function isTaskProblem(task: TaskSnapshot, tools?: ToolOutcomeCounts): boolean {
   if (task.phase === "failed" || task.phase === "cancelled") return true;
   return tools !== undefined && tools.failed + tools.rejected > 0;
@@ -53,6 +60,7 @@ export function isTaskLowCache(task: TaskSnapshot, thresholdBps: number): boolea
 export function isTaskFilterActive(filter: TaskFilter): boolean {
   return (
     filter.protocol !== "all" ||
+    filter.provider !== "all" ||
     filter.harness !== "all" ||
     filter.session !== "all" ||
     filter.model !== "all" ||
@@ -64,6 +72,7 @@ export function isTaskFilterActive(filter: TaskFilter): boolean {
 
 export function matchesTaskFilter(task: TaskSnapshot, filter: TaskFilter, ctx: TaskFilterContext): boolean {
   if (filter.protocol !== "all" && task.protocol !== filter.protocol) return false;
+  if (filter.provider !== "all" && taskProvider(task) !== filter.provider) return false;
   if (filter.harness !== "all" && taskHarness(task) !== filter.harness) return false;
   if (filter.session !== "all" && task.session_id !== filter.session) return false;
   if (filter.model !== "all" && task.resolved_model !== filter.model) return false;
@@ -78,6 +87,7 @@ export function matchesTaskFilter(task: TaskSnapshot, filter: TaskFilter, ctx: T
 export function matchesTaskQuery(task: TaskSnapshot, query: string): boolean {
   return [
     task.task_id,
+    task.provider_id,
     task.session_id,
     task.resolved_model,
     task.requested_model,
@@ -171,6 +181,7 @@ export function loadTaskFilter(): TaskFilter {
     const protocol = str("protocol");
     return {
       protocol: protocol === "openai_responses" || protocol === "anthropic_messages" ? protocol : "all",
+      provider: str("provider") || "all",
       harness: str("harness"),
       session: str("session"),
       model: str("model"),

@@ -130,6 +130,26 @@ pub struct ActiveTurnStream {
     _worker: JoinHandle<()>,
 }
 
+impl ActiveTurnStream {
+    /// Constructs an [`ActiveTurnStream`] from a custom provider worker task.
+    #[must_use]
+    pub(crate) fn from_parts(
+        resolved_model: ModelId,
+        response_id: String,
+        rx: mpsc::Receiver<TurnEvent>,
+        cancel_guard: DropGuard,
+        worker: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            resolved_model,
+            response_id,
+            rx,
+            _cancel_guard: cancel_guard,
+            _worker: worker,
+        }
+    }
+}
+
 impl Drop for ActiveTurnStream {
     fn drop(&mut self) {
         // `_cancel_guard` drops immediately after this hook, signalling `CancellationToken`
@@ -189,6 +209,36 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
     telemetry: &Arc<TelemetryHub>,
     cfg: &GatewayRuntimeConfig,
     protocol: TaskProtocol,
+    req: NormalizedTurnRequest,
+    response_id: String,
+) -> Result<ActiveTurnStream, GatewayError> {
+    execute_normalized_turn_with_provider(
+        backend,
+        pool,
+        telemetry,
+        cfg,
+        "agy".to_owned(),
+        liftgate_types::provider::OptimizationPolicy::optimized(),
+        protocol,
+        req,
+        response_id,
+    )
+    .await
+}
+
+/// Like [`execute_normalized_turn`], attributing telemetry to `provider_id` and `optimization`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal provider-attributed ACP turn entry point"
+)]
+pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
+    backend: Arc<B>,
+    pool: Arc<SessionPool>,
+    telemetry: &Arc<TelemetryHub>,
+    cfg: &GatewayRuntimeConfig,
+    provider_id: String,
+    optimization: liftgate_types::provider::OptimizationPolicy,
+    protocol: TaskProtocol,
     mut req: NormalizedTurnRequest,
     response_id: String,
 ) -> Result<ActiveTurnStream, GatewayError> {
@@ -200,6 +250,9 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         }
     }
     req.materialize_system_instructions();
+    if !optimization.prompt_distillation {
+        req.allow_prompt_distillation = false;
+    }
 
     let requested_label = req
         .requested_model
@@ -214,6 +267,7 @@ pub async fn execute_normalized_turn<B: AcpBackend>(
         req.auxiliary_task,
         &req.messages,
     );
+    task_guard.set_provider_and_optimization(&provider_id, optimization.mode());
 
     let timeout_secs = cfg.limits.turn_timeout_secs().get();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);

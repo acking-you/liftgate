@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::{
     CALL_CLIENT_TOOL_MCP_NAME, GATEWAY_WEB_FETCH_MCP_NAME, NAMESPACE_HUB_MCP_PREFIX,
     READ_CONTEXT_SPILL_MCP_NAME, SEARCH_CLIENT_TOOLS_MCP_NAME,
+    budget::{VirtualizationTargetMode, VirtualizerBudget},
     profile::{
         DetectedHarness, HarnessToolProfile, ProtocolHint, ToolPlacement, V4aPatchContract,
         detect_harness,
@@ -34,6 +35,14 @@ use crate::{
 pub struct McpSessionOptions {
     pub enable_gateway_web_fetch: bool,
     pub enable_context_spill_reader: bool,
+}
+
+/// Extended planner configuration supporting both loopback MCP (`mcp_lg_*`) and native HTTP APIs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VirtualizerPlanConfig {
+    pub session: McpSessionOptions,
+    pub target_mode: VirtualizationTargetMode,
+    pub budget_override: Option<VirtualizerBudget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,32 +240,69 @@ pub fn partition_tools_for_mcp_session_with_options<S: TruncationSpillSink>(
     options: McpSessionOptions,
     spill: &mut S,
 ) -> McpSessionCatalog {
+    partition_tools_with_config(
+        hint,
+        client_tools,
+        VirtualizerPlanConfig {
+            session: options,
+            target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
+            budget_override: None,
+        },
+        spill,
+    )
+}
+
+/// Auto-detects the caller harness and partitions `client_tools` for a stateless native HTTP API.
+#[must_use]
+pub fn partition_tools_for_native_api<S: TruncationSpillSink>(
+    hint: ProtocolHint,
+    client_tools: &[CanonicalToolSpec],
+    enable_gateway_web_fetch: bool,
+    budget_override: Option<VirtualizerBudget>,
+    spill: &mut S,
+) -> McpSessionCatalog {
+    partition_tools_with_config(
+        hint,
+        client_tools,
+        VirtualizerPlanConfig {
+            session: McpSessionOptions {
+                enable_gateway_web_fetch,
+                enable_context_spill_reader: false,
+            },
+            target_mode: VirtualizationTargetMode::NativeApiTools,
+            budget_override: Some(
+                budget_override.unwrap_or(VirtualizerBudget::NATIVE_PLATFORM_API),
+            ),
+        },
+        spill,
+    )
+}
+
+/// Auto-detects the caller harness and partitions `client_tools` with [`VirtualizerPlanConfig`].
+#[must_use]
+pub fn partition_tools_with_config<S: TruncationSpillSink>(
+    hint: ProtocolHint,
+    client_tools: &[CanonicalToolSpec],
+    config: VirtualizerPlanConfig,
+    spill: &mut S,
+) -> McpSessionCatalog {
     let harness = detect_harness(hint, client_tools);
     match harness {
         DetectedHarness::Codex => {
-            plan_virtualization_with_session_options(CodexToolProfile, client_tools, options, spill)
+            plan_virtualization_with_config(CodexToolProfile, client_tools, config, spill)
         }
-        DetectedHarness::ClaudeCode => plan_virtualization_with_session_options(
-            ClaudeCodeToolProfile,
-            client_tools,
-            options,
-            spill,
-        ),
-        DetectedHarness::OpenCode => plan_virtualization_with_session_options(
-            OpenCodeToolProfile,
-            client_tools,
-            options,
-            spill,
-        ),
+        DetectedHarness::ClaudeCode => {
+            plan_virtualization_with_config(ClaudeCodeToolProfile, client_tools, config, spill)
+        }
+        DetectedHarness::OpenCode => {
+            plan_virtualization_with_config(OpenCodeToolProfile, client_tools, config, spill)
+        }
         DetectedHarness::Omp => {
-            plan_virtualization_with_session_options(OmpToolProfile, client_tools, options, spill)
+            plan_virtualization_with_config(OmpToolProfile, client_tools, config, spill)
         }
-        DetectedHarness::Generic => plan_virtualization_with_session_options(
-            GenericToolProfile,
-            client_tools,
-            options,
-            spill,
-        ),
+        DetectedHarness::Generic => {
+            plan_virtualization_with_config(GenericToolProfile, client_tools, config, spill)
+        }
     }
 }
 
@@ -323,13 +369,38 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
     options: McpSessionOptions,
     spill: &mut S,
 ) -> McpSessionCatalog {
+    plan_virtualization_with_config(
+        profile,
+        client_tools,
+        VirtualizerPlanConfig {
+            session: options,
+            target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
+            budget_override: None,
+        },
+        spill,
+    )
+}
+
+/// Monomorphized zero-cost 3-tier virtualization planner parameterized by [`VirtualizerPlanConfig`].
+#[must_use]
+pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpillSink>(
+    profile: P,
+    client_tools: &[CanonicalToolSpec],
+    config: VirtualizerPlanConfig,
+    spill: &mut S,
+) -> McpSessionCatalog {
     assert_eq!(
         std::mem::size_of::<P>(),
         0,
         "HarnessToolProfile implementations must be zero-sized unit structs"
     );
-    let budget = P::BUDGET;
-    budget.assert_valid();
+    let options = config.session;
+    let target_mode = config.target_mode;
+    let budget = config.budget_override.unwrap_or(match target_mode {
+        VirtualizationTargetMode::AcpLoopbackMcp => P::BUDGET,
+        VirtualizationTargetMode::NativeApiTools => VirtualizerBudget::NATIVE_PLATFORM_API,
+    });
+    budget.assert_valid_for_mode(target_mode);
 
     #[derive(Clone, Debug)]
     enum CandidateKind {
@@ -441,7 +512,8 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         .collect();
     let has_folded_tools = !folded_indices.is_empty();
     if has_folded_tools {
-        let folded_block = build_folded_orchestrator_tools_block(client_tools, &folded_indices);
+        let folded_block =
+            build_folded_orchestrator_tools_block(client_tools, &folded_indices, target_mode);
         if !folded_block.is_empty()
             && let Some(orch_cand) = eligible.iter_mut().find(|c| {
                 c.is_orchestrator
@@ -569,8 +641,10 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         if let Some(sp_wire) = spill_reader_wire {
             wire_tools.push(sp_wire);
         }
-        wire_tools.push(call_tool_wire);
-        wire_tools.push(search_tool_wire);
+        if matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp) {
+            wire_tools.push(call_tool_wire);
+            wire_tools.push(search_tool_wire);
+        }
     } else {
         let mut core_indices: Vec<(u8, u8, usize)> = eligible
             .iter()
@@ -799,15 +873,20 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         ))
     });
 
-    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_session_options(
+    let has_virtualized_dispatch =
+        should_virtualize || matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp);
+
+    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_target_mode(
         profile,
         &prepass,
         client_tools,
         by_mcp_name.clone(),
         hub_names_by_namespace,
-        true,
+        has_virtualized_dispatch,
         options.enable_gateway_web_fetch,
         options.enable_context_spill_reader,
+        target_mode,
+        budget,
     ));
 
     McpSessionCatalog {
@@ -819,7 +898,7 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
         is_passthrough: !should_virtualize,
         declared_tool_count: client_tools.len(),
         wire_tool_bytes,
-        has_virtualized_dispatch: true,
+        has_virtualized_dispatch,
         has_gateway_web_fetch: options.enable_gateway_web_fetch,
         has_context_spill_reader: options.enable_context_spill_reader,
         routing_table,
@@ -832,12 +911,14 @@ const MAX_FOLDED_TOOLS_SUMMARY_BYTES: usize = 6 * 1024;
 fn build_folded_orchestrator_tools_block(
     client_tools: &[CanonicalToolSpec],
     folded_indices: &[usize],
+    target_mode: VirtualizationTargetMode,
 ) -> String {
+    let pfx = target_mode.wire_prefix();
     let mut out = String::with_capacity(1024);
-    out.push_str(
+    out.push_str(&format!(
         "<eval_session_tools>\n\
-         Folded session tools (omitted from top-level `mcp_lg_*`; invoke inside `eval` via `await tool.<name>(args)` in Python/JS, or inspect full schemas with `mcp_lg_search_client_tools`):\n",
-    );
+         Folded session tools (omitted from top-level `{pfx}*`; invoke inside `eval` via `await tool.<name>(args)` in Python/JS, or inspect full schemas with `{pfx}search_client_tools`):\n"
+    ));
     let mut omitted_count: usize = 0;
     for (pos, &orig_idx) in folded_indices.iter().enumerate() {
         let Some(spec) = client_tools.get(orig_idx) else {
@@ -858,7 +939,7 @@ fn build_folded_orchestrator_tools_block(
     }
     if omitted_count > 0 {
         out.push_str(&format!(
-            "- ... (+{omitted_count} additional folded session tools; query `mcp_lg_search_client_tools`)\n"
+            "- ... (+{omitted_count} additional folded session tools; query `{pfx}search_client_tools`)\n"
         ));
     }
     out.push_str("</eval_session_tools>");

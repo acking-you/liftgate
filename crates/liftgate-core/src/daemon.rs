@@ -11,6 +11,7 @@ use liftgate_types::config::{
     AcpModeId, GatewayEndpoint, GatewayLimits, GatewayTargetMode, ModelId, ProxyUrl,
     is_endpoint_local_keyword,
 };
+use liftgate_types::provider::{OptimizationPolicy, ProviderId, parse_route_provider_spec};
 use liftgate_types::telemetry::GatewayTelemetrySnapshot;
 use serde::Serialize;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ use crate::error::{CliError, DaemonStopError, GatewayTransportError};
 use crate::harness::{
     resolve_claude_command, resolve_codex_command, resolve_omp_command, resolve_opencode_command,
 };
-use crate::serve::{ENV_SHUTDOWN_TOKEN, active_embedded_ui};
+use crate::serve::{ENV_ALLOW_NO_AGY, ENV_SHUTDOWN_TOKEN, active_embedded_ui};
 use crate::state::{
     DaemonState, EffectiveTargetMode, StatePaths, format_connect_url, now_unix_ms,
     resolve_effective_agy_auto_update, resolve_effective_agy_bin, resolve_effective_agy_proxy,
@@ -49,6 +50,16 @@ pub struct ActiveGatewayTarget {
     pub default_model: String,
     pub api_key: Option<String>,
     pub is_remote: bool,
+    /// Optional `/p/<spec>` route selector (`<provider_id>` or `<provider_id>@<opt_mode>`).
+    pub route_spec: Option<String>,
+}
+
+impl ActiveGatewayTarget {
+    /// Effective base URL passed to downstream child harnesses (`http://host:port` or `http://host:port/p/<spec>`).
+    #[must_use]
+    pub fn scoped_base_url(&self) -> String {
+        self.client.scoped_base_url(self.route_spec.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,7 +80,7 @@ pub async fn start_daemon(
     serve: ServeArgs,
     force_restart: bool,
 ) -> Result<DaemonStartOutcome, CliError> {
-    start_daemon_with_exe(state_paths, None, serve, force_restart).await
+    start_daemon_with_options(state_paths, None, serve, force_restart, false).await
 }
 
 pub async fn start_daemon_with_exe(
@@ -77,6 +88,16 @@ pub async fn start_daemon_with_exe(
     explicit_exe: Option<&Path>,
     serve: ServeArgs,
     force_restart: bool,
+) -> Result<DaemonStartOutcome, CliError> {
+    start_daemon_with_options(state_paths, explicit_exe, serve, force_restart, false).await
+}
+
+pub async fn start_daemon_with_options(
+    state_paths: &StatePaths,
+    explicit_exe: Option<&Path>,
+    serve: ServeArgs,
+    force_restart: bool,
+    allow_missing_agy: bool,
 ) -> Result<DaemonStartOutcome, CliError> {
     let settings = state_paths.read_settings()?;
     let effective_proxy = resolve_effective_agy_proxy(serve.agy_proxy.as_deref(), &settings)?;
@@ -167,14 +188,22 @@ pub async fn start_daemon_with_exe(
         }
     }
 
-    let resolved_agy = resolve_effective_agy_bin(
+    let active_non_agy = state_paths
+        .read_provider_registry()
+        .active_provider
+        .as_str()
+        != "agy";
+    let can_skip_agy = allow_missing_agy || active_non_agy;
+    let maybe_resolved_agy = resolve_effective_agy_bin(
         serve
             .agy_bin
             .clone()
             .or_else(|| existing_daemon.as_ref().and_then(|d| d.agy_bin.clone())),
         &settings,
-    )
-    .ok_or(CliError::AgyBinaryNotFound)?;
+    );
+    if maybe_resolved_agy.is_none() && !can_skip_agy {
+        return Err(CliError::AgyBinaryNotFound);
+    }
 
     let existing_owns_target_listen = existing_daemon
         .as_ref()
@@ -218,8 +247,6 @@ pub async fn start_daemon_with_exe(
         .arg("serve")
         .arg("--listen")
         .arg(serve.listen.to_string())
-        .arg("--agy-bin")
-        .arg(&resolved_agy)
         .arg("--agy-proxy")
         .arg(effective_proxy.as_ref().map_or("off", ProxyUrl::as_str))
         .arg("--vision-offload")
@@ -271,6 +298,11 @@ pub async fn start_daemon_with_exe(
         .arg("--turn-timeout-secs")
         .arg(serve.turn_timeout_secs.to_string());
 
+    if let Some(ref resolved_agy) = maybe_resolved_agy {
+        cmd.arg("--agy-bin").arg(resolved_agy);
+    } else if can_skip_agy {
+        cmd.env(ENV_ALLOW_NO_AGY, "1");
+    }
     if let Some(ui_addr) = serve.ui_listen {
         cmd.arg("--ui-listen").arg(ui_addr.to_string());
     }
@@ -349,7 +381,7 @@ pub async fn start_daemon_with_exe(
         default_model: serve.default_model,
         acp_mode: serve.acp_mode,
         api_key: clean_api_key,
-        agy_bin: Some(resolved_agy),
+        agy_bin: maybe_resolved_agy,
         acp_cwd: serve.acp_cwd,
         ui_dir: serve.ui_dir,
         agy_proxy: effective_proxy.as_ref().map(|p| p.as_str().to_owned()),
@@ -626,6 +658,140 @@ pub async fn ensure_gateway_ready_for_target(
     preferred_model: Option<&str>,
     auto_start: bool,
 ) -> Result<ActiveGatewayTarget, CliError> {
+    ensure_gateway_ready_for_provider_target(
+        state_paths,
+        explicit_listen,
+        explicit_remote,
+        explicit_api_key,
+        preferred_model,
+        None,
+        None,
+        auto_start,
+    )
+    .await
+}
+
+/// Parses and validates per-session `--provider` (`<id>` or `<id>@<opt>`) and `--opt` flags
+/// into an optional `/p/<route_spec>` slug and optional resolved [`ProviderId`].
+pub fn resolve_session_route_spec(
+    state_paths: &StatePaths,
+    raw_provider: Option<&str>,
+    raw_opt: Option<&str>,
+) -> Result<(Option<String>, Option<ProviderId>), CliError> {
+    let explicit_opt = match raw_opt.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(slug) => {
+            let pol =
+                OptimizationPolicy::from_slug(slug).ok_or_else(|| CliError::ProviderConfig {
+                    message: format!(
+                        "invalid optimization mode `{slug}`; expected `optimized` or `passthrough`"
+                    ),
+                })?;
+            Some(pol.mode())
+        }
+        None => None,
+    };
+
+    let (explicit_prov, inline_opt) = match raw_provider.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(spec) => {
+            let (id, opt) =
+                parse_route_provider_spec(spec).ok_or_else(|| CliError::ProviderConfig {
+                    message: format!(
+                        "invalid provider specification `{spec}`; expected `<provider_id>` or `<provider_id>@<optimized|passthrough>`"
+                    ),
+                })?;
+            (Some(id), opt.map(|o| o.mode()))
+        }
+        None => (None, None),
+    };
+
+    let final_opt = explicit_opt.or(inline_opt);
+    let route_spec = match (&explicit_prov, final_opt) {
+        (Some(id), Some(mode)) => Some(format!("{}@{}", id.as_str(), mode.as_str())),
+        (Some(id), None) => Some(id.as_str().to_owned()),
+        (None, Some(mode)) => {
+            let active = state_paths.read_provider_registry().active_provider;
+            Some(format!("{}@{}", active.as_str(), mode.as_str()))
+        }
+        (None, None) => None,
+    };
+    Ok((route_spec, explicit_prov))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "launcher readiness resolver accepts optional listen, remote, api_key, model, provider, optimization, and auto_start"
+)]
+pub async fn ensure_gateway_ready_for_provider_target(
+    state_paths: &StatePaths,
+    explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
+    explicit_api_key: Option<String>,
+    preferred_model: Option<&str>,
+    raw_provider: Option<&str>,
+    raw_opt: Option<&str>,
+    auto_start: bool,
+) -> Result<ActiveGatewayTarget, CliError> {
+    let (route_spec, explicit_prov) =
+        resolve_session_route_spec(state_paths, raw_provider, raw_opt)?;
+    let reg_snapshot = state_paths.read_provider_registry();
+    let target_prov_id = explicit_prov
+        .clone()
+        .unwrap_or_else(|| reg_snapshot.active_provider.clone());
+    let allow_missing_agy = target_prov_id.as_str() != "agy";
+    let registry_model_fallback = reg_snapshot
+        .get(&target_prov_id)
+        .map(|p| p.default_model.as_str().to_owned());
+
+    let mut target = ensure_gateway_base_target(
+        state_paths,
+        explicit_listen,
+        explicit_remote,
+        explicit_api_key,
+        preferred_model,
+        route_spec,
+        allow_missing_agy,
+        auto_start,
+    )
+    .await?;
+
+    if preferred_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+        && (target.route_spec.is_some() || allow_missing_agy)
+    {
+        if let Ok(models) = target
+            .client
+            .fetch_models_for_route(target.route_spec.as_deref())
+            .await
+            && let Some(first) = models.first()
+        {
+            target.default_model = first.id.clone();
+        } else if let Some(fallback_m) = registry_model_fallback {
+            target.default_model = fallback_m;
+        }
+    }
+    if let Some(pref) = preferred_model.map(str::trim).filter(|s| !s.is_empty()) {
+        target.default_model = pref.to_owned();
+    }
+
+    Ok(target)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper resolving local or remote gateway endpoint before provider model resolution"
+)]
+async fn ensure_gateway_base_target(
+    state_paths: &StatePaths,
+    explicit_listen: Option<SocketAddr>,
+    explicit_remote: Option<&str>,
+    explicit_api_key: Option<String>,
+    preferred_model: Option<&str>,
+    route_spec: Option<String>,
+    allow_missing_agy: bool,
+    auto_start: bool,
+) -> Result<ActiveGatewayTarget, CliError> {
     let settings = state_paths.read_settings()?;
     match resolve_effective_target_mode(
         explicit_listen,
@@ -641,20 +807,21 @@ pub async fn ensure_gateway_ready_for_target(
                     source: GatewayTransportError::NotRunning,
                 });
             }
-            let default_model =
-                if let Some(pref) = preferred_model.map(str::trim).filter(|s| !s.is_empty()) {
-                    pref.to_owned()
-                } else if let Ok(snap) = client.fetch_telemetry().await
-                    && !snap.acp_process.default_model.trim().is_empty()
-                {
-                    snap.acp_process.default_model
-                } else if let Ok(models) = client.fetch_models().await
-                    && let Some(first) = models.first()
-                {
-                    first.id.clone()
-                } else {
-                    "gemini-4-carbon-high".to_owned()
-                };
+            let default_model = if let Some(pref) =
+                preferred_model.map(str::trim).filter(|s| !s.is_empty())
+            {
+                pref.to_owned()
+            } else if let Ok(snap) = client.fetch_telemetry().await
+                && !snap.acp_process.default_model.trim().is_empty()
+            {
+                snap.acp_process.default_model
+            } else if let Ok(models) = client.fetch_models_for_route(route_spec.as_deref()).await
+                && let Some(first) = models.first()
+            {
+                first.id.clone()
+            } else {
+                "gemini-4-carbon-high".to_owned()
+            };
             let dashboard_url = format!("{}/", client.base_url());
             Ok(ActiveGatewayTarget {
                 client,
@@ -662,6 +829,7 @@ pub async fn ensure_gateway_ready_for_target(
                 default_model,
                 api_key,
                 is_remote: true,
+                route_spec,
             })
         }
         EffectiveTargetMode::Local {
@@ -690,6 +858,7 @@ pub async fn ensure_gateway_ready_for_target(
                         api_key: key,
                         client,
                         is_remote: false,
+                        route_spec,
                     });
                 }
                 let conflicting_managed_daemon = daemon
@@ -709,7 +878,10 @@ pub async fn ensure_gateway_ready_for_target(
                 if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
                     serve.default_model = m.to_owned();
                 }
-                let daemon = start_daemon(state_paths, serve, false).await?.daemon;
+                let daemon =
+                    start_daemon_with_options(state_paths, None, serve, false, allow_missing_agy)
+                        .await?
+                        .daemon;
                 let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
                 return Ok(ActiveGatewayTarget {
                     dashboard_url: format!("{}/", daemon.dashboard_base_url()),
@@ -717,6 +889,7 @@ pub async fn ensure_gateway_ready_for_target(
                     api_key: daemon.api_key,
                     client,
                     is_remote: false,
+                    route_spec,
                 });
             }
 
@@ -739,6 +912,7 @@ pub async fn ensure_gateway_ready_for_target(
                         api_key: key,
                         client,
                         is_remote: false,
+                        route_spec,
                     });
                 }
             }
@@ -759,6 +933,7 @@ pub async fn ensure_gateway_ready_for_target(
                     api_key: fallback_key,
                     client: fallback_client,
                     is_remote: false,
+                    route_spec,
                 });
             }
 
@@ -776,7 +951,10 @@ pub async fn ensure_gateway_ready_for_target(
             if let Some(m) = preferred_model.filter(|s| !s.trim().is_empty()) {
                 serve.default_model = m.to_owned();
             }
-            let daemon = start_daemon(state_paths, serve, false).await?.daemon;
+            let daemon =
+                start_daemon_with_options(state_paths, None, serve, false, allow_missing_agy)
+                    .await?
+                    .daemon;
             let client = GatewayClient::new(daemon.listen, daemon.api_key.clone());
             Ok(ActiveGatewayTarget {
                 dashboard_url: format!("{}/", daemon.dashboard_base_url()),
@@ -784,6 +962,7 @@ pub async fn ensure_gateway_ready_for_target(
                 api_key: daemon.api_key,
                 client,
                 is_remote: false,
+                route_spec,
             })
         }
     }
@@ -2661,6 +2840,11 @@ mod tests {
                         serde_json::to_string(&GatewayTelemetrySnapshot {
                             generated_at_unix_ms: 1,
                             gateway_version: std::borrow::Cow::Borrowed("0.2.13"),
+                            active_provider: "agy".to_owned(),
+                            optimization_mode:
+                                liftgate_types::provider::OptimizationMode::Optimized,
+                            optimization_policy: OptimizationPolicy::optimized(),
+                            providers: Vec::new(),
                             vision_offload_enabled: false,
                             mcp_tool_bridge_enabled: true,
                             acp_process: liftgate_types::telemetry::AcpProcessTelemetry {

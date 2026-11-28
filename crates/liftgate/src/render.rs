@@ -24,8 +24,9 @@ use liftgate_core::{
     cli::{
         AgyArgs, AgyCommand, AgyInstallArgs, AgyLoginArgs, AgyStatusArgs, AgyUpdateArgs, AliasArgs,
         AutoUpdateArgs, AutoUpdateCommand, ClaudeArgs, ClaudeDesktopArgs, CodexAppArgs, CodexArgs,
-        ConfigArgs, DoctorArgs, LogsArgs, ModelsArgs, OmpArgs, OpencodeArgs, ProxyArgs, RemoteArgs,
-        RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs, invoked_bin_name,
+        ConfigArgs, DoctorArgs, LogsArgs, ModelsArgs, OmpArgs, OpencodeArgs, ProviderArgs,
+        ProxyArgs, RemoteArgs, RestartArgs, ServeArgs, StartArgs, StatusArgs, UiArgs, UpgradeArgs,
+        invoked_bin_name,
     },
     client::GatewayClient,
     config_sync::execute_config_sync,
@@ -38,6 +39,7 @@ use liftgate_core::{
     desktop::{DesktopLaunchOutcome, launch_claude_desktop, launch_codex_app},
     error::CliError,
     harness,
+    provider_cmd::{ProviderCommandOutcome, execute_provider_command},
     state::{
         DaemonState, EffectiveTargetMode, StatePaths, resolve_effective_agy_bin,
         resolve_effective_agy_proxy, resolve_effective_target_mode,
@@ -766,6 +768,8 @@ pub async fn run_claude_cli(state_paths: &StatePaths, args: ClaudeArgs) -> Resul
                 listen: args.listen,
                 remote: args.remote,
                 api_key: args.api_key,
+                provider: args.provider,
+                opt: args.opt,
                 model: args.model,
                 restart_app: args.restart_app,
                 restore: false,
@@ -787,6 +791,8 @@ pub async fn run_codex_cli(state_paths: &StatePaths, args: CodexArgs) -> Result<
                 listen: args.listen,
                 remote: args.remote,
                 api_key: args.api_key,
+                provider: args.provider,
+                opt: args.opt,
                 model: args.model,
                 no_bypass: args.no_bypass,
                 code_mode: args.code_mode,
@@ -2171,5 +2177,230 @@ async fn render_auto_update_status(
         "Open interactive Auto-Update Manager TUI",
         &format!("{} auto-update", invoked_bin_name()),
     );
+    Ok(())
+}
+
+pub async fn run_provider(state_paths: &StatePaths, args: ProviderArgs) -> Result<(), CliError> {
+    let outcome = execute_provider_command(state_paths, args).await?;
+    let bin = invoked_bin_name();
+    match outcome {
+        ProviderCommandOutcome::List { report, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(
+                Tone::Ok,
+                &format!(
+                    "Multi-Provider Registry · active `{}` · optimization `{}`",
+                    report.active_provider,
+                    report.optimization_mode.as_str()
+                ),
+            );
+            let mut table = ui::new_table(&[
+                "Active",
+                "Provider",
+                "Family / Driver",
+                "Default Model",
+                "Auth",
+                "Endpoint / Spill",
+            ]);
+            for p in &report.providers {
+                let active_cell = if p.active {
+                    ui::status_cell("★ ACTIVE", Tone::Ok)
+                } else {
+                    ui::status_cell("·", Tone::Muted)
+                };
+                let auth_tone = if p.auth_configured {
+                    Tone::Ok
+                } else {
+                    Tone::Warn
+                };
+                let auth_label = if p.auth_configured {
+                    format!("✓ {}", p.auth_source)
+                } else {
+                    format!("! missing ({})", p.auth_source)
+                };
+                let ep_note = match &p.endpoint {
+                    Some(ep) => format!(
+                        "{ep} ({})",
+                        if p.spill_enabled {
+                            "spill:on"
+                        } else {
+                            "no-spill"
+                        }
+                    ),
+                    None => format!(
+                        "stdio ({})",
+                        if p.spill_enabled {
+                            "spill:on"
+                        } else {
+                            "no-spill"
+                        }
+                    ),
+                };
+                table.add_row(vec![
+                    active_cell,
+                    Cell::new(&p.id),
+                    Cell::new(format!("{} · {}", p.family.label(), p.driver.as_str())),
+                    Cell::new(&p.default_model),
+                    ui::status_cell(&auth_label, auth_tone),
+                    Cell::new(ep_note),
+                ]);
+            }
+            println!("{table}");
+            println!();
+            ui::cmd_hint(
+                "Launch any harness on a specific provider",
+                &format!("{bin} cx -p openai   |   {bin} cc -p anthropic   |   {bin} oc -p gemini"),
+            );
+            ui::cmd_hint(
+                "Switch global active provider or optimization mode",
+                &format!("{bin} provider use <id>   |   {bin} provider opt passthrough"),
+            );
+        }
+        ProviderCommandOutcome::Mutated { report, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(Tone::Ok, &report.headline);
+            ui::kv("Active Provider", &report.active_provider);
+            ui::kv(
+                "Live Gateway",
+                if report.daemon_synced {
+                    "reloaded in place"
+                } else {
+                    "persisted to ~/.liftgate/providers.json"
+                },
+            );
+        }
+        ProviderCommandOutcome::Test { result, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let pid = result
+                .get("provider_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let drv = result
+                .get("driver")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if ok {
+                ui::headline(
+                    Tone::Ok,
+                    &format!("Provider `{pid}` ({drv}) connectivity check passed"),
+                );
+            } else {
+                ui::headline(
+                    Tone::Err,
+                    &format!("Provider `{pid}` ({drv}) connectivity check failed"),
+                );
+            }
+            if let Some(ms) = result.get("latency_ms").and_then(|v| v.as_u64()) {
+                ui::kv("Latency", &format!("{ms} ms"));
+            }
+            if let Some(cnt) = result.get("models_discovered").and_then(|v| v.as_u64()) {
+                ui::kv("Models Discovered", &cnt.to_string());
+            }
+            if let Some(bin_p) = result.get("binary").and_then(|v| v.as_str()) {
+                ui::kv("Executable", bin_p);
+            }
+            if let Some(err_s) = result.get("error").and_then(|v| v.as_str()) {
+                ui::kv("Detail", err_s);
+            }
+        }
+        ProviderCommandOutcome::Models { report, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            ui::headline(
+                Tone::Ok,
+                &format!(
+                    "Models for provider `{}` ({})",
+                    report.provider_id,
+                    report.driver.display_name()
+                ),
+            );
+            ui::kv("Default Model", &report.default_model);
+            if let Some(ref fm) = report.fast_model {
+                ui::kv("Fast Model", fm);
+            }
+            let mut table =
+                ui::new_table(&["Model ID", "Display Name", "Context Window", "Auto-Compact"]);
+            for m in &report.models {
+                table.add_row(vec![
+                    Cell::new(&m.id),
+                    Cell::new(&m.display_name),
+                    Cell::new(format!("{}k", m.context_window_tokens / 1_000)),
+                    Cell::new(format!("{}k", m.auto_compact_token_limit / 1_000)),
+                ]);
+            }
+            println!("{table}");
+        }
+        ProviderCommandOutcome::Opt { report, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+                );
+                return Ok(());
+            }
+            let verb = if report.updated {
+                "Updated gateway optimization mode"
+            } else {
+                "Current gateway optimization mode"
+            };
+            ui::headline(Tone::Ok, &format!("{verb}: `{}`", report.mode.as_str()));
+            ui::kv(
+                "Prompt Distillation",
+                if report.policy.prompt_distillation {
+                    "ON"
+                } else {
+                    "OFF (verbatim)"
+                },
+            );
+            ui::kv(
+                "Tool Virtualization",
+                if report.policy.tool_virtualization {
+                    "ON (0-RTT)"
+                } else {
+                    "OFF (raw schemas)"
+                },
+            );
+            ui::kv(
+                "Code Mode Healing",
+                if report.policy.code_mode_enhancements {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+            );
+            ui::kv(
+                "Billing Noise Strip",
+                if report.policy.strip_billing_noise {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+            );
+        }
+    }
     Ok(())
 }

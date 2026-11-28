@@ -62,6 +62,15 @@ impl GatewayClient {
         self.endpoint.base_url()
     }
 
+    /// Returns the gateway base URL optionally scoped to `/p/<route_spec>` for per-session routing.
+    #[must_use]
+    pub fn scoped_base_url(&self, route_spec: Option<&str>) -> String {
+        match route_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => format!("{}/p/{spec}", self.base_url()),
+            None => self.base_url().to_owned(),
+        }
+    }
+
     pub async fn check_health(&self, timeout_dur: Duration) -> bool {
         matches!(
             self.raw_request("GET", "/healthz", &[], timeout_dur).await,
@@ -70,9 +79,19 @@ impl GatewayClient {
     }
 
     pub async fn fetch_models(&self) -> Result<Vec<DiscoveredModel>, CliError> {
-        let path = "/v1/models";
+        self.fetch_models_for_route(None).await
+    }
+
+    pub async fn fetch_models_for_route(
+        &self,
+        route_spec: Option<&str>,
+    ) -> Result<Vec<DiscoveredModel>, CliError> {
+        let path = match route_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => format!("/p/{spec}/v1/models"),
+            None => "/v1/models".to_owned(),
+        };
         let url = format!("{}{path}", self.base_url());
-        let (status, body) = self.authed_get(path, DEFAULT_TIMEOUT).await?;
+        let (status, body) = self.authed_get(&path, DEFAULT_TIMEOUT).await?;
         if !(200..300).contains(&status) {
             return Err(CliError::GatewayHttpStatus {
                 url,
@@ -90,13 +109,27 @@ impl GatewayClient {
         default_model: &str,
         tool_mode: Option<&str>,
     ) -> Result<Vec<u8>, CliError> {
+        self.fetch_codex_catalog_json_for_route(None, default_model, tool_mode)
+            .await
+    }
+
+    pub async fn fetch_codex_catalog_json_for_route(
+        &self,
+        route_spec: Option<&str>,
+        default_model: &str,
+        tool_mode: Option<&str>,
+    ) -> Result<Vec<u8>, CliError> {
         let encoded = percent_encode_query_component(default_model);
+        let prefix = match route_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => format!("/p/{spec}"),
+            None => String::new(),
+        };
         let path = match tool_mode.map(str::trim).filter(|s| !s.is_empty()) {
             Some(mode) => {
                 let encoded_mode = percent_encode_query_component(mode);
-                format!("/v1/codex-models?default_model={encoded}&tool_mode={encoded_mode}")
+                format!("{prefix}/v1/codex-models?default_model={encoded}&tool_mode={encoded_mode}")
             }
-            None => format!("/v1/codex-models?default_model={encoded}"),
+            None => format!("{prefix}/v1/codex-models?default_model={encoded}"),
         };
         let url = format!("{}{path}", self.base_url());
         let (status, body) = self.authed_get(&path, DEFAULT_TIMEOUT).await?;
@@ -191,6 +224,46 @@ impl GatewayClient {
         let parsed: McpToolBridgeResponse = serde_json::from_slice(&body)
             .map_err(|source| CliError::GatewayBadJson { url, source })?;
         Ok(parsed.mcp_tool_bridge_enabled)
+    }
+
+    pub async fn reload_providers(&self) -> Result<(), CliError> {
+        let path = "/api/admin/providers/reload";
+        let url = format!("{}{path}", self.base_url());
+        let (status, body) = self.authed_request("POST", path, DEFAULT_TIMEOUT).await?;
+        if !(200..300).contains(&status) {
+            return Err(CliError::GatewayHttpStatus {
+                url,
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn set_active_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        self.post_json(
+            "/api/telemetry/providers/active",
+            &serde_json::json!({ "provider_id": provider_id }),
+        )
+        .await
+    }
+
+    pub async fn set_optimization_policy(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        self.post_json("/api/telemetry/optimization", payload).await
+    }
+
+    pub async fn test_provider(&self, provider_id: &str) -> Result<serde_json::Value, CliError> {
+        self.post_json(
+            "/api/telemetry/providers/test",
+            &serde_json::json!({ "provider_id": provider_id }),
+        )
+        .await
     }
 
     pub async fn request_shutdown(&self, shutdown_token: &str) -> Result<(), CliError> {
@@ -315,15 +388,51 @@ impl GatewayClient {
         path_and_query: &str,
         timeout_dur: Duration,
     ) -> Result<(u16, Vec<u8>), CliError> {
-        if let Some(key) = &self.api_key {
-            let auth_val = format!("Bearer {key}");
-            let headers = [("Authorization", auth_val.as_str())];
-            self.raw_request(method, path_and_query, &headers, timeout_dur)
-                .await
-        } else {
-            self.raw_request(method, path_and_query, &[], timeout_dur)
-                .await
+        self.authed_request_with_body(method, path_and_query, None, timeout_dur)
+            .await
+    }
+
+    async fn post_json(
+        &self,
+        path_and_query: &str,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}{path_and_query}", self.base_url());
+        let body_bytes =
+            serde_json::to_vec(payload).map_err(|source| CliError::GatewayBadJson {
+                url: url.clone(),
+                source,
+            })?;
+        let (status, body) = self
+            .authed_request_with_body("POST", path_and_query, Some(&body_bytes), DEFAULT_TIMEOUT)
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(CliError::GatewayHttpStatus {
+                url,
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
         }
+        serde_json::from_slice(&body).map_err(|source| CliError::GatewayBadJson { url, source })
+    }
+
+    async fn authed_request_with_body(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&[u8]>,
+        timeout_dur: Duration,
+    ) -> Result<(u16, Vec<u8>), CliError> {
+        let mut headers: Vec<(&str, String)> = Vec::new();
+        if let Some(key) = &self.api_key {
+            headers.push(("Authorization", format!("Bearer {key}")));
+        }
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json".to_owned()));
+        }
+        let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.raw_request_with_body(method, path_and_query, &borrowed, body, timeout_dur)
+            .await
     }
 
     async fn raw_request(
@@ -333,8 +442,21 @@ impl GatewayClient {
         extra_headers: &[(&str, &str)],
         timeout_dur: Duration,
     ) -> Result<(u16, Vec<u8>), CliError> {
+        self.raw_request_with_body(method, path_and_query, extra_headers, None, timeout_dur)
+            .await
+    }
+
+    async fn raw_request_with_body(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        timeout_dur: Duration,
+    ) -> Result<(u16, Vec<u8>), CliError> {
         let full_url = format!("{}{path_and_query}", self.base_url());
         let deadline = Instant::now() + timeout_dur;
+        let body_slice = body.unwrap_or(&[]);
 
         let mut req_buf = String::with_capacity(256);
         let _ = write!(
@@ -342,8 +464,8 @@ impl GatewayClient {
             "{method} {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n",
             self.endpoint.host_header()
         );
-        if method == "POST" {
-            req_buf.push_str("Content-Length: 0\r\n");
+        if method == "POST" || !body_slice.is_empty() {
+            let _ = write!(req_buf, "Content-Length: {}\r\n", body_slice.len());
         }
         for (name, val) in extra_headers {
             let clean_val: String = val.chars().filter(|&c| c != '\r' && c != '\n').collect();
@@ -355,6 +477,9 @@ impl GatewayClient {
         let io_fut = async {
             let mut stream = TcpStream::connect(connect_target).await?;
             stream.write_all(req_buf.as_bytes()).await?;
+            if !body_slice.is_empty() {
+                stream.write_all(body_slice).await?;
+            }
             let mut raw = Vec::with_capacity(4096);
             stream
                 .take(MAX_RESPONSE_BYTES)

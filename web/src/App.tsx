@@ -21,7 +21,7 @@ import {
 import { LocaleToggle } from "@/components/LocaleToggle";
 import { ConnectionModal, ProbeModal } from "@/components/modals";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { Button, Dot, Note } from "@/components/ui";
+import { Button, Dot, Note, Pill, Select } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
 import { type ViewId, useHashRoute } from "@/hooks/useHashRoute";
 import { useI18n } from "@/lib/i18n";
@@ -77,7 +77,7 @@ function BrandMark(): React.JSX.Element {
 }
 
 export function App(): React.JSX.Element {
-  const { client, snapshot, connectionState, lastError, lowCacheRecords, toolCalls } = useGateway();
+  const { client, snapshot, connectionState, lastError, lowCacheRecords, toolCalls, refresh } = useGateway();
   const { m } = useI18n();
   const { view, arg, navigate } = useHashRoute();
   const title = m.shell.views[view];
@@ -92,8 +92,26 @@ export function App(): React.JSX.Element {
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [probeOpen, setProbeOpen] = useState(false);
   const [probeModel, setProbeModel] = useState("");
+  const [switchingOpt, setSwitchingOpt] = useState(false);
 
   const acp = snapshot?.acp_process;
+  const providers = snapshot?.providers ?? [];
+  const activeProvider = snapshot?.active_provider ?? "agy";
+  const optMode = snapshot?.optimization_mode ?? "optimized";
+
+  const toggleOptimizationMode = (): void => {
+    if (switchingOpt) return;
+    const nextMode = optMode === "passthrough" ? "optimized" : "passthrough";
+    setSwitchingOpt(true);
+    void client
+      .setOptimizationPolicy({ mode: nextMode })
+      .then(() => refresh())
+      .finally(() => setSwitchingOpt(false));
+  };
+
+  const handleProviderChange = (nextId: string): void => {
+    void client.setActiveProvider(nextId).then(() => refresh());
+  };
   const defaultModel = acp?.default_model ?? "";
   useEffect(() => {
     if (probeModel === "" && defaultModel !== "") setProbeModel(defaultModel);
@@ -239,6 +257,36 @@ export function App(): React.JSX.Element {
               <Dot tone={status.tone} live={status.tone !== "ok"} />
               <span className="max-sm:hidden">{status.label}</span>
             </span>
+            {providers.length > 0 && (
+              <Select
+                ariaLabel={m.shell.providerSelectAria}
+                className="max-md:hidden min-w-[148px]"
+                value={activeProvider}
+                onChange={handleProviderChange}
+                options={providers
+                  .filter((p) => p.enabled)
+                  .map((p) => ({
+                    value: p.id,
+                    label: `${p.id} · ${p.default_model}`,
+                  }))}
+              />
+            )}
+            {snapshot?.optimization_mode && (
+              <Button
+                size="sm"
+                disabled={switchingOpt}
+                title={
+                  optMode === "passthrough"
+                    ? m.shell.optMode.toggleHintPassthrough
+                    : m.shell.optMode.toggleHintOptimized
+                }
+                onClick={toggleOptimizationMode}
+              >
+                <Pill tone={optMode === "passthrough" ? "warn" : "ok"}>
+                  {m.shell.optMode[optMode]}
+                </Pill>
+              </Button>
+            )}
             <Button aria-label={m.shell.probe} onClick={() => openProbe()}>
               <Play />
               <span className="max-sm:hidden">{m.shell.probe}</span>

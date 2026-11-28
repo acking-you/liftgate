@@ -92,6 +92,7 @@ impl Default for ToolCallLimits {
 #[derive(Clone, Debug, Default)]
 pub struct ToolCallTaskContext {
     pub task_id: String,
+    pub provider_id: String,
     pub session_id: Option<String>,
     pub model_id: String,
     pub harness_profile: &'static str,
@@ -610,6 +611,11 @@ impl ToolCallStore {
                 seq,
                 revision,
                 task_id: capped_label(&ctx.task_id),
+                provider_id: if ctx.provider_id.is_empty() {
+                    "agy".to_owned()
+                } else {
+                    capped_label(&ctx.provider_id)
+                },
                 session_id: ctx.session_id.as_deref().map(capped_label),
                 turn_index: ctx.turn_index,
                 step_index,
@@ -1056,6 +1062,7 @@ mod tests {
     fn ctx() -> ToolCallTaskContext {
         ToolCallTaskContext {
             task_id: "resp_1".to_owned(),
+            provider_id: "agy".to_owned(),
             session_id: Some("sess-1".to_owned()),
             model_id: "gemini-4-carbon-high".to_owned(),
             harness_profile: "codex",

@@ -1,11 +1,13 @@
 //! Pre-Clap argv normalizer separating Liftgate flags from passthrough harness arguments.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use liftgate_harness::{
     claude::rewrite_claude_session_aliases, codex::rewrite_codex_session_aliases,
     omp::rewrite_omp_session_aliases, opencode::rewrite_opencode_session_aliases,
 };
+use liftgate_types::provider::{OptimizationPolicy, ProviderId, ProviderRegistryConfig};
 
 /// Normalizes `liftgate claude ...` and `liftgate codex ...` argv sequences so callers can pass
 /// native `claude` / `codex` flags or prompts directly (e.g. `liftgate claude -p "hi"` or
@@ -37,12 +39,28 @@ pub fn normalize_harness_args(raw_args: impl IntoIterator<Item = OsString>) -> V
     let post_dd = dd_pos.and_then(|pos| rest.get(pos..));
 
     let is_desktop_mode = detect_desktop_mode(kind, pre_dd);
+    let configured_providers = load_configured_provider_ids(&args, pre_dd);
+    let normalized_pre_dd = rewrite_disambiguated_short_provider_flag(
+        kind,
+        is_desktop_mode,
+        pre_dd,
+        &configured_providers,
+    );
+    let pre_dd = normalized_pre_dd.as_slice();
     let value_flags = harness_value_flags(kind);
     let bool_flags = harness_bool_flags(kind, is_desktop_mode);
 
     // Caller explicitly separated Liftgate options from raw child arguments (`lg cx [-m ...] -- ...`).
     if dd_pos.is_some() && all_tokens_are_liftgate_flags(pre_dd, value_flags, bool_flags) {
-        return args;
+        let mut out = Vec::with_capacity(args.len() + 2);
+        if let Some(prefix) = args.get(..=sub_idx) {
+            out.extend_from_slice(prefix);
+        }
+        out.extend_from_slice(pre_dd);
+        if let Some(tail) = post_dd {
+            out.extend_from_slice(tail);
+        }
+        return out;
     }
 
     let native_value_flags = native_single_value_flags(kind);
@@ -196,6 +214,8 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--listen",
             "--remote",
             "--api-key",
+            "--provider",
+            "--opt",
             "-m",
             "--model",
             "--fast-model",
@@ -207,15 +227,33 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--listen",
             "--remote",
             "--api-key",
+            "-p",
+            "--provider",
+            "--opt",
             "-m",
             "--model",
             "--claude-desktop-bin",
         ],
-        HarnessSubcommand::Codex | HarnessSubcommand::CodexApp => &[
+        HarnessSubcommand::Codex => &[
             "--state-dir",
             "--listen",
             "--remote",
             "--api-key",
+            "--provider",
+            "--opt",
+            "-m",
+            "--model",
+            "--codex-bin",
+            "--codex-app-bin",
+        ],
+        HarnessSubcommand::CodexApp => &[
+            "--state-dir",
+            "--listen",
+            "--remote",
+            "--api-key",
+            "-p",
+            "--provider",
+            "--opt",
             "-m",
             "--model",
             "--codex-bin",
@@ -226,6 +264,9 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--listen",
             "--remote",
             "--api-key",
+            "-p",
+            "--provider",
+            "--opt",
             "-m",
             "--model",
             "--fast-model",
@@ -236,12 +277,116 @@ fn harness_value_flags(kind: HarnessSubcommand) -> &'static [&'static str] {
             "--listen",
             "--remote",
             "--api-key",
+            "-p",
+            "--provider",
+            "--opt",
             "-m",
             "--model",
             "--fast-model",
             "--omp-bin",
         ],
     }
+}
+
+fn rewrite_disambiguated_short_provider_flag(
+    kind: HarnessSubcommand,
+    is_desktop_mode: bool,
+    pre_dd: &[OsString],
+    configured_provider_ids: &[String],
+) -> Vec<OsString> {
+    if !matches!(kind, HarnessSubcommand::Claude | HarnessSubcommand::Codex) {
+        return pre_dd.to_vec();
+    }
+    let mut out = Vec::with_capacity(pre_dd.len() + 2);
+    let mut idx = 0usize;
+    while let Some(tok) = pre_dd.get(idx) {
+        if let Some(s) = tok.to_str() {
+            if s == "-p"
+                && let Some(val) = pre_dd.get(idx + 1)
+                && let Some(val_str) = val.to_str()
+                && (is_desktop_mode || is_provider_spec_token(val_str, configured_provider_ids))
+            {
+                out.push(OsString::from("--provider"));
+                out.push(val.clone());
+                idx += 2;
+                continue;
+            }
+            if let Some(inline_val) = s.strip_prefix("-p=")
+                && (is_desktop_mode || is_provider_spec_token(inline_val, configured_provider_ids))
+            {
+                out.push(OsString::from(format!("--provider={inline_val}")));
+                idx += 1;
+                continue;
+            }
+        }
+        out.push(tok.clone());
+        idx += 1;
+    }
+    out
+}
+
+fn is_provider_spec_token(raw: &str, configured_ids: &[String]) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let (base, opt_ok) = match trimmed.split_once('@') {
+        Some((b, opt)) => (b, OptimizationPolicy::from_slug(opt).is_some()),
+        None => (trimmed, true),
+    };
+    if !opt_ok || base.is_empty() {
+        return false;
+    }
+    ProviderId::is_builtin_id_or_alias(base)
+        || configured_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(base))
+}
+
+fn load_configured_provider_ids(all_args: &[OsString], pre_dd: &[OsString]) -> Vec<String> {
+    let explicit_state_dir =
+        extract_state_dir_arg(pre_dd).or_else(|| extract_state_dir_arg(all_args));
+    let root = explicit_state_dir
+        .or_else(|| {
+            std::env::var_os("LIFTGATE_HOME")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".liftgate"))
+        });
+    let Some(dir) = root else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(dir.join("providers.json")) else {
+        return Vec::new();
+    };
+    let Ok(cfg) = serde_json::from_str::<ProviderRegistryConfig>(&raw) else {
+        return Vec::new();
+    };
+    cfg.providers
+        .into_iter()
+        .map(|p| p.id.as_str().to_owned())
+        .collect()
+}
+
+fn extract_state_dir_arg(tokens: &[OsString]) -> Option<PathBuf> {
+    let mut idx = 0usize;
+    while let Some(tok) = tokens.get(idx) {
+        if let Some(s) = tok.to_str() {
+            if s == "--state-dir" {
+                return tokens.get(idx + 1).map(PathBuf::from);
+            }
+            if let Some(val) = s.strip_prefix("--state-dir=") {
+                return Some(PathBuf::from(val));
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn harness_bool_flags(kind: HarnessSubcommand, is_desktop_mode: bool) -> &'static [&'static str] {

@@ -8,6 +8,8 @@ import type {
   LowCacheHitsResponse,
   LowCachePayloadDetailResponse,
   ModelPrice,
+  OptimizationMode,
+  OptimizationPolicy,
   PricingResponse,
   SessionToolCatalog,
   TaskProtocol,
@@ -69,6 +71,11 @@ export interface GatewayClient {
   closeSession(sessionId: string): Promise<boolean>;
   setVisionOffload(enabled: boolean): Promise<void>;
   setMcpToolBridge(enabled: boolean): Promise<void>;
+  setActiveProvider(providerId: string): Promise<{ ok: boolean; active_provider: string }>;
+  setOptimizationPolicy(
+    update: Partial<OptimizationPolicy> & { mode?: OptimizationMode },
+  ): Promise<{ ok: boolean; mode: OptimizationMode; policy: OptimizationPolicy }>;
+  testProvider(providerId: string): Promise<Record<string, unknown>>;
 
   /** Calls changed after `since` (every retained call when omitted). */
   toolCalls(since?: number): Promise<ToolCallsResponse>;
@@ -293,6 +300,23 @@ export class HttpGatewayClient implements GatewayClient {
 
   setModelPrice(key: string, price: ModelPrice | null): Promise<PricingResponse> {
     return this.request("/api/telemetry/pricing", { method: "POST", body: { key, price } });
+  }
+
+  setActiveProvider(providerId: string): Promise<{ ok: boolean; active_provider: string }> {
+    return this.request("/api/telemetry/providers/active", {
+      method: "POST",
+      body: { provider_id: providerId },
+    });
+  }
+
+  setOptimizationPolicy(
+    update: Partial<OptimizationPolicy> & { mode?: OptimizationMode },
+  ): Promise<{ ok: boolean; mode: OptimizationMode; policy: OptimizationPolicy }> {
+    return this.request("/api/telemetry/optimization", { method: "POST", body: update });
+  }
+
+  testProvider(providerId: string): Promise<Record<string, unknown>> {
+    return this.request("/api/telemetry/providers/test", { method: "POST", body: { provider_id: providerId } });
   }
 
   async probe(protocol: TaskProtocol, model: string, prompt: string): Promise<string> {

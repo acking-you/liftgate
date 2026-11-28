@@ -7,6 +7,7 @@ use liftgate_server::{
     context_capture::ContextCaptureConfig,
     job::install_panic_cleanup_hook as install_server_panic_hook,
     platform::{canonicalize_clean, prepare_isolated_session_cwd, wait_for_shutdown_signal},
+    provider_runtime::ProviderRuntimeRegistry,
     routes::{AdminShutdownHandle, AppState, EmbeddedUiAsset, build_router, serve_router},
     session_pool::SessionPool,
     telemetry::{CacheTelemetryConfig, TelemetryConfig, TelemetryHub},
@@ -29,6 +30,7 @@ use crate::state::{
 };
 
 pub const ENV_SHUTDOWN_TOKEN: &str = "LIFTGATE_SHUTDOWN_TOKEN";
+pub const ENV_ALLOW_NO_AGY: &str = "LIFTGATE_ALLOW_NO_AGY";
 
 /// Installs the cross-platform panic hook that tears down supervised `agy acp` child trees.
 pub fn install_panic_cleanup_hook() {
@@ -168,8 +170,17 @@ pub async fn run_serve_with_hook(
     let max_context_capture_mib =
         resolve_effective_max_context_capture_mib(args.max_context_capture_mib, &settings)?;
     let context_capture_dir = state_paths.ensure_context_capture_dir()?;
-    let binary_path =
-        resolve_effective_agy_bin(args.agy_bin, &settings).ok_or(CliError::AgyBinaryNotFound)?;
+    let provider_registry = Arc::new(ProviderRuntimeRegistry::load_from_dir(
+        state_paths.root(),
+        &default_model,
+        agy_proxy.clone(),
+    ));
+    let allow_missing_agy = provider_registry.config_snapshot().active_provider.as_str() != "agy"
+        || std::env::var(ENV_ALLOW_NO_AGY).as_deref() == Ok("1");
+    let maybe_binary_path = resolve_effective_agy_bin(args.agy_bin, &settings);
+    if maybe_binary_path.is_none() && !allow_missing_agy {
+        return Err(CliError::AgyBinaryNotFound);
+    }
     let (_, session_cwd) = prepare_isolated_session_cwd(args.acp_cwd)?;
     let spill_dir = state_paths.ensure_spill_dir()?;
 
@@ -198,7 +209,10 @@ pub async fn run_serve_with_hook(
     tracing::info!(
         listen = %args.listen,
         ui_listen = ?args.ui_listen,
-        agy_bin = %binary_path.display(),
+        agy_bin = %maybe_binary_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none (non-agy provider mode)".to_owned()),
         session_cwd = %session_cwd.display(),
         default_model = %default_model,
         acp_mode = %acp_mode,
@@ -220,18 +234,21 @@ pub async fn run_serve_with_hook(
         "starting liftgate"
     );
 
-    let live_client = Arc::new(
-        LiveAcpClient::spawn_and_init(LiveAcpConfig {
-            binary_path,
-            extra_args: Vec::new(),
-            session_cwd,
-            spill_dir: Some(spill_dir.clone()),
-            limits,
-            agy_proxy: agy_proxy.clone(),
-            auto_update_enabled,
-        })
-        .await?,
-    );
+    let live_client: Option<Arc<LiveAcpClient>> = match maybe_binary_path {
+        Some(binary_path) => Some(Arc::new(
+            LiveAcpClient::spawn_and_init(LiveAcpConfig {
+                binary_path,
+                extra_args: Vec::new(),
+                session_cwd,
+                spill_dir: Some(spill_dir.clone()),
+                limits,
+                agy_proxy: agy_proxy.clone(),
+                auto_update_enabled,
+            })
+            .await?,
+        )),
+        None => None,
+    };
 
     let pool = Arc::new(SessionPool::new(limits));
     let telemetry = Arc::new(TelemetryHub::with_telemetry_config(TelemetryConfig {
@@ -253,6 +270,7 @@ pub async fn run_serve_with_hook(
         pricing_path: Some(state_paths.model_pricing_file()),
         usage_path: Some(state_paths.usage_ledger_file()),
     }));
+    telemetry.set_provider_registry(Arc::clone(&provider_registry));
     let ui_dist_dir = resolve_ui_dist_dir(args.ui_dir);
     let (embedded_ui, full_bundle_embedded) = active_embedded_ui();
     let api_key = normalize_optional_api_key(args.api_key.as_deref()).map(Arc::<str>::from);
@@ -289,7 +307,7 @@ pub async fn run_serve_with_hook(
     };
 
     let app_state = AppState {
-        backend: Arc::new(Arc::clone(&live_client)),
+        backend: Arc::new(live_client.clone()),
         pool: Arc::clone(&pool),
         telemetry: Arc::clone(&telemetry),
         config: GatewayRuntimeConfig {
@@ -327,9 +345,9 @@ pub async fn run_serve_with_hook(
         let _ = shutdown_stop_tx.send_replace(true);
     });
 
-    {
+    if let Some(ref reaper_client) = live_client {
         let reaper_pool = Arc::clone(&pool);
-        let reaper_client = Arc::clone(&live_client);
+        let reaper_client = Arc::clone(reaper_client);
         let reaper_telemetry = Arc::clone(&telemetry);
         let mut reaper_stop_rx = stop_rx.clone();
         bg_tasks.spawn(async move {
@@ -359,9 +377,9 @@ pub async fn run_serve_with_hook(
         });
     }
 
-    {
+    if let Some(ref updater_client) = live_client {
         let updater_paths = state_paths.clone();
-        let updater_client = Arc::clone(&live_client);
+        let updater_client = Arc::clone(updater_client);
         let updater_pool = Arc::clone(&pool);
         let updater_telemetry = Arc::clone(&telemetry);
         let updater_stop_tx = stop_tx.clone();
@@ -463,7 +481,9 @@ pub async fn run_serve_with_hook(
     while bg_tasks.join_next().await.is_some() {}
 
     tracing::info!("shutting down ACP subprocess tree");
-    live_client.shutdown().await;
+    if let Some(ref client) = live_client {
+        client.shutdown().await;
+    }
     pool.clear_for_shutdown();
     drop(app_state);
 

@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::cli::{ClaudeArgs, ClaudeDesktopArgs, PLACEHOLDER_API_KEY, normalize_optional_api_key};
 use crate::config_sync::{HarnessSyncParams, build_claude_settings_map, resolve_fast_model};
-use crate::daemon::ensure_gateway_ready_for_target;
+use crate::daemon::ensure_gateway_ready_for_provider_target;
 use crate::error::CliError;
 use crate::state::{EphemeralFileGuard, StatePaths};
 use crate::terminal::TerminalLaunchSpec;
@@ -28,6 +28,8 @@ pub async fn run_claude(state_paths: &StatePaths, args: ClaudeArgs) -> Result<i3
                 listen: args.listen,
                 remote: args.remote,
                 api_key: args.api_key,
+                provider: args.provider,
+                opt: args.opt,
                 model: args.model,
                 restart_app: args.restart_app,
                 restore: false,
@@ -108,16 +110,19 @@ pub(super) async fn build_claude_invocation(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let target = ensure_gateway_ready_for_target(
+    let target = ensure_gateway_ready_for_provider_target(
         state_paths,
         args.listen,
         args.remote.as_deref(),
         args.api_key.clone(),
         requested_model,
+        args.provider.as_deref(),
+        args.opt.as_deref(),
         true,
     )
     .await?;
 
+    let scoped_base_url = target.scoped_base_url();
     let no_proxy =
         merge_endpoint_no_proxy(existing_no_proxy.as_deref(), Some(target.client.base_url()));
 
@@ -125,11 +130,15 @@ pub(super) async fn build_claude_invocation(
     let auth_token = normalize_optional_api_key(target.api_key.as_deref())
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
-    let discovered = target.client.fetch_models().await.unwrap_or_default();
+    let discovered = target
+        .client
+        .fetch_models_for_route(target.route_spec.as_deref())
+        .await
+        .unwrap_or_default();
 
     let fast_model = resolve_fast_model(args.fast_model.as_deref(), &primary_model, &discovered);
     let (env_set, env_remove) = build_claude_gateway_env_pairs(
-        target.client.base_url(),
+        &scoped_base_url,
         &auth_token,
         &primary_model,
         &fast_model,
@@ -160,7 +169,7 @@ pub(super) async fn build_claude_invocation(
     }
 
     let sync_params = HarnessSyncParams {
-        gateway_base_url: target.client.base_url().to_owned(),
+        gateway_base_url: scoped_base_url,
         api_key: auth_token.clone(),
         primary_model: primary_model.clone(),
         fast_model: fast_model.clone(),

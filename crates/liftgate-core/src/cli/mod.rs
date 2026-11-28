@@ -158,6 +158,10 @@ pub enum Commands {
     /// Inspect, install, sign in, update, or run Antigravity CLI (`agy`) with Liftgate's proxy & auto-update policy.
     Agy(AgyArgs),
 
+    /// Manage multi-provider upstream endpoints, API credentials, active provider, and optimization modes (`agy`, `openai`, `anthropic`, `gemini`, `codex-app-server`, `grok-acp`, custom).
+    #[command(visible_aliases = ["pv", "providers"])]
+    Provider(ProviderArgs),
+
     /// View, set (`lg proxy 7890`), or clear (`lg proxy off`) the outbound proxy forced into `agy` (default: none).
     #[command(visible_alias = "px")]
     Proxy(ProxyArgs),
@@ -1134,6 +1138,175 @@ impl Default for UpgradeArgs {
             base_url,
         }
     }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub action: Option<ProviderCommand>,
+
+    /// Emit machine-readable JSON when listing providers (`lg provider --json`).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// List all built-in and custom providers, auth status, default models, and active state.
+    #[command(visible_alias = "ls")]
+    List(ProviderListArgs),
+
+    /// Register or update a provider profile and optional API key (`--api-key-env` or `--api-key-stdin`).
+    #[command(visible_aliases = ["set", "upsert"])]
+    Add(Box<ProviderAddArgs>),
+
+    /// Remove a custom provider (or reset a built-in provider to factory defaults) and clear stored credentials.
+    #[command(visible_aliases = ["rm", "delete"])]
+    Remove(ProviderRemoveArgs),
+
+    /// Switch the global default active provider used when `-p` / `--provider` is omitted.
+    #[command(visible_alias = "select")]
+    Use(ProviderUseArgs),
+
+    /// Test upstream connectivity, binary presence, or `/models` reachability for a provider.
+    Test(ProviderTestArgs),
+
+    /// List configured/discovered models and context windows for a provider.
+    Models(ProviderModelsArgs),
+
+    /// View or switch the gateway context/tool optimization mode (`optimized` vs `passthrough` / custom flags).
+    #[command(visible_alias = "optimization")]
+    Opt(ProviderOptArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderListArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderAddArgs {
+    /// Provider ID slug (e.g. `openai`, `anthropic`, `gemini`, `codex-app-server`, `grok-acp`, or custom `my-vllm`).
+    pub id: String,
+
+    /// Protocol driver (`agy-acp`, `openai`, `anthropic`, `gemini`, `codex-app-server`, `grok-acp`); auto-inferred for built-in IDs.
+    #[arg(long)]
+    pub driver: Option<String>,
+
+    /// Friendly display name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Upstream base URL override for HTTP Platform API providers (e.g. `https://api.openai.com/v1`).
+    #[arg(long)]
+    pub endpoint: Option<String>,
+
+    /// Default primary model ID for this provider.
+    #[arg(short = 'm', long)]
+    pub default_model: Option<String>,
+
+    /// Fast/auxiliary model ID override for this provider.
+    #[arg(long)]
+    pub fast_model: Option<String>,
+
+    /// Session title model ID override for this provider.
+    #[arg(long)]
+    pub title_model: Option<String>,
+
+    /// Environment variable name supplying the API key (e.g. `OPENAI_API_KEY`).
+    #[arg(long, conflicts_with_all = ["api_key_stdin", "clear_auth"])]
+    pub api_key_env: Option<String>,
+
+    /// Read the API secret from standard input and store it in owner-only (`0600`) `~/.liftgate/credentials.json` (never argv).
+    #[arg(long, conflicts_with_all = ["api_key_env", "clear_auth"])]
+    pub api_key_stdin: bool,
+
+    /// Configure unauthenticated requests (`ApiKeySource::None`) and remove any stored secret.
+    #[arg(long, conflicts_with_all = ["api_key_env", "api_key_stdin"])]
+    pub clear_auth: bool,
+
+    /// Per-provider outbound proxy URL (`http://...`, `socks5://...`, port `7890`, or `direct`/`off`).
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Executable path override for stateful session providers (`agy`, `codex`, `grok`).
+    #[arg(long)]
+    pub bin: Option<PathBuf>,
+
+    /// Per-provider optimization mode override (`optimized`, `passthrough`, or `inherit`).
+    #[arg(long)]
+    pub opt: Option<String>,
+
+    /// Immediately make this provider the global active default.
+    #[arg(long)]
+    pub activate: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderRemoveArgs {
+    /// Provider ID to remove or reset.
+    pub id: String,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderUseArgs {
+    /// Provider ID to set as global active default.
+    pub id: String,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderTestArgs {
+    /// Provider ID to test (defaults to the active provider).
+    pub id: Option<String>,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderModelsArgs {
+    /// Provider ID whose model catalog to inspect (defaults to the active provider).
+    pub id: Option<String>,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProviderOptArgs {
+    /// Target mode (`optimized` or `passthrough`). Omit to inspect current policy or toggle granular flags.
+    pub mode: Option<String>,
+
+    #[arg(long)]
+    pub prompt_distillation: Option<bool>,
+    #[arg(long)]
+    pub tool_virtualization: Option<bool>,
+    #[arg(long)]
+    pub code_mode: Option<bool>,
+    #[arg(long)]
+    pub strip_billing: Option<bool>,
+    #[arg(long)]
+    pub spill: Option<bool>,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, Args)]

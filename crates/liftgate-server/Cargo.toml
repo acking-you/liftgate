@@ -11,6 +11,8 @@ default = []
 test-support = ["liftgate-types/test-support", "liftgate-tool-virtualizer/test-support"]
 
 [dependencies]
+liftgate-provider-http = { workspace = true }
+liftgate-provider-stateful = { workspace = true }
 liftgate-tool-virtualizer = { workspace = true }
 liftgate-types = { workspace = true }
 axum = { workspace = true }

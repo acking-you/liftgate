@@ -1,13 +1,13 @@
 import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { LocateFixed, WrapText } from "lucide-react";
+import { ArrowRight, LocateFixed, WrapText } from "lucide-react";
 import { DiffStat, ProseBlock } from "@/components/CodeBlock";
 import { CopyButton } from "@/components/CopyButton";
-import { Button, Disclosure, Pill, Segmented, type Tone } from "@/components/ui";
+import { Button, Disclosure, Pill, ProviderBadge, Segmented, type Tone } from "@/components/ui";
 import { byteLength, formatBytes, formatPct, shortId } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { diffLines, foldContext, revealControls } from "@/lib/textdiff";
-import type { ContextRewrite } from "@/types/telemetry";
+import type { ContextRewrite, UpstreamWireSummary } from "@/types/telemetry";
 
 /** Diff rows mounted before the reader asks for the rest. */
 const ROW_PAGE = 400;
@@ -29,6 +29,112 @@ export function sizeChange(before: number, after: number): { pct: string; shrank
   const ratio = before === 0 ? 0 : Math.abs(before - after) / before;
   if (ratio < 0.005) return null;
   return { pct: formatPct(ratio), shrank: after < before };
+}
+
+export function ThreeStagePipelineBanner({
+  wire,
+}: {
+  wire: UpstreamWireSummary;
+}): React.JSX.Element {
+  const { m } = useI18n();
+  const t = m.context.rewrites;
+  const p = t.pipeline;
+  const promptDelta = sizeChange(wire.raw_system_bytes, wire.forwarded_system_bytes);
+  const toolDelta = sizeChange(wire.raw_tool_bytes, wire.forwarded_tool_bytes);
+  const modeLabel =
+    wire.optimization_mode === "passthrough"
+      ? p.modePassthrough
+      : wire.optimization_mode === "custom"
+        ? p.modeCustom
+        : p.modeOptimized;
+  const modeTone: Tone =
+    wire.optimization_mode === "passthrough"
+      ? "warn"
+      : wire.optimization_mode === "custom"
+        ? "neutral"
+        : "accent";
+
+  return (
+    <section className="rounded-lg border border-line bg-surface-2/40 p-3">
+      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-[12px] font-semibold text-fg-2">{p.title}</span>
+        <ProviderBadge id={wire.provider_id} mode={wire.optimization_mode} compact className="text-[12px]" />
+      </div>
+      <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-[1fr_auto_1.15fr_auto_1.1fr] lg:items-stretch">
+        <div className="flex flex-col justify-between gap-1.5 rounded-md border border-line bg-surface px-3 py-2">
+          <span className="text-[11.5px] font-medium text-fg-3">{p.stage1}</span>
+          <div className="lg-num text-[12.5px] text-fg">
+            <span className="text-fg-3">{p.systemPrompt}: </span>
+            <span className="font-semibold">{formatBytes(wire.raw_system_bytes)}</span>
+          </div>
+          <div className="lg-num text-[12px] text-fg-2">
+            {p.tools(wire.raw_tool_count, formatBytes(wire.raw_tool_bytes))}
+          </div>
+        </div>
+
+        <div className="hidden items-center justify-center text-fg-4 lg:flex" aria-hidden="true">
+          <ArrowRight className="size-4" />
+        </div>
+
+        <div className="flex flex-col justify-between gap-1.5 rounded-md border border-line bg-surface px-3 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-1.5">
+            <span className="text-[11.5px] font-medium text-fg-3">{p.stage2}</span>
+            <Pill tone={modeTone}>{modeLabel}</Pill>
+          </div>
+          <div className="lg-num flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-fg-2">
+            <span>
+              {formatBytes(wire.raw_system_bytes)} → {formatBytes(wire.forwarded_system_bytes)}
+              {promptDelta && (
+                <span className={promptDelta.shrank ? "ml-1 text-ok-fg" : "ml-1 text-warn-fg"}>
+                  ({promptDelta.shrank ? t.saved(promptDelta.pct) : t.grew(promptDelta.pct)})
+                </span>
+              )}
+            </span>
+            <span className="text-fg-4">·</span>
+            <span>
+              {wire.raw_tool_count} → {wire.forwarded_tool_count}
+              {toolDelta && (
+                <span className={toolDelta.shrank ? "ml-1 text-ok-fg" : "ml-1 text-warn-fg"}>
+                  ({toolDelta.shrank ? t.saved(toolDelta.pct) : t.grew(toolDelta.pct)})
+                </span>
+              )}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Pill tone={wire.spill_enabled ? "warn" : "ok"}>{wire.spill_enabled ? p.spillOn : p.spillOff}</Pill>
+            {wire.zero_rtt_continuations > 0 && (
+              <Pill tone="accent">{p.zeroRtt(wire.zero_rtt_continuations)}</Pill>
+            )}
+          </div>
+        </div>
+
+        <div className="hidden items-center justify-center text-fg-4 lg:flex" aria-hidden="true">
+          <ArrowRight className="size-4" />
+        </div>
+
+        <div className="flex flex-col justify-between gap-1.5 rounded-md border border-line bg-surface px-3 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-1.5">
+            <span className="text-[11.5px] font-medium text-fg-3">{p.stage3}</span>
+            <code className="lg-num text-[11px] text-fg-3">
+              {wire.driver} · {wire.wire_protocol}
+            </code>
+          </div>
+          <div className="lg-num text-[12px] text-fg">
+            {formatBytes(wire.forwarded_system_bytes)} ·{" "}
+            {p.tools(wire.forwarded_tool_count, formatBytes(wire.forwarded_tool_bytes))}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Pill tone={wire.isomorphic_wire ? "ok" : "neutral"}>
+              {wire.isomorphic_wire ? p.isomorphic : p.bridged}
+            </Pill>
+            {wire.cache_breakpoints_aligned > 0 && (
+              <Pill tone="ok">{p.cacheAligned(wire.cache_breakpoints_aligned)}</Pill>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 export function DiffBlock({

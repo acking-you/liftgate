@@ -6,6 +6,14 @@ use crate::acp::{AcpUsage, AvailableModel};
 use crate::canonical::{AuxiliaryTaskKind, ReasoningEffort};
 use crate::config::AutoUpdateTarget;
 use crate::pricing::UsageSummary;
+use crate::provider::{
+    OptimizationMode, OptimizationPolicy, ProviderDriverKind, ProviderFamily, ProviderId,
+    ToolWireMode, UpstreamWireProtocol,
+};
+
+fn default_provider_id_string() -> String {
+    ProviderId::AGY.to_owned()
+}
 
 /// Single bounded stderr diagnostic line captured from `agy acp`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,6 +145,8 @@ pub struct SessionMcpSummary {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionSummary {
     pub session_id: String,
+    #[serde(default = "default_provider_id_string")]
+    pub provider_id: String,
     pub model_id: String,
     pub state: SessionSlotState,
     #[serde(default)]
@@ -203,6 +213,10 @@ pub enum TaskPhase {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TaskSnapshot {
     pub task_id: String,
+    #[serde(default = "default_provider_id_string")]
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization_mode: Option<OptimizationMode>,
     pub protocol: TaskProtocol,
     pub stream: bool,
     pub requested_model: String,
@@ -854,11 +868,42 @@ pub struct AutoUpdateTelemetrySummary {
     pub targets: Vec<AutoUpdateTargetTelemetry>,
 }
 
+/// Live status of one configured upstream provider surfaced on telemetry snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderTelemetrySummary {
+    pub id: String,
+    pub display_name: String,
+    pub driver: ProviderDriverKind,
+    pub family: ProviderFamily,
+    pub wire_protocol: UpstreamWireProtocol,
+    pub tool_wire_mode: ToolWireMode,
+    pub enabled: bool,
+    pub active: bool,
+    pub auth_configured: bool,
+    pub auth_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub default_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_model: Option<String>,
+    pub spill_enabled: bool,
+}
+
 /// Top-level observability payload served over `GET /api/telemetry/snapshot` and SSE.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GatewayTelemetrySnapshot {
     pub generated_at_unix_ms: u64,
     pub gateway_version: Cow<'static, str>,
+    #[serde(default = "default_provider_id_string")]
+    pub active_provider: String,
+    #[serde(default)]
+    pub optimization_mode: OptimizationMode,
+    #[serde(default)]
+    pub optimization_policy: OptimizationPolicy,
+    #[serde(default)]
+    pub providers: Vec<ProviderTelemetrySummary>,
     #[serde(default)]
     pub vision_offload_enabled: bool,
     #[serde(default = "default_true")]
@@ -957,6 +1002,8 @@ pub struct ToolCallRecord {
     /// Buffer revision at which this record last changed (used for incremental `?since=` polling).
     pub revision: u64,
     pub task_id: String,
+    #[serde(default = "default_provider_id_string")]
+    pub provider_id: String,
     #[serde(default)]
     pub session_id: Option<String>,
     /// Session turn (one per HTTP request against the session) that emitted the call.
@@ -1268,6 +1315,10 @@ pub struct ContextCaptureSummary {
 pub struct ContextCaptureRecord {
     pub task_id: String,
     pub recorded_at_unix_ms: u64,
+    #[serde(default = "default_provider_id_string")]
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization_mode: Option<OptimizationMode>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -1353,11 +1404,35 @@ pub struct ContextCapturesResponse {
     pub records: Vec<ContextCaptureRecord>,
 }
 
+/// Stage-3 wire delivery summary enabling 3-stage comparison:
+/// `Raw Harness Input -> Gateway Provider-Aware Optimization -> Final Upstream Provider Wire`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UpstreamWireSummary {
+    pub provider_id: String,
+    pub driver: ProviderDriverKind,
+    pub wire_protocol: UpstreamWireProtocol,
+    pub optimization_mode: OptimizationMode,
+    /// `true` when ingress and upstream share the same native wire format (e.g. Codex -> OpenAI Responses).
+    pub isomorphic_wire: bool,
+    pub raw_system_bytes: usize,
+    pub forwarded_system_bytes: usize,
+    pub raw_tool_count: usize,
+    pub raw_tool_bytes: usize,
+    pub forwarded_tool_count: usize,
+    pub forwarded_tool_bytes: usize,
+    pub spill_enabled: bool,
+    pub cache_breakpoints_aligned: usize,
+    pub zero_rtt_continuations: usize,
+}
+
 /// On-disk payload of one captured turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FullContextPayload {
     #[serde(flatten)]
     pub request: LowCacheFullRequestPayload,
+    /// Three-stage pipeline delivery summary (`None` on captures written before multi-provider support).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_wire: Option<UpstreamWireSummary>,
     /// Reasoning the model produced during this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_reasoning: Option<String>,
@@ -1394,6 +1469,7 @@ mod tests {
                 seq: 3,
                 revision: 9,
                 task_id: "resp_1".to_owned(),
+                provider_id: "agy".to_owned(),
                 session_id: Some("sess".to_owned()),
                 turn_index: 2,
                 step_index: 0,

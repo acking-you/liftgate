@@ -4,6 +4,8 @@ members = [
     "crates/liftgate-codemode-js",
     "crates/liftgate-types",
     "crates/liftgate-tool-virtualizer",
+    "crates/liftgate-provider-stateful",
+    "crates/liftgate-provider-http",
     "crates/liftgate-harness",
     "crates/liftgate-auto-update",
     "crates/liftgate-auto-update-tui",
@@ -23,6 +25,8 @@ repository = "https://github.com/acking-you/liftgate"
 liftgate-codemode-js = { path = "crates/liftgate-codemode-js", default-features = false }
 liftgate-types = { path = "crates/liftgate-types", default-features = false }
 liftgate-tool-virtualizer = { path = "crates/liftgate-tool-virtualizer", default-features = false }
+liftgate-provider-stateful = { path = "crates/liftgate-provider-stateful", default-features = false }
+liftgate-provider-http = { path = "crates/liftgate-provider-http", default-features = false }
 liftgate-harness = { path = "crates/liftgate-harness", default-features = false }
 liftgate-auto-update = { path = "crates/liftgate-auto-update", default-features = false }
 liftgate-auto-update-tui = { path = "crates/liftgate-auto-update-tui", default-features = false }

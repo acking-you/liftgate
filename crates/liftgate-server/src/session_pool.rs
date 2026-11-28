@@ -938,6 +938,7 @@ impl SessionPool {
         for (sid, meta) in &guard.active_leases {
             sessions.push(SessionSummary {
                 session_id: sid.clone(),
+                provider_id: "agy".to_owned(),
                 model_id: meta.model_id.as_str().to_owned(),
                 state: SessionSlotState::Running,
                 cache_warmth: PromptCacheWarmth::classify(
@@ -963,6 +964,7 @@ impl SessionPool {
         for susp in guard.suspended_sessions.iter().rev() {
             sessions.push(SessionSummary {
                 session_id: susp.session_id.as_str().to_owned(),
+                provider_id: "agy".to_owned(),
                 model_id: susp.model_id.as_str().to_owned(),
                 state: SessionSlotState::Suspended,
                 cache_warmth: PromptCacheWarmth::classify(
@@ -988,6 +990,7 @@ impl SessionPool {
         for idle in guard.idle_sessions.iter().rev() {
             sessions.push(SessionSummary {
                 session_id: idle.session_id.as_str().to_owned(),
+                provider_id: "agy".to_owned(),
                 model_id: idle.model_id.as_str().to_owned(),
                 state: SessionSlotState::Idle,
                 cache_warmth: PromptCacheWarmth::classify(
