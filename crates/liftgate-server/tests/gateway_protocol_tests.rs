@@ -11783,7 +11783,7 @@ async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn resumed_mcp_continuation_without_tools_preserves_distill_harness_and_records_spill_diff() {
     let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
         steps: vec![
@@ -11835,6 +11835,7 @@ async fn resumed_mcp_continuation_without_tools_preserves_distill_harness_and_re
             usage_path: None,
         },
     ));
+    let mut telemetry_rx = state.telemetry.subscribe();
     let app = build_router(state);
 
     let codex_tools = json!([
@@ -11917,19 +11918,21 @@ async fn resumed_mcp_continuation_without_tools_preserves_distill_harness_and_re
             < call_detail["output_bytes"].as_u64().unwrap()
     );
 
-    let mut r2_capture_ready = false;
-    for _ in 0..250 {
+    loop {
         let (_, listed) = get_json(&app, "/api/telemetry/context-captures").await;
         if listed["records"].as_array().is_some_and(|recs| {
             recs.iter()
                 .any(|rec| rec["task_id"] == r2["id"] && rec["rewrite_count"] == 2)
         }) {
-            r2_capture_ready = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        match telemetry_rx.recv().await {
+            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                panic!("telemetry notification channel closed before r2 capture committed");
+            }
+        }
     }
-    assert!(r2_capture_ready, "expected r2 capture with 2 rewrites");
 
     let (status, ctx_detail) = get_json(
         &app,

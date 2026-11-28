@@ -88,12 +88,13 @@ export function useRevisionResource<T>(
   revision: number | string,
 ): Resource<T> {
   const resource = useResource(load, key);
-  const seen = useRef(revision);
+  const seen = useRef({ key, revision });
   const { reload } = resource;
   useEffect(() => {
-    if (seen.current === revision) return;
-    seen.current = revision;
+    const prev = seen.current;
+    seen.current = { key, revision };
+    if (prev.key !== key || prev.revision === revision) return;
     reload();
-  }, [revision, reload]);
+  }, [key, revision, reload]);
   return resource;
 }

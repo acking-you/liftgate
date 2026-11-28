@@ -17,7 +17,7 @@ import { DiffBlock, sizeChange } from "@/components/ContextRewrites";
 import { RouteFlow, ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
 import { Button, Figure, HarnessBadge, Latency, Note, Pill, Segmented } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
-import { useResource } from "@/hooks/useResource";
+import { useRevisionResource } from "@/hooks/useResource";
 import { byteLength, formatBytes, formatNumber, formatSmartTime, shortId } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import {
@@ -125,10 +125,12 @@ export function ToolCallInspector({
   const { client } = useGateway();
   const { m } = useI18n();
   const t = m.tools.inspector;
-  // Keyed on status too: a pending call is refetched the moment it lands.
-  const detail = useResource(
+  // Refetch in place whenever status or revision advances (for example when a
+  // pending call completes or post-completion spill shaping attaches forwarded_output).
+  const detail = useRevisionResource(
     () => client.toolCallDetail(record.call_id),
-    `${record.call_id}|${record.status}`,
+    record.call_id,
+    `${record.status}|${record.revision}`,
   );
   const [argView, setArgView] = useState<"client" | "wire">("client");
   const [outView, setOutView] = useState<"raw" | "diff" | "forwarded">(
