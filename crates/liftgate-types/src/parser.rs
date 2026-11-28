@@ -1487,9 +1487,10 @@ pub fn normalize_apply_patch_text(raw: &str) -> String {
 /// Normalizes JavaScript source passed to a Code Mode `exec` custom tool:
 /// 1. Strips accidental outer markdown code fences (` ```js ... ``` `).
 /// 2. Auto-escapes unescaped literal backticks (`` ` `` -> `` \` ``) at `${...}` depth 0 inside
-///    embedded V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``),
+///    broken single V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``),
 ///    preventing `SyntaxError: missing ) after argument list` in V8 while leaving `${...}`
-///    interpolations and already-escaped `` \` `` sequences untouched.
+///    interpolations, already-escaped `` \` `` sequences, regex literals, tagged templates, and
+///    valid multi-template patch concatenations untouched.
 #[must_use]
 pub fn normalize_code_mode_exec_js(raw: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = raw.trim();
@@ -1516,9 +1517,259 @@ pub fn normalize_code_mode_exec_js(raw: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Advances past a quoted JS string (`'` or `"`), returning the byte index right after the
-/// closing quote (or `src.len()` if unclosed).
-fn skip_js_quoted_string(src: &str, open_quote_pos: usize, quote: char) -> usize {
+/// closing quote along with whether the string closed cleanly without an unescaped line break.
+fn skip_js_quoted_string_checked(src: &str, open_quote_pos: usize, quote: char) -> (usize, bool) {
     let mut pos = open_quote_pos.saturating_add(quote.len_utf8());
+    let mut escaped = false;
+    while let Some(tail) = src.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        if escaped {
+            if ch == '\r'
+                && src
+                    .get(pos.saturating_add(1)..)
+                    .is_some_and(|r| r.starts_with('\n'))
+            {
+                pos = pos.saturating_add(2);
+            } else {
+                pos = pos.saturating_add(ch.len_utf8());
+            }
+            escaped = false;
+            continue;
+        }
+        if matches!(ch, '\n' | '\r') {
+            return (pos, false);
+        }
+        pos = pos.saturating_add(ch.len_utf8());
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return (pos, true);
+        }
+    }
+    (pos, false)
+}
+
+fn is_js_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || (!ch.is_ascii() && ch.is_alphabetic())
+}
+
+fn is_js_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || (!ch.is_ascii() && ch.is_alphanumeric())
+}
+
+fn scan_js_ident(src: &str, start: usize) -> (&str, usize) {
+    let mut end = start;
+    while let Some(tail) = src.get(end..)
+        && let Some(ch) = tail.chars().next()
+        && is_js_ident_continue(ch)
+    {
+        end = end.saturating_add(ch.len_utf8());
+    }
+    (src.get(start..end).unwrap_or_default(), end)
+}
+
+fn js_keyword_allows_regex(word: &str) -> bool {
+    matches!(
+        word,
+        "return"
+            | "throw"
+            | "case"
+            | "in"
+            | "of"
+            | "typeof"
+            | "void"
+            | "delete"
+            | "new"
+            | "do"
+            | "else"
+            | "default"
+            | "yield"
+            | "await"
+            | "instanceof"
+    )
+}
+
+fn js_keyword_can_precede_ident(word: &str) -> bool {
+    matches!(
+        word,
+        "const"
+            | "let"
+            | "var"
+            | "function"
+            | "class"
+            | "async"
+            | "import"
+            | "export"
+            | "default"
+            | "from"
+            | "as"
+            | "of"
+            | "in"
+            | "instanceof"
+            | "typeof"
+            | "void"
+            | "delete"
+            | "new"
+            | "return"
+            | "throw"
+            | "case"
+            | "yield"
+            | "await"
+            | "else"
+            | "do"
+            | "get"
+            | "set"
+            | "static"
+    )
+}
+
+/// Attempts to scan a single-line JS regex literal (`/pattern/flags`) starting at `slash_pos`.
+/// Returns `None` if `slash_pos` starts a comment or reaches a line terminator/EOF before closing.
+fn try_skip_js_regex_literal(src: &str, slash_pos: usize) -> Option<usize> {
+    let tail = src.get(slash_pos..)?;
+    if !tail.starts_with('/') || tail.starts_with("//") || tail.starts_with("/*") {
+        return None;
+    }
+    let mut pos = slash_pos.saturating_add(1);
+    let mut escaped = false;
+    let mut in_class = false;
+    while let Some(rem) = src.get(pos..)
+        && let Some(ch) = rem.chars().next()
+    {
+        if matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            return None;
+        }
+        pos = pos.saturating_add(ch.len_utf8());
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if ch == ']' {
+                in_class = false;
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        } else if ch == '/' {
+            while let Some(flag_tail) = src.get(pos..)
+                && let Some(flag) = flag_tail.chars().next()
+                && flag.is_ascii_alphabetic()
+            {
+                pos = pos.saturating_add(1);
+            }
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Advances past a `${ ... }` interpolation body starting right after `${`, handling strings,
+/// comments, regex literals, nested templates, and nested braces.
+fn skip_js_brace_expr_checked(src: &str, after_open_brace: usize) -> (usize, bool) {
+    let mut pos = after_open_brace;
+    let mut brace_depth = 1_usize;
+    let mut regex_allowed = true;
+    while let Some(tail) = src.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        match ch {
+            ' ' | '\t' | '\r' | '\n' | '\u{2028}' | '\u{2029}' => {
+                pos = pos.saturating_add(ch.len_utf8());
+            }
+            '\'' | '"' => {
+                let (end, closed) = skip_js_quoted_string_checked(src, pos, ch);
+                if !closed {
+                    return (end, false);
+                }
+                pos = end;
+                regex_allowed = false;
+            }
+            '`' => {
+                let (end, closed) = skip_js_template_literal_checked(src, pos);
+                if !closed {
+                    return (end, false);
+                }
+                pos = end;
+                regex_allowed = false;
+            }
+            '/' if tail.starts_with("//") => {
+                pos = tail
+                    .find('\n')
+                    .map_or(src.len(), |nl| pos.saturating_add(nl + 1));
+            }
+            '/' if tail.starts_with("/*") => {
+                let Some(end) = src
+                    .get(pos.saturating_add(2)..)
+                    .and_then(|r| r.find("*/").map(|rel| pos.saturating_add(rel + 4)))
+                else {
+                    return (src.len(), false);
+                };
+                pos = end;
+            }
+            '/' if regex_allowed => {
+                if let Some(end) = try_skip_js_regex_literal(src, pos) {
+                    pos = end;
+                    regex_allowed = false;
+                } else {
+                    pos = pos.saturating_add(1);
+                    regex_allowed = true;
+                }
+            }
+            '{' => {
+                brace_depth = brace_depth.saturating_add(1);
+                pos = pos.saturating_add(1);
+                regex_allowed = true;
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                pos = pos.saturating_add(1);
+                if brace_depth == 0 {
+                    return (pos, true);
+                }
+                regex_allowed = true;
+            }
+            ')' | ']' => {
+                pos = pos.saturating_add(1);
+                regex_allowed = false;
+            }
+            '+' | '-' if tail.starts_with("++") || tail.starts_with("--") => {
+                pos = pos.saturating_add(2);
+            }
+            _ if is_js_ident_start(ch) => {
+                let (word, end) = scan_js_ident(src, pos);
+                pos = end;
+                regex_allowed = js_keyword_allows_regex(word);
+            }
+            _ if ch.is_ascii_digit() => {
+                pos = pos.saturating_add(1);
+                while let Some(num_tail) = src.get(pos..)
+                    && let Some(nc) = num_tail.chars().next()
+                    && (nc.is_ascii_alphanumeric() || nc == '_' || nc == '.')
+                {
+                    pos = pos.saturating_add(1);
+                }
+                regex_allowed = false;
+            }
+            _ => {
+                pos = pos.saturating_add(ch.len_utf8());
+                regex_allowed = true;
+            }
+        }
+    }
+    (pos, false)
+}
+
+/// Advances past an ordinary JS template literal starting at `open_tick_pos`, handling `\` escapes
+/// and nested `${ ... }` expressions.
+fn skip_js_template_literal_checked(src: &str, open_tick_pos: usize) -> (usize, bool) {
+    let mut pos = open_tick_pos.saturating_add(1);
     let mut escaped = false;
     while let Some(tail) = src.get(pos..)
         && let Some(ch) = tail.chars().next()
@@ -1530,77 +1781,22 @@ fn skip_js_quoted_string(src: &str, open_quote_pos: usize, quote: char) -> usize
         }
         if ch == '\\' {
             escaped = true;
-        } else if ch == quote {
-            break;
+        } else if ch == '`' {
+            return (pos, true);
+        } else if ch == '$' && src.get(pos..).is_some_and(|r| r.starts_with('{')) {
+            let (after_brace, closed) = skip_js_brace_expr_checked(src, pos.saturating_add(1));
+            if !closed {
+                return (after_brace, false);
+            }
+            pos = after_brace;
         }
     }
-    pos
+    (pos, false)
 }
 
-/// Advances past an ordinary JS template literal starting at `open_tick_pos`, handling `\` escapes
-/// and nested `${ ... }` expressions.
-fn skip_js_template_literal(src: &str, open_tick_pos: usize) -> usize {
-    let mut pos = open_tick_pos.saturating_add(1);
-    let mut escaped = false;
-    let mut interp_depth = 0_usize;
-    while let Some(tail) = src.get(pos..)
-        && let Some(ch) = tail.chars().next()
-    {
-        if interp_depth == 0 {
-            pos = pos.saturating_add(ch.len_utf8());
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-            } else if ch == '`' {
-                break;
-            } else if ch == '$' && src.get(pos..).is_some_and(|r| r.starts_with('{')) {
-                pos = pos.saturating_add(1);
-                interp_depth = 1;
-            }
-        } else {
-            match ch {
-                '\'' | '"' => {
-                    pos = skip_js_quoted_string(src, pos, ch);
-                }
-                '`' => {
-                    pos = skip_js_template_literal(src, pos);
-                }
-                '/' if src.get(pos..).is_some_and(|r| r.starts_with("//")) => {
-                    pos = src
-                        .get(pos..)
-                        .and_then(|r| r.find('\n').map(|nl| pos.saturating_add(nl + 1)))
-                        .unwrap_or(src.len());
-                }
-                '/' if src.get(pos..).is_some_and(|r| r.starts_with("/*")) => {
-                    pos = src
-                        .get(pos.saturating_add(2)..)
-                        .and_then(|r| r.find("*/").map(|end| pos.saturating_add(end + 4)))
-                        .unwrap_or(src.len());
-                }
-                '{' => {
-                    interp_depth = interp_depth.saturating_add(1);
-                    pos = pos.saturating_add(1);
-                }
-                '}' => {
-                    interp_depth = interp_depth.saturating_sub(1);
-                    pos = pos.saturating_add(1);
-                }
-                _ => {
-                    pos = pos.saturating_add(ch.len_utf8());
-                }
-            }
-        }
-    }
-    pos
-}
-
-/// Checks whether the template literal opening at `open_tick_pos` begins with `*** Begin Patch`
-/// and, if so, locates the matching closing `` ` `` right after the nearest line-leading
-/// `*** End Patch`.
-fn find_v4a_template_bounds(src: &str, open_tick_pos: usize) -> Option<usize> {
+/// Strips optional leading whitespace/`\r`/`\n` escapes after an opening `` ` `` and returns the
+/// byte index right after the `*** Begin Patch` newline if present.
+fn skip_v4a_begin_patch_header(src: &str, open_tick_pos: usize) -> Option<usize> {
     let body_start = open_tick_pos.saturating_add(1);
     let after_open = src.get(body_start..)?;
     let mut trim_ws = after_open;
@@ -1618,15 +1814,30 @@ fn find_v4a_template_bounds(src: &str, open_tick_pos: usize) -> Option<usize> {
         }
     }
     let after_begin = trim_ws.strip_prefix("*** Begin Patch")?;
-    if !(after_begin.starts_with('\n')
-        || after_begin.starts_with("\r\n")
-        || after_begin.starts_with("\\n")
-        || after_begin.starts_with("\\r\\n"))
-    {
-        return None;
-    }
+    let rest = if let Some(r) = after_begin.strip_prefix("\r\n") {
+        r
+    } else if let Some(r) = after_begin.strip_prefix('\n') {
+        r
+    } else if let Some(r) = after_begin.strip_prefix("\\r\\n") {
+        r
+    } else {
+        after_begin.strip_prefix("\\n")?
+    };
+    Some(src.len().saturating_sub(rest.len()))
+}
 
-    let mut search_from = src.len().saturating_sub(after_begin.len());
+/// Checks whether the template literal opening at `open_tick_pos` begins with `*** Begin Patch`
+/// and, if so, locates the matching closing `` ` `` right after the nearest line-leading
+/// `*** End Patch`, provided every intermediate line conforms to V4A patch structure and the span
+/// is not already a valid multi-template JS expression.
+fn find_v4a_template_bounds(
+    src: &str,
+    open_tick_pos: usize,
+    outer_delims: &[char],
+) -> Option<usize> {
+    let content_after_header = skip_v4a_begin_patch_header(src, open_tick_pos)?;
+
+    let mut search_from = content_after_header;
     while let Some(rem) = src.get(search_from..) {
         let rel = rem.find("*** End Patch")?;
         let marker_pos = search_from.saturating_add(rel);
@@ -1653,12 +1864,426 @@ fn find_v4a_template_bounds(src: &str, open_tick_pos: usize) -> Option<usize> {
                 }
             }
             if tail.starts_with('`') {
-                return Some(marker_end.saturating_add(consumed));
+                let close_tick_pos = marker_end.saturating_add(consumed);
+                let mid = src.get(content_after_header..marker_pos)?;
+                let candidate_slice = src.get(open_tick_pos..=close_tick_pos)?;
+                if !v4a_mid_has_only_patch_lines(mid)
+                    || is_valid_js_patch_expression(candidate_slice, outer_delims)
+                {
+                    return None;
+                }
+                return Some(close_tick_pos);
             }
         }
         search_from = marker_end;
     }
     None
+}
+
+/// Verifies that every line between `*** Begin Patch\n` and `*** End Patch` (outside `${...}`
+/// interpolations) starts with a V4A patch marker and contains no nested `` `*** Begin Patch ``.
+fn v4a_mid_has_only_patch_lines(mid: &str) -> bool {
+    let mut pos = 0_usize;
+    let mut at_line_start = true;
+
+    while let Some(rem) = mid.get(pos..)
+        && !rem.is_empty()
+    {
+        if at_line_start {
+            if let Some(r) = rem.strip_prefix("\r\n") {
+                pos = mid.len().saturating_sub(r.len());
+                continue;
+            }
+            if let Some(r) = rem.strip_prefix('\n') {
+                pos = mid.len().saturating_sub(r.len());
+                continue;
+            }
+            if let Some(r) = rem.strip_prefix("\\r\\n") {
+                pos = mid.len().saturating_sub(r.len());
+                continue;
+            }
+            if let Some(r) = rem.strip_prefix("\\n") {
+                pos = mid.len().saturating_sub(r.len());
+                continue;
+            }
+            let valid_start = rem.starts_with("*** Update File:")
+                || rem.starts_with("*** Add File:")
+                || rem.starts_with("*** Delete File:")
+                || rem.starts_with("*** Move to:")
+                || rem.starts_with("*** End of File")
+                || rem.starts_with("@@")
+                || rem.starts_with('+')
+                || rem.starts_with('-')
+                || rem.starts_with(' ')
+                || rem.starts_with("${");
+            if !valid_start {
+                return false;
+            }
+            at_line_start = false;
+        }
+
+        if rem.starts_with("\r\n") {
+            pos = pos.saturating_add(2);
+            at_line_start = true;
+        } else if rem.starts_with('\n') {
+            pos = pos.saturating_add(1);
+            at_line_start = true;
+        } else if rem.starts_with("\\\\") {
+            pos = pos.saturating_add(2);
+        } else if rem.starts_with("\\r\\n") {
+            pos = pos.saturating_add(4);
+            at_line_start = true;
+        } else if rem.starts_with("\\n") {
+            pos = pos.saturating_add(2);
+            at_line_start = true;
+        } else if rem.starts_with('\\') {
+            let step = rem
+                .get(1..)
+                .and_then(|r| r.chars().next())
+                .map_or(1, |c| 1 + c.len_utf8());
+            pos = pos.saturating_add(step);
+        } else if rem.starts_with("${") {
+            let (after_brace, closed) = skip_js_brace_expr_checked(mid, pos.saturating_add(2));
+            if !closed {
+                return false;
+            }
+            pos = after_brace;
+        } else if rem.starts_with('`') && skip_v4a_begin_patch_header(mid, pos).is_some() {
+            return false;
+        } else if let Some(ch) = rem.chars().next() {
+            pos = pos.saturating_add(ch.len_utf8());
+        } else {
+            break;
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchSliceToken {
+    Start,
+    UntaggedTemplate,
+    QuotedString,
+    Ident {
+        allows_regex: bool,
+        can_precede_ident: bool,
+        is_raw: bool,
+    },
+    Number,
+    Dot,
+    CloseGroup,
+    Operator,
+}
+
+/// Returns `true` when `slice` (`&src[open_tick_pos..=close_tick_pos]`) is already a valid JS
+/// single-template or multi-template patch expression (for example `` `*** Begin Patch\n` + `...` ``
+/// or `` [`*** Begin Patch\n...`, `...`] ``) and therefore must not be rewritten.
+fn is_valid_js_patch_expression(slice: &str, outer_delims: &[char]) -> bool {
+    let mut pos = 0_usize;
+    let mut prev = PatchSliceToken::Start;
+    let mut saw_newline = false;
+    let mut delim_stack: Vec<char> = outer_delims.to_vec();
+    let mut min_delim_depth = delim_stack.len();
+
+    while let Some(tail) = src_tail(slice, pos)
+        && let Some(ch) = tail.chars().next()
+    {
+        if matches!(ch, ' ' | '\t') {
+            pos = pos.saturating_add(1);
+            continue;
+        }
+        if matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            saw_newline = true;
+            pos = pos.saturating_add(ch.len_utf8());
+            continue;
+        }
+        if tail.starts_with("//") {
+            pos = tail
+                .find('\n')
+                .map_or(slice.len(), |nl| pos.saturating_add(nl + 1));
+            saw_newline = true;
+            continue;
+        }
+        if tail.starts_with("/*") {
+            let Some(rel_end) = slice
+                .get(pos.saturating_add(2)..)
+                .and_then(|r| r.find("*/"))
+            else {
+                return false;
+            };
+            let comment_body = slice
+                .get(pos.saturating_add(2)..pos.saturating_add(2 + rel_end))
+                .unwrap_or_default();
+            if comment_body.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
+                saw_newline = true;
+            }
+            pos = pos.saturating_add(rel_end + 4);
+            continue;
+        }
+
+        if prev == PatchSliceToken::UntaggedTemplate
+            && !is_allowed_after_patch_template(tail, saw_newline)
+        {
+            return false;
+        }
+
+        match ch {
+            '`' => {
+                match prev {
+                    PatchSliceToken::UntaggedTemplate
+                    | PatchSliceToken::QuotedString
+                    | PatchSliceToken::Number
+                    | PatchSliceToken::CloseGroup
+                    | PatchSliceToken::Dot => return false,
+                    PatchSliceToken::Ident { is_raw: false, .. } => return false,
+                    PatchSliceToken::Start
+                    | PatchSliceToken::Operator
+                    | PatchSliceToken::Ident { is_raw: true, .. } => {}
+                }
+                let (end, closed) = skip_js_template_literal_checked(slice, pos);
+                if !closed {
+                    return false;
+                }
+                pos = end;
+                prev = PatchSliceToken::UntaggedTemplate;
+                saw_newline = false;
+            }
+            '\'' | '"' => {
+                if !saw_newline
+                    && matches!(
+                        prev,
+                        PatchSliceToken::Ident {
+                            can_precede_ident: false,
+                            ..
+                        } | PatchSliceToken::Number
+                            | PatchSliceToken::QuotedString
+                            | PatchSliceToken::CloseGroup
+                    )
+                {
+                    return false;
+                }
+                let (end, closed) = skip_js_quoted_string_checked(slice, pos, ch);
+                if !closed {
+                    return false;
+                }
+                pos = end;
+                prev = PatchSliceToken::QuotedString;
+                saw_newline = false;
+            }
+            '/' => {
+                let regex_allowed = matches!(
+                    prev,
+                    PatchSliceToken::Start
+                        | PatchSliceToken::Operator
+                        | PatchSliceToken::Ident {
+                            allows_regex: true,
+                            ..
+                        }
+                );
+                if regex_allowed && let Some(end) = try_skip_js_regex_literal(slice, pos) {
+                    pos = end;
+                    prev = PatchSliceToken::CloseGroup;
+                    saw_newline = false;
+                } else if matches!(
+                    prev,
+                    PatchSliceToken::Start | PatchSliceToken::Operator | PatchSliceToken::Dot
+                ) {
+                    return false;
+                } else {
+                    pos = pos.saturating_add(if tail.starts_with("/=") { 2 } else { 1 });
+                    prev = PatchSliceToken::Operator;
+                    saw_newline = false;
+                }
+            }
+            '(' | '[' | '{' => {
+                delim_stack.push(ch);
+                pos = pos.saturating_add(1);
+                prev = PatchSliceToken::Operator;
+                saw_newline = false;
+            }
+            ')' | ']' | '}' => {
+                let expected = match ch {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                if delim_stack.pop() != Some(expected) {
+                    return false;
+                }
+                min_delim_depth = min_delim_depth.min(delim_stack.len());
+                pos = pos.saturating_add(1);
+                prev = if ch == '}' {
+                    PatchSliceToken::Operator
+                } else {
+                    PatchSliceToken::CloseGroup
+                };
+                saw_newline = false;
+            }
+            _ if is_js_ident_start(ch) => {
+                let (word, end) = scan_js_ident(slice, pos);
+                if !saw_newline
+                    && !matches!(word, "in" | "instanceof")
+                    && matches!(
+                        prev,
+                        PatchSliceToken::Ident {
+                            can_precede_ident: false,
+                            ..
+                        } | PatchSliceToken::Number
+                            | PatchSliceToken::QuotedString
+                            | PatchSliceToken::CloseGroup
+                    )
+                {
+                    return false;
+                }
+                let is_raw = prev == PatchSliceToken::Dot && word == "raw";
+                prev = PatchSliceToken::Ident {
+                    allows_regex: js_keyword_allows_regex(word),
+                    can_precede_ident: js_keyword_can_precede_ident(word),
+                    is_raw,
+                };
+                pos = end;
+                saw_newline = false;
+            }
+            _ if ch.is_ascii_digit() => {
+                if !saw_newline
+                    && matches!(
+                        prev,
+                        PatchSliceToken::Ident {
+                            can_precede_ident: false,
+                            ..
+                        } | PatchSliceToken::Number
+                            | PatchSliceToken::QuotedString
+                            | PatchSliceToken::CloseGroup
+                    )
+                {
+                    return false;
+                }
+                pos = pos.saturating_add(1);
+                while let Some(num_tail) = slice.get(pos..)
+                    && let Some(nc) = num_tail.chars().next()
+                    && (nc.is_ascii_alphanumeric() || nc == '_' || nc == '.')
+                {
+                    pos = pos.saturating_add(1);
+                }
+                prev = PatchSliceToken::Number;
+                saw_newline = false;
+            }
+            _ if tail.starts_with("***") => {
+                return false;
+            }
+            '?' if tail.starts_with("?.")
+                && !tail
+                    .get(2..)
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit())) =>
+            {
+                pos = pos.saturating_add(2);
+                prev = PatchSliceToken::Dot;
+                saw_newline = false;
+            }
+            '.' => {
+                if tail.starts_with("...") {
+                    pos = pos.saturating_add(3);
+                    prev = PatchSliceToken::Operator;
+                } else {
+                    pos = pos.saturating_add(1);
+                    prev = PatchSliceToken::Dot;
+                }
+                saw_newline = false;
+            }
+            '+' | '-' if tail.starts_with("++") || tail.starts_with("--") => {
+                pos = pos.saturating_add(2);
+                saw_newline = false;
+            }
+            _ => {
+                let op_len = if tail.starts_with("===")
+                    || tail.starts_with("!==")
+                    || tail.starts_with(">>>")
+                    || tail.starts_with("<<=")
+                    || tail.starts_with(">>=")
+                    || tail.starts_with("**=")
+                    || tail.starts_with("&&=")
+                    || tail.starts_with("||=")
+                    || tail.starts_with("??=")
+                {
+                    3
+                } else if tail.starts_with("==")
+                    || tail.starts_with("!=")
+                    || tail.starts_with("<=")
+                    || tail.starts_with(">=")
+                    || tail.starts_with("=>")
+                    || tail.starts_with("&&")
+                    || tail.starts_with("||")
+                    || tail.starts_with("??")
+                    || tail.starts_with("**")
+                    || tail.starts_with("<<")
+                    || tail.starts_with(">>")
+                    || tail.starts_with("+=")
+                    || tail.starts_with("-=")
+                    || tail.starts_with("*=")
+                    || tail.starts_with("%=")
+                    || tail.starts_with("&=")
+                    || tail.starts_with("|=")
+                    || tail.starts_with("^=")
+                {
+                    2
+                } else if matches!(
+                    ch,
+                    '+' | '-'
+                        | '*'
+                        | '%'
+                        | '='
+                        | '!'
+                        | '<'
+                        | '>'
+                        | '&'
+                        | '|'
+                        | '^'
+                        | '~'
+                        | '?'
+                        | ':'
+                        | ','
+                        | ';'
+                ) {
+                    if ch == ';' && matches!(delim_stack.last(), Some('(' | '[')) {
+                        return false;
+                    }
+                    1
+                } else {
+                    return false;
+                };
+                pos = pos.saturating_add(op_len);
+                prev = PatchSliceToken::Operator;
+                saw_newline = false;
+            }
+        }
+    }
+
+    prev == PatchSliceToken::UntaggedTemplate
+        && delim_stack
+            .get(min_delim_depth..)
+            .unwrap_or_default()
+            .iter()
+            .all(|&d| d == '(' || d == '[')
+}
+
+fn src_tail(src: &str, pos: usize) -> Option<&str> {
+    src.get(pos..).filter(|s| !s.is_empty())
+}
+
+fn is_allowed_after_patch_template(tail: &str, saw_newline: bool) -> bool {
+    if (tail.starts_with('+') && !tail.starts_with("++") && !tail.starts_with("+-"))
+        || tail.starts_with([',', ';', ')', ']', '}', '.', '?', ':'])
+        || tail.starts_with("||")
+        || tail.starts_with("&&")
+        || tail.starts_with("==")
+        || tail.starts_with("!=")
+    {
+        return true;
+    }
+    if saw_newline && let Some(ch) = tail.chars().next() {
+        return is_js_ident_start(ch);
+    }
+    false
 }
 
 /// Escapes unescaped literal `` ` `` characters at `${...}` depth 0 inside V4A patch template
@@ -1667,13 +2292,21 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
     let mut out: Option<String> = None;
     let mut copied_until = 0_usize;
     let mut pos = 0_usize;
+    let mut regex_allowed = true;
+    let mut prev_can_tag_template = false;
+    let mut outer_delims: Vec<char> = Vec::new();
 
     while let Some(tail) = src.get(pos..)
         && let Some(ch) = tail.chars().next()
     {
         match ch {
+            ' ' | '\t' | '\r' | '\n' | '\u{2028}' | '\u{2029}' => {
+                pos = pos.saturating_add(ch.len_utf8());
+            }
             '\'' | '"' => {
-                pos = skip_js_quoted_string(src, pos, ch);
+                pos = skip_js_quoted_string_checked(src, pos, ch).0;
+                regex_allowed = false;
+                prev_can_tag_template = false;
             }
             '/' if tail.starts_with("//") => {
                 pos = tail
@@ -1686,8 +2319,21 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
                     .and_then(|r| r.find("*/").map(|end| pos.saturating_add(end + 4)))
                     .unwrap_or(src.len());
             }
+            '/' if regex_allowed => {
+                if let Some(end) = try_skip_js_regex_literal(src, pos) {
+                    pos = end;
+                    regex_allowed = false;
+                    prev_can_tag_template = false;
+                } else {
+                    pos = pos.saturating_add(1);
+                    regex_allowed = true;
+                    prev_can_tag_template = false;
+                }
+            }
             '`' => {
-                if let Some(close_tick_pos) = find_v4a_template_bounds(src, pos) {
+                if !prev_can_tag_template
+                    && let Some(close_tick_pos) = find_v4a_template_bounds(src, pos, &outer_delims)
+                {
                     let body_start = pos.saturating_add(1);
                     if let Some(body) = src.get(body_start..close_tick_pos)
                         && let Some(healed_body) = escape_unescaped_template_backticks(body)
@@ -1702,11 +2348,59 @@ fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
                     }
                     pos = close_tick_pos.saturating_add(1);
                 } else {
-                    pos = skip_js_template_literal(src, pos);
+                    pos = skip_js_template_literal_checked(src, pos).0;
                 }
+                regex_allowed = false;
+                prev_can_tag_template = false;
+            }
+            '(' | '[' | '{' => {
+                outer_delims.push(ch);
+                pos = pos.saturating_add(1);
+                regex_allowed = true;
+                prev_can_tag_template = false;
+            }
+            '}' => {
+                if outer_delims.last() == Some(&'{') {
+                    outer_delims.pop();
+                }
+                pos = pos.saturating_add(1);
+                regex_allowed = true;
+                prev_can_tag_template = false;
+            }
+            ')' | ']' => {
+                let expected = if ch == ')' { '(' } else { '[' };
+                if outer_delims.last() == Some(&expected) {
+                    outer_delims.pop();
+                }
+                pos = pos.saturating_add(1);
+                regex_allowed = false;
+                prev_can_tag_template = true;
+            }
+            '+' | '-' if tail.starts_with("++") || tail.starts_with("--") => {
+                pos = pos.saturating_add(2);
+                prev_can_tag_template = false;
+            }
+            _ if is_js_ident_start(ch) => {
+                let (word, end) = scan_js_ident(src, pos);
+                pos = end;
+                regex_allowed = js_keyword_allows_regex(word);
+                prev_can_tag_template = !js_keyword_allows_regex(word);
+            }
+            _ if ch.is_ascii_digit() => {
+                pos = pos.saturating_add(1);
+                while let Some(num_tail) = src.get(pos..)
+                    && let Some(nc) = num_tail.chars().next()
+                    && (nc.is_ascii_alphanumeric() || nc == '_' || nc == '.')
+                {
+                    pos = pos.saturating_add(1);
+                }
+                regex_allowed = false;
+                prev_can_tag_template = false;
             }
             _ => {
                 pos = pos.saturating_add(ch.len_utf8());
+                regex_allowed = true;
+                prev_can_tag_template = false;
             }
         }
     }
@@ -1728,63 +2422,40 @@ fn escape_unescaped_template_backticks(body: &str) -> Option<String> {
     let mut copied_until = 0_usize;
     let mut pos = 0_usize;
     let mut escaped = false;
-    let mut interp_depth = 0_usize;
 
     while let Some(tail) = body.get(pos..)
         && let Some(ch) = tail.chars().next()
     {
-        if interp_depth == 0 {
-            if escaped {
-                escaped = false;
-                pos = pos.saturating_add(ch.len_utf8());
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                pos = pos.saturating_add(1);
-                continue;
-            }
-            if ch == '$'
-                && body
-                    .get(pos.saturating_add(1)..)
-                    .is_some_and(|r| r.starts_with('{'))
-            {
-                pos = pos.saturating_add(2);
-                interp_depth = 1;
-                continue;
-            }
-            if ch == '`' {
-                let buf = out.get_or_insert_with(|| String::with_capacity(body.len() + 8));
-                if let Some(prefix) = body.get(copied_until..pos) {
-                    buf.push_str(prefix);
-                }
-                buf.push_str("\\`");
-                pos = pos.saturating_add(1);
-                copied_until = pos;
-                continue;
-            }
+        if escaped {
+            escaped = false;
             pos = pos.saturating_add(ch.len_utf8());
-        } else {
-            match ch {
-                '\'' | '"' => {
-                    pos = skip_js_quoted_string(body, pos, ch);
-                }
-                '`' => {
-                    pos = skip_js_template_literal(body, pos);
-                }
-                '{' => {
-                    interp_depth = interp_depth.saturating_add(1);
-                    pos = pos.saturating_add(1);
-                }
-                '}' => {
-                    interp_depth = interp_depth.saturating_sub(1);
-                    pos = pos.saturating_add(1);
-                }
-                _ => {
-                    pos = pos.saturating_add(ch.len_utf8());
-                }
-            }
+            continue;
         }
+        if ch == '\\' {
+            escaped = true;
+            pos = pos.saturating_add(1);
+            continue;
+        }
+        if ch == '$'
+            && body
+                .get(pos.saturating_add(1)..)
+                .is_some_and(|r| r.starts_with('{'))
+        {
+            let (after_brace, _) = skip_js_brace_expr_checked(body, pos.saturating_add(2));
+            pos = after_brace;
+            continue;
+        }
+        if ch == '`' {
+            let buf = out.get_or_insert_with(|| String::with_capacity(body.len() + 8));
+            if let Some(prefix) = body.get(copied_until..pos) {
+                buf.push_str(prefix);
+            }
+            buf.push_str("\\`");
+            pos = pos.saturating_add(1);
+            copied_until = pos;
+            continue;
+        }
+        pos = pos.saturating_add(ch.len_utf8());
     }
 
     out.map(|mut buf| {
@@ -3137,5 +3808,45 @@ mod tests {
             normalize_code_mode_exec_js(expected),
             std::borrow::Cow::Borrowed(_)
         ));
+
+        // 4. Valid concatenated, array-joined, `.concat(...)`, and tagged template expressions
+        //    must stay untouched (`Cow::Borrowed`).
+        let valid_concat = "const p = `*** Begin Patch\\n` + `*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch`;\nawait tools.apply_patch(p);";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_concat),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let valid_mid_concat = "const p = `*** Begin Patch\\n*** Update File: ` + path + `\\n@@\\n-old\\n+new\\n*** End Patch`;";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_mid_concat),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let valid_paren_mid_concat = "if (ok) {\n  const p = (`*** Begin Patch\\n*** Update File: ` + path) + `\\n@@\\n-old\\n+new\\n*** End Patch`;\n  await tools.apply_patch(p);\n}";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_paren_mid_concat),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let valid_array_join = "const p = [\n  `*** Begin Patch\\n*** Update File: a.txt`,\n  `@@\\n-old\\n+new\\n*** End Patch`,\n].join('\\n');";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_array_join),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let valid_method_concat = "const p = `*** Begin Patch\\n*** Update File: a.txt\\n`.concat(`@@\\n-old\\n+new\\n*** End Patch`);";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_method_concat),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let valid_raw_tag = "const p = String.raw`*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch`;";
+        assert!(matches!(
+            normalize_code_mode_exec_js(valid_raw_tag),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // 5. Mixed script containing a valid concatenated patch, a regex literal with an
+        //    unescaped backtick, a separate header template, AND a broken V4A patch heals ONLY
+        //    the broken V4A patch.
+        let mixed = "const clean = s.replace(/`/g, '\\\\`');\nconst hdr = `*** Begin Patch\\n`;\nconst ok = `*** Begin Patch\\n` + `*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch`;\nawait tools.apply_patch(`*** Begin Patch\n*** Update File: b.md\n@@\n+- Path `/api/v1` and\n+```rust\n+fn f() {}\n+```\n*** End Patch`);";
+        let mixed_expected = "const clean = s.replace(/`/g, '\\\\`');\nconst hdr = `*** Begin Patch\\n`;\nconst ok = `*** Begin Patch\\n` + `*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch`;\nawait tools.apply_patch(`*** Begin Patch\n*** Update File: b.md\n@@\n+- Path \\`/api/v1\\` and\n+\\`\\`\\`rust\n+fn f() {}\n+\\`\\`\\`\n*** End Patch`);";
+        assert_eq!(normalize_code_mode_exec_js(mixed).as_ref(), mixed_expected);
     }
 }

@@ -12,7 +12,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - **Codex `exec` script reliability (`JSON.parse`, template-literal backticks, and nested `apply_patch`)**:
   - Clarified in `CodexExec` `<api_gateway_bridge_rules>` and `mcp_lg_exec`'s input schema that `tools.exec_command(...).output` merges `stdout` + `stderr` and prepends truncation headers past `max_output_tokens` (requiring `2>/dev/null` and single-document JSON before `JSON.parse`), and steered 1-4 file edits to top-level `mcp_lg_apply_patch` rather than `tools.apply_patch` inside `exec` (reserving `Promise.allSettled` for 5+ file patches after reading exact target lines).
-  - Added 0-RTT `normalize_code_mode_exec_js` normalization on `mcp_lg_exec` to strip accidental outer markdown code fences and auto-escape unescaped literal backticks inside embedded V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``) while preserving `${...}` interpolations, eliminating `SyntaxError: missing ) after argument list` failures.
+  - Added 0-RTT `normalize_code_mode_exec_js` normalization on `mcp_lg_exec` to strip accidental outer markdown code fences and auto-escape unescaped literal backticks inside broken single V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``) while preserving `${...}` interpolations, regex literals, tagged templates, and valid multi-template patch concatenations, eliminating `SyntaxError: missing ) after argument list` failures.
   - Added targeted recovery hints when `exec` fails with `JSON.parse` `SyntaxError`, JS template-literal `SyntaxError`, or uncaught `apply_patch verification failed:` rejections.
 
 ## [0.2.20] - 2026-11-28
