@@ -57,6 +57,12 @@ struct PartRenderLimits {
     emit_images: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PartRenderMode {
+    is_archival: bool,
+    strip_billing: bool,
+}
+
 impl PartRenderLimits {
     const UNBOUNDED: Self = Self {
         max_text_bytes: usize::MAX,
@@ -64,6 +70,14 @@ impl PartRenderLimits {
         max_tool_result_bytes: usize::MAX,
         emit_images: true,
     };
+}
+
+fn maybe_strip_billing(input: &str, strip_billing: bool) -> std::borrow::Cow<'_, str> {
+    if strip_billing {
+        std::borrow::Cow::Owned(strip_billing_noise(input))
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
 }
 
 /// Converts a slice of `CanonicalMessage` turns into ACP `AcpPromptBlock`s.
@@ -112,7 +126,8 @@ pub fn build_acp_prompt_blocks_with_spill<S: TruncationSpillSink>(
         .unwrap_or((&[], messages));
 
     if estimate_raw_prompt_bytes(history_slice, active_slice) <= MAX_ACP_PROMPT_TEXT_BYTES {
-        let uncompacted = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+        let uncompacted =
+            render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce, true);
         if total_text_block_bytes(&uncompacted) <= MAX_ACP_PROMPT_TEXT_BYTES {
             return sanitize_slash_command_blocks(uncompacted);
         }
@@ -123,6 +138,7 @@ pub fn build_acp_prompt_blocks_with_spill<S: TruncationSpillSink>(
         active_slice,
         tool_nonce,
         MAX_ACP_PROMPT_TEXT_BYTES,
+        true,
         spill,
     ))
 }
@@ -152,6 +168,26 @@ pub fn build_acp_prompt_plan_with_spill<S: TruncationSpillSink>(
     tool_nonce: &str,
     is_full_history_replay: bool,
     leading_directive_xml: Option<&str>,
+    spill: &mut S,
+) -> Result<Vec<AcpPromptBlock>, ProtocolError> {
+    build_acp_prompt_plan_with_options(
+        messages,
+        tool_nonce,
+        is_full_history_replay,
+        leading_directive_xml,
+        true,
+        spill,
+    )
+}
+
+/// Like [`build_acp_prompt_plan_with_spill`], controlling whether non-semantic billing noise
+/// is stripped (`strip_billing = true`) or preserved verbatim (`strip_billing = false`).
+pub fn build_acp_prompt_plan_with_options<S: TruncationSpillSink>(
+    messages: &[CanonicalMessage],
+    tool_nonce: &str,
+    is_full_history_replay: bool,
+    leading_directive_xml: Option<&str>,
+    strip_billing: bool,
     spill: &mut S,
 ) -> Result<Vec<AcpPromptBlock>, ProtocolError> {
     // Reserve framing and slash-escaping bytes as well as the complete tool/directive update.
@@ -188,9 +224,14 @@ pub fn build_acp_prompt_plan_with_spill<S: TruncationSpillSink>(
 
     let budget = MAX_ACP_PROMPT_TEXT_BYTES.saturating_sub(directive_bytes);
     let mut blocks = if history_slice.is_empty() {
-        render_smart_bounded_active_slice(active_slice, tool_nonce, budget, spill)
+        render_smart_bounded_active_slice(active_slice, tool_nonce, budget, strip_billing, spill)
     } else {
-        let uncompacted = render_uncompacted_prompt_blocks(history_slice, active_slice, tool_nonce);
+        let uncompacted = render_uncompacted_prompt_blocks(
+            history_slice,
+            active_slice,
+            tool_nonce,
+            strip_billing,
+        );
         if total_text_block_bytes(&uncompacted) <= budget {
             uncompacted
         } else {
@@ -198,9 +239,21 @@ pub fn build_acp_prompt_plan_with_spill<S: TruncationSpillSink>(
                 .min(budget / 3)
                 .min(MAX_HISTORY_RESERVE_BYTES);
             let active_budget = budget.saturating_sub(hist_reserve);
-            let active =
-                render_smart_bounded_active_slice(active_slice, tool_nonce, active_budget, spill);
-            render_history_around_active(history_slice, active, tool_nonce, budget, spill)
+            let active = render_smart_bounded_active_slice(
+                active_slice,
+                tool_nonce,
+                active_budget,
+                strip_billing,
+                spill,
+            );
+            render_history_around_active(
+                history_slice,
+                active,
+                tool_nonce,
+                budget,
+                strip_billing,
+                spill,
+            )
         }
     };
     prepend_directive_to_blocks(&mut blocks, leading_directive_xml);
@@ -253,6 +306,7 @@ fn render_uncompacted_prompt_blocks(
     history_slice: &[CanonicalMessage],
     active_slice: &[CanonicalMessage],
     tool_nonce: &str,
+    strip_billing: bool,
 ) -> Vec<AcpPromptBlock> {
     let mut blocks = Vec::new();
     let mut text_acc = String::new();
@@ -270,7 +324,10 @@ fn render_uncompacted_prompt_blocks(
             render_parts_into(
                 msg,
                 tool_nonce,
-                true,
+                PartRenderMode {
+                    is_archival: true,
+                    strip_billing,
+                },
                 PartRenderLimits::UNBOUNDED,
                 &mut text_acc,
                 &mut blocks,
@@ -290,7 +347,10 @@ fn render_uncompacted_prompt_blocks(
         render_parts_into(
             msg,
             tool_nonce,
-            false,
+            PartRenderMode {
+                is_archival: false,
+                strip_billing,
+            },
             PartRenderLimits::UNBOUNDED,
             &mut text_acc,
             &mut blocks,
@@ -314,6 +374,7 @@ fn render_bounded_prompt_blocks<S: TruncationSpillSink>(
     active_slice: &[CanonicalMessage],
     tool_nonce: &str,
     max_bytes: usize,
+    strip_billing: bool,
     spill: &mut S,
 ) -> Vec<AcpPromptBlock> {
     let active_budget = if history_slice.is_empty() {
@@ -326,9 +387,21 @@ fn render_bounded_prompt_blocks<S: TruncationSpillSink>(
             .saturating_sub(hist_reserve)
             .max(MAX_ACTIVE_WITH_HISTORY_TEXT_BYTES.min(max_bytes / 2))
     };
-    let active_blocks =
-        render_smart_bounded_active_slice(active_slice, tool_nonce, active_budget, spill);
-    render_history_around_active(history_slice, active_blocks, tool_nonce, max_bytes, spill)
+    let active_blocks = render_smart_bounded_active_slice(
+        active_slice,
+        tool_nonce,
+        active_budget,
+        strip_billing,
+        spill,
+    );
+    render_history_around_active(
+        history_slice,
+        active_blocks,
+        tool_nonce,
+        max_bytes,
+        strip_billing,
+        spill,
+    )
 }
 
 fn render_history_around_active<S: TruncationSpillSink>(
@@ -336,6 +409,7 @@ fn render_history_around_active<S: TruncationSpillSink>(
     active_blocks: Vec<AcpPromptBlock>,
     tool_nonce: &str,
     max_bytes: usize,
+    strip_billing: bool,
     spill: &mut S,
 ) -> Vec<AcpPromptBlock> {
     let active_bytes = total_text_block_bytes(&active_blocks);
@@ -354,8 +428,13 @@ fn render_history_around_active<S: TruncationSpillSink>(
         .saturating_sub(active_bytes)
         .saturating_sub(framing_bytes);
 
-    let history_body =
-        build_compacted_history_body(history_slice, tool_nonce, history_budget, spill);
+    let history_body = build_compacted_history_body(
+        history_slice,
+        tool_nonce,
+        history_budget,
+        strip_billing,
+        spill,
+    );
 
     let mut archive_prefix = String::with_capacity(
         ARCHIVE_OPEN_HEADER.len() + history_body.len() + ARCHIVE_CLOSE_HEADER.len(),
@@ -467,9 +546,11 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
     active_slice: &[CanonicalMessage],
     tool_nonce: &str,
     budget: usize,
+    strip_billing: bool,
     spill: &mut S,
 ) -> Vec<AcpPromptBlock> {
-    let uncompacted = render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce);
+    let uncompacted =
+        render_uncompacted_prompt_blocks(&[], active_slice, tool_nonce, strip_billing);
     if total_text_block_bytes(&uncompacted) <= budget {
         return uncompacted;
     }
@@ -510,7 +591,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
             }
         }
     }
-    let stage1_blocks = render_uncompacted_prompt_blocks(&[], &work, tool_nonce);
+    let stage1_blocks = render_uncompacted_prompt_blocks(&[], &work, tool_nonce, strip_billing);
     if total_text_block_bytes(&stage1_blocks) <= budget {
         return stage1_blocks;
     }
@@ -521,7 +602,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
     for msg in &mut empty_results_probe {
         for part in &mut msg.parts {
             if let CanonicalPart::ToolResult { output, .. } = part {
-                let cleaned = strip_billing_noise(output);
+                let cleaned = maybe_strip_billing(output, strip_billing);
                 let scrubbed = scrub_terminal_control_noise(cleaned.trim());
                 result_lens.push(scrubbed.trim().len());
                 output.clear();
@@ -533,6 +614,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
             &[],
             &empty_results_probe,
             tool_nonce,
+            strip_billing,
         ));
         let safety_pad = result_lens.len().saturating_mul(16).saturating_add(128);
         let available_for_results =
@@ -544,7 +626,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
             for msg in &mut stage2_msgs {
                 for part in &mut msg.parts {
                     if let CanonicalPart::ToolResult { output, .. } = part {
-                        let cleaned = strip_billing_noise(output);
+                        let cleaned = maybe_strip_billing(output, strip_billing);
                         let raw_trimmed = cleaned.trim();
                         let scrubbed = scrub_terminal_control_noise(raw_trimmed);
                         let trimmed = scrubbed.trim();
@@ -563,7 +645,8 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                     }
                 }
             }
-            let stage2_blocks = render_uncompacted_prompt_blocks(&[], &stage2_msgs, tool_nonce);
+            let stage2_blocks =
+                render_uncompacted_prompt_blocks(&[], &stage2_msgs, tool_nonce, strip_billing);
             if total_text_block_bytes(&stage2_blocks) <= budget {
                 return stage2_blocks;
             }
@@ -583,6 +666,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
             &[],
             &non_dev_probe,
             tool_nonce,
+            strip_billing,
         ));
         if non_dev_bytes.saturating_add(512) < budget {
             let available_dev = budget.saturating_sub(non_dev_bytes.saturating_add(256));
@@ -617,7 +701,8 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                         }
                     }
                 }
-                let stage3_blocks = render_uncompacted_prompt_blocks(&[], &stage3_msgs, tool_nonce);
+                let stage3_blocks =
+                    render_uncompacted_prompt_blocks(&[], &stage3_msgs, tool_nonce, strip_billing);
                 if total_text_block_bytes(&stage3_blocks) <= budget {
                     return stage3_blocks;
                 }
@@ -663,7 +748,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
         for part in &msg.parts {
             match part {
                 CanonicalPart::Text(t) => {
-                    let cleaned = strip_billing_noise(t);
+                    let cleaned = maybe_strip_billing(t, strip_billing);
                     let trimmed = cleaned.trim();
                     if !trimmed.is_empty() {
                         if is_assistant {
@@ -677,7 +762,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                 CanonicalPart::ToolResult {
                     call_id, output, ..
                 } => {
-                    let cleaned = strip_billing_noise(output);
+                    let cleaned = maybe_strip_billing(output, strip_billing);
                     let scrubbed = scrub_terminal_control_noise(cleaned.trim());
                     variable_lens.push(scrubbed.trim().len());
                     fixed_overhead = fixed_overhead.saturating_add(call_id.len() + 80);
@@ -700,7 +785,10 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                         call_id.len() + name.len() + encoded_args_len + tool_nonce.len() * 2 + 96,
                     );
                 }
-                CanonicalPart::ImageBase64 { .. } | CanonicalPart::Reasoning(_) => {}
+                CanonicalPart::ImageBase64 { .. }
+                | CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
             }
         }
     }
@@ -715,7 +803,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                     if is_assistant {
                         continue;
                     }
-                    let cleaned = strip_billing_noise(text);
+                    let cleaned = maybe_strip_billing(text, strip_billing);
                     let trimmed = cleaned.trim();
                     if trimmed.len() > universal_cap {
                         if is_developer_instructions_wrapper(trimmed) {
@@ -745,7 +833,7 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                     }
                 }
                 CanonicalPart::ToolResult { output, .. } => {
-                    let cleaned = strip_billing_noise(output);
+                    let cleaned = maybe_strip_billing(output, strip_billing);
                     let raw_trimmed = cleaned.trim();
                     let scrubbed = scrub_terminal_control_noise(raw_trimmed);
                     let trimmed = scrubbed.trim();
@@ -764,12 +852,14 @@ pub(super) fn render_smart_bounded_active_slice<S: TruncationSpillSink>(
                 }
                 CanonicalPart::ToolCall { .. }
                 | CanonicalPart::ImageBase64 { .. }
-                | CanonicalPart::Reasoning(_) => {}
+                | CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => {}
             }
         }
     }
 
-    let mut blocks = render_uncompacted_prompt_blocks(&[], &stage4_work, tool_nonce);
+    let mut blocks = render_uncompacted_prompt_blocks(&[], &stage4_work, tool_nonce, strip_billing);
     clamp_blocks_to_budget(&mut blocks, budget, spill);
     blocks
 }
@@ -781,7 +871,11 @@ struct CompactedHistoryEntry {
     text: String,
 }
 
-fn render_uncompacted_archival_slice(messages: &[CanonicalMessage], tool_nonce: &str) -> String {
+fn render_uncompacted_archival_slice(
+    messages: &[CanonicalMessage],
+    tool_nonce: &str,
+    strip_billing: bool,
+) -> String {
     let mut out = String::new();
     let mut ignored_blocks = Vec::new();
     let unlimited_archival = PartRenderLimits {
@@ -802,7 +896,10 @@ fn render_uncompacted_archival_slice(messages: &[CanonicalMessage], tool_nonce: 
         render_parts_into(
             msg,
             tool_nonce,
-            true,
+            PartRenderMode {
+                is_archival: true,
+                strip_billing,
+            },
             unlimited_archival,
             &mut out,
             &mut ignored_blocks,
@@ -819,6 +916,7 @@ fn render_single_archival_entry<S: TruncationSpillSink>(
     msg: &CanonicalMessage,
     tool_nonce: &str,
     limits: PartRenderLimits,
+    strip_billing: bool,
     spill: &mut S,
 ) -> String {
     let mut entry_text = String::new();
@@ -831,7 +929,10 @@ fn render_single_archival_entry<S: TruncationSpillSink>(
     render_parts_into(
         msg,
         tool_nonce,
-        true,
+        PartRenderMode {
+            is_archival: true,
+            strip_billing,
+        },
         limits,
         &mut entry_text,
         &mut ignored_blocks,
@@ -847,6 +948,7 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
     history_slice: &[CanonicalMessage],
     tool_nonce: &str,
     budget: usize,
+    strip_billing: bool,
     spill: &mut S,
 ) -> String {
     if history_slice.is_empty() || budget == 0 {
@@ -958,7 +1060,13 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
 
         // Phase 1 sizes entries with `NoopSpillSink` so entries dropped in the priority loop
         // do not create individual spill files before being grouped into an omitted run.
-        let entry_text = render_single_archival_entry(msg, tool_nonce, limits, &mut NoopSpillSink);
+        let entry_text = render_single_archival_entry(
+            msg,
+            tool_nonce,
+            limits,
+            strip_billing,
+            &mut NoopSpillSink,
+        );
 
         entries.push(CompactedHistoryEntry {
             priority,
@@ -1001,7 +1109,8 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
         }
         if let Some(msg) = history_slice.get(idx) {
             let old_len = entry.text.len();
-            entry.text = render_single_archival_entry(msg, tool_nonce, entry.limits, spill);
+            entry.text =
+                render_single_archival_entry(msg, tool_nonce, entry.limits, strip_billing, spill);
             current_bytes = current_bytes
                 .saturating_sub(old_len)
                 .saturating_add(entry.text.len());
@@ -1021,8 +1130,11 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
             if entry.text.len() > 2_400 {
                 let old_len = entry.text.len();
                 let pre_spilled = history_slice.get(idx).and_then(|msg| {
-                    let full_turn =
-                        render_uncompacted_archival_slice(std::slice::from_ref(msg), tool_nonce);
+                    let full_turn = render_uncompacted_archival_slice(
+                        std::slice::from_ref(msg),
+                        tool_nonce,
+                        strip_billing,
+                    );
                     spill.spill_truncated_content("archival turn", &full_turn)
                 });
                 entry.text = truncate_middle_utf8_bytes_pre_spilled(
@@ -1061,6 +1173,7 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
                 history_slice.get(run_start..idx).unwrap_or(&[]),
                 omitted_run,
                 tool_nonce,
+                strip_billing,
                 spill,
             );
         }
@@ -1073,12 +1186,14 @@ fn build_compacted_history_body<S: TruncationSpillSink>(
             history_slice.get(run_start..).unwrap_or(&[]),
             omitted_run,
             tool_nonce,
+            strip_billing,
             spill,
         );
     }
 
     if assembled.len() > budget {
-        let full_history = render_uncompacted_archival_slice(history_slice, tool_nonce);
+        let full_history =
+            render_uncompacted_archival_slice(history_slice, tool_nonce, strip_billing);
         let spilled_hist =
             spill.spill_truncated_content("archival conversation history", &full_history);
         // Favor the tail (70%) so `last_user_idx` and the newest turns stay completely intact.
@@ -1093,9 +1208,10 @@ fn append_omitted_archival_run_notice<S: TruncationSpillSink>(
     omitted_slice: &[CanonicalMessage],
     omitted_run: usize,
     tool_nonce: &str,
+    strip_billing: bool,
     spill: &mut S,
 ) {
-    let full_turns = render_uncompacted_archival_slice(omitted_slice, tool_nonce);
+    let full_turns = render_uncompacted_archival_slice(omitted_slice, tool_nonce, strip_billing);
     if let Some(path) = spill.spill_truncated_content("omitted archival turns", &full_turns) {
         assembled.push_str(&format!(
             "[... omitted {omitted_run} earlier archival turns to fit context window; full uncompacted turns saved locally at `{path}` ...]\n"
@@ -1132,6 +1248,8 @@ fn is_conversational_user_message(msg: &CanonicalMessage) -> bool {
                 return true;
             }
             CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. }
             | CanonicalPart::ToolCall { .. }
             | CanonicalPart::ToolResult { .. } => {}
         }
@@ -1159,7 +1277,9 @@ fn estimate_raw_prompt_bytes(
                     call_id, output, ..
                 } => call_id.len() + output.len() + 80,
                 CanonicalPart::ImageBase64 { media_type, .. } => media_type.len() + 48,
-                CanonicalPart::Reasoning(_) => 0,
+                CanonicalPart::Reasoning(_)
+                | CanonicalPart::SignedThinking { .. }
+                | CanonicalPart::RedactedThinking { .. } => 0,
             };
             total = total.saturating_add(part_len);
         }
@@ -1180,7 +1300,7 @@ pub(super) fn total_text_block_bytes(blocks: &[AcpPromptBlock]) -> usize {
 fn render_parts_into<S: TruncationSpillSink>(
     msg: &CanonicalMessage,
     tool_nonce: &str,
-    is_archival: bool,
+    mode: PartRenderMode,
     limits: PartRenderLimits,
     text_acc: &mut String,
     blocks: &mut Vec<AcpPromptBlock>,
@@ -1189,7 +1309,7 @@ fn render_parts_into<S: TruncationSpillSink>(
     for part in &msg.parts {
         match part {
             CanonicalPart::Text(text) => {
-                let cleaned = strip_billing_noise(text);
+                let cleaned = maybe_strip_billing(text, mode.strip_billing);
                 if !cleaned.trim().is_empty() {
                     if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                         text_acc.push('\n');
@@ -1227,7 +1347,9 @@ fn render_parts_into<S: TruncationSpillSink>(
                     text_acc.push_str(&format!("[Prior Image media_type={media_type}]\n"));
                 }
             }
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
             CanonicalPart::ToolCall {
                 call_id,
                 name,
@@ -1237,7 +1359,7 @@ fn render_parts_into<S: TruncationSpillSink>(
                 if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                     text_acc.push('\n');
                 }
-                if is_archival {
+                if mode.is_archival {
                     // Render historical tool invocations without live `<agy_tool_call_...>` XML tags
                     // so multi-turn cold replays never prime the model to continue generating fake
                     // tool results after its own closing `</agy_tool_call_...>` tag.
@@ -1280,7 +1402,7 @@ fn render_parts_into<S: TruncationSpillSink>(
                 if !text_acc.is_empty() && !text_acc.ends_with('\n') {
                     text_acc.push('\n');
                 }
-                let cleaned_output = strip_billing_noise(output);
+                let cleaned_output = maybe_strip_billing(output, mode.strip_billing);
                 let raw_trimmed = cleaned_output.trim();
                 let scrubbed = scrub_terminal_control_noise(raw_trimmed);
                 let trimmed_output = scrubbed.trim();

@@ -843,6 +843,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "liftgate-provider-http"
+version = "0.2.24"
+dependencies = [
+ "bytes",
+ "liftgate-provider-stateful",
+ "liftgate-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "liftgate-provider-stateful"
+version = "0.2.24"
+dependencies = [
+ "bytes",
+ "libc",
+ "liftgate-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "windows-sys",
+]
+
+[[package]]
 name = "liftgate-server"
 version = "0.2.24"
 dependencies = [
@@ -851,6 +882,8 @@ dependencies = [
  "dunce",
  "http-body-util",
  "libc",
+ "liftgate-provider-http",
+ "liftgate-provider-stateful",
  "liftgate-tool-virtualizer",
  "liftgate-types",
  "serde",

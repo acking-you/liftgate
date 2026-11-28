@@ -2069,3 +2069,78 @@ fn describe_attributes_omp_folded_tools_to_the_eval_orchestrator() {
         "the wait barrier is not the script orchestrator"
     );
 }
+
+#[test]
+fn native_api_mode_keeps_medium_toolsets_pure_and_virtualizes_massive_suites_without_mcp_prefix() {
+    let mut small = vec![
+        fn_tool(
+            "exec_command",
+            "Run shell",
+            json!({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}),
+        ),
+        fn_tool(
+            "apply_patch",
+            "Patch files",
+            json!({"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}),
+        ),
+    ];
+    for idx in 0..10 {
+        small.push(fn_tool(
+            &format!("github__action_{idx}"),
+            "GitHub tool",
+            json!({"type":"object","properties":{"id":{"type":"number"}}}),
+        ));
+    }
+    let cat_small = crate::partition_tools_for_native_api(
+        ProtocolHint::OpenAiResponses,
+        &small,
+        false,
+        None,
+        &mut NoopSpillSink,
+    );
+    assert!(cat_small.is_passthrough);
+    assert!(!cat_small.has_virtualized_dispatch);
+    assert_eq!(cat_small.wire_tools.len(), small.len());
+
+    let mut massive = small;
+    for idx in 0..85 {
+        massive.push(fn_tool(
+            &format!("slack__op_{idx}"),
+            "Slack enterprise connector action with schema payload",
+            json!({"type":"object","properties":{"channel":{"type":"string"},"text":{"type":"string"}},"required":["channel"]}),
+        ));
+    }
+    let cat_massive = crate::partition_tools_for_native_api(
+        ProtocolHint::OpenAiResponses,
+        &massive,
+        false,
+        None,
+        &mut NoopSpillSink,
+    );
+    assert!(!cat_massive.is_passthrough);
+    assert!(cat_massive.has_virtualized_dispatch);
+    assert!(
+        cat_massive
+            .wire_tools
+            .iter()
+            .any(|t| t.name == "search_client_tools")
+    );
+    assert!(cat_massive.wire_tools.iter().any(|t| t.name == "ns__slack"));
+
+    let search_dec = cat_massive.routing_table.resolve_call(
+        "search_client_tools",
+        &serde_json::json!({"namespace": "slack", "query": "op_42"}),
+        &massive,
+    );
+    match search_dec {
+        VirtualizedCallDecision::LocalReply { text, is_error, .. } => {
+            assert!(!is_error);
+            assert!(text.contains("`ns__slack`"));
+            assert!(
+                !text.contains("mcp_lg_"),
+                "native API mode must never emit mcp_lg_ prefix: {text}"
+            );
+        }
+        other => panic!("expected LocalReply, got {other:?}"),
+    }
+}

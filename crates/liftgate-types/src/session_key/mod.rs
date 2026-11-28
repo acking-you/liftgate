@@ -20,7 +20,7 @@ pub use codemode::{
 };
 pub use prompt_plan::{
     MAX_ACP_PROMPT_TEXT_BYTES, build_acp_prompt_blocks, build_acp_prompt_blocks_with_spill,
-    build_acp_prompt_plan, build_acp_prompt_plan_with_spill,
+    build_acp_prompt_plan, build_acp_prompt_plan_with_options, build_acp_prompt_plan_with_spill,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use spill::MemorySpillSink;
@@ -252,7 +252,9 @@ fn feed_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
                 hasher.update(data.as_bytes());
                 hasher.update(b"\x1d");
             }
-            CanonicalPart::Reasoning(_) => {
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {
                 // Intentionally omitted from cross-turn match key because some clients drop
                 // reasoning summaries when resending history.
             }
@@ -311,7 +313,9 @@ fn feed_dialogue_message_hash(hasher: &mut Sha256, msg: &CanonicalMessage) {
                 hasher.update(data.as_bytes());
                 hasher.update(b"\x1d");
             }
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
             CanonicalPart::ToolCall {
                 call_id: _,
                 name,
@@ -352,7 +356,9 @@ fn message_has_stable_hash_content(msg: &CanonicalMessage, skip_developer_wrappe
             CanonicalPart::ImageBase64 { .. }
             | CanonicalPart::ToolCall { .. }
             | CanonicalPart::ToolResult { .. } => return true,
-            CanonicalPart::Reasoning(_) => {}
+            CanonicalPart::Reasoning(_)
+            | CanonicalPart::SignedThinking { .. }
+            | CanonicalPart::RedactedThinking { .. } => {}
         }
     }
     false
@@ -368,7 +374,21 @@ pub(super) fn is_developer_instructions_wrapper(text: &str) -> bool {
 /// and wraps it in `<developer_instructions>` (idempotently, never double-wrapping).
 #[must_use]
 pub fn wrap_developer_instructions_block(raw_text: &str) -> Option<String> {
-    let cleaned = strip_billing_noise(raw_text);
+    wrap_developer_instructions_block_with_options(raw_text, true)
+}
+
+/// Like [`wrap_developer_instructions_block`], optionally preserving billing noise verbatim
+/// when `strip_billing` is `false` (for example in `Passthrough` mode).
+#[must_use]
+pub fn wrap_developer_instructions_block_with_options(
+    raw_text: &str,
+    strip_billing: bool,
+) -> Option<String> {
+    let cleaned: std::borrow::Cow<'_, str> = if strip_billing {
+        std::borrow::Cow::Owned(strip_billing_noise(raw_text))
+    } else {
+        std::borrow::Cow::Borrowed(raw_text)
+    };
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
@@ -414,11 +434,27 @@ pub(crate) fn materialize_system_prompt_into_messages_with_slot(
     client_tools: &[CanonicalToolSpec],
     messages: &mut Vec<CanonicalMessage>,
 ) -> Option<MaterializedSystemSlot> {
+    materialize_system_prompt_into_messages_with_slot_and_options(
+        raw_system,
+        has_previous_response_anchor,
+        true,
+        client_tools,
+        messages,
+    )
+}
+
+pub(crate) fn materialize_system_prompt_into_messages_with_slot_and_options(
+    raw_system: Option<&str>,
+    has_previous_response_anchor: bool,
+    strip_billing: bool,
+    client_tools: &[CanonicalToolSpec],
+    messages: &mut Vec<CanonicalMessage>,
+) -> Option<MaterializedSystemSlot> {
     if has_previous_response_anchor {
         return None;
     }
     let sys_raw = raw_system?;
-    let wrapped = wrap_developer_instructions_block(sys_raw)?;
+    let wrapped = wrap_developer_instructions_block_with_options(sys_raw, strip_billing)?;
     if client_tools.is_empty() && is_compaction_instructions_prompt(&wrapped) {
         if let Some(last_user) = messages
             .last_mut()

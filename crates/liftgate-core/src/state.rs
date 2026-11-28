@@ -104,6 +104,30 @@ impl StatePaths {
         self.root.join("title-model")
     }
 
+    /// Multi-provider registry configuration (`~/.liftgate/providers.json`).
+    #[must_use]
+    pub fn providers_file(&self) -> PathBuf {
+        self.root.join("providers.json")
+    }
+
+    /// Owner-only (`0600`) provider API secret store (`~/.liftgate/credentials.json`).
+    #[must_use]
+    pub fn credentials_file(&self) -> PathBuf {
+        self.root.join("credentials.json")
+    }
+
+    /// Reads `~/.liftgate/providers.json`, falling back to normalized built-in defaults when absent.
+    #[must_use]
+    pub fn read_provider_registry(&self) -> liftgate_types::provider::ProviderRegistryConfig {
+        std::fs::read_to_string(self.providers_file())
+            .ok()
+            .and_then(|raw| {
+                serde_json::from_str::<liftgate_types::provider::ProviderRegistryConfig>(&raw).ok()
+            })
+            .unwrap_or_default()
+            .normalized()
+    }
+
     #[must_use]
     pub fn config_sync_ledger_file(&self) -> PathBuf {
         self.root.join("config-sync-ledger.json")

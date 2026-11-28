@@ -1034,8 +1034,13 @@ fn truncated_tool_output_rescues_buried_root_cause_diagnostics_and_spills_raw_or
             is_error: true,
         }],
     };
-    let blocks =
-        render_smart_bounded_active_slice(std::slice::from_ref(&msg), "1122", 12_000, &mut sink);
+    let blocks = render_smart_bounded_active_slice(
+        std::slice::from_ref(&msg),
+        "1122",
+        12_000,
+        true,
+        &mut sink,
+    );
     let rendered = match blocks.first() {
         Some(AcpPromptBlock::Text { text }) => text,
         _ => panic!("expected text block"),

@@ -1,0 +1,127 @@
+//! Incremental resumable Server-Sent Events (SSE) parser reusing frame buffers.
+
+/// Maximum accumulated payload bytes permitted in a single SSE frame across repeated `data:` lines.
+pub const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_EVENT_NAME_BYTES: usize = 4 * 1024;
+
+/// Returned when an upstream stream accumulates `data:` or `event:` lines without a blank-line
+/// separator past [`MAX_SSE_FRAME_BYTES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SseFrameOverflowError {
+    pub attempted_bytes: usize,
+}
+
+/// Single decoded SSE frame (event + concatenated data lines).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SseFrame {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Resumable line-oriented SSE state machine that reuses internal buffers across frames.
+#[derive(Debug, Default)]
+pub struct SseDecoder {
+    current_event: Option<String>,
+    current_data: String,
+    has_data_line: bool,
+}
+
+impl SseDecoder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one CR/LF-stripped text line from a text/event-stream body.
+    /// Returns Some(frame) when a blank line dispatches a complete frame.
+    pub fn push_line(&mut self, raw_line: &str) -> Option<SseFrame> {
+        self.try_push_line(raw_line).ok().flatten()
+    }
+
+    /// Like [`Self::push_line`], enforcing [`MAX_SSE_FRAME_BYTES`] on the accumulated frame buffer
+    /// before appending so repeated `data:` lines without a blank separator cannot grow unboundedly.
+    pub fn try_push_line(
+        &mut self,
+        raw_line: &str,
+    ) -> Result<Option<SseFrame>, SseFrameOverflowError> {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            return Ok(self.take_frame());
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((f, rest)) => (f, rest.strip_prefix(' ').unwrap_or(rest)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => {
+                if value.len() > MAX_SSE_EVENT_NAME_BYTES {
+                    return Err(SseFrameOverflowError {
+                        attempted_bytes: value.len(),
+                    });
+                }
+                self.current_event = Some(value.to_owned());
+            }
+            "data" => {
+                let sep_bytes = usize::from(self.has_data_line);
+                let attempted_bytes = self
+                    .current_data
+                    .len()
+                    .saturating_add(sep_bytes)
+                    .saturating_add(value.len());
+                if attempted_bytes > MAX_SSE_FRAME_BYTES {
+                    return Err(SseFrameOverflowError { attempted_bytes });
+                }
+                if self.has_data_line {
+                    self.current_data.push('\n');
+                }
+                self.current_data.push_str(value);
+                self.has_data_line = true;
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Flushes any trailing buffered frame when the HTTP stream closes cleanly without a final blank line.
+    pub fn finish(&mut self) -> Option<SseFrame> {
+        self.take_frame()
+    }
+
+    fn take_frame(&mut self) -> Option<SseFrame> {
+        if !self.has_data_line && self.current_event.is_none() {
+            return None;
+        }
+        let event = self.current_event.take();
+        let data = std::mem::take(&mut self.current_data);
+        self.has_data_line = false;
+        if data.is_empty() && event.is_none() {
+            return None;
+        }
+        Some(SseFrame { event, data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_decoder_parses_multiline_data_and_reuses_state() {
+        let mut dec = SseDecoder::new();
+        assert_eq!(dec.push_line("event: content_block_delta\r"), None);
+        assert_eq!(dec.push_line("data: {\"a\": 1,"), None);
+        assert_eq!(dec.push_line("data: \"b\": 2}"), None);
+        let f1 = dec.push_line("").expect("frame 1");
+        assert_eq!(f1.event.as_deref(), Some("content_block_delta"));
+        assert_eq!(f1.data, "{\"a\": 1,\n\"b\": 2}");
+
+        assert_eq!(dec.push_line(": keepalive"), None);
+        assert_eq!(dec.push_line("data: [DONE]"), None);
+        let f2 = dec.finish().expect("frame 2");
+        assert_eq!(f2.event, None);
+        assert_eq!(f2.data, "[DONE]");
+    }
+}

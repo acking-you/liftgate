@@ -49,7 +49,9 @@ use crate::client::DiscoveredModel;
 use crate::config_sync::{
     build_offline_codex_catalog_bytes_with_mode, merge_isolated_codex_app_config_toml,
 };
-use crate::daemon::{configure_detached_command, ensure_gateway_ready_for_target, is_pid_alive};
+use crate::daemon::{
+    configure_detached_command, ensure_gateway_ready_for_provider_target, is_pid_alive,
+};
 use crate::error::{CliError, DesktopLaunchError};
 use crate::harness::resolve_codex_command;
 use crate::state::{StatePaths, now_unix_ms, user_home_dir, write_file_atomic};
@@ -397,12 +399,14 @@ pub async fn launch_codex_app(
         sweep_stale_desktop_sessions(state_paths);
     }
 
-    let target = ensure_gateway_ready_for_target(
+    let target = ensure_gateway_ready_for_provider_target(
         state_paths,
         args.listen,
         args.remote.as_deref(),
         args.api_key.clone(),
         args.model.as_deref(),
+        args.provider.as_deref(),
+        args.opt.as_deref(),
         true,
     )
     .await?;
@@ -427,12 +431,20 @@ pub async fn launch_codex_app(
 
     let catalog_bytes = match target
         .client
-        .fetch_codex_catalog_json_with_mode(&primary_model, Some(tool_mode))
+        .fetch_codex_catalog_json_for_route(
+            target.route_spec.as_deref(),
+            &primary_model,
+            Some(tool_mode),
+        )
         .await
     {
         Ok(bytes) => bytes,
         Err(_) => {
-            let discovered = target.client.fetch_models().await.unwrap_or_default();
+            let discovered = target
+                .client
+                .fetch_models_for_route(target.route_spec.as_deref())
+                .await
+                .unwrap_or_default();
             build_offline_codex_catalog_bytes_with_mode(
                 &discovered,
                 &primary_model,
@@ -452,10 +464,11 @@ pub async fn launch_codex_app(
     let codex_home = canonicalize_clean(&codex_home);
 
     let source_codex_dir = user_home_dir().ok().map(|h| h.join(".codex"));
+    let scoped_base_url = target.scoped_base_url();
     seed_ephemeral_codex_home(
         &codex_home,
         source_codex_dir.as_deref(),
-        target.client.base_url(),
+        &scoped_base_url,
         &primary_model,
         &auth_token,
         &catalog_bytes,
@@ -606,12 +619,14 @@ pub async fn launch_claude_desktop(
     // before snapshotting clean baseline files.
     let _ = force_restore_claude_desktop_sessions(state_paths);
 
-    let target = ensure_gateway_ready_for_target(
+    let target = ensure_gateway_ready_for_provider_target(
         state_paths,
         args.listen,
         args.remote.as_deref(),
         args.api_key.clone(),
         args.model.as_deref(),
+        args.provider.as_deref(),
+        args.opt.as_deref(),
         true,
     )
     .await?;
@@ -626,7 +641,11 @@ pub async fn launch_claude_desktop(
     let auth_token = normalize_optional_api_key(target.api_key.as_deref())
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
-    let discovered = target.client.fetch_models().await.unwrap_or_default();
+    let discovered = target
+        .client
+        .fetch_models_for_route(target.route_spec.as_deref())
+        .await
+        .unwrap_or_default();
 
     let path_sets = resolve_claude_desktop_path_sets()?;
     let backups = snapshot_claude_desktop_path_sets(&path_sets)?;
@@ -648,10 +667,8 @@ pub async fn launch_claude_desktop(
     write_journal_file(&journal_path, &initial_journal)?;
     let mut guard = ForegroundJournalGuard::new(journal_path.clone(), initial_journal);
 
-    let gateway_3p_url = format!(
-        "{}/claude-desktop",
-        target.client.base_url().trim_end_matches('/')
-    );
+    let scoped_base_url = target.scoped_base_url();
+    let gateway_3p_url = format!("{}/claude-desktop", scoped_base_url.trim_end_matches('/'));
     let profile_doc =
         build_claude_desktop_3p_profile(&gateway_3p_url, &auth_token, &primary_model, &discovered);
     apply_claude_desktop_3p_profile(&path_sets, &profile_doc)?;

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Multi-provider architecture across stateful session protocols & native platform APIs (`#33`)**:
+  - Added `ProviderId`, `ProviderCapabilities`, `OptimizationMode` (`optimized` / `passthrough` / `custom`), `OptimizationPolicy`, `ProviderRegistryConfig`, official model pricing families (`gpt-5.4`, `gpt-5-mini`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`, `gemini-2.5-pro`, `gemini-2.5-flash`), and 3-stage `UpstreamWireSummary` telemetry in `liftgate-types`.
+  - Extracted `liftgate-provider-stateful` (shared cross-platform child process-group / Win32 Job Object supervision, JSON-RPC 2.0 `StdioRpcPeer`, and stateful session dialects for `codex-app-server` and `grok-acp` alongside `agy-acp`) and `liftgate-provider-http` (dual-mode `TcpStream` + `curl --config -` HTTP/SSE transport keeping credentials off `argv`, plus streaming codecs for OpenAI `/v1/responses`, Anthropic `/v1/messages` with automatic `cache_control` breakpoint alignment, and Google Gemini `streamGenerateContent` without silent `429` cross-model failover).
+  - Extended `liftgate-tool-virtualizer` with `VirtualizationTargetMode::NativeApiTools` (`VirtualizerBudget::NATIVE_PLATFORM_API`, unprefixed `search_client_tools` / `ns__*` / `call_client_tool` / `gateway_web_fetch`) and added gateway-local `0-RTT` continuation loops on stateless HTTP providers while disabling `agy`-specific narrow `SpillStore` truncation on large-window native APIs by default.
+  - Added `lg provider` (`pv` / `providers`: `list`, `add`, `remove`, `use`, `test`, `models`, `opt`) with `--api-key-env` and mode-`0600` `credentials.json` (`--api-key-stdin`), plus zero-config-pollution per-session `--provider` (`-p`) and `--opt` flags across `lg cx`, `lg cxa`, `lg cc`, `lg cd`, `lg oc`, and `lg omp` via scoped `/p/<provider_spec>` gateway URLs (allowing non-`agy` providers to run cleanly even on hosts without `agy` installed).
+  - Upgraded `lg top` (`prov` / `opt` badges, per-provider cost breakdown, `[p]` / `[O]` live hotkeys) and the Web Dashboard (`web/`: top-bar active provider switcher & `Optimized` / `Passthrough` toggle, per-provider Usage comparison, Context 3-stage `Raw Harness → Gateway Optimization → Upstream Provider Wire` pipeline inspector, Sessions & ToolCalls provider badges, and Diagnostics provider connectivity matrix).
+
 ## [0.2.24] - 2026-11-28
 
 ### Added

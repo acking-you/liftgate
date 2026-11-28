@@ -26,6 +26,7 @@ import {
   Meter,
   Note,
   Pill,
+  ProviderBadge,
   Segmented,
   Stat,
   StatGrid,
@@ -63,6 +64,7 @@ import type {
   ModelPricingEntry,
   ModelUsage,
   PricingResponse,
+  ProviderUsage,
   UsageInterval,
   UsageSeriesResponse,
   UsageTokens,
@@ -953,6 +955,50 @@ export function UsageView({ arg, navigate }: ViewProps): React.JSX.Element {
               {t.thinkingShare(<span className="lg-num text-fg-2">{formatNumber(totals.tokens.thought)}</span>)}
             </p>
           )}
+        </Card>
+      )}
+
+      {report && (report.providers ?? report.summary.by_provider ?? []).length > 0 && (
+        <Card flush title={t.byProvider} sub={t.byProviderSub} className={dim}>
+          <div className="lg-table-wrap">
+            <table className="lg-table">
+              <thead>
+                <tr>
+                  <th>{t.col.provider}</th>
+                  <th className="num">{t.col.calls}</th>
+                  <th className="num hide-sm">{t.col.input}</th>
+                  <th className="num hide-sm">{t.col.cached}</th>
+                  <th className="num hide-sm">{t.col.output}</th>
+                  <th className="num">{t.col.total}</th>
+                  <th className="num hide-sm">{t.col.savings}</th>
+                  <th className="num">{t.col.cost}</th>
+                  <th className="hide-sm w-[140px]">{t.col.share}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(report.providers ?? report.summary.by_provider ?? []).map((p: ProviderUsage) => {
+                  const share = report.summary.cost_usd > 0 ? p.cost_usd / report.summary.cost_usd : 0;
+                  return (
+                    <tr key={p.provider_id}>
+                      <td>
+                        <ProviderBadge id={p.provider_id} />
+                      </td>
+                      <td className="num">{formatNumber(p.calls)}</td>
+                      <td className="num hide-sm">{formatCompact(p.tokens.input)}</td>
+                      <td className="num hide-sm">{formatCompact(p.tokens.cached_input)}</td>
+                      <td className="num hide-sm">{formatCompact(p.tokens.output)}</td>
+                      <td className="num">{formatCompact(totalTokens(p.tokens))}</td>
+                      <td className="num hide-sm text-ok-fg">{formatUsd(p.cache_savings_usd)}</td>
+                      <td className="num font-medium text-fg">{formatUsd(p.cost_usd)}</td>
+                      <td className="hide-sm">
+                        <Meter ratio={share} label={`${p.provider_id} share`} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </Card>
       )}
 

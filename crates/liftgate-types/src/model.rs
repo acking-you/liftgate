@@ -39,6 +39,16 @@ const _: () = {
 #[must_use]
 pub fn context_limits(model_id: &str) -> (u64, u64) {
     let trimmed = model_id.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("gemini-2.5-") {
+        return (1_048_576, 890_000);
+    }
+    if lower.starts_with("gpt-5") {
+        return (400_000, 272_000);
+    }
+    if lower.starts_with("grok-") {
+        return (256_000, 215_000);
+    }
     if trimmed
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("gemini-"))

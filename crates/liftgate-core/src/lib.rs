@@ -15,6 +15,7 @@ pub mod desktop;
 pub mod error;
 pub mod format;
 pub mod harness;
+pub mod provider_cmd;
 pub mod serve;
 pub mod state;
 pub mod terminal;

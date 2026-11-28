@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use liftgate_types::acp::AvailableModel;
 use liftgate_types::pricing::{
     DEFAULT_PRICING, DEFAULT_PRICING_AS_OF, MAX_PRICING_KEY_BYTES, ModelPrice, ModelPricingEntry,
-    ModelUsage, PricingFamily, PricingResponse, UsageInterval, UsageResponse, UsageSeriesResponse,
-    UsageSummary, UsageTokens, default_family, family_for_model, pricing_key,
+    ModelUsage, PricingFamily, PricingResponse, ProviderUsage, UsageInterval, UsageResponse,
+    UsageSeriesResponse, UsageSummary, UsageTokens, default_family, family_for_model, pricing_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +53,31 @@ const TOKEN_FIELDS: [TokenField; 5] = [
     |t| &mut t.thought,
 ];
 
+fn default_agy_provider() -> String {
+    "agy".to_owned()
+}
+
+fn encode_history_key(provider_id: &str, model_id: &str) -> String {
+    let p = provider_id.trim();
+    if p.is_empty() || p == "agy" {
+        model_id.to_owned()
+    } else {
+        format!("{p}\t{model_id}")
+    }
+}
+
+fn split_history_key(raw_key: &str) -> (&str, &str) {
+    match raw_key.split_once('\t') {
+        Some((prov, model)) if !prov.is_empty() => (prov, model),
+        _ => ("agy", raw_key),
+    }
+}
+
 /// All-time usage of one model within one default price period.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LedgerRow {
+    #[serde(default = "default_agy_provider")]
+    pub provider_id: String,
     pub model_id: String,
     /// Start of the default price period the usage falls in (`0` for the opening period).
     #[serde(default)]
@@ -296,6 +318,27 @@ fn add_usage(
     }
 }
 
+fn add_provider_usage(
+    entry: &mut ProviderUsage,
+    price: Option<ModelPrice>,
+    calls: (u64, u64),
+    tokens: &UsageTokens,
+) {
+    let (calls, auxiliary_calls) = calls;
+    entry.calls = entry.calls.saturating_add(calls);
+    entry.auxiliary_calls = entry.auxiliary_calls.saturating_add(auxiliary_calls);
+    entry.tokens = entry.tokens.saturating_add(*tokens);
+    match price {
+        Some(price) => {
+            entry.cost_usd += price.cost_usd(tokens);
+            entry.cache_savings_usd += price.cache_savings_usd(tokens);
+        }
+        None => {
+            entry.unpriced_calls = entry.unpriced_calls.saturating_add(calls);
+        }
+    }
+}
+
 /// The per-model entry of `model_id`, widened to cover `[first_used, last_used]`.
 fn model_entry<'a>(
     by_model: &'a mut BTreeMap<String, ModelUsage>,
@@ -416,16 +459,22 @@ impl UsageLedger {
         self.rows
             .iter()
             .map(|row| row.model_id.as_str())
-            .chain(self.history.keys().map(String::as_str))
+            .chain(self.history.keys().map(|k| split_history_key(k).1))
             .collect()
     }
 
-    fn row_mut(&mut self, model_id: &str, period: u64, now_ms: u64) -> Option<&mut LedgerRow> {
-        let pos = match self
-            .rows
-            .iter()
-            .position(|row| row.model_id == model_id && row.period_start_unix_ms == period)
-        {
+    fn row_mut(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        period: u64,
+        now_ms: u64,
+    ) -> Option<&mut LedgerRow> {
+        let pos = match self.rows.iter().position(|row| {
+            row.provider_id == provider_id
+                && row.model_id == model_id
+                && row.period_start_unix_ms == period
+        }) {
             Some(pos) => pos,
             None => {
                 if self.rows.len() >= MAX_LEDGER_ROWS
@@ -443,6 +492,7 @@ impl UsageLedger {
                     );
                 }
                 self.rows.push(LedgerRow {
+                    provider_id: provider_id.to_owned(),
                     model_id: model_id.to_owned(),
                     period_start_unix_ms: period,
                     first_used_at_unix_ms: now_ms,
@@ -513,12 +563,28 @@ impl UsageLedger {
 
     /// Adds one completed request.
     pub fn record(&mut self, model_id: &str, auxiliary: bool, tokens: UsageTokens, now_ms: u64) {
+        self.record_with_provider("agy", model_id, auxiliary, tokens, now_ms);
+    }
+
+    /// Adds one completed request attributed to `provider_id`.
+    pub fn record_with_provider(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        auxiliary: bool,
+        tokens: UsageTokens,
+        now_ms: u64,
+    ) {
         let id = bounded_id(model_id);
         if id.is_empty() {
             return;
         }
+        let prov = {
+            let p = bounded_id(provider_id);
+            if p.is_empty() { "agy" } else { p }
+        };
         let period = period_start(id, now_ms);
-        if let Some(row) = self.row_mut(id, period, now_ms) {
+        if let Some(row) = self.row_mut(prov, id, period, now_ms) {
             row.calls = row.calls.saturating_add(1);
             if auxiliary {
                 row.auxiliary_calls = row.auxiliary_calls.saturating_add(1);
@@ -526,8 +592,9 @@ impl UsageLedger {
             row.tokens = row.tokens.saturating_add(tokens);
             row.last_used_at_unix_ms = now_ms;
         }
+        let hist_key = encode_history_key(prov, id);
         self.add_bucket(
-            id,
+            &hist_key,
             Bucket {
                 slot: now_ms / HISTORY_BUCKET_MS,
                 calls: 1,
@@ -554,23 +621,47 @@ impl UsageLedger {
         authoritative: UsageTokens,
         now_ms: u64,
     ) {
+        self.reconcile_with_provider("agy", model_id, epoch, accounted, authoritative, now_ms);
+    }
+
+    /// Like [`Self::reconcile`], scoped exclusively to `provider_id`'s rows and history buckets
+    /// so Antigravity cascade drift corrections never mutate another provider sharing `model_id`.
+    pub fn reconcile_with_provider(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        epoch: u64,
+        accounted: UsageTokens,
+        authoritative: UsageTokens,
+        now_ms: u64,
+    ) {
         if epoch != self.epoch {
             return;
         }
         let id = bounded_id(model_id);
+        if id.is_empty() {
+            return;
+        }
+        let prov = {
+            let p = bounded_id(provider_id);
+            if p.is_empty() { "agy" } else { p }
+        };
         let period = period_start(id, now_ms);
         let deltas = corrections(accounted, authoritative);
         let mut rows: Vec<&mut LedgerRow> = self
             .rows
             .iter_mut()
-            .filter(|row| row.model_id == id && row.period_start_unix_ms <= period)
+            .filter(|row| {
+                row.provider_id == prov && row.model_id == id && row.period_start_unix_ms <= period
+            })
             .collect();
         if rows.is_empty() {
             return;
         }
         rows.sort_by_key(|row| std::cmp::Reverse(row.period_start_unix_ms));
         apply_correction(rows.into_iter().map(|row| &mut row.tokens), deltas);
-        if let Some(buckets) = self.history.get_mut(id) {
+        let hist_key = encode_history_key(prov, id);
+        if let Some(buckets) = self.history.get_mut(&hist_key) {
             apply_correction(
                 buckets.iter_mut().rev().map(|bucket| &mut bucket.tokens),
                 deltas,
@@ -595,6 +686,7 @@ impl UsageLedger {
     #[must_use]
     pub fn report(&self, prices: &PriceBook, range: Option<(u64, u64)>) -> UsageResponse {
         let mut by_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
+        let mut by_provider: BTreeMap<String, ProviderUsage> = BTreeMap::new();
         let mut cache_savings_usd = 0.0;
         match range {
             None => {
@@ -614,18 +706,47 @@ impl UsageLedger {
                         (row.calls, row.auxiliary_calls),
                         &row.tokens,
                     );
+                    let prov_key = if row.provider_id.is_empty() {
+                        "agy"
+                    } else {
+                        row.provider_id.as_str()
+                    };
+                    add_provider_usage(
+                        by_provider
+                            .entry(prov_key.to_owned())
+                            .or_insert_with(|| ProviderUsage {
+                                provider_id: prov_key.to_owned(),
+                                ..ProviderUsage::default()
+                            }),
+                        price,
+                        (row.calls, row.auxiliary_calls),
+                        &row.tokens,
+                    );
                 }
             }
             Some((from, to)) => {
-                for (model_id, buckets) in &self.history {
+                for (raw_key, buckets) in &self.history {
+                    let (prov_id, model_id) = split_history_key(raw_key);
                     let rule = prices.rule_for(pricing_key(model_id));
                     for bucket in buckets_within(buckets, from, to) {
                         let start = bucket.start_unix_ms();
+                        let p = rule.at(start);
                         let entry = model_entry(&mut by_model, model_id, start, start);
                         add_usage(
                             entry,
                             &mut cache_savings_usd,
-                            rule.at(start),
+                            p,
+                            (bucket.calls, bucket.auxiliary_calls),
+                            &bucket.tokens,
+                        );
+                        add_provider_usage(
+                            by_provider.entry(prov_id.to_owned()).or_insert_with(|| {
+                                ProviderUsage {
+                                    provider_id: prov_id.to_owned(),
+                                    ..ProviderUsage::default()
+                                }
+                            }),
+                            p,
                             (bucket.calls, bucket.auxiliary_calls),
                             &bucket.tokens,
                         );
@@ -640,12 +761,19 @@ impl UsageLedger {
                 .total_cmp(&a.cost_usd.unwrap_or(-1.0))
                 .then_with(|| b.tokens.total().cmp(&a.tokens.total()))
         });
+        let mut providers: Vec<ProviderUsage> = by_provider.into_values().collect();
+        providers.sort_by(|a, b| {
+            b.cost_usd
+                .total_cmp(&a.cost_usd)
+                .then_with(|| b.tokens.total().cmp(&a.tokens.total()))
+        });
         let mut summary = UsageSummary {
             revision: self.revision.saturating_add(prices.revision()),
             since_unix_ms: range.map_or(self.since_unix_ms, |(from, _)| from),
             until_unix_ms: range.map(|(_, to)| to),
             history_from_unix_ms: self.history_from_unix_ms(),
             cache_savings_usd,
+            by_provider: providers.clone(),
             ..UsageSummary::default()
         };
         for model in &models {
@@ -656,7 +784,11 @@ impl UsageLedger {
                 None => summary.unpriced_calls = summary.unpriced_calls.saturating_add(model.calls),
             }
         }
-        UsageResponse { summary, models }
+        UsageResponse {
+            summary,
+            models,
+            providers,
+        }
     }
 
     /// Usage per interval between consecutive `bounds` (ascending instants, typically the
@@ -675,7 +807,8 @@ impl UsageLedger {
             })
             .collect();
         if let (Some(&first), Some(&last)) = (bounds.first(), bounds.last()) {
-            for (model_id, buckets) in &self.history {
+            for (raw_key, buckets) in &self.history {
+                let (prov_id, model_id) = split_history_key(raw_key);
                 let rule = prices.rule_for(pricing_key(model_id));
                 let mut cursor = 0;
                 for bucket in buckets_within(buckets, first, last) {
@@ -697,7 +830,8 @@ impl UsageLedger {
                         .auxiliary_calls
                         .saturating_add(bucket.auxiliary_calls);
                     interval.tokens = interval.tokens.saturating_add(bucket.tokens);
-                    match rule.at(start) {
+                    let p = rule.at(start);
+                    match p {
                         Some(price) => {
                             interval.cost_usd += price.cost_usd(&bucket.tokens);
                             interval.cache_savings_usd += price.cache_savings_usd(&bucket.tokens);
@@ -707,6 +841,30 @@ impl UsageLedger {
                                 interval.unpriced_calls.saturating_add(bucket.calls);
                         }
                     }
+                    let prov_entry = match interval
+                        .by_provider
+                        .iter_mut()
+                        .find(|pu| pu.provider_id == prov_id)
+                    {
+                        Some(existing) => existing,
+                        None => {
+                            interval.by_provider.push(ProviderUsage {
+                                provider_id: prov_id.to_owned(),
+                                ..ProviderUsage::default()
+                            });
+                            let idx = interval.by_provider.len() - 1;
+                            let Some(slot) = interval.by_provider.get_mut(idx) else {
+                                continue;
+                            };
+                            slot
+                        }
+                    };
+                    add_provider_usage(
+                        prov_entry,
+                        p,
+                        (bucket.calls, bucket.auxiliary_calls),
+                        &bucket.tokens,
+                    );
                 }
             }
         }
@@ -1518,5 +1676,75 @@ mod tests {
         assert_eq!(fresh.since_unix_ms(), 42);
         assert_eq!(fresh.report(&prices, None).summary.calls, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_scopes_adjustments_to_target_provider_rows_and_history() {
+        let prices = PriceBook::default();
+        let mut ledger = UsageLedger::load(None, 1_000);
+        let epoch = ledger.epoch();
+        let now = 5 * HISTORY_BUCKET_MS + 100;
+
+        // Insert native provider row FIRST for the same model and price period.
+        let native_tok = UsageTokens {
+            input: 500,
+            cached_input: 100,
+            cache_write: 0,
+            output: 50,
+            thought: 0,
+        };
+        let agy_est = UsageTokens {
+            input: 300,
+            cached_input: 0,
+            cache_write: 0,
+            output: 20,
+            thought: 0,
+        };
+        ledger.record_with_provider("gemini", "gemini-3-pro", false, native_tok, now);
+        ledger.record_with_provider("agy", "gemini-3-pro", false, agy_est, now + 10);
+
+        // Reconcile Antigravity upward (+200 input) and downward (-10 output).
+        let agy_auth = UsageTokens {
+            input: 500,
+            cached_input: 50,
+            cache_write: 0,
+            output: 10,
+            thought: 0,
+        };
+        ledger.reconcile("gemini-3-pro", epoch, agy_est, agy_auth, now + 20);
+
+        let all_time = ledger.report(&prices, None);
+        let gem_prov = all_time
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "gemini")
+            .expect("gemini provider summary");
+        let agy_prov = all_time
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "agy")
+            .expect("agy provider summary");
+        assert_eq!(
+            gem_prov.tokens, native_tok,
+            "native provider row must stay untouched"
+        );
+        assert_eq!(
+            agy_prov.tokens, agy_auth,
+            "agy provider row must absorb full delta"
+        );
+
+        let ranged = ledger.report(&prices, Some((0, 10 * HISTORY_BUCKET_MS)));
+        let gem_ranged = ranged
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "gemini")
+            .expect("gemini ranged summary");
+        let agy_ranged = ranged
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "agy")
+            .expect("agy ranged summary");
+        assert_eq!(gem_ranged.tokens, native_tok);
+        assert_eq!(agy_ranged.tokens, agy_auth);
     }
 }

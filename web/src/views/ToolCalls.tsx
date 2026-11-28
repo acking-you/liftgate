@@ -24,6 +24,7 @@ import {
   Loading,
   Note,
   Pager,
+  ProviderBadge,
   SearchInput,
   Segmented,
   Select,
@@ -769,6 +770,7 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
                 <React.Fragment key={`${group.taskId}-${group.head.call_id}`}>
                   <li className="lg-callgroup" role="presentation">
                     <HarnessBadge id={group.head.harness_profile} className="font-medium text-fg-2" />
+                    <ProviderBadge id={group.head.provider_id} compact className="text-fg-3" />
                     <span className="lg-num" title={group.head.session_id ?? undefined}>
                       {shortId(group.head.session_id)}
                     </span>

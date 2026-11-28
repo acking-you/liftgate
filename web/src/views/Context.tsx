@@ -2,7 +2,7 @@ import * as React from "react";
 import { useEffect, useMemo, useState } from "react";
 import { CircleAlert, CircleCheck, FilterX, GitCompare, ScrollText, Trash2, TrendingDown } from "lucide-react";
 import { ProseBlock } from "@/components/CodeBlock";
-import { ContextRewritesView } from "@/components/ContextRewrites";
+import { ContextRewritesView, ThreeStagePipelineBanner } from "@/components/ContextRewrites";
 import { CopyButton } from "@/components/CopyButton";
 import { MessageTimeline } from "@/components/MessageTimeline";
 import { AcpRequestView, ClientToolsView } from "@/components/PayloadViews";
@@ -20,6 +20,7 @@ import {
   Meter,
   Note,
   Pill,
+  ProviderBadge,
   SearchInput,
   Select,
   SwitchRow,
@@ -32,6 +33,7 @@ import { errorMessage } from "@/lib/api";
 import { formatBytes, formatDateTime, formatNumber, formatSmartTime, shortId } from "@/lib/format";
 import { harnessMeta, sortHarnessIds } from "@/lib/harness";
 import { useI18n } from "@/lib/i18n";
+import { providerMeta, sortProviderIds } from "@/lib/provider";
 import { UNKNOWN_HARNESS } from "@/lib/taskfilter";
 import type { ContextCaptureRecord, ContextCaptureSummary } from "@/types/telemetry";
 import type { ViewProps } from "@/views/types";
@@ -48,6 +50,7 @@ type TabId = "timeline" | "rewrites" | "request" | "output" | "tools";
 interface CaptureFilter {
   /** Harness profile id, {@link UNKNOWN_HARNESS}, or `"all"`. */
   harness: string;
+  provider: string;
   session: string;
   model: string;
   rewrittenOnly: boolean;
@@ -58,6 +61,7 @@ interface CaptureFilter {
 
 const EMPTY_CAPTURE_FILTER: CaptureFilter = {
   harness: "all",
+  provider: "all",
   session: "all",
   model: "all",
   rewrittenOnly: false,
@@ -69,8 +73,13 @@ function captureHarness(rec: ContextCaptureRecord): string {
   return rec.harness_profile || UNKNOWN_HARNESS;
 }
 
+function captureProvider(rec: ContextCaptureRecord): string {
+  return (rec.provider_id ?? "agy").trim().toLowerCase() || "agy";
+}
+
 function matchesCapture(rec: ContextCaptureRecord, filter: CaptureFilter, thresholdBps: number): boolean {
   if (filter.harness !== "all" && captureHarness(rec) !== filter.harness) return false;
+  if (filter.provider !== "all" && captureProvider(rec) !== filter.provider) return false;
   if (filter.session !== "all" && rec.session_id !== filter.session) return false;
   if (filter.model !== "all" && rec.resolved_model !== filter.model) return false;
   if (filter.rewrittenOnly && (rec.rewrite_count ?? 0) === 0) return false;
@@ -80,7 +89,7 @@ function matchesCapture(rec: ContextCaptureRecord, filter: CaptureFilter, thresh
   const query = filter.query.trim().toLowerCase();
   return (
     query === "" ||
-    [rec.task_id, rec.session_id, rec.resolved_model, rec.prompt_preview].some(
+    [rec.task_id, rec.session_id, rec.provider_id, rec.resolved_model, rec.prompt_preview].some(
       (field) => typeof field === "string" && field.toLowerCase().includes(query),
     )
   );
@@ -141,6 +150,12 @@ function ContextSheet({
           <>
             <span className="lg-num">{record.task_id}</span>
             <HarnessBadge id={record.harness_profile} className="text-[12.5px] font-normal text-fg-2" />
+            <ProviderBadge
+              id={record.provider_id}
+              mode={record.optimization_mode}
+              compact
+              className="text-[12.5px] font-normal text-fg-2"
+            />
           </>
         )
       }
@@ -176,6 +191,8 @@ function ContextSheet({
             />
             <Figure label={t.payload} value={formatBytes(record.payload_bytes)} />
           </div>
+
+          {payload?.upstream_wire && <ThreeStagePipelineBanner wire={payload.upstream_wire} />}
 
           <div className="flex items-end justify-between gap-3">
             <div className="min-w-0 flex-1">
@@ -455,6 +472,7 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
   const patchFilter = (patch: Partial<CaptureFilter>): void => setFilter((prev) => ({ ...prev, ...patch }));
   const filterActive =
     filter.harness !== "all" ||
+    filter.provider !== "all" ||
     filter.session !== "all" ||
     filter.model !== "all" ||
     filter.rewrittenOnly ||
@@ -470,6 +488,7 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
       records.filter((rec) => matchesCapture(rec, { ...filter, ...patch }, thresholdBps));
     return {
       byHarness: tally(without({ harness: "all" }), captureHarness),
+      byProvider: tally(without({ provider: "all" }), captureProvider),
       bySession: tally(without({ session: "all" }), (rec) => rec.session_id),
       byModel: tally(without({ model: "all" }), (rec) => rec.resolved_model),
       rewritten: without({ rewrittenOnly: false }).filter((rec) => (rec.rewrite_count ?? 0) > 0).length,
@@ -507,6 +526,15 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
       ...[...counts].map(([id, count]) => ({ value: id, label: `${id} (${count})` })),
     ];
   }, [facets.byModel, filter.model, fo.allModels]);
+  const providerOptions = useMemo(() => {
+    const counts = new Map(facets.byProvider);
+    if (filter.provider !== "all" && !counts.has(filter.provider)) counts.set(filter.provider, 0);
+    const ids = sortProviderIds([...counts.keys()]);
+    return [
+      { value: "all", label: fo.allProviders },
+      ...ids.map((id) => ({ value: id, label: `${providerMeta(id).label} (${counts.get(id) ?? 0})` })),
+    ];
+  }, [facets.byProvider, filter.provider, fo.allProviders]);
 
   if (advertised === null) {
     return (
@@ -605,6 +633,13 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
                 placeholder={fv.search}
               />
               <Select
+                ariaLabel={fo.provider}
+                className="min-w-[165px] flex-1"
+                value={filter.provider}
+                onChange={(provider) => patchFilter({ provider })}
+                options={providerOptions}
+              />
+              <Select
                 ariaLabel={fo.session}
                 className="min-w-[180px] flex-1"
                 value={filter.session}
@@ -650,6 +685,7 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
                 <tr>
                   <th>{t.col.time}</th>
                   <th>{t.col.harness}</th>
+                  <th className="hide-sm">{t.col.provider}</th>
                   <th className="hide-sm">{t.col.model}</th>
                   <th className="num hide-sm">{t.col.turn}</th>
                   <th className="num">{t.col.hitRate}</th>
@@ -705,6 +741,22 @@ export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
                           {shortId(rec.session_id)}
                         </button>
                       )}
+                    </td>
+                    <td className="hide-sm whitespace-nowrap">
+                      <button
+                        type="button"
+                        className="lg-cellfilter"
+                        aria-pressed={filter.provider === captureProvider(rec)}
+                        title={fo.provider}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          const id = captureProvider(rec);
+                          patchFilter({ provider: filter.provider === id ? "all" : id });
+                        }}
+                        onKeyDown={(ev) => ev.stopPropagation()}
+                      >
+                        <ProviderBadge id={rec.provider_id} mode={rec.optimization_mode} compact className="text-fg" />
+                      </button>
                     </td>
                     <td className="lg-num hide-sm whitespace-nowrap text-[12px]">{rec.resolved_model}</td>
                     <td className="num hide-sm">{rec.session_turn_index}</td>

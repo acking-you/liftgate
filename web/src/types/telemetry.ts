@@ -47,8 +47,57 @@ export interface SessionMcpSummary {
   wire_bytes: number;
 }
 
+export type OptimizationMode = "optimized" | "passthrough" | "custom";
+
+export interface OptimizationPolicy {
+  prompt_distillation: boolean;
+  tool_virtualization: boolean;
+  code_mode_enhancements: boolean;
+  strip_billing_noise: boolean;
+  spill_truncation?: boolean | null;
+}
+
+export type ProviderDriverKind =
+  | "agy-acp"
+  | "openai"
+  | "anthropic"
+  | "gemini"
+  | "codex-app-server"
+  | "grok-acp"
+  | (string & {});
+
+export type ProviderFamily = "stateful_session" | "stateless_http" | (string & {});
+
+export type UpstreamWireProtocol =
+  | "stateful_rpc"
+  | "openai_responses"
+  | "anthropic_messages"
+  | "google_gemini"
+  | (string & {});
+
+export type ToolWireMode = "acp_loopback_mcp" | "native_api_tools" | (string & {});
+
+export interface ProviderTelemetrySummary {
+  id: string;
+  display_name: string;
+  driver: ProviderDriverKind;
+  family: ProviderFamily;
+  wire_protocol: UpstreamWireProtocol;
+  tool_wire_mode: ToolWireMode;
+  enabled: boolean;
+  active: boolean;
+  auth_configured: boolean;
+  auth_source: string;
+  endpoint?: string | null;
+  default_model: string;
+  fast_model?: string | null;
+  title_model?: string | null;
+  spill_enabled: boolean;
+}
+
 export interface SessionSummary {
   session_id: string;
+  provider_id?: string;
   model_id: string;
   state: SessionSlotState;
   cache_warmth?: PromptCacheWarmth;
@@ -102,6 +151,8 @@ export interface AcpUsage {
 
 export interface TaskSnapshot {
   task_id: string;
+  provider_id?: string;
+  optimization_mode?: OptimizationMode | null;
   protocol: TaskProtocol;
   stream: boolean;
   requested_model: string;
@@ -428,6 +479,10 @@ export interface AutoUpdateTelemetrySummary {
 export interface GatewayTelemetrySnapshot {
   generated_at_unix_ms: number;
   gateway_version: string;
+  active_provider?: string;
+  optimization_mode?: OptimizationMode;
+  optimization_policy?: OptimizationPolicy;
+  providers?: ProviderTelemetrySummary[];
   vision_offload_enabled?: boolean;
   mcp_tool_bridge_enabled?: boolean;
   acp_process: AcpProcessTelemetry;
@@ -497,6 +552,7 @@ export interface ToolCallRecord {
   /** Buffer revision at which this record last changed (for `?since=` polling). */
   revision: number;
   task_id: string;
+  provider_id?: string;
   session_id: string | null;
   /** Session turn (one per HTTP request against the session). */
   turn_index: number;
@@ -674,6 +730,8 @@ export interface ContextCaptureSummary {
 export interface ContextCaptureRecord {
   task_id: string;
   recorded_at_unix_ms: number;
+  provider_id?: string;
+  optimization_mode?: OptimizationMode | null;
   session_id: string | null;
   harness_profile?: string | null;
   resolved_model: string;
@@ -720,7 +778,26 @@ export interface ContextCapturesResponse {
   records: ContextCaptureRecord[];
 }
 
+export interface UpstreamWireSummary {
+  provider_id: string;
+  driver: ProviderDriverKind;
+  wire_protocol: UpstreamWireProtocol;
+  optimization_mode: OptimizationMode;
+  isomorphic_wire: boolean;
+  raw_system_bytes: number;
+  forwarded_system_bytes: number;
+  raw_tool_count: number;
+  raw_tool_bytes: number;
+  forwarded_tool_count: number;
+  forwarded_tool_bytes: number;
+  spill_enabled: boolean;
+  cache_breakpoints_aligned: number;
+  zero_rtt_continuations: number;
+}
+
 export interface FullContextPayload extends LowCacheFullRequestPayload {
+  /** Stage-3 upstream delivery summary (`Raw Harness -> Gateway Optimization -> Upstream Provider Wire`). */
+  upstream_wire?: UpstreamWireSummary | null;
   /** Reasoning the model produced during this turn. */
   assistant_reasoning?: string | null;
   /** Complete text output of this turn. */
@@ -758,6 +835,16 @@ export interface UsageTokens {
   thought: number;
 }
 
+export interface ProviderUsage {
+  provider_id: string;
+  calls: number;
+  auxiliary_calls: number;
+  tokens: UsageTokens;
+  cost_usd: number;
+  cache_savings_usd: number;
+  unpriced_calls: number;
+}
+
 export interface UsageSummary {
   revision: number;
   /** Start of the covered range: when recording started (or was reset), or the requested `from`. */
@@ -774,6 +861,7 @@ export interface UsageSummary {
   cache_savings_usd?: number;
   /** Calls on models without a price, left out of `cost_usd`. */
   unpriced_calls: number;
+  by_provider?: ProviderUsage[];
 }
 
 /** Usage within one interval of `GET /api/telemetry/usage/series`. */
@@ -788,6 +876,7 @@ export interface UsageInterval {
   cache_savings_usd: number;
   /** Calls on models without a price, left out of `cost_usd`. */
   unpriced_calls: number;
+  by_provider?: ProviderUsage[];
 }
 
 /** One interval per consecutive pair of requested bounds, e.g. the viewer's local midnights. */
@@ -816,6 +905,8 @@ export interface UsageResponse {
   summary: UsageSummary;
   /** Costliest first. */
   models: ModelUsage[];
+  /** Per-provider usage breakdown, costliest first. */
+  providers?: ProviderUsage[];
 }
 
 /** USD per 1M tokens. */

@@ -1789,8 +1789,15 @@ fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
     }
 
     let mut ops: Vec<V4aOp> = Vec::new();
+    let mut in_root_gap = false;
     for line in inner.split('\n') {
+        let right_trimmed = line.trim_end();
+        if right_trimmed == "*** End Patch" || right_trimmed == "*** Begin Patch" {
+            in_root_gap = true;
+            continue;
+        }
         if let Some(p) = line.strip_prefix("*** Add File: ") {
+            in_root_gap = false;
             ops.push(V4aOp::Add {
                 path: p.trim().to_owned(),
                 lines: Vec::new(),
@@ -1798,18 +1805,26 @@ fn coalesce_and_repair_v4a_patch(framed: &str) -> String {
             continue;
         }
         if let Some(p) = line.strip_prefix("*** Delete File: ") {
+            in_root_gap = false;
             ops.push(V4aOp::Delete {
                 path: p.trim().to_owned(),
             });
             continue;
         }
         if let Some(p) = line.strip_prefix("*** Update File: ") {
+            in_root_gap = false;
             ops.push(V4aOp::Update {
                 path: p.trim().to_owned(),
                 move_to: None,
                 lines: Vec::new(),
             });
             continue;
+        }
+        if in_root_gap {
+            if right_trimmed.trim().is_empty() || right_trimmed.starts_with("```") {
+                continue;
+            }
+            return framed.to_owned();
         }
 
         match ops.last_mut() {
@@ -2887,5 +2902,71 @@ mod tests {
             normalize_code_mode_exec_js(&deep),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn coalesces_concatenated_multi_file_patches_with_interior_end_or_begin_markers() {
+        // 1. Interior `*** End Patch` before the next `*** Update File:` (exact LLM multi-file mistake)
+        let split_end_only = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.rs\n",
+            "@@\n",
+            "-let x = 1;\n",
+            "+let x = 2;\n",
+            "*** End Patch\n",
+            "*** Update File: b.rs\n",
+            "@@\n",
+            "-let y = 3;\n",
+            "+let y = 4;\n",
+            "*** End Patch"
+        );
+        let healed1 = normalize_apply_patch_text(split_end_only);
+        validate_apply_patch_preflight(&healed1)
+            .expect("healed multi-file patch must pass preflight");
+        assert_eq!(
+            healed1,
+            concat!(
+                "*** Begin Patch\n",
+                "*** Update File: a.rs\n",
+                "@@\n",
+                "-let x = 1;\n",
+                "+let x = 2;\n",
+                "*** Update File: b.rs\n",
+                "@@\n",
+                "-let y = 3;\n",
+                "+let y = 4;\n",
+                "*** End Patch"
+            )
+        );
+
+        // 2. Concatenated full patches (`*** End Patch\n\n*** Begin Patch`) across Delete + Add
+        let concat_two = concat!(
+            "*** Begin Patch\n",
+            "*** Delete File: old.rs\n",
+            "*** End Patch\n\n",
+            "*** Begin Patch\n",
+            "*** Add File: new.rs\n",
+            "+pub fn ok() {}\n",
+            "*** End Patch"
+        );
+        let healed2 = normalize_apply_patch_text(concat_two);
+        validate_apply_patch_preflight(&healed2).expect("concatenated patches must pass preflight");
+        assert!(
+            healed2.contains("*** Delete File: old.rs\n*** Add File: new.rs\n+pub fn ok() {}\n")
+        );
+
+        // 3. Literal `*** End Patch` inside prefixed hunk lines (`+`, `-`, `' '`) is preserved verbatim
+        let literal_hunk = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: parser.rs\n",
+            "@@\n",
+            " *** Begin Patch\n",
+            "-*** End Patch\n",
+            "+*** End Patch\n",
+            "*** End Patch"
+        );
+        let healed3 = normalize_apply_patch_text(literal_hunk);
+        validate_apply_patch_preflight(&healed3).expect("prefixed literal lines must stay valid");
+        assert_eq!(healed3, literal_hunk);
     }
 }

@@ -4,6 +4,7 @@ import { formatDurationMs, formatUsd } from "@/lib/format";
 import { harnessMeta } from "@/lib/harness";
 import { useI18n } from "@/lib/i18n";
 import { LATENCY_SCALES, type LatencyKind, latencyTone } from "@/lib/latency";
+import { providerMeta } from "@/lib/provider";
 import { cn } from "@/lib/utils";
 
 export type Tone = "neutral" | "ok" | "warn" | "err" | "accent";
@@ -142,6 +143,29 @@ export function HarnessBadge({
     <span className={cn("inline-flex items-center gap-1.5 whitespace-nowrap", className)}>
       <span className="lg-swatch" style={{ background: meta.color }} aria-hidden="true" />
       <span>{meta.label}</span>
+    </span>
+  );
+}
+
+/** Upstream provider identity + optional Passthrough observe-only marker. */
+export function ProviderBadge({
+  id,
+  mode,
+  compact = false,
+  className,
+}: {
+  id: string | null | undefined;
+  mode?: string | null;
+  compact?: boolean;
+  className?: string;
+}): React.JSX.Element {
+  const meta = providerMeta(id);
+  const isPassthrough = mode === "passthrough";
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 whitespace-nowrap", className)}>
+      <span className="lg-swatch" style={{ background: meta.color }} aria-hidden="true" />
+      <span className="lg-num">{compact ? meta.short : meta.label}</span>
+      {isPassthrough && <Pill tone="warn">passthrough</Pill>}
     </span>
   );
 }

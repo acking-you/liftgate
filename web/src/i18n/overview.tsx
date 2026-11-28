@@ -46,6 +46,8 @@ const zh = {
   filters: {
     harness: "按 Harness 筛选",
     harnessHint: (name: string) => `只看 ${name} 的请求，再点一次取消`,
+    provider: "按 Provider 筛选",
+    allProviders: "全部 Provider",
     session: "按会话筛选",
     sessionHint: "只看这个会话的请求，再点一次取消",
     allSessions: "全部会话",
@@ -71,6 +73,7 @@ const zh = {
   col: {
     time: "时间",
     harness: "Harness",
+    provider: "Provider",
     model: "模型",
     session: "会话",
     activity: "活动",
@@ -194,6 +197,8 @@ const en: OverviewMessages = {
   filters: {
     harness: "Filter by harness",
     harnessHint: (name) => `Only ${name} requests; click again to clear`,
+    provider: "Filter by provider",
+    allProviders: "All providers",
     session: "Filter by session",
     sessionHint: "Only this session's requests; click again to clear",
     allSessions: "All sessions",
@@ -220,6 +225,7 @@ const en: OverviewMessages = {
   col: {
     time: "Time",
     harness: "Harness",
+    provider: "Provider",
     model: "Model",
     session: "Session",
     activity: "Activity",

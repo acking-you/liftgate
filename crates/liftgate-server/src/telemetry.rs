@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU32, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,7 @@ use liftgate_types::{
     pricing::{
         ModelPrice, PricingResponse, UsageResponse, UsageSeriesResponse, UsageSummary, UsageTokens,
     },
+    provider::OptimizationMode,
     session_key::{WebToolBridgeConfig, truncate_head_tail_lines},
     telemetry::{
         AutoUpdateTelemetrySummary, CacheTelemetrySummary, CapturedAcpPromptBlock,
@@ -33,7 +34,7 @@ use liftgate_types::{
         LowCacheDiagnosticCause, LowCacheFullRequestPayload, LowCacheHitReason, LowCacheHitRecord,
         LowCacheHitsResponse, LowCachePayloadDetailResponse, LowCacheRequestCapture,
         LowCacheRequestMetrics, LowCacheRoutingStrategy, TaskPhase, TaskProtocol, TaskSnapshot,
-        ToolCallDetail, ToolCallTelemetrySummary, ToolCallsResponse,
+        ToolCallDetail, ToolCallTelemetrySummary, ToolCallsResponse, UpstreamWireSummary,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,7 @@ use crate::context_capture::{
     CaptureCommit, CaptureTicket, ContextCaptureConfig, ContextCaptureIoError, ContextCaptureStore,
     encode_payload, payload_file_name, read_payload,
 };
+use crate::provider_runtime::ProviderRuntimeRegistry;
 use crate::tool_calls::{
     ToolCallLimits, ToolCallOutcome, ToolCallStart, ToolCallStore, ToolCallTaskContext,
 };
@@ -726,6 +728,7 @@ impl UsageWriter {
 /// Central bounded telemetry store and real-time event notifier for the companion web UI.
 pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
+    providers: RwLock<Arc<ProviderRuntimeRegistry>>,
     persist_lock: Mutex<u64>,
     context_persist_lock: Mutex<u64>,
     pricing_persist_lock: Mutex<u64>,
@@ -816,6 +819,7 @@ impl TelemetryHub {
                 active_tasks: BTreeMap::new(),
                 recent_tasks: VecDeque::with_capacity(MAX_RECENT_TASKS),
             }),
+            providers: RwLock::new(Arc::new(ProviderRuntimeRegistry::default())),
             persist_lock: Mutex::new(0),
             context_persist_lock: Mutex::new(0),
             pricing_persist_lock: Mutex::new(0),
@@ -892,6 +896,24 @@ impl TelemetryHub {
 
     /// Subscribes to gateway shutdown so long-lived telemetry SSE streams close immediately
     /// instead of blocking `axum`'s graceful connection drain.
+    /// Returns the active multi-provider runtime registry attached to this hub.
+    #[must_use]
+    pub fn provider_registry(&self) -> Arc<ProviderRuntimeRegistry> {
+        match self.providers.read() {
+            Ok(g) => Arc::clone(&g),
+            Err(p) => Arc::clone(&p.into_inner()),
+        }
+    }
+
+    /// Attaches a disk-backed or pre-configured [`ProviderRuntimeRegistry`] to this hub.
+    pub fn set_provider_registry(&self, registry: Arc<ProviderRuntimeRegistry>) {
+        match self.providers.write() {
+            Ok(mut g) => *g = registry,
+            Err(p) => *p.into_inner() = registry,
+        }
+        self.notify_change();
+    }
+
     #[must_use]
     pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
@@ -920,6 +942,8 @@ impl TelemetryHub {
 
         let snapshot = TaskSnapshot {
             task_id: task_id.clone(),
+            provider_id: "agy".to_owned(),
+            optimization_mode: None,
             protocol,
             stream,
             requested_model: requested_model.clone(),
@@ -971,6 +995,7 @@ impl TelemetryHub {
             hub: Arc::clone(self),
             tool_ctx: Mutex::new(ToolCallTaskContext {
                 task_id: task_id.clone(),
+                provider_id: "agy".to_owned(),
                 session_id: None,
                 model_id: requested_model_for_ctx,
                 harness_profile: GENERIC_HARNESS_PROFILE,
@@ -979,6 +1004,7 @@ impl TelemetryHub {
             }),
             next_tool_step: AtomicU32::new(0),
             text_capture: capturing.then(|| Mutex::new(TurnTextCapture::default())),
+            upstream_wire: Mutex::new(None),
             task_id,
             armed: true,
         }
@@ -1636,7 +1662,8 @@ impl TelemetryHub {
                 .min(cs.file_state.warm_prompt_tokens);
             }
             cs.revision = cs.revision.saturating_add(1);
-            guard.usage.reconcile(
+            guard.usage.reconcile_with_provider(
+                "agy",
                 model_id,
                 usage_epoch,
                 UsageTokens::from_acp(&accounted_sum),
@@ -1915,6 +1942,7 @@ pub struct ActiveTaskGuard {
     tool_ctx: Mutex<ToolCallTaskContext>,
     next_tool_step: AtomicU32,
     text_capture: Option<Mutex<TurnTextCapture>>,
+    upstream_wire: Mutex<Option<UpstreamWireSummary>>,
 }
 
 impl ActiveTaskGuard {
@@ -1932,6 +1960,30 @@ impl ActiveTaskGuard {
         match self.tool_ctx.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Tags this turn with its resolved upstream provider ID and optimization mode.
+    pub fn set_provider_and_optimization(&self, provider_id: &str, opt_mode: OptimizationMode) {
+        {
+            let mut ctx = self.lock_tool_ctx();
+            provider_id.clone_into(&mut ctx.provider_id);
+        }
+        {
+            let mut guard = self.hub.lock_inner();
+            if let Some(task) = guard.active_tasks.get_mut(&self.task_id) {
+                provider_id.clone_into(&mut task.provider_id);
+                task.optimization_mode = Some(opt_mode);
+            }
+        }
+        self.hub.notify_change();
+    }
+
+    /// Attaches Stage-3 upstream wire delivery metrics for full-context 3-stage comparison.
+    pub fn set_upstream_wire_summary(&self, summary: UpstreamWireSummary) {
+        match self.upstream_wire.lock() {
+            Ok(mut g) => *g = Some(summary),
+            Err(p) => *p.into_inner() = Some(summary),
         }
     }
 
@@ -2494,7 +2546,8 @@ impl ActiveTaskGuard {
                 task.stop_reason = Some(stop_reason);
                 task.usage = Some(usage);
                 task.cache_hit_rate_bps = turn_hit_bps;
-                guard.usage.record(
+                guard.usage.record_with_provider(
+                    &task.provider_id,
                     &task.resolved_model,
                     task.auxiliary_task.is_some(),
                     UsageTokens::from_acp(&usage),
@@ -2677,13 +2730,19 @@ impl ActiveTaskGuard {
     ) -> Option<PendingContextCapture> {
         let capture = self.text_capture.as_ref()?;
         let diag = diagnostics?;
-        let (slot, ticket, (session_id, resolved_model, prompt_preview, output_preview)) = {
+        let (
+            slot,
+            ticket,
+            (provider_id, opt_mode, session_id, resolved_model, prompt_preview, output_preview),
+        ) = {
             let mut guard = self.hub.lock_inner();
             if !guard.context_store.is_capturing() {
                 return None;
             }
             let task = guard.active_tasks.get(&self.task_id)?;
             let fields = (
+                task.provider_id.clone(),
+                task.optimization_mode,
                 task.session_id.clone(),
                 task.resolved_model.clone(),
                 task.prompt_preview.clone(),
@@ -2727,6 +2786,8 @@ impl ActiveTaskGuard {
         let mut record = ContextCaptureRecord {
             task_id: self.task_id.clone(),
             recorded_at_unix_ms: now_ms,
+            provider_id,
+            optimization_mode: opt_mode,
             session_id,
             harness_profile: Some(self.harness_profile().to_owned()),
             resolved_model,
@@ -2742,8 +2803,13 @@ impl ActiveTaskGuard {
         };
         let (rewrites, rewrites_truncated) = collect_context_rewrites(diag, tool_result_rewrites);
         record.rewrite_count = Some(rewrites.len());
+        let upstream_wire = match self.upstream_wire.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
         let mut payload = FullContextPayload {
             request,
+            upstream_wire,
             assistant_reasoning: (!reasoning.is_empty()).then_some(reasoning),
             assistant_output: (!output.is_empty()).then_some(output),
             assistant_reasoning_truncated: reasoning_truncated,
@@ -2952,6 +3018,21 @@ fn measure_messages(messages: &[CanonicalMessage], delta_start_index: usize) -> 
                     has_conversational_part = true;
                     m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
                     m.reasoning_bytes = m.reasoning_bytes.saturating_add(r.len());
+                }
+                CanonicalPart::SignedThinking {
+                    thinking,
+                    signature,
+                } => {
+                    has_conversational_part = true;
+                    m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
+                    m.reasoning_bytes = m
+                        .reasoning_bytes
+                        .saturating_add(thinking.len().saturating_add(signature.len()));
+                }
+                CanonicalPart::RedactedThinking { data } => {
+                    has_conversational_part = true;
+                    m.reasoning_part_count = m.reasoning_part_count.saturating_add(1);
+                    m.reasoning_bytes = m.reasoning_bytes.saturating_add(data.len());
                 }
                 CanonicalPart::ImageBase64 { media_type, data } => {
                     has_conversational_part = true;
@@ -3269,6 +3350,12 @@ fn summarize_message_inline(
             CanonicalPart::Reasoning(r) => {
                 part_kinds.push(format!("reasoning({}B)", r.len()));
             }
+            CanonicalPart::SignedThinking { thinking, .. } => {
+                part_kinds.push(format!("signed_thinking({}B)", thinking.len()));
+            }
+            CanonicalPart::RedactedThinking { data } => {
+                part_kinds.push(format!("redacted_thinking({}B)", data.len()));
+            }
             CanonicalPart::ImageBase64 { media_type, data } => {
                 part_kinds.push(format!("image:{media_type}({}B)", data.len()));
             }
@@ -3429,6 +3516,18 @@ fn build_full_request_payload(
                     let bytes = r.len();
                     let text = bound_part_string(r, &mut budget, per_part, &mut truncated);
                     parts.push(CapturedFullPart::Reasoning { bytes, text });
+                }
+                CanonicalPart::SignedThinking { thinking, .. } => {
+                    let bytes = thinking.len();
+                    let text = bound_part_string(thinking, &mut budget, per_part, &mut truncated);
+                    parts.push(CapturedFullPart::Reasoning { bytes, text });
+                }
+                CanonicalPart::RedactedThinking { data } => {
+                    let bytes = data.len();
+                    parts.push(CapturedFullPart::Reasoning {
+                        bytes,
+                        text: "[redacted_thinking]".to_owned(),
+                    });
                 }
                 CanonicalPart::ImageBase64 { media_type, data } => {
                     parts.push(CapturedFullPart::Image {

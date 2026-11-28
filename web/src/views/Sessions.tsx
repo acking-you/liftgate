@@ -14,6 +14,7 @@ import {
   Meter,
   Note,
   Pill,
+  ProviderBadge,
   SwitchRow,
   Tag,
 } from "@/components/ui";
@@ -263,7 +264,12 @@ export function SessionsView({ navigate }: ViewProps): React.JSX.Element {
                     <td className="hide-sm">
                       <SessionState session={sess} />
                     </td>
-                    <td className="lg-num hide-sm whitespace-nowrap text-[12px]">{sess.model_id}</td>
+                    <td className="lg-num hide-sm whitespace-nowrap text-[12px]">
+                      <span className="inline-flex items-center gap-2">
+                        <ProviderBadge id={sess.provider_id} compact className="text-fg-2" />
+                        <span>{sess.model_id}</span>
+                      </span>
+                    </td>
                     <td>
                       {sess.mcp ? (
                         <div className="md:min-w-[190px]">

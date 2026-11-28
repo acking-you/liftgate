@@ -34,6 +34,7 @@ import {
   Meter,
   Pager,
   Pill,
+  ProviderBadge,
   SearchInput,
   Segmented,
   Select,
@@ -80,6 +81,7 @@ import {
   saveTaskFilter,
   summarizeTasks,
   taskHarness,
+  taskProvider,
 } from "@/lib/taskfilter";
 import { toolOutcomesByTask } from "@/lib/toolcalls";
 import type { ElasticIoTelemetry, SessionSummary, TaskProtocol, TaskSnapshot } from "@/types/telemetry";
@@ -242,6 +244,8 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
     patchFilter({ harness: filter.harness === harness ? "all" : harness });
   const toggleSession = (session: string): void =>
     patchFilter({ session: filter.session === session ? "all" : session });
+  const toggleProvider = (provider: string): void =>
+    patchFilter({ provider: filter.provider === provider ? "all" : provider });
   const filterActive = isTaskFilterActive(filter);
   useEffect(() => saveTaskFilter(filter), [filter]);
   const filteredTasks = useMemo(
@@ -254,6 +258,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
     const without = (patch: Partial<TaskFilter>): TaskSnapshot[] =>
       filterTasks(recentTasks, { ...filter, ...patch }, filterCtx);
     const byHarness = countInOrder(without({ harness: "all" }), taskHarness);
+    const byProvider = countInOrder(without({ provider: "all" }), taskProvider);
     const bySession = countInOrder(without({ session: "all" }), (task) => task.session_id);
     const byModel = countInOrder(without({ model: "all" }), (task) => task.resolved_model);
     const byProtocol = countInOrder(without({ protocol: "all" }), (task) => task.protocol);
@@ -261,7 +266,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
       isTaskProblem(task, outcomes.get(task.task_id)),
     ).length;
     const lowCache = without({ lowCacheOnly: false }).filter((task) => isTaskLowCache(task, thresholdBps)).length;
-    return { byHarness, bySession, byModel, byProtocol, problems, lowCache };
+    return { byHarness, byProvider, bySession, byModel, byProtocol, problems, lowCache };
   }, [recentTasks, filter, filterCtx, outcomes, thresholdBps]);
   const harnessIds = useMemo(() => {
     const ids = new Set(recentTasks.map(taskHarness));
@@ -292,6 +297,14 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
       ...[...counts].map(([id, count]) => ({ value: id, label: `${id} (${count})` })),
     ];
   }, [facets.byModel, filter.model, t.filters.allModels]);
+  const providerOptions = useMemo(() => {
+    const counts = new Map(facets.byProvider);
+    if (filter.provider !== "all" && !counts.has(filter.provider)) counts.set(filter.provider, 0);
+    return [
+      { value: "all", label: t.filters.allProviders },
+      ...[...counts].map(([id, count]) => ({ value: id, label: `${id} (${count})` })),
+    ];
+  }, [facets.byProvider, filter.provider, t.filters.allProviders]);
   const taskPages = Math.max(1, Math.ceil(filteredTasks.length / TASK_PAGE_SIZE));
   const clampedTaskPage = Math.min(taskPage, taskPages);
   const shownTasks = filteredTasks.slice(
@@ -495,6 +508,13 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                 placeholder={t.filters.search}
               />
               <Select
+                ariaLabel={t.filters.provider}
+                className="min-w-[155px] flex-[0.8]"
+                value={filter.provider}
+                onChange={(provider) => patchFilter({ provider })}
+                options={providerOptions}
+              />
+              <Select
                 ariaLabel={t.filters.session}
                 className="min-w-[180px] flex-1"
                 value={filter.session}
@@ -558,6 +578,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                 <tr>
                   <th>{t.col.time}</th>
                   <th>{t.col.harness}</th>
+                  <th>{t.col.provider}</th>
                   <th>{t.col.model}</th>
                   <th className="hide-sm">{t.col.session}</th>
                   <th className="hide-sm">{t.col.activity}</th>
@@ -603,6 +624,20 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                           onKeyDown={(ev) => ev.stopPropagation()}
                         >
                           <HarnessBadge id={task.harness_profile} />
+                        </button>
+                      </td>
+                      <td className="whitespace-nowrap text-[12px] text-fg-2">
+                        <button
+                          type="button"
+                          className="lg-cellfilter"
+                          aria-pressed={filter.provider === taskProvider(task)}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            toggleProvider(taskProvider(task));
+                          }}
+                          onKeyDown={(ev) => ev.stopPropagation()}
+                        >
+                          <ProviderBadge id={task.provider_id} mode={task.optimization_mode} compact />
                         </button>
                       </td>
                       <td className="text-[12px] text-fg">

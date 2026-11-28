@@ -179,6 +179,183 @@ pub trait AcpBackend: Send + Sync + 'static {
     }
 }
 
+impl<T: AcpBackend> AcpBackend for Option<T> {
+    fn available_models(&self) -> Vec<AvailableModel> {
+        self.as_ref()
+            .map_or_else(Vec::new, AcpBackend::available_models)
+    }
+
+    fn refresh_models_if_empty(&self) -> impl Future<Output = Vec<AvailableModel>> + Send {
+        let inner = self.as_ref().map(AcpBackend::refresh_models_if_empty);
+        async move {
+            match inner {
+                Some(fut) => fut.await,
+                None => Vec::new(),
+            }
+        }
+    }
+
+    fn create_session(
+        &self,
+        system_append: &str,
+    ) -> impl Future<Output = Result<SessionNewResult, AcpError>> + Send {
+        let fut = self.as_ref().map(|b| b.create_session(system_append));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Err(AcpError::Rpc {
+                    method: "session/new",
+                    code: -32000,
+                    message: "Antigravity CLI (`agy`) is not installed; run `lg agy install` or select another provider (`lg provider use <id>` / `-p <provider>`)".to_owned(),
+                }),
+            }
+        }
+    }
+
+    fn create_session_with_mcp(
+        &self,
+        system_append: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> impl Future<Output = Result<SessionNewResult, AcpError>> + Send {
+        let fut = self
+            .as_ref()
+            .map(|b| b.create_session_with_mcp(system_append, mcp_servers));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Err(AcpError::Rpc {
+                    method: "session/new",
+                    code: -32000,
+                    message: "Antigravity CLI (`agy`) is not installed; run `lg agy install` or select another provider (`lg provider use <id>` / `-p <provider>`)".to_owned(),
+                }),
+            }
+        }
+    }
+
+    fn set_session_model(
+        &self,
+        session_id: &SessionId,
+        model_id: &ModelId,
+    ) -> impl Future<Output = Result<(), AcpError>> + Send {
+        let fut = self
+            .as_ref()
+            .map(|b| b.set_session_model(session_id, model_id));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn set_session_mode(
+        &self,
+        session_id: &SessionId,
+        mode_id: &AcpModeId,
+    ) -> impl Future<Output = Result<(), AcpError>> + Send {
+        let fut = self
+            .as_ref()
+            .map(|b| b.set_session_mode(session_id, mode_id));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn start_prompt(
+        &self,
+        session_id: &SessionId,
+        prompt: &[AcpPromptBlock],
+        updates_tx: mpsc::Sender<SessionUpdatePayload>,
+    ) -> impl Future<Output = Result<PromptTurnResult, AcpError>> + Send {
+        let fut = self
+            .as_ref()
+            .map(|b| b.start_prompt(session_id, prompt, updates_tx));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Err(AcpError::Rpc {
+                    method: "session/prompt",
+                    code: -32000,
+                    message: "Antigravity CLI (`agy`) is not installed".to_owned(),
+                }),
+            }
+        }
+    }
+
+    fn cancel_prompt_nonblocking(&self, session_id: &SessionId) {
+        if let Some(b) = self.as_ref() {
+            b.cancel_prompt_nonblocking(session_id);
+        }
+    }
+
+    fn cancel_prompt_for_reuse(&self, session_id: &SessionId) -> bool {
+        self.as_ref()
+            .is_some_and(|b| b.cancel_prompt_for_reuse(session_id))
+    }
+
+    fn abort_session_nonblocking(&self, session_id: &SessionId) {
+        if let Some(b) = self.as_ref() {
+            b.abort_session_nonblocking(session_id);
+        }
+    }
+
+    fn close_session(
+        &self,
+        session_id: &SessionId,
+    ) -> impl Future<Output = Result<(), AcpError>> + Send {
+        let fut = self.as_ref().map(|b| b.close_session(session_id));
+        async move {
+            match fut {
+                Some(f) => f.await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn recent_stderr_since(&self, since_unix_ms: u64) -> Vec<String> {
+        self.as_ref()
+            .map_or_else(Vec::new, |b| b.recent_stderr_since(since_unix_ms))
+    }
+
+    fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
+        match self.as_ref() {
+            Some(b) => b.process_telemetry(default_model, acp_mode),
+            None => AcpProcessTelemetry {
+                connected: false,
+                pid: None,
+                binary_path: "not installed".to_owned(),
+                session_cwd: String::new(),
+                os: Cow::Borrowed(std::env::consts::OS),
+                arch: Cow::Borrowed(std::env::consts::ARCH),
+                supervision_strategy: Cow::Borrowed(supervision_strategy_name()),
+                protocol_version: ACP_PROTOCOL_VERSION,
+                agent_name: None,
+                agent_version: None,
+                started_at_unix_ms: 0,
+                uptime_secs: 0,
+                default_model: default_model.to_owned(),
+                acp_mode: acp_mode.to_owned(),
+                rpc_requests_sent: 0,
+                rpc_responses_received: 0,
+                rpc_notifications_received: 0,
+                rpc_pending_in_flight: 0,
+                active_prompt_streams: 0,
+                recent_stderr: Vec::new(),
+                agy_proxy: None,
+                auto_update_enabled: false,
+                latest_known_version: None,
+                last_update_check_unix_ms: None,
+                last_auto_update_unix_ms: None,
+                last_auto_updated_from: None,
+                auto_update_note: None,
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 struct RpcCounters {
     requests_sent: AtomicU64,

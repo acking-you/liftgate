@@ -6,6 +6,7 @@ pub mod error;
 pub mod job;
 pub mod mcp_bridge;
 pub mod platform;
+pub mod provider_runtime;
 pub mod routes;
 pub mod session_pool;
 pub mod spill_store;

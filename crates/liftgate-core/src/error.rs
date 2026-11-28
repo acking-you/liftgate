@@ -328,6 +328,9 @@ pub enum CliError {
     )]
     NoHomeDirectory,
 
+    #[error("{message}")]
+    ProviderConfig { message: String },
+
     #[error("filesystem operation failed at `{}`", path.display())]
     StateIo {
         path: PathBuf,
@@ -642,6 +645,9 @@ pub fn recovery_hint_for_error(err: &CliError, bin: &str) -> Option<String> {
         )),
         CliError::UnknownAutoUpdateTarget { .. } => Some(format!(
             "Open `{bin} auto-update` for the interactive manager, or pass `lg`, `agy`, `codex`, `claude`, `opencode`, `omp`, or `--all`."
+        )),
+        CliError::ProviderConfig { .. } => Some(format!(
+            "Run `{bin} provider list` to inspect providers, `{bin} provider add <id> ...` to configure one, or pass `--opt optimized|passthrough`."
         )),
         _ => None,
     }

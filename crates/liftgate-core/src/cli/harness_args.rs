@@ -19,6 +19,14 @@ pub struct ClaudeArgs {
     #[arg(long)]
     pub api_key: Option<String>,
 
+    /// Target upstream provider override for this session (`agy`, `openai`, `anthropic`, `gemini`, `codex-app-server`, `grok-acp`, or `<id>@<opt>`).
+    #[arg(long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
+
     /// Primary model ID override for this session.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
@@ -67,6 +75,8 @@ impl ClaudeArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             fast_model: None,
             no_bypass: false,
@@ -98,6 +108,14 @@ pub struct ClaudeDesktopArgs {
     /// Optional gateway API key.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Target upstream provider override for this Claude Desktop session (`agy`, `openai`, `anthropic`, `gemini`, or `<id>@<opt>`).
+    #[arg(short = 'p', long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
 
     /// Primary model ID selected by default in Claude Desktop.
     #[arg(short = 'm', long)]
@@ -131,6 +149,8 @@ impl ClaudeDesktopArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             restart_app: false,
             restore: false,
@@ -156,6 +176,14 @@ pub struct CodexArgs {
     /// Optional gateway API key.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Target upstream provider override for this session (`agy`, `openai`, `anthropic`, `gemini`, `codex-app-server`, `grok-acp`, or `<id>@<opt>`).
+    #[arg(long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
 
     /// Primary model ID override for this session.
     #[arg(short = 'm', long)]
@@ -213,6 +241,8 @@ impl CodexArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             no_bypass: false,
             code_mode: false,
@@ -246,6 +276,14 @@ pub struct CodexAppArgs {
     /// Optional gateway API key.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Target upstream provider override for this Codex App session (`agy`, `openai`, `anthropic`, `gemini`, or `<id>@<opt>`).
+    #[arg(short = 'p', long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
 
     /// Primary model ID configured as default in Codex App.
     #[arg(short = 'm', long)]
@@ -299,6 +337,8 @@ impl CodexAppArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             no_bypass: false,
             code_mode: false,
@@ -347,6 +387,14 @@ pub struct OpencodeArgs {
     #[arg(long)]
     pub api_key: Option<String>,
 
+    /// Target upstream provider override for this OpenCode session (`agy`, `openai`, `anthropic`, `gemini`, or `<id>@<opt>`).
+    #[arg(short = 'p', long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
+
     /// Primary Antigravity model ID override for this session.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
@@ -391,6 +439,8 @@ impl OpencodeArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             fast_model: None,
             no_bypass: false,
@@ -418,6 +468,14 @@ pub struct OmpArgs {
     /// Optional gateway API key.
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Target upstream provider override for this Oh My Pi session (`agy`, `openai`, `anthropic`, `gemini`, or `<id>@<opt>`).
+    #[arg(short = 'p', long)]
+    pub provider: Option<String>,
+
+    /// Context & tool optimization mode for this session (`optimized` or `passthrough`).
+    #[arg(long)]
+    pub opt: Option<String>,
 
     /// Primary Antigravity model ID override for this session (`modelRoles.default`).
     #[arg(short = 'm', long)]
@@ -459,6 +517,8 @@ impl OmpArgs {
             listen: None,
             remote: None,
             api_key: None,
+            provider: None,
+            opt: None,
             model: None,
             fast_model: None,
             no_bypass: false,

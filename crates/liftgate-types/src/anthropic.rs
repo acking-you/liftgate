@@ -11,8 +11,8 @@ use crate::canonical::{
 };
 use crate::error::ProtocolError;
 use crate::session_key::{
-    MaterializedSystemSlot, materialize_system_prompt_into_messages_with_slot, strip_billing_noise,
-    wrap_developer_instructions_block,
+    MaterializedSystemSlot, materialize_system_prompt_into_messages_with_slot_and_options,
+    strip_billing_noise, wrap_developer_instructions_block_with_options,
 };
 
 pub const ANTHROPIC_THOUGHT_SIGNATURE: &str = "agy-acp-thought-v1";
@@ -70,11 +70,21 @@ impl AnthropicSystemPrompt {
 
     #[must_use]
     pub fn into_cleaned_segments(self) -> Vec<String> {
+        self.into_segments_with_options(true)
+    }
+
+    #[must_use]
+    pub fn into_segments_with_options(self, strip_billing: bool) -> Vec<String> {
         match self {
-            Self::Text(s) => sanitize_system_segment(&s).into_iter().collect(),
+            Self::Text(s) => sanitize_system_segment_with_options(&s, strip_billing)
+                .into_iter()
+                .collect(),
             Self::Blocks(blocks) => blocks
                 .into_iter()
-                .filter_map(|b| b.text.and_then(|t| sanitize_system_segment(&t)))
+                .filter_map(|b| {
+                    b.text
+                        .and_then(|t| sanitize_system_segment_with_options(&t, strip_billing))
+                })
                 .collect(),
         }
     }
@@ -86,6 +96,14 @@ impl AnthropicSystemPrompt {
 }
 
 fn sanitize_system_segment(raw: &str) -> Option<String> {
+    sanitize_system_segment_with_options(raw, true)
+}
+
+fn sanitize_system_segment_with_options(raw: &str, strip_billing: bool) -> Option<String> {
+    if !strip_billing {
+        let trimmed = raw.trim();
+        return (!trimmed.is_empty()).then(|| raw.to_owned());
+    }
     let cleaned = strip_billing_noise(raw);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
@@ -259,9 +277,17 @@ pub struct AnthropicThinkingConfig {
 pub fn normalize_anthropic_request(
     req: AnthropicMessagesRequest,
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
+    normalize_anthropic_request_with_options(req, true)
+}
+
+/// Normalizes an `AnthropicMessagesRequest` with configurable billing-noise stripping.
+pub fn normalize_anthropic_request_with_options(
+    req: AnthropicMessagesRequest,
+    strip_billing: bool,
+) -> Result<NormalizedTurnRequest, ProtocolError> {
     let system_segments = req
         .system
-        .map(AnthropicSystemPrompt::into_cleaned_segments)
+        .map(|s| s.into_segments_with_options(strip_billing))
         .unwrap_or_default();
 
     let json_schema_directive = req
@@ -299,7 +325,9 @@ pub fn normalize_anthropic_request(
         match msg.content {
             AnthropicMessageContent::Text(s) => {
                 if is_system_or_developer {
-                    if let Some(wrapped) = wrap_developer_instructions_block(&s) {
+                    if let Some(wrapped) =
+                        wrap_developer_instructions_block_with_options(&s, strip_billing)
+                    {
                         msg_dev_part_indices.push(parts.len());
                         parts.push(CanonicalPart::Text(wrapped));
                     }
@@ -313,7 +341,12 @@ pub fn normalize_anthropic_request(
                     match block {
                         AnthropicInputBlock::Text { text } => {
                             if is_system_or_developer {
-                                if let Some(wrapped) = wrap_developer_instructions_block(&text) {
+                                if let Some(wrapped) =
+                                    wrap_developer_instructions_block_with_options(
+                                        &text,
+                                        strip_billing,
+                                    )
+                                {
                                     msg_dev_part_indices.push(parts.len());
                                     parts.push(CanonicalPart::Text(wrapped));
                                 }
@@ -336,9 +369,27 @@ pub fn normalize_anthropic_request(
                                 return Err(ProtocolError::UnsupportedImageUrl);
                             }
                         }
-                        AnthropicInputBlock::Thinking { thinking, .. } => {
+                        AnthropicInputBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
                             has_conversational_input = true;
-                            parts.push(CanonicalPart::Reasoning(thinking));
+                            if let Some(sig) = signature
+                                .filter(|s| !s.is_empty() && s != ANTHROPIC_THOUGHT_SIGNATURE)
+                            {
+                                parts.push(CanonicalPart::SignedThinking {
+                                    thinking,
+                                    signature: sig,
+                                });
+                            } else {
+                                parts.push(CanonicalPart::Reasoning(thinking));
+                            }
+                        }
+                        AnthropicInputBlock::RedactedThinking { data } => {
+                            has_conversational_input = true;
+                            if !data.is_empty() {
+                                parts.push(CanonicalPart::RedactedThinking { data });
+                            }
                         }
                         AnthropicInputBlock::ToolUse {
                             id,
@@ -400,8 +451,7 @@ pub fn normalize_anthropic_request(
                             });
                             parts.extend(image_parts);
                         }
-                        AnthropicInputBlock::RedactedThinking { .. }
-                        | AnthropicInputBlock::ServerToolUse { .. }
+                        AnthropicInputBlock::ServerToolUse { .. }
                         | AnthropicInputBlock::WebSearchToolResult { .. }
                         | AnthropicInputBlock::WebFetchToolResult { .. }
                         | AnthropicInputBlock::Unknown => {}
@@ -512,9 +562,10 @@ pub fn normalize_anthropic_request(
     let allow_prompt_distillation = auxiliary_task.is_none() && !is_compaction;
 
     let mut messages = conv_messages;
-    match materialize_system_prompt_into_messages_with_slot(
+    match materialize_system_prompt_into_messages_with_slot_and_options(
         aux_system.as_deref(),
         false,
+        strip_billing,
         &client_tools,
         &mut messages,
     ) {
@@ -799,6 +850,9 @@ pub enum AnthropicOutputBlock {
     Thinking {
         thinking: String,
         signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
     ServerToolUse {
         id: String,

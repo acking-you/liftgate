@@ -133,6 +133,57 @@ fn claude_and_codex_forward_native_flags_without_requiring_double_dash() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
+
+    let cx_provider = parse_strs(&["lg", "cx", "-p", "openai", "exec", "cargo check"]);
+    match cx_provider.command {
+        Some(Commands::Codex(c)) => {
+            assert_eq!(c.provider.as_deref(), Some("openai"));
+            assert_eq!(c.passthrough_args, vec!["exec", "cargo check"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cc_provider_and_prompt = parse_strs(&[
+        "lg",
+        "cc",
+        "-p",
+        "anthropic@passthrough",
+        "-p",
+        "summarize repo",
+    ]);
+    match cc_provider_and_prompt.command {
+        Some(Commands::Claude(c)) => {
+            assert_eq!(c.provider.as_deref(), Some("anthropic@passthrough"));
+            assert_eq!(c.passthrough_args, vec!["-p", "summarize repo"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let oc_provider_opt = parse_strs(&["lg", "oc", "-p", "gemini", "--opt", "passthrough"]);
+    match oc_provider_opt.command {
+        Some(Commands::Opencode(c)) => {
+            assert_eq!(c.provider.as_deref(), Some("gemini"));
+            assert_eq!(c.opt.as_deref(), Some("passthrough"));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let pv_add = parse_strs(&[
+        "lg",
+        "pv",
+        "add",
+        "openai",
+        "--api-key-env",
+        "OPENAI_API_KEY",
+        "--activate",
+    ]);
+    assert!(matches!(
+        pv_add.command,
+        Some(Commands::Provider(ProviderArgs {
+            action: Some(ProviderCommand::Add(_)),
+            ..
+        }))
+    ));
 }
 
 #[test]

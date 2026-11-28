@@ -1042,6 +1042,8 @@ enum TuiCommand {
     CloseSession(String),
     ToggleVisionOffload,
     ToggleMcpToolBridge,
+    ToggleOptimizationMode(String),
+    SwitchActiveProvider(String),
     SwitchDefaultModel(String),
     SetTitleModel(String),
     StartOrRestartDaemon,
@@ -1436,6 +1438,44 @@ pub async fn run_top(state_paths: &StatePaths, args: TopArgs) -> Result<(), CliE
                         Err(err) => Err(TuiActionError::Cli(err)),
                     }
                 }
+                TuiCommand::ToggleOptimizationMode(next_mode) => {
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) => match resolved
+                            .client
+                            .set_optimization_policy(&serde_json::json!({ "mode": next_mode }))
+                            .await
+                        {
+                            Ok(_) => Ok(format!(
+                                "Gateway optimization mode switched to `{next_mode}`"
+                            )),
+                            Err(err) => Err(TuiActionError::Cli(err)),
+                        },
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
+                }
+                TuiCommand::SwitchActiveProvider(next_provider) => {
+                    match resolve_tui_gateway_client(
+                        &worker_paths,
+                        worker_listen,
+                        worker_remote.as_deref(),
+                        worker_key.as_deref(),
+                    ) {
+                        Ok(resolved) => {
+                            match resolved.client.set_active_provider(&next_provider).await {
+                                Ok(_) => Ok(format!(
+                                    "Active default provider switched to `{next_provider}`"
+                                )),
+                                Err(err) => Err(TuiActionError::Cli(err)),
+                            }
+                        }
+                        Err(err) => Err(TuiActionError::Cli(err)),
+                    }
+                }
                 TuiCommand::SwitchDefaultModel(model_id) => {
                     match resolve_tui_gateway_client(
                         &worker_paths,
@@ -1675,6 +1715,45 @@ fn handle_top_key(
         KeyCode::Char('b') => {
             let _ = cmd_tx.try_send(TuiCommand::ToggleMcpToolBridge);
         }
+        KeyCode::Char('O') => {
+            let next_mode = app
+                .data
+                .telemetry
+                .as_ref()
+                .map_or("passthrough", |t| {
+                    if t.optimization_mode
+                        == liftgate_types::provider::OptimizationMode::Passthrough
+                    {
+                        "optimized"
+                    } else {
+                        "passthrough"
+                    }
+                })
+                .to_owned();
+            let _ = cmd_tx.try_send(TuiCommand::ToggleOptimizationMode(next_mode));
+        }
+        KeyCode::Char('p') => {
+            if let Some(snap) = &app.data.telemetry
+                && !snap.providers.is_empty()
+            {
+                let enabled: Vec<&str> = snap
+                    .providers
+                    .iter()
+                    .filter(|p| p.enabled)
+                    .map(|p| p.id.as_str())
+                    .collect();
+                if !enabled.is_empty() {
+                    let cur_pos = enabled
+                        .iter()
+                        .position(|&id| id == snap.active_provider)
+                        .unwrap_or(0);
+                    if let Some(&next_id) = enabled.get((cur_pos + 1) % enabled.len()) {
+                        let _ =
+                            cmd_tx.try_send(TuiCommand::SwitchActiveProvider(next_id.to_owned()));
+                    }
+                }
+            }
+        }
         KeyCode::Char('o') => {
             let _ = cmd_tx.try_send(TuiCommand::OpenBrowser);
         }
@@ -1847,6 +1926,18 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             .telemetry
             .as_ref()
             .is_none_or(|t| t.mcp_tool_bridge_enabled);
+        let active_prov = app
+            .data
+            .telemetry
+            .as_ref()
+            .map_or("agy", |t| t.active_provider.as_str());
+        let opt_mode = app
+            .data
+            .telemetry
+            .as_ref()
+            .map_or(liftgate_types::provider::OptimizationMode::Optimized, |t| {
+                t.optimization_mode
+            });
         spans.extend([
             Span::styled(
                 " ● ONLINE ",
@@ -1865,6 +1956,24 @@ fn draw_top_header(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
             Span::styled(
                 format!("  {mode} · up {up} · agy_pid {agy_pid}"),
                 Style::default().fg(Color::Gray),
+            ),
+            Span::styled("   prov ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                active_prov,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   opt ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                opt_mode.as_str(),
+                Style::default()
+                    .fg(match opt_mode {
+                        liftgate_types::provider::OptimizationMode::Optimized => Color::Green,
+                        liftgate_types::provider::OptimizationMode::Passthrough => Color::Yellow,
+                        liftgate_types::provider::OptimizationMode::Custom => Color::Cyan,
+                    })
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("   model ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1949,6 +2058,15 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 s.metrics.anthropic_requests,
             )
         });
+        let prov_breakdown = snap.filter(|s| !s.usage.by_provider.is_empty()).map(|s| {
+            s.usage
+                .by_provider
+                .iter()
+                .take(3)
+                .map(|p| format!("{} ${:.2} ({}c)", p.provider_id, p.cost_usd, p.calls))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        });
         let card = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
@@ -1973,11 +2091,15 @@ fn draw_kpi_row(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     Style::default().fg(if err > 0 { Color::Red } else { Color::DarkGray }),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled(format!("OAI {oai}"), Style::default().fg(Color::Cyan)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("ANT {ant}"), Style::default().fg(Color::Magenta)),
-            ]),
+            if let Some(pb) = prov_breakdown {
+                Line::from(Span::styled(pb, Style::default().fg(Color::Cyan)))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("OAI {oai}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("ANT {ant}"), Style::default().fg(Color::Magenta)),
+                ])
+            },
         ])
         .block(kpi_block(" Requests "));
         frame.render_widget(card, c0);
@@ -2285,12 +2407,21 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                     )
                 },
             );
+            let prov_badge = if matches!(
+                t.optimization_mode,
+                Some(liftgate_types::provider::OptimizationMode::Passthrough)
+            ) {
+                format!("{}@pass", t.provider_id)
+            } else {
+                t.provider_id.clone()
+            };
             Row::new(vec![
                 Cell::from(phase_txt).style(
                     Style::default()
                         .fg(phase_color)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(prov_badge).style(Style::default().fg(Color::Yellow)),
                 Cell::from(api_txt).style(Style::default().fg(Color::Cyan)),
                 Cell::from(t.resolved_model.clone()),
                 Cell::from(warm_txt).style(Style::default().fg(if t.session_reused {
@@ -2314,8 +2445,9 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         rows,
         [
             Constraint::Length(16),
+            Constraint::Length(12),
             Constraint::Length(5),
-            Constraint::Percentage(28),
+            Constraint::Percentage(24),
             Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Length(16),
@@ -2324,7 +2456,7 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
     )
     .header(
         Row::new(vec![
-            "STATE", "API", "MODEL", "SESSION", "TOOLS", "IN / OUT", "ELAPSED",
+            "STATE", "PROVIDER", "API", "MODEL", "SESSION", "TOOLS", "IN / OUT", "ELAPSED",
         ])
         .style(
             Style::default()
@@ -2415,6 +2547,17 @@ fn draw_turns_tab(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
                 Line::from(vec![
                     Span::styled("Task   : ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&selected.task_id, Style::default().fg(Color::Cyan)),
+                    Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} ({})",
+                            selected.provider_id,
+                            selected
+                                .optimization_mode
+                                .map_or("optimized", |m| m.as_str())
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ),
                     Span::styled("   Session: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(sess_id, Style::default().fg(Color::Green)),
                     Span::styled("   TTFT: ", Style::default().fg(Color::DarkGray)),
@@ -2763,6 +2906,20 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
         ),
         Span::styled("Select  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
+            "p ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Provider  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "O ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("OptMode  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
             "u ",
             Style::default()
                 .fg(Color::Green)
@@ -2852,7 +3009,7 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, app: &TopApp) {
 }
 
 fn draw_help_modal(frame: &mut Frame<'_>) {
-    let area = centered_rect(68, 17, frame.area());
+    let area = centered_rect(68, 19, frame.area());
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from(vec![
@@ -2926,6 +3083,24 @@ fn draw_help_modal(frame: &mut Frame<'_>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle >=300k ephemeral vision sub-session offload"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  p                      ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Cycle active default upstream Provider"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  O (Shift+o)            ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle Optimization Mode (`optimized` vs `passthrough` observe-only)"),
         ]),
         Line::from(vec![
             Span::styled(

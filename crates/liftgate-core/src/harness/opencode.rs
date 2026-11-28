@@ -18,7 +18,7 @@ use crate::config_sync::{
     HarnessSyncParams, merged_opencode_config_into, parse_opencode_env_config_content,
     resolve_fast_model, strip_agy_provider_prefix,
 };
-use crate::daemon::ensure_gateway_ready_for_target;
+use crate::daemon::ensure_gateway_ready_for_provider_target;
 use crate::error::CliError;
 use crate::state::StatePaths;
 use crate::terminal::TerminalLaunchSpec;
@@ -87,12 +87,14 @@ pub(super) async fn build_opencode_invocation(
         .filter(|s| !s.is_empty());
 
     let (target, v2_runtime) = tokio::join!(
-        ensure_gateway_ready_for_target(
+        ensure_gateway_ready_for_provider_target(
             state_paths,
             args.listen,
             args.remote.as_deref(),
             args.api_key.clone(),
             requested_model,
+            args.provider.as_deref(),
+            args.opt.as_deref(),
             true,
         ),
         detect_opencode_v2(&resolved_cmd),
@@ -102,7 +104,11 @@ pub(super) async fn build_opencode_invocation(
     let primary_model = requested_model
         .map(str::to_owned)
         .unwrap_or_else(|| target.default_model.clone());
-    let discovered_models = target.client.fetch_models().await.unwrap_or_default();
+    let discovered_models = target
+        .client
+        .fetch_models_for_route(target.route_spec.as_deref())
+        .await
+        .unwrap_or_default();
     let fast_model = resolve_fast_model(
         args.fast_model.as_deref().map(strip_agy_provider_prefix),
         &primary_model,
@@ -112,7 +118,7 @@ pub(super) async fn build_opencode_invocation(
         .unwrap_or_else(|| PLACEHOLDER_API_KEY.to_owned());
 
     let sync_params = HarnessSyncParams {
-        gateway_base_url: target.client.base_url().to_owned(),
+        gateway_base_url: target.scoped_base_url(),
         api_key: auth_token,
         primary_model: primary_model.clone(),
         fast_model,
