@@ -13,7 +13,8 @@ use crate::canonical::{
 use crate::error::ProtocolError;
 use crate::session_key::{
     INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL,
-    is_compaction_instructions_prompt, strip_billing_noise, wrap_developer_instructions_block,
+    is_compaction_instructions_prompt, strip_billing_noise,
+    wrap_developer_instructions_block_with_options,
 };
 
 /// Incoming `POST /v1/responses` request body.
@@ -194,6 +195,14 @@ pub struct NestedFunctionDef {
 pub fn normalize_responses_request(
     req: &CreateResponseRequest,
 ) -> Result<NormalizedTurnRequest, ProtocolError> {
+    normalize_responses_request_with_options(req, true)
+}
+
+/// Normalizes an OpenAI `CreateResponseRequest` with configurable billing-noise stripping.
+pub fn normalize_responses_request_with_options(
+    req: &CreateResponseRequest,
+    strip_billing: bool,
+) -> Result<NormalizedTurnRequest, ProtocolError> {
     let mut aux_system_parts = Vec::new();
     let mut messages: Vec<CanonicalMessage> = Vec::new();
     let mut developer_slots: Vec<ProtocolDeveloperSlot> = Vec::new();
@@ -204,14 +213,20 @@ pub fn normalize_responses_request(
     let mut dynamic_tools: Vec<Value> = Vec::new();
 
     if let Some(inst) = req.instructions.as_deref() {
-        let cleaned = strip_billing_noise(inst);
+        let cleaned: std::borrow::Cow<'_, str> = if strip_billing {
+            std::borrow::Cow::Owned(strip_billing_noise(inst))
+        } else {
+            std::borrow::Cow::Borrowed(inst)
+        };
         let trimmed = cleaned.trim();
         if !trimmed.is_empty() {
             aux_system_parts.push(trimmed.to_owned());
             if req.previous_response_id.is_none() {
                 if is_compaction_instructions_prompt(trimmed) {
                     deferred_compaction_instructions = Some(trimmed.to_owned());
-                } else if let Some(wrapped) = wrap_developer_instructions_block(trimmed) {
+                } else if let Some(wrapped) =
+                    wrap_developer_instructions_block_with_options(trimmed, strip_billing)
+                {
                     has_base_instructions_slot = true;
                     let msg_index = messages.len();
                     messages.push(CanonicalMessage {
@@ -375,14 +390,22 @@ pub fn normalize_responses_request(
                         let role_str = item.role.as_deref().unwrap_or("user");
                         if matches!(role_str, "system" | "developer") {
                             if let Some(content) = &item.content {
-                                let extracted = strip_billing_noise(&extract_plain_text(content));
+                                let raw_text = extract_plain_text(content);
+                                let extracted = if strip_billing {
+                                    strip_billing_noise(&raw_text)
+                                } else {
+                                    raw_text
+                                };
                                 let trimmed = extracted.trim();
                                 if !trimmed.is_empty() {
                                     if !has_conversational_input {
                                         aux_system_parts.push(trimmed.to_owned());
                                     }
                                     if let Some(wrapped) =
-                                        wrap_developer_instructions_block(trimmed)
+                                        wrap_developer_instructions_block_with_options(
+                                            trimmed,
+                                            strip_billing,
+                                        )
                                     {
                                         let (msg_index, part_index) = push_part(
                                             &mut messages,
@@ -433,7 +456,8 @@ pub fn normalize_responses_request(
     }
 
     if let Some(compaction_inst) = deferred_compaction_instructions
-        && let Some(wrapped) = wrap_developer_instructions_block(&compaction_inst)
+        && let Some(wrapped) =
+            wrap_developer_instructions_block_with_options(&compaction_inst, strip_billing)
     {
         has_conversational_input = true;
         push_part(

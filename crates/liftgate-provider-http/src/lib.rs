@@ -146,11 +146,13 @@ mod tests {
         assert!(events.contains(&NativeStreamEvent::TextDelta("Checking files.".to_owned())));
         assert!(events.iter().any(|e| matches!(e, NativeStreamEvent::ToolCall { name, is_custom: false, .. } if name == "read_file")));
         assert!(events.iter().any(|e| matches!(e, NativeStreamEvent::ToolCall { name, is_custom: true, .. } if name == "exec")));
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, NativeStreamEvent::Usage(u) if u.cached_read_tokens == 768))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            NativeStreamEvent::Usage(u)
+                if u.input_tokens == 232
+                    && u.cached_read_tokens == 768
+                    && u.total_prompt_tokens() == 1000
+        )));
     }
 
     #[tokio::test]
@@ -230,9 +232,10 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             NativeStreamEvent::Usage(u)
-                if u.input_tokens == 1000
+                if u.input_tokens == 50
                     && u.cached_read_tokens == 850
                     && u.cached_write_tokens == 100
+                    && u.total_prompt_tokens() == 1000
                     && u.output_tokens == 12
         )));
     }
@@ -295,5 +298,234 @@ mod tests {
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_request_serializes_custom_tool_call_output_for_custom_tools() {
+        let input = NativeDriverInput {
+            provider_id: "openai".to_owned(),
+            driver: ProviderDriverKind::OpenAiResponses,
+            endpoint: "http://127.0.0.1:9999/v1".to_owned(),
+            api_key: None,
+            proxy: None,
+            force_direct_proxy: true,
+            model: "gpt-5.4".to_owned(),
+            effort: None,
+            max_output_tokens: None,
+            system_blocks: Vec::new(),
+            messages: vec![
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::Text("Run script and read file".to_owned())],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    parts: vec![
+                        CanonicalPart::ToolCall {
+                            call_id: "call_exec_1".to_owned(),
+                            name: "exec".to_owned(),
+                            arguments: "text(1 + 1)".to_owned(),
+                            is_custom: true,
+                        },
+                        CanonicalPart::ToolCall {
+                            call_id: "call_fn_2".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
+                            is_custom: false,
+                        },
+                    ],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![
+                        CanonicalPart::ToolResult {
+                            call_id: "call_exec_1".to_owned(),
+                            output: "2".to_owned(),
+                            is_error: false,
+                        },
+                        CanonicalPart::ToolResult {
+                            call_id: "call_fn_2".to_owned(),
+                            output: "[workspace]".to_owned(),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            tools: vec![
+                NativeWireTool {
+                    name: "exec".to_owned(),
+                    description: Some("Exec".to_owned()),
+                    input_schema: json!({"type":"object"}),
+                    is_custom_freeform: true,
+                    custom_format: None,
+                },
+                NativeWireTool {
+                    name: "read_file".to_owned(),
+                    description: Some("Read".to_owned()),
+                    input_schema: json!({"type":"object"}),
+                    is_custom_freeform: false,
+                    custom_format: None,
+                },
+            ],
+            enable_native_web_search: false,
+            prompt_cache_key: None,
+            align_cache_breakpoints: false,
+            connect_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(10),
+        };
+
+        let (spec, _) = crate::build_driver_http_request(&input).expect("build request");
+        let body: Value =
+            serde_json::from_slice(spec.body.as_deref().expect("body")).expect("json");
+        let arr = body["input"].as_array().expect("input array");
+        let exec_out = arr
+            .iter()
+            .find(|i| i["call_id"] == "call_exec_1" && i["output"].is_string())
+            .expect("custom output item");
+        assert_eq!(exec_out["type"], "custom_tool_call_output");
+        let fn_out = arr
+            .iter()
+            .find(|i| i["call_id"] == "call_fn_2" && i["output"].is_string())
+            .expect("function output item");
+        assert_eq!(fn_out["type"], "function_call_output");
+    }
+
+    #[tokio::test]
+    async fn premature_sse_eof_without_terminal_event_fails_and_drops_partial_tool_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_full_http_request(&mut sock).await;
+            let truncated_sse = concat!(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"call_id\":\"call_trunc\",\"type\":\"function_call\",\"name\":\"rm_something\"}}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"cmd\\\":\\\"partial\"}\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{truncated_sse}"
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let input = NativeDriverInput {
+            provider_id: "openai".to_owned(),
+            driver: ProviderDriverKind::OpenAiResponses,
+            endpoint: format!("http://{addr}/v1"),
+            api_key: None,
+            proxy: None,
+            force_direct_proxy: true,
+            model: "gpt-5.4".to_owned(),
+            effort: None,
+            max_output_tokens: None,
+            system_blocks: Vec::new(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("Hi".to_owned())],
+            }],
+            tools: Vec::new(),
+            enable_native_web_search: false,
+            prompt_cache_key: None,
+            align_cache_breakpoints: false,
+            connect_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(5),
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let res = execute_driver_sse_step(&DefaultHttpTransport, &input, &tx).await;
+        drop(tx);
+        assert!(matches!(res, Err(PlatformApiError::Protocol { .. })));
+        while let Some(ev) = rx.recv().await {
+            assert!(
+                !matches!(
+                    ev,
+                    Ok(NativeStreamEvent::ToolCall { .. } | NativeStreamEvent::Completed { .. })
+                ),
+                "must never emit unfinished tool call or synthetic Completed on premature EOF"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_header_is_rejected_without_allocation_and_stalled_body_times_out() {
+        // 1. Oversized chunk header (`ffffffff` = 4 GiB) must fail cleanly with Protocol error
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_full_http_request(&mut sock).await;
+            let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\nffffffff\r\n";
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let mut input = NativeDriverInput {
+            provider_id: "openai".to_owned(),
+            driver: ProviderDriverKind::OpenAiResponses,
+            endpoint: format!("http://{addr}/v1"),
+            api_key: None,
+            proxy: None,
+            force_direct_proxy: true,
+            model: "gpt-5.4".to_owned(),
+            effort: None,
+            max_output_tokens: None,
+            system_blocks: Vec::new(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("Hi".to_owned())],
+            }],
+            tools: Vec::new(),
+            enable_native_web_search: false,
+            prompt_cache_key: None,
+            align_cache_breakpoints: false,
+            connect_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_millis(180),
+        };
+
+        let (tx, _rx) = mpsc::channel(16);
+        let res = execute_driver_sse_step(&DefaultHttpTransport, &input, &tx).await;
+        assert!(matches!(res, Err(PlatformApiError::Protocol { .. })));
+
+        // 2. Stalled SSE body after 200 OK headers must enforce total_timeout
+        let stall_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let stall_addr = stall_listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = stall_listener.accept().await.expect("accept");
+            let _ = read_full_http_request(&mut sock).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        input.endpoint = format!("http://{stall_addr}/v1");
+        let (tx2, _rx2) = mpsc::channel(16);
+        let stall_res = execute_driver_sse_step(&DefaultHttpTransport, &input, &tx2).await;
+        assert!(
+            matches!(stall_res, Err(PlatformApiError::Timeout { .. })),
+            "expected Timeout on stalled stream body, got {stall_res:?}"
+        );
+
+        // 3. Proxy `HTTP/1.1 200 Connection established` ahead of upstream 429 must surface 429
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_addr = proxy_listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = proxy_listener.accept().await.expect("accept");
+            let _ = read_full_http_request(&mut sock).await;
+            let raw = concat!(
+                "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n",
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"message\":\"Quota hit\"}}"
+            );
+            sock.write_all(raw.as_bytes()).await.unwrap();
+        });
+        input.endpoint = format!("http://{proxy_addr}/v1");
+        input.total_timeout = Duration::from_secs(3);
+        let (tx3, _rx3) = mpsc::channel(16);
+        let proxy_res = execute_driver_sse_step(&DefaultHttpTransport, &input, &tx3).await;
+        assert!(
+            matches!(
+                proxy_res,
+                Err(PlatformApiError::RateLimited { status: 429, .. })
+            ),
+            "expected upstream 429 past CONNECT headers, got {proxy_res:?}"
+        );
     }
 }

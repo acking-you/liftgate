@@ -20,6 +20,24 @@ pub enum StatefulDialect {
     GrokAcp,
 }
 
+/// Client tool declaration bridged into a stateful stdio session (`dynamicTools` or ACP tool catalog).
+#[derive(Clone, Debug)]
+pub struct StatefulClientToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub is_custom_freeform: bool,
+}
+
+/// Disposition chosen by the gateway when a stateful peer invokes a bridged tool in-band.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DynamicToolDisposition {
+    /// Reply immediately on the open JSON-RPC request (`0-RTT` search / preflight / web_fetch) and keep the turn running.
+    LocalReply { text: String, is_error: bool },
+    /// Emit [`StatefulStreamEvent::ToolCall`] to the downstream client and conclude this HTTP turn with `stop_reason = "tool_use"`.
+    SuspendToClient,
+}
+
 /// Normalized turn request passed into a stateful stdio dialect adapter.
 #[derive(Clone, Debug)]
 pub struct StatefulTurnInput {
@@ -30,6 +48,7 @@ pub struct StatefulTurnInput {
     pub prompt_text: String,
     pub cwd: PathBuf,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub dynamic_tools: Vec<StatefulClientToolSpec>,
 }
 
 /// Streaming event emitted by a stateful stdio session turn.
@@ -37,8 +56,16 @@ pub struct StatefulTurnInput {
 pub enum StatefulStreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments_json: String,
+        is_custom: bool,
+    },
     Usage(AcpUsage),
-    Completed { stop_reason: String },
+    Completed {
+        stop_reason: String,
+    },
 }
 
 impl StatefulDialect {
@@ -57,8 +84,24 @@ pub async fn run_turn_on_spawned_peer(
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
 ) -> Result<(), StatefulRpcError> {
+    run_turn_on_spawned_peer_with_handler(spawn_cfg, input, events_tx, |_, _| {
+        DynamicToolDisposition::SuspendToClient
+    })
+    .await
+}
+
+/// Executes a single turn over a spawned stateful stdio peer with a custom in-band tool handler.
+pub async fn run_turn_on_spawned_peer_with_handler<F>(
+    spawn_cfg: &StdioSpawnConfig,
+    input: &StatefulTurnInput,
+    events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
+    mut on_tool_call: F,
+) -> Result<(), StatefulRpcError>
+where
+    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+{
     let peer = StdioRpcPeer::spawn(spawn_cfg)?;
-    run_turn_on_peer(&peer, input, events_tx).await
+    run_turn_on_peer_with_handler(&peer, input, events_tx, &mut on_tool_call).await
 }
 
 /// Executes a single turn over an already-connected [`StdioRpcPeer`] (enabling deterministic duplex unit tests).
@@ -67,17 +110,79 @@ pub async fn run_turn_on_peer(
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
 ) -> Result<(), StatefulRpcError> {
-    match input.dialect {
-        StatefulDialect::CodexAppServer => run_codex_app_server_turn(peer, input, events_tx).await,
-        StatefulDialect::GrokAcp => run_standard_acp_turn(peer, input, events_tx).await,
-    }
+    run_turn_on_peer_with_handler(peer, input, events_tx, |_, _| {
+        DynamicToolDisposition::SuspendToClient
+    })
+    .await
 }
 
-async fn run_codex_app_server_turn(
+/// Executes a single turn over an already-connected [`StdioRpcPeer`] with an in-band tool-call handler.
+pub async fn run_turn_on_peer_with_handler<F>(
     peer: &StdioRpcPeer,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
-) -> Result<(), StatefulRpcError> {
+    mut on_tool_call: F,
+) -> Result<(), StatefulRpcError>
+where
+    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+{
+    match input.dialect {
+        StatefulDialect::CodexAppServer => {
+            run_codex_app_server_turn(peer, input, events_tx, &mut on_tool_call).await
+        }
+        StatefulDialect::GrokAcp => {
+            run_standard_acp_turn(peer, input, events_tx, &mut on_tool_call).await
+        }
+    }
+}
+
+fn build_codex_mcp_servers_config(mcp_servers: &[McpServerConfig]) -> Option<Value> {
+    if mcp_servers.is_empty() {
+        return None;
+    }
+    let mut servers = serde_json::Map::new();
+    for srv in mcp_servers {
+        if let Some(ref url) = srv.url {
+            servers.insert(srv.name.clone(), json!({ "url": url }));
+        } else if let Some(ref command) = srv.command {
+            servers.insert(
+                srv.name.clone(),
+                json!({
+                    "command": command,
+                    "args": srv.args,
+                }),
+            );
+        }
+    }
+    (!servers.is_empty()).then(|| json!({ "mcp_servers": servers }))
+}
+
+fn serialize_tool_arguments(args_val: &Value, is_custom: bool) -> String {
+    if let Some(s) = args_val.as_str() {
+        return s.to_owned();
+    }
+    if is_custom
+        && let Some(obj) = args_val.as_object()
+        && let Some(raw) = obj
+            .get("input")
+            .or_else(|| obj.get("code"))
+            .or_else(|| obj.get("patch"))
+            .and_then(Value::as_str)
+    {
+        return raw.to_owned();
+    }
+    args_val.to_string()
+}
+
+async fn run_codex_app_server_turn<F>(
+    peer: &StdioRpcPeer,
+    input: &StatefulTurnInput,
+    events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
+    on_tool_call: &mut F,
+) -> Result<(), StatefulRpcError>
+where
+    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+{
     let _: Value = peer
         .request(
             "initialize",
@@ -86,11 +191,21 @@ async fn run_codex_app_server_turn(
                     "name": "liftgate",
                     "title": "Liftgate Multi-Provider Gateway",
                     "version": env!("CARGO_PKG_VERSION"),
-                }
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
             }),
         )
         .await?;
     peer.notify("initialized", &json!({})).await?;
+
+    let custom_names: std::collections::HashSet<&str> = input
+        .dynamic_tools
+        .iter()
+        .filter(|t| t.is_custom_freeform)
+        .map(|t| t.name.as_str())
+        .collect();
 
     let mut thread_params = json!({
         "model": input.model,
@@ -98,17 +213,36 @@ async fn run_codex_app_server_turn(
         "approvalPolicy": "never",
         "ephemeral": true,
     });
-    if let Some(sys) = input
-        .system_instructions
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && let Some(obj) = thread_params.as_object_mut()
-    {
-        obj.insert(
-            "developerInstructions".to_owned(),
-            Value::String(sys.to_owned()),
-        );
+    if let Some(obj) = thread_params.as_object_mut() {
+        if let Some(sys) = input
+            .system_instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert(
+                "developerInstructions".to_owned(),
+                Value::String(sys.to_owned()),
+            );
+        }
+        if let Some(cfg_val) = build_codex_mcp_servers_config(&input.mcp_servers) {
+            obj.insert("config".to_owned(), cfg_val);
+        }
+        if !input.dynamic_tools.is_empty() {
+            let specs: Vec<Value> = input
+                .dynamic_tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
+                .collect();
+            obj.insert("dynamicTools".to_owned(), Value::Array(specs));
+        }
     }
 
     let thread_res: Value = peer.request("thread/start", &thread_params).await?;
@@ -140,6 +274,65 @@ async fn run_codex_app_server_turn(
 
     while let Some(msg) = peer.next_inbound().await {
         if let Some(req_id) = msg.id {
+            if msg.method == "item/tool/call" {
+                let call_id = msg
+                    .params
+                    .get("callId")
+                    .or_else(|| msg.params.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_codex_dyn")
+                    .to_owned();
+                let tool_name = msg
+                    .params
+                    .get("tool")
+                    .or_else(|| msg.params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let args_val = msg
+                    .params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                match on_tool_call(&tool_name, &args_val) {
+                    DynamicToolDisposition::LocalReply { text, is_error } => {
+                        let _ = peer
+                            .respond(
+                                req_id,
+                                &json!({
+                                    "contentItems": [{
+                                        "type": "inputText",
+                                        "text": text,
+                                    }],
+                                    "success": !is_error,
+                                }),
+                            )
+                            .await;
+                        continue;
+                    }
+                    DynamicToolDisposition::SuspendToClient => {
+                        let is_custom = custom_names.contains(tool_name.as_str());
+                        let args_json = serialize_tool_arguments(&args_val, is_custom);
+                        let _ = events_tx
+                            .send(Ok(StatefulStreamEvent::ToolCall {
+                                id: call_id,
+                                name: tool_name,
+                                arguments_json: args_json,
+                                is_custom,
+                            }))
+                            .await;
+                        let _ = events_tx
+                            .send(Ok(StatefulStreamEvent::Completed {
+                                stop_reason: "tool_use".to_owned(),
+                            }))
+                            .await;
+                        let _ = peer
+                            .notify("turn/interrupt", &json!({ "threadId": thread_id }))
+                            .await;
+                        return Ok(());
+                    }
+                }
+            }
             let _ = peer.respond(req_id, &json!({ "decision": "accept" })).await;
             continue;
         }
@@ -169,7 +362,7 @@ async fn run_codex_app_server_turn(
                     .and_then(|u| u.get("last"))
                     .or_else(|| msg.params.get("usage"))
                 {
-                    let input_tokens = usage_obj
+                    let raw_input_tokens = usage_obj
                         .get("inputTokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
@@ -185,10 +378,11 @@ async fn run_codex_app_server_turn(
                         .get("cachedInputTokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
+                    let uncached_input_tokens = raw_input_tokens.saturating_sub(cached_read_tokens);
                     let _ = events_tx
                         .send(Ok(StatefulStreamEvent::Usage(AcpUsage {
-                            total_tokens: input_tokens.saturating_add(output_tokens),
-                            input_tokens,
+                            total_tokens: raw_input_tokens.saturating_add(output_tokens),
+                            input_tokens: uncached_input_tokens,
                             output_tokens,
                             thought_tokens,
                             cached_read_tokens,
@@ -241,11 +435,15 @@ async fn run_codex_app_server_turn(
     Err(StatefulRpcError::ChannelClosed)
 }
 
-async fn run_standard_acp_turn(
+async fn run_standard_acp_turn<F>(
     peer: &StdioRpcPeer,
     input: &StatefulTurnInput,
     events_tx: &mpsc::Sender<Result<StatefulStreamEvent, StatefulRpcError>>,
-) -> Result<(), StatefulRpcError> {
+    on_tool_call: &mut F,
+) -> Result<(), StatefulRpcError>
+where
+    F: FnMut(&str, &Value) -> DynamicToolDisposition + Send,
+{
     let _: Value = peer
         .request(
             "initialize",
@@ -263,15 +461,35 @@ async fn run_standard_acp_turn(
         )
         .await?;
 
-    let new_res: Value = peer
-        .request(
-            "session/new",
-            &json!({
-                "cwd": input.cwd.to_string_lossy(),
-                "mcpServers": input.mcp_servers,
-            }),
-        )
-        .await?;
+    let custom_names: std::collections::HashSet<&str> = input
+        .dynamic_tools
+        .iter()
+        .filter(|t| t.is_custom_freeform)
+        .map(|t| t.name.as_str())
+        .collect();
+
+    let mut session_new_params = json!({
+        "cwd": input.cwd.to_string_lossy(),
+        "mcpServers": input.mcp_servers,
+    });
+    if !input.dynamic_tools.is_empty()
+        && input.mcp_servers.is_empty()
+        && let Some(obj) = session_new_params.as_object_mut()
+    {
+        let tools_arr: Vec<Value> = input
+            .dynamic_tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
+            })
+            .collect();
+        obj.insert("tools".to_owned(), Value::Array(tools_arr));
+    }
+    let new_res: Value = peer.request("session/new", &session_new_params).await?;
     let session_id = new_res
         .get("sessionId")
         .and_then(Value::as_str)
@@ -328,6 +546,69 @@ async fn run_standard_acp_turn(
                     return Ok(());
                 };
                 if let Some(req_id) = msg.id {
+                    if matches!(
+                        msg.method.as_str(),
+                        "tool/call" | "session/tool_call" | "item/tool/call"
+                    ) {
+                        let call_id = msg
+                            .params
+                            .get("callId")
+                            .or_else(|| msg.params.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("call_acp_dyn")
+                            .to_owned();
+                        let tool_name = msg
+                            .params
+                            .get("tool")
+                            .or_else(|| msg.params.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let args_val = msg
+                            .params
+                            .get("arguments")
+                            .or_else(|| msg.params.get("input"))
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        match on_tool_call(&tool_name, &args_val) {
+                            DynamicToolDisposition::LocalReply { text, is_error } => {
+                                let _ = peer
+                                    .respond(
+                                        req_id,
+                                        &json!({
+                                            "content": [{ "type": "text", "text": text }],
+                                            "isError": is_error,
+                                        }),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                            DynamicToolDisposition::SuspendToClient => {
+                                let is_custom = custom_names.contains(tool_name.as_str());
+                                let args_json = serialize_tool_arguments(&args_val, is_custom);
+                                let _ = events_tx
+                                    .send(Ok(StatefulStreamEvent::ToolCall {
+                                        id: call_id,
+                                        name: tool_name,
+                                        arguments_json: args_json,
+                                        is_custom,
+                                    }))
+                                    .await;
+                                let _ = events_tx
+                                    .send(Ok(StatefulStreamEvent::Completed {
+                                        stop_reason: "tool_use".to_owned(),
+                                    }))
+                                    .await;
+                                let _ = peer
+                                    .notify(
+                                        "session/cancel",
+                                        &json!({ "sessionId": session_id }),
+                                    )
+                                    .await;
+                                return Ok(());
+                            }
+                        }
+                    }
                     let _ = peer
                         .respond(
                             req_id,

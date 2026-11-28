@@ -166,6 +166,7 @@ pub struct McpRoutingTable {
     has_virtualized_dispatch: bool,
     has_gateway_web_fetch: bool,
     has_context_spill_reader: bool,
+    code_mode_enhancements: bool,
     target_mode: VirtualizationTargetMode,
     rebuild_fn: RebuildRoutingFn,
 }
@@ -183,6 +184,7 @@ impl Default for McpRoutingTable {
             has_virtualized_dispatch: false,
             has_gateway_web_fetch: false,
             has_context_spill_reader: false,
+            code_mode_enhancements: true,
             target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
             rebuild_fn: build_routing_table_for_profile::<crate::profiles::GenericToolProfile>,
         }
@@ -533,9 +535,15 @@ impl McpRoutingTable {
             has_virtualized_dispatch,
             has_gateway_web_fetch,
             has_context_spill_reader,
+            code_mode_enhancements: true,
             target_mode,
             rebuild_fn: build_routing_table_for_profile::<P>,
         }
+    }
+
+    /// Controls whether Code Mode JS auto-healing and `btoa`/`atob` polyfill injection run on tool calls.
+    pub fn set_code_mode_enhancements(&mut self, enabled: bool) {
+        self.code_mode_enhancements = enabled;
     }
 
     /// Active [`HarnessToolProfile::ID`] (`"codex"`, `"claude-code"`, `"generic"`, etc.).
@@ -563,7 +571,7 @@ impl McpRoutingTable {
         if self.source_tools == client_tools {
             return None;
         }
-        Some((self.rebuild_fn)(
+        let mut rebuilt = (self.rebuild_fn)(
             client_tools,
             self.direct_by_mcp.clone(),
             self.hub_names_by_namespace.clone(),
@@ -572,7 +580,9 @@ impl McpRoutingTable {
             self.has_context_spill_reader,
             self.target_mode,
             self.budget,
-        ))
+        );
+        rebuilt.code_mode_enhancements = self.code_mode_enhancements;
+        Some(rebuilt)
     }
 
     /// Estimates heap bytes retained by all indexed tools in this routing table.
@@ -859,6 +869,7 @@ impl McpRoutingTable {
                     arguments,
                     live_bridged.unwrap_custom_key,
                     live_bridged.v4a_patch,
+                    self.code_mode_enhancements,
                 );
             }
             let (serialized, patch_repaired) = match format_direct_tool_arguments(
@@ -866,6 +877,7 @@ impl McpRoutingTable {
                 &live_bridged,
                 active_spec,
                 self.budget.max_single_schema_in_search_bytes,
+                self.code_mode_enhancements,
             ) {
                 Ok(formatted) => formatted,
                 Err(preflight_msg) => return preflight_error_decision(preflight_msg),
@@ -898,6 +910,7 @@ impl McpRoutingTable {
                 None,
                 true,
                 self.budget.max_single_schema_in_search_bytes,
+                self.code_mode_enhancements,
             );
         }
 
@@ -973,6 +986,7 @@ impl McpRoutingTable {
             outer_summary,
             true,
             self.budget.max_single_schema_in_search_bytes,
+            self.code_mode_enhancements,
         )
     }
 
@@ -1048,6 +1062,7 @@ impl McpRoutingTable {
             outer_summary,
             true,
             self.budget.max_single_schema_in_search_bytes,
+            self.code_mode_enhancements,
         )
     }
 
@@ -1271,6 +1286,7 @@ fn resolve_custom_tool_call(
     raw_args: &Value,
     unwrap_custom_key: Option<&'static str>,
     v4a_patch: Option<V4aPatchContract>,
+    code_mode_enhancements: bool,
 ) -> VirtualizedCallDecision {
     let extracted = extract_custom_tool_input(raw_args, unwrap_custom_key);
     if matches!(v4a_patch, Some(V4aPatchContract::CustomFreeform)) {
@@ -1285,7 +1301,7 @@ fn resolve_custom_tool_call(
             is_custom: true,
         };
     }
-    if unwrap_custom_key == Some("code") {
+    if code_mode_enhancements && unwrap_custom_key == Some("code") {
         let normalized = normalize_code_mode_exec_js(&extracted);
         let repaired = normalized.as_ref() != extracted && extracted.contains("*** Begin Patch");
         return VirtualizedCallDecision::ForwardToClient {
@@ -1447,6 +1463,7 @@ fn format_direct_tool_arguments(
     bridged: &McpBridgedTool,
     active_spec: &CanonicalToolSpec,
     max_schema_bytes: usize,
+    code_mode_enhancements: bool,
 ) -> Result<(String, bool), String> {
     if bridged.is_custom {
         return Ok((
@@ -1467,8 +1484,9 @@ fn format_direct_tool_arguments(
         if let Some(ref params_json) = bridged.parameters_json {
             let _ = coerce_stringified_container_fields(map, params_json);
         }
-        if (liftgate_types::session_key::is_codex_exec_orchestrator_tool(active_spec)
-            || liftgate_types::session_key::is_opencode_execute_orchestrator_tool(active_spec))
+        if code_mode_enhancements
+            && (liftgate_types::session_key::is_codex_exec_orchestrator_tool(active_spec)
+                || liftgate_types::session_key::is_opencode_execute_orchestrator_tool(active_spec))
             && let Some(Value::String(raw_code)) = map.get_mut("code")
         {
             let normalized = normalize_code_mode_exec_js(raw_code);
@@ -1560,6 +1578,7 @@ fn finalize_indexed_tool_call(
     outer_summary_fallback: Option<&str>,
     enforce_required_preflight: bool,
     max_schema_bytes: usize,
+    code_mode_enhancements: bool,
 ) -> VirtualizedCallDecision {
     if indexed.is_custom {
         return resolve_custom_tool_call(
@@ -1567,6 +1586,7 @@ fn finalize_indexed_tool_call(
             inner_args,
             indexed.unwrap_custom_key,
             indexed.v4a_patch,
+            code_mode_enhancements,
         );
     }
 

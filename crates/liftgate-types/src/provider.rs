@@ -1002,10 +1002,15 @@ impl ProviderProfileConfig {
                 out.push(builtin);
             }
         }
-        if !out
+        if let Some(pos) = out
             .iter()
-            .any(|m| m.id.eq_ignore_ascii_case(self.default_model.as_str()))
+            .position(|m| m.id.eq_ignore_ascii_case(self.default_model.as_str()))
         {
+            if pos > 0 {
+                let default_entry = out.remove(pos);
+                out.insert(0, default_entry);
+            }
+        } else {
             let (win, compact) =
                 context_limits_for_driver(self.default_model.as_str(), self.driver);
             out.insert(
@@ -1302,5 +1307,26 @@ mod tests {
         let (id2, opt2) = parse_route_provider_spec("anthropic").unwrap();
         assert_eq!(id2, ProviderId::anthropic());
         assert!(opt2.is_none());
+    }
+
+    #[test]
+    fn effective_models_places_configured_default_model_first() {
+        let anth = ProviderProfileConfig::builtin(
+            ProviderId::anthropic(),
+            ProviderDriverKind::AnthropicMessages,
+        );
+        assert_eq!(anth.default_model.as_str(), "claude-sonnet-4-6");
+        let anth_models = anth.effective_models();
+        assert_eq!(anth_models[0].id, "claude-sonnet-4-6");
+        assert!(anth_models.iter().any(|m| m.id == "claude-opus-4-6"));
+
+        let mut oai = ProviderProfileConfig::builtin(
+            ProviderId::openai(),
+            ProviderDriverKind::OpenAiResponses,
+        );
+        oai.default_model = ModelId::try_new("gpt-5-mini").unwrap();
+        let oai_models = oai.effective_models();
+        assert_eq!(oai_models[0].id, "gpt-5-mini");
+        assert!(oai_models.iter().any(|m| m.id == "gpt-5.4"));
     }
 }

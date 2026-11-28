@@ -19,7 +19,8 @@ use liftgate_types::{
     anthropic::{
         ANTHROPIC_THOUGHT_SIGNATURE, AnthropicCountTokensResponse, AnthropicMessagesRequest,
         AnthropicMessagesResponse, AnthropicOutputBlock, AnthropicServerToolUsage, AnthropicUsage,
-        AnthropicWebSearchResultItem, estimate_anthropic_tokens, normalize_anthropic_request,
+        AnthropicWebSearchResultItem, estimate_anthropic_tokens,
+        normalize_anthropic_request_with_options,
     },
     canonical::{extract_markdown_links, extract_search_query_hint},
     config::{
@@ -30,7 +31,7 @@ use liftgate_types::{
         ModelModalities, OutputMessageContentPart, ReasoningSummaryPart, ResponseInlineError,
         ResponseObject, ResponseOutputItem, ResponseTextFormatConfig, ResponsesUsage,
         WebSearchAction, WebSearchSource, build_codex_model_catalog_with_tool_mode,
-        normalize_responses_request, split_namespaced_tool_name,
+        normalize_responses_request_with_options, split_namespaced_tool_name,
     },
     pricing::{MAX_PRICING_KEY_BYTES, ModelPrice},
     session_key::{INTERNAL_CODEX_LOCAL_SHELL_TOOL, INTERNAL_CODEX_TOOL_SEARCH_TOOL},
@@ -806,7 +807,10 @@ async fn handle_create_response<B: AcpBackend>(
         Err(err) => return err.into_openai_response(),
     };
 
-    let normalized = match normalize_responses_request(&req) {
+    let normalized = match normalize_responses_request_with_options(
+        &req,
+        resolved_provider.optimization.strip_billing_noise,
+    ) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_openai_response(),
     };
@@ -2790,7 +2794,10 @@ async fn handle_anthropic_messages<B: AcpBackend>(
     };
     let requested_model_echo = req.model.clone();
 
-    let normalized = match normalize_anthropic_request(req) {
+    let normalized = match normalize_anthropic_request_with_options(
+        req,
+        resolved_provider.optimization.strip_billing_noise,
+    ) {
         Ok(n) => n,
         Err(err) => return GatewayError::from(err).into_anthropic_response(),
     };

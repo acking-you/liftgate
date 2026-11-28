@@ -43,6 +43,12 @@ pub struct VirtualizerPlanConfig {
     pub session: McpSessionOptions,
     pub target_mode: VirtualizationTargetMode,
     pub budget_override: Option<VirtualizerBudget>,
+    /// When `true` (e.g. `passthrough` or `tool_virtualization = false`), skip hub/dispatch virtualization
+    /// and preserve raw tool descriptions verbatim up to the transport slot ceiling.
+    pub disable_virtualization: bool,
+    /// When `true` (e.g. `passthrough` or `code_mode_enhancements = false`), skip Code Mode orchestrator
+    /// schema synthesis, subordinate folding, and V8 JS normalization.
+    pub disable_code_mode_enhancements: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +253,8 @@ pub fn partition_tools_for_mcp_session_with_options<S: TruncationSpillSink>(
             session: options,
             target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
             budget_override: None,
+            disable_virtualization: false,
+            disable_code_mode_enhancements: false,
         },
         spill,
     )
@@ -273,6 +281,8 @@ pub fn partition_tools_for_native_api<S: TruncationSpillSink>(
             budget_override: Some(
                 budget_override.unwrap_or(VirtualizerBudget::NATIVE_PLATFORM_API),
             ),
+            disable_virtualization: false,
+            disable_code_mode_enhancements: false,
         },
         spill,
     )
@@ -376,6 +386,8 @@ pub fn plan_virtualization_with_session_options<P: HarnessToolProfile, S: Trunca
             session: options,
             target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
             budget_override: None,
+            disable_virtualization: false,
+            disable_code_mode_enhancements: false,
         },
         spill,
     )
@@ -430,13 +442,19 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
 
     for (orig_idx, spec) in client_tools.iter().enumerate() {
         let placement = profile.classify_tool(spec, &prepass);
-        let v4a_patch = profile.v4a_patch_contract(spec);
+        let v4a_patch = if config.disable_virtualization && config.disable_code_mode_enhancements {
+            None
+        } else {
+            profile.v4a_patch_contract(spec)
+        };
         let (schema_val, is_custom, unwrap_custom_key, parameters_json) = match &spec.kind {
             CanonicalToolKind::Custom { .. } => {
                 let (unwrap_key, schema_val) = match &placement {
                     ToolPlacement::Orchestrator {
                         custom_unwrap_key: Some(key),
-                    } => (*key, code_mode_exec_input_schema()),
+                    } if !config.disable_code_mode_enhancements => {
+                        (*key, code_mode_exec_input_schema())
+                    }
                     ToolPlacement::Orchestrator { .. }
                     | ToolPlacement::CoreDirect { .. }
                     | ToolPlacement::Namespaced { .. }
@@ -453,7 +471,10 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
         };
 
         let (cand_kind, is_orchestrator) = match placement {
-            ToolPlacement::Orchestrator { .. } => (CandidateKind::Orchestrator, true),
+            ToolPlacement::Orchestrator { .. } if !config.disable_code_mode_enhancements => {
+                (CandidateKind::Orchestrator, true)
+            }
+            ToolPlacement::Orchestrator { .. } => (CandidateKind::CoreDirect { rank: 0 }, false),
             ToolPlacement::CoreDirect { rank } => (CandidateKind::CoreDirect { rank }, false),
             ToolPlacement::Namespaced { namespace, action } => (
                 CandidateKind::Namespaced {
@@ -465,28 +486,35 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
             ToolPlacement::Standalone { backfill_rank } => {
                 (CandidateKind::Standalone { backfill_rank }, false)
             }
+            ToolPlacement::FoldedIntoOrchestrator if config.disable_code_mode_enhancements => {
+                (CandidateKind::Standalone { backfill_rank: 50 }, false)
+            }
             ToolPlacement::FoldedIntoOrchestrator => (CandidateKind::FoldedIntoOrchestrator, false),
         };
 
-        let max_desc = if is_orchestrator {
-            budget.max_orchestrator_desc_bytes
+        let description = if config.disable_virtualization {
+            spec.description.clone()
         } else {
-            budget.max_standard_desc_bytes
-        };
-        let dehydrated_spec = if is_orchestrator {
-            None
-        } else {
-            spec.description.as_deref().and_then(|raw| {
-                let (prose, ts) = profile.dehydrate_description(raw, false);
-                ts.is_some().then(|| CanonicalToolSpec {
-                    name: spec.name.clone(),
-                    description: Some(prose.to_owned()),
-                    kind: spec.kind.clone(),
+            let max_desc = if is_orchestrator {
+                budget.max_orchestrator_desc_bytes
+            } else {
+                budget.max_standard_desc_bytes
+            };
+            let dehydrated_spec = if is_orchestrator {
+                None
+            } else {
+                spec.description.as_deref().and_then(|raw| {
+                    let (prose, ts) = profile.dehydrate_description(raw, false);
+                    ts.is_some().then(|| CanonicalToolSpec {
+                        name: spec.name.clone(),
+                        description: Some(prose.to_owned()),
+                        kind: spec.kind.clone(),
+                    })
                 })
-            })
+            };
+            let effective_spec = dehydrated_spec.as_ref().unwrap_or(spec);
+            compact_mcp_tool_description(effective_spec, max_desc, spill)
         };
-        let effective_spec = dehydrated_spec.as_ref().unwrap_or(spec);
-        let description = compact_mcp_tool_description(effective_spec, max_desc, spill);
         let schema_meta = extract_schema_metadata(parameters_json.as_deref());
         let est_wire_bytes =
             estimate_wire_tool_bytes(&spec.name, description.as_deref(), &schema_val);
@@ -564,8 +592,9 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
     let passthrough_max_tools = budget
         .direct_passthrough_max_tools
         .min(budget.max_eager_tools.saturating_sub(reserved_slots));
-    let should_virtualize = wire_eligible_count > passthrough_max_tools
-        || non_orch_wire_bytes > budget.direct_passthrough_max_non_orchestrator_bytes;
+    let should_virtualize = !config.disable_virtualization
+        && (wire_eligible_count > passthrough_max_tools
+            || non_orch_wire_bytes > budget.direct_passthrough_max_non_orchestrator_bytes);
 
     let mut used_mcp_names: HashSet<String> =
         HashSet::with_capacity(budget.max_eager_tools.saturating_add(4));
@@ -594,7 +623,19 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
         .then(build_read_context_spill_wire_tool);
 
     if !should_virtualize {
+        let direct_cap = if config.disable_virtualization
+            && matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp)
+        {
+            let aux_slots = usize::from(options.enable_gateway_web_fetch)
+                .saturating_add(usize::from(options.enable_context_spill_reader));
+            budget.max_eager_tools.saturating_sub(aux_slots)
+        } else {
+            usize::MAX
+        };
         for c in eligible {
+            if wire_tools.len() >= direct_cap {
+                break;
+            }
             if matches!(c.kind, CandidateKind::FoldedIntoOrchestrator) {
                 continue;
             }
@@ -602,7 +643,8 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
                 continue;
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
-            if orchestrator.is_none()
+            if !config.disable_code_mode_enhancements
+                && orchestrator.is_none()
                 && let Some(contract) = profile.orchestrator_prompt_contract(
                     spec,
                     &mcp_name,
@@ -641,7 +683,9 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
         if let Some(sp_wire) = spill_reader_wire {
             wire_tools.push(sp_wire);
         }
-        if matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp) {
+        if !config.disable_virtualization
+            && matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp)
+        {
             wire_tools.push(call_tool_wire);
             wire_tools.push(search_tool_wire);
         }
@@ -812,7 +856,8 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
                 continue;
             };
             let mcp_name = sanitize_mcp_tool_name(&spec.name, &mut used_mcp_names);
-            if orchestrator.is_none()
+            if !config.disable_code_mode_enhancements
+                && orchestrator.is_none()
                 && let Some(contract) = profile.orchestrator_prompt_contract(
                     spec,
                     &mcp_name,
@@ -873,10 +918,10 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
         ))
     });
 
-    let has_virtualized_dispatch =
-        should_virtualize || matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp);
+    let has_virtualized_dispatch = !config.disable_virtualization
+        && (should_virtualize || matches!(target_mode, VirtualizationTargetMode::AcpLoopbackMcp));
 
-    let routing_table = Arc::new(McpRoutingTable::build_with_prepass_and_target_mode(
+    let mut routing_obj = McpRoutingTable::build_with_prepass_and_target_mode(
         profile,
         &prepass,
         client_tools,
@@ -887,7 +932,9 @@ pub fn plan_virtualization_with_config<P: HarnessToolProfile, S: TruncationSpill
         options.enable_context_spill_reader,
         target_mode,
         budget,
-    ));
+    );
+    routing_obj.set_code_mode_enhancements(!config.disable_code_mode_enhancements);
+    let routing_table = Arc::new(routing_obj);
 
     McpSessionCatalog {
         profile_id: P::ID,

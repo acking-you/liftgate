@@ -233,6 +233,14 @@ fn build_openai_responses_request(
     };
 
     let mut items: Vec<Value> = Vec::with_capacity(input.messages.len() + 4);
+    let custom_tool_names: std::collections::HashSet<&str> = input
+        .tools
+        .iter()
+        .filter(|t| t.is_custom_freeform)
+        .map(|t| t.name.as_str())
+        .collect();
+    let mut custom_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for msg in &input.messages {
         let mut msg_parts: Vec<Value> = Vec::new();
         let role_str = match msg.role {
@@ -278,7 +286,9 @@ fn build_openai_responses_request(
                     is_custom,
                 } => {
                     flush_msg_parts(&mut msg_parts, &mut items);
-                    if *is_custom {
+                    let emit_as_custom = *is_custom || custom_tool_names.contains(name.as_str());
+                    if emit_as_custom {
+                        custom_call_ids.insert(call_id.clone());
                         items.push(json!({
                             "type": "custom_tool_call",
                             "call_id": call_id,
@@ -300,8 +310,13 @@ fn build_openai_responses_request(
                     is_error: _,
                 } => {
                     flush_msg_parts(&mut msg_parts, &mut items);
+                    let output_type = if custom_call_ids.contains(call_id.as_str()) {
+                        "custom_tool_call_output"
+                    } else {
+                        "function_call_output"
+                    };
                     items.push(json!({
-                        "type": "function_call_output",
+                        "type": output_type,
                         "call_id": call_id,
                         "output": output,
                     }));
@@ -577,7 +592,8 @@ async fn decode_openai_sse(
                 if let Some(resp) = val.get("response")
                     && let Some(u) = resp.get("usage")
                 {
-                    let input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let raw_input_tokens =
+                        u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
                     let output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
                     let thought_tokens = u
                         .get("output_tokens_details")
@@ -589,14 +605,15 @@ async fn decode_openai_sse(
                         .and_then(|d| d.get("cached_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
+                    let uncached_input_tokens = raw_input_tokens.saturating_sub(cached_read_tokens);
                     let total_tokens = u
                         .get("total_tokens")
                         .and_then(Value::as_u64)
-                        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+                        .unwrap_or_else(|| raw_input_tokens.saturating_add(output_tokens));
                     let _ = tx
                         .send(Ok(NativeStreamEvent::Usage(AcpUsage {
                             total_tokens,
-                            input_tokens,
+                            input_tokens: uncached_input_tokens,
                             output_tokens,
                             thought_tokens,
                             cached_read_tokens,
@@ -608,6 +625,50 @@ async fn decode_openai_sse(
                     "tool_use"
                 } else {
                     "end_turn"
+                }
+                .to_owned();
+                let _ = tx
+                    .send(Ok(NativeStreamEvent::Completed { stop_reason }))
+                    .await;
+                completed = true;
+            }
+            "response.incomplete" => {
+                if let Some(resp) = val.get("response")
+                    && let Some(u) = resp.get("usage")
+                {
+                    let raw_input_tokens =
+                        u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let thought_tokens = u
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("reasoning_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let cached_read_tokens = u
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let uncached_input_tokens = raw_input_tokens.saturating_sub(cached_read_tokens);
+                    let total_tokens = u
+                        .get("total_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| raw_input_tokens.saturating_add(output_tokens));
+                    let _ = tx
+                        .send(Ok(NativeStreamEvent::Usage(AcpUsage {
+                            total_tokens,
+                            input_tokens: uncached_input_tokens,
+                            output_tokens,
+                            thought_tokens,
+                            cached_read_tokens,
+                            cached_write_tokens: 0,
+                        })))
+                        .await;
+                }
+                let stop_reason = if saw_tool_call {
+                    "tool_use"
+                } else {
+                    "max_tokens"
                 }
                 .to_owned();
                 let _ = tx
@@ -649,35 +710,25 @@ async fn decode_openai_sse(
         }
     }
 
-    for (_, pending) in items_by_id {
-        if !pending.emitted && !pending.name.is_empty() {
-            saw_tool_call = true;
-            let _ = tx
-                .send(Ok(NativeStreamEvent::ToolCall {
-                    id: pending.call_id,
-                    name: pending.name,
-                    arguments_json: if pending.args_buf.is_empty() {
-                        "{}".to_owned()
-                    } else {
-                        pending.args_buf
-                    },
-                    is_custom: pending.is_custom,
-                    thought_signature: None,
-                }))
-                .await;
-        }
+    if let Some(pending) = items_by_id.values().find(|p| !p.emitted) {
+        return Err(PlatformApiError::Protocol {
+            message: format!(
+                "OpenAI SSE stream closed with unfinished {} `{}` ({})",
+                if pending.is_custom {
+                    "custom_tool_call"
+                } else {
+                    "function_call"
+                },
+                pending.name,
+                pending.call_id,
+            ),
+        });
     }
 
     if !completed {
-        let stop_reason = if saw_tool_call {
-            "tool_use"
-        } else {
-            "end_turn"
-        }
-        .to_owned();
-        let _ = tx
-            .send(Ok(NativeStreamEvent::Completed { stop_reason }))
-            .await;
+        return Err(PlatformApiError::Protocol {
+            message: "OpenAI SSE stream ended before terminal response.completed event".to_owned(),
+        });
     }
     Ok(())
 }
@@ -969,7 +1020,7 @@ async fn decode_anthropic_sse(
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    prompt_tokens = uncached.saturating_add(cw).saturating_add(cr);
+                    prompt_tokens = uncached;
                     cached_read = cr;
                     cached_write = cw;
                     output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -1084,9 +1135,18 @@ async fn decode_anthropic_sse(
                 }
             }
             "message_stop" => {
+                if !active_tools.is_empty() {
+                    return Err(PlatformApiError::Protocol {
+                        message: "Anthropic message_stop received before content_block_stop"
+                            .to_owned(),
+                    });
+                }
+                let total_prompt = prompt_tokens
+                    .saturating_add(cached_read)
+                    .saturating_add(cached_write);
                 let _ = tx
                     .send(Ok(NativeStreamEvent::Usage(AcpUsage {
-                        total_tokens: prompt_tokens.saturating_add(output_tokens),
+                        total_tokens: total_prompt.saturating_add(output_tokens),
                         input_tokens: prompt_tokens,
                         output_tokens,
                         thought_tokens: 0,
@@ -1129,19 +1189,9 @@ async fn decode_anthropic_sse(
     }
 
     if !completed {
-        let _ = tx
-            .send(Ok(NativeStreamEvent::Usage(AcpUsage {
-                total_tokens: prompt_tokens.saturating_add(output_tokens),
-                input_tokens: prompt_tokens,
-                output_tokens,
-                thought_tokens: 0,
-                cached_read_tokens: cached_read,
-                cached_write_tokens: cached_write,
-            })))
-            .await;
-        let _ = tx
-            .send(Ok(NativeStreamEvent::Completed { stop_reason }))
-            .await;
+        return Err(PlatformApiError::Protocol {
+            message: "Anthropic SSE stream ended before terminal message_stop event".to_owned(),
+        });
     }
     Ok(())
 }
@@ -1424,17 +1474,31 @@ async fn decode_gemini_sse(
 ) -> Result<(), PlatformApiError> {
     let mut call_seq: u32 = 0;
     let mut saw_tool_call = false;
+    let mut terminal_stop_reason: Option<String> = None;
     let mut latest_usage: Option<AcpUsage> = None;
 
     while let Some(frame_res) = rx.recv().await {
         let frame = frame_res?;
         let data = frame.data.trim();
-        if data.is_empty() || data == "[DONE]" {
+        if data.is_empty() {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<Value>(data) else {
+        if data == "[DONE]" {
+            if terminal_stop_reason.is_none() && (saw_tool_call || latest_usage.is_some()) {
+                terminal_stop_reason = Some(
+                    if saw_tool_call {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                    .to_owned(),
+                );
+            }
             continue;
-        };
+        }
+        let val = serde_json::from_str::<Value>(data).map_err(|e| PlatformApiError::Protocol {
+            message: format!("malformed Gemini SSE JSON frame: {e}"),
+        })?;
         if let Some(err_obj) = val.get("error") {
             let code = err_obj.get("code").and_then(Value::as_u64).unwrap_or(500);
             let msg = err_obj
@@ -1459,55 +1523,69 @@ async fn decode_gemini_sse(
             .get("candidates")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
-            && let Some(parts) = cand
+        {
+            if let Some(parts) = cand
                 .get("content")
                 .and_then(|c| c.get("parts"))
                 .and_then(Value::as_array)
-        {
-            for part in parts {
-                let is_thought = part
-                    .get("thought")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if let Some(text) = part.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    if is_thought {
+            {
+                for part in parts {
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(text) = part.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        if is_thought {
+                            let _ = tx
+                                .send(Ok(NativeStreamEvent::ReasoningDelta(text.to_owned())))
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Ok(NativeStreamEvent::TextDelta(text.to_owned())))
+                                .await;
+                        }
+                    }
+                    if let Some(fc) = part.get("functionCall") {
+                        call_seq += 1;
+                        saw_tool_call = true;
+                        let name = fc
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let args_json = fc
+                            .get("args")
+                            .map(Value::to_string)
+                            .unwrap_or_else(|| "{}".to_owned());
+                        let sig = part
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                         let _ = tx
-                            .send(Ok(NativeStreamEvent::ReasoningDelta(text.to_owned())))
-                            .await;
-                    } else {
-                        let _ = tx
-                            .send(Ok(NativeStreamEvent::TextDelta(text.to_owned())))
+                            .send(Ok(NativeStreamEvent::ToolCall {
+                                id: format!("call_gem_{call_seq}"),
+                                name,
+                                arguments_json: args_json,
+                                is_custom: false,
+                                thought_signature: sig,
+                            }))
                             .await;
                     }
                 }
-                if let Some(fc) = part.get("functionCall") {
-                    call_seq += 1;
-                    saw_tool_call = true;
-                    let name = fc
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    let args_json = fc
-                        .get("args")
-                        .map(Value::to_string)
-                        .unwrap_or_else(|| "{}".to_owned());
-                    let sig = part
-                        .get("thoughtSignature")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let _ = tx
-                        .send(Ok(NativeStreamEvent::ToolCall {
-                            id: format!("call_gem_{call_seq}"),
-                            name,
-                            arguments_json: args_json,
-                            is_custom: false,
-                            thought_signature: sig,
-                        }))
-                        .await;
-                }
+            }
+            if let Some(fr) = cand.get("finishReason").and_then(Value::as_str)
+                && !fr.is_empty()
+            {
+                let mapped = if saw_tool_call {
+                    "tool_use"
+                } else if fr == "MAX_TOKENS" {
+                    "max_tokens"
+                } else {
+                    "end_turn"
+                };
+                terminal_stop_reason = Some(mapped.to_owned());
             }
         }
 
@@ -1528,14 +1606,16 @@ async fn decode_gemini_sse(
                 .get("cachedContentTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let uncached_prompt = prompt.saturating_sub(cached);
+            let combined_output = candidates.saturating_add(thoughts);
             let total = um
                 .get("totalTokenCount")
                 .and_then(Value::as_u64)
-                .unwrap_or_else(|| prompt.saturating_add(candidates).saturating_add(thoughts));
+                .unwrap_or_else(|| prompt.saturating_add(combined_output));
             latest_usage = Some(AcpUsage {
                 total_tokens: total,
-                input_tokens: prompt,
-                output_tokens: candidates,
+                input_tokens: uncached_prompt,
+                output_tokens: combined_output,
                 thought_tokens: thoughts,
                 cached_read_tokens: cached,
                 cached_write_tokens: 0,
@@ -1543,15 +1623,15 @@ async fn decode_gemini_sse(
         }
     }
 
+    let Some(stop_reason) = terminal_stop_reason else {
+        return Err(PlatformApiError::Protocol {
+            message: "Gemini SSE stream ended before terminal finishReason".to_owned(),
+        });
+    };
+
     if let Some(u) = latest_usage {
         let _ = tx.send(Ok(NativeStreamEvent::Usage(u))).await;
     }
-    let stop_reason = if saw_tool_call {
-        "tool_use"
-    } else {
-        "end_turn"
-    }
-    .to_owned();
     let _ = tx
         .send(Ok(NativeStreamEvent::Completed { stop_reason }))
         .await;

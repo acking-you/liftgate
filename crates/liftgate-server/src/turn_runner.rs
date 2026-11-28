@@ -16,9 +16,10 @@ use liftgate_types::{
     harness_prompt::detect_harness_by_tools,
     model::{resolve_model_id, select_fastest_gemini_model},
     parser::{IncrementalToolParser, ParsedStreamItem, ParsedToolCall},
+    provider::OptimizationPolicy,
     session_key::{
         ConversationHash, INTERNAL_GATEWAY_WEB_FETCH_TOOL, MAX_ACP_PROMPT_TEXT_BYTES,
-        McpBridgePromptSpec, WebToolBridgeConfig, build_acp_prompt_plan_with_spill,
+        McpBridgePromptSpec, WebToolBridgeConfig, build_acp_prompt_plan_with_options,
         build_client_tools_delta_xml_with_spill, build_compaction_directive_xml_with_spill,
         build_mcp_virtualized_tools_delta_xml_with_spill,
         build_session_system_append_for_mcp_with_spill_sink,
@@ -299,10 +300,17 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
     let mcp_enabled = cfg.mcp_tool_bridge.load(Ordering::Relaxed);
     let vision_offload_enabled = cfg.vision_offload.load(Ordering::Relaxed);
     let cap = cfg.limits.channel_capacity().get();
-    let mut spill_store = cfg
-        .spill_dir
-        .as_ref()
-        .map(|dir| SpillStore::new(dir).with_telemetry(Arc::clone(telemetry)));
+    let agy_caps = liftgate_types::provider::ProviderCapabilities::for_driver(
+        liftgate_types::provider::ProviderDriverKind::AgyAcp,
+    );
+    let spill_enabled = agy_caps.effective_spill_limit(&optimization).is_some();
+    let mut spill_store = if spill_enabled {
+        cfg.spill_dir
+            .as_ref()
+            .map(|dir| SpillStore::new(dir).with_telemetry(Arc::clone(telemetry)))
+    } else {
+        None
+    };
 
     // 0. Fast-path check for a parked MCP-suspended session (`session/prompt` awaiting `tools/call`
     //    reply). Either resumes directly inside the live `session/prompt` or gracefully unwinds via
@@ -323,6 +331,9 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
         {
             if mcp_enabled
                 && susp_checkout.entry().model_id == resolved_model
+                && (req.client_tools.is_empty()
+                    || susp_checkout.entry().mcp_handle.has_virtualized_dispatch()
+                        == optimization.tool_virtualization)
                 && can_satisfy_pending_mcp_calls(
                     &susp_checkout.entry().pending_calls,
                     &req.messages,
@@ -362,6 +373,7 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                     timeout_secs,
                     cap,
                     spill_store,
+                    optimization.clone(),
                 ));
             }
 
@@ -472,6 +484,9 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                     if mcp_enabled
                         && !susp_is_compaction
                         && checkout.entry().model_id == resolved_model
+                        && (req.client_tools.is_empty()
+                            || checkout.entry().mcp_handle.has_virtualized_dispatch()
+                                == optimization.tool_virtualization)
                         && let Some(delta_slice) = req.messages.get(delta_start..)
                         && can_satisfy_pending_mcp_calls(
                             &checkout.entry().pending_calls,
@@ -505,6 +520,7 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                             timeout_secs,
                             cap,
                             spill_store,
+                            optimization.clone(),
                         ));
                     }
 
@@ -593,6 +609,11 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                         && cfg.mcp_server.is_some()
                         && checkout.entry().mcp_handle.is_none())
                     || (mcp_enabled
+                        && !req.client_tools.is_empty()
+                        && checkout.entry().mcp_handle.as_ref().is_some_and(|h| {
+                            h.has_virtualized_dispatch() != optimization.tool_virtualization
+                        }))
+                    || (mcp_enabled
                         && web_cfg.enable_native_web_fetch
                         && checkout
                             .entry()
@@ -631,11 +652,12 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                         detect_harness_by_tools(&checkout.entry().declared_tools)
                             .or(req.detected_harness);
                     let outbound_delta = req.render_messages_for_outbound(0, outbound_harness);
-                    let prompt_blocks = build_acp_prompt_plan_with_spill(
+                    let prompt_blocks = build_acp_prompt_plan_with_options(
                         &outbound_delta,
                         &checkout.entry().tool_nonce,
                         false,
                         tools_delta.as_deref(),
+                        optimization.strip_billing_noise,
                         &mut spill_store,
                     )?;
                     let (mut guard, mut combined, mut combined_slots) =
@@ -767,11 +789,12 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                             .or(req.detected_harness);
                     let outbound_delta =
                         req.render_messages_for_outbound(delta_start, outbound_harness);
-                    let prompt_blocks = build_acp_prompt_plan_with_spill(
+                    let prompt_blocks = build_acp_prompt_plan_with_options(
                         &outbound_delta,
                         &checkout.entry().tool_nonce,
                         false,
                         tools_delta.as_deref(),
+                        optimization.strip_billing_noise,
                         &mut spill_store,
                     )?;
                     let (mut guard, _, _) = checkout.into_lease_guard(req.messages.len());
@@ -846,11 +869,12 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                     tools_delta.as_deref(),
                     &mut spill_store,
                 );
-                let prompt_blocks = build_acp_prompt_plan_with_spill(
+                let prompt_blocks = build_acp_prompt_plan_with_options(
                     delta_slice,
                     &checkout.entry().tool_nonce,
                     false,
                     directive.as_deref(),
+                    optimization.strip_billing_noise,
                     &mut spill_store,
                 )?;
                 let (mut guard, _, _) = checkout.into_lease_guard(req.messages.len());
@@ -914,29 +938,43 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
                 TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
                 TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
             };
-            let catalog = crate::mcp_bridge::partition_tools_for_mcp_session_with_options(
+            let catalog = liftgate_tool_virtualizer::partition_tools_with_config(
                 proto_hint,
                 &req.client_tools,
-                crate::mcp_bridge::McpSessionOptions {
-                    enable_gateway_web_fetch: web_cfg.enable_native_web_fetch,
-                    enable_context_spill_reader: spill_store.is_some(),
+                liftgate_tool_virtualizer::VirtualizerPlanConfig {
+                    session: crate::mcp_bridge::McpSessionOptions {
+                        enable_gateway_web_fetch: web_cfg.enable_native_web_fetch,
+                        enable_context_spill_reader: spill_store.is_some(),
+                    },
+                    target_mode:
+                        liftgate_tool_virtualizer::VirtualizationTargetMode::AcpLoopbackMcp,
+                    budget_override: None,
+                    disable_virtualization: !optimization.tool_virtualization,
+                    disable_code_mode_enhancements: !optimization.code_mode_enhancements,
                 },
                 &mut spill_store,
             );
-            let out = build_session_system_append_for_mcp_with_spill_sink(
-                req.system_instructions.as_deref(),
-                McpBridgePromptSpec {
-                    bridged_tools: &catalog.bridged_pairs,
-                    virtualized_hubs: &catalog.virtualized_hubs,
-                    has_virtualized_dispatch: catalog.has_virtualized_dispatch,
-                    has_gateway_web_fetch: catalog.has_gateway_web_fetch,
-                    has_context_spill_reader: catalog.has_context_spill_reader,
-                    orchestrator: catalog.orchestrator_contract(),
-                },
-                web_cfg,
-                &nonce,
-                &mut spill_store,
-            );
+            let out = if matches!(
+                optimization.mode(),
+                liftgate_types::provider::OptimizationMode::Passthrough
+            ) {
+                (req.system_instructions.clone().unwrap_or_default(), None)
+            } else {
+                build_session_system_append_for_mcp_with_spill_sink(
+                    req.system_instructions.as_deref(),
+                    McpBridgePromptSpec {
+                        bridged_tools: &catalog.bridged_pairs,
+                        virtualized_hubs: &catalog.virtualized_hubs,
+                        has_virtualized_dispatch: catalog.has_virtualized_dispatch,
+                        has_gateway_web_fetch: catalog.has_gateway_web_fetch,
+                        has_context_spill_reader: catalog.has_context_spill_reader,
+                        orchestrator: catalog.orchestrator_contract(),
+                    },
+                    web_cfg,
+                    &nonce,
+                    &mut spill_store,
+                )
+            };
             let handle = mcp_srv.register_session(catalog);
             handle.record_bridge_rules(&out.0);
             mcp_session_handle = Some(handle);
@@ -985,11 +1023,12 @@ pub async fn execute_normalized_turn_with_provider<B: AcpBackend>(
         .with_mcp_handle(mcp_session_handle);
 
         let outbound_messages = req.render_messages_for_outbound(0, req.detected_harness);
-        let prompt_blocks = build_acp_prompt_plan_with_spill(
+        let prompt_blocks = build_acp_prompt_plan_with_options(
             &outbound_messages,
             guard.tool_nonce(),
             true,
             initial_tools_spill.as_deref(),
+            optimization.strip_billing_noise,
             &mut spill_store,
         )?;
 
@@ -4427,6 +4466,7 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
     timeout_secs: u64,
     channel_cap: usize,
     mut spill_store: Option<SpillStore>,
+    optimization: OptimizationPolicy,
 ) -> ActiveTurnStream {
     let distill_harness =
         req.distillation_harness_with(detect_harness_by_tools(&promoted.declared_tools));
@@ -4529,11 +4569,12 @@ fn spawn_resumed_mcp_continuation<B: AcpBackend>(
             }
         }
 
-        let built_replies = build_mcp_tool_replies(
+        let built_replies = build_mcp_tool_replies_with_policy(
             &promoted.pending_calls,
             &delta_for_reply,
             tools_delta.as_deref(),
             &mut spill_store,
+            &optimization,
             &task_guard,
         );
         task_guard
@@ -4641,15 +4682,42 @@ fn is_developer_instructions_block(text: &str) -> bool {
         && trimmed.ends_with("</developer_instructions>")
 }
 
+#[cfg(test)]
 fn sanitize_mcp_tool_result_text(
     raw_output: &str,
     client_tool_name: &str,
     spill_store: &mut Option<SpillStore>,
 ) -> (String, bool) {
-    let billing_clean = strip_billing_noise(raw_output);
-    let term_clean = scrub_terminal_control_noise(&billing_clean);
+    sanitize_mcp_tool_result_text_with_policy(
+        raw_output,
+        client_tool_name,
+        spill_store,
+        &OptimizationPolicy::optimized(),
+    )
+}
+
+fn sanitize_mcp_tool_result_text_with_policy(
+    raw_output: &str,
+    client_tool_name: &str,
+    spill_store: &mut Option<SpillStore>,
+    optimization: &OptimizationPolicy,
+) -> (String, bool) {
+    let agy_caps = liftgate_types::provider::ProviderCapabilities::for_driver(
+        liftgate_types::provider::ProviderDriverKind::AgyAcp,
+    );
+    let allow_spill = agy_caps.effective_spill_limit(optimization).is_some();
+    if !optimization.strip_billing_noise && !allow_spill && !optimization.code_mode_enhancements {
+        return (raw_output.to_owned(), false);
+    }
+    let term_clean: std::borrow::Cow<'_, str> = if optimization.strip_billing_noise {
+        let billing_clean = strip_billing_noise(raw_output);
+        std::borrow::Cow::Owned(scrub_terminal_control_noise(&billing_clean).into_owned())
+    } else {
+        std::borrow::Cow::Borrowed(raw_output)
+    };
     let mut spilled = false;
-    let mut sanitized = if spill_store.is_some()
+    let mut sanitized = if allow_spill
+        && spill_store.is_some()
         && term_clean.len() > MAX_INLINE_MCP_TOOL_RESULT_WITH_SPILL_BYTES
     {
         spilled = true;
@@ -4660,7 +4728,7 @@ fn sanitize_mcp_tool_result_text(
             &label,
             spill_store,
         )
-    } else if term_clean.len() > MAX_SINGLE_MCP_TOOL_RESULT_BYTES {
+    } else if allow_spill && term_clean.len() > MAX_SINGLE_MCP_TOOL_RESULT_BYTES {
         spilled = true;
         let label = format!("tool_result:{client_tool_name}");
         truncate_head_tail_lines_with_spill(
@@ -4672,6 +4740,9 @@ fn sanitize_mcp_tool_result_text(
     } else {
         term_clean.into_owned()
     };
+    if !optimization.code_mode_enhancements {
+        return (sanitized, spilled);
+    }
     if client_tool_name == "apply_patch"
         && sanitized
             .trim_start()
@@ -4711,11 +4782,12 @@ struct BuiltMcpToolReplies {
     spilled_results: usize,
 }
 
-fn build_mcp_tool_replies(
+fn build_mcp_tool_replies_with_policy(
     pending_calls: &[PendingMcpCallInfo],
     delta_messages: &[CanonicalMessage],
     tools_delta_xml: Option<&str>,
     spill_store: &mut Option<SpillStore>,
+    optimization: &OptimizationPolicy,
     task_guard: &ActiveTaskGuard,
 ) -> BuiltMcpToolReplies {
     let telemetry = task_guard.hub();
@@ -4762,7 +4834,11 @@ fn build_mcp_tool_replies(
                     if is_developer_instructions_block(text) {
                         continue;
                     }
-                    let cleaned = strip_billing_noise(text);
+                    let cleaned: std::borrow::Cow<'_, str> = if optimization.strip_billing_noise {
+                        std::borrow::Cow::Owned(strip_billing_noise(text))
+                    } else {
+                        std::borrow::Cow::Borrowed(text)
+                    };
                     let trimmed = cleaned.trim();
                     if !trimmed.is_empty() {
                         followup_texts.push(trimmed.to_owned());
@@ -4786,8 +4862,12 @@ fn build_mcp_tool_replies(
         let (raw_out, is_error) = matched_results
             .remove(&pending.nonce_suffix)
             .unwrap_or_else(|| (String::new(), false));
-        let (sanitized, did_spill) =
-            sanitize_mcp_tool_result_text(&raw_out, &pending.client_name, spill_store);
+        let (sanitized, did_spill) = sanitize_mcp_tool_result_text_with_policy(
+            &raw_out,
+            &pending.client_name,
+            spill_store,
+            optimization,
+        );
         if sanitized != raw_out {
             task_guard.record_tool_result_rewrite(
                 &pending.call_id,
@@ -4824,8 +4904,12 @@ fn build_mcp_tool_replies(
 
         if idx + 1 == total_pending {
             for (xml_id, xml_out, xml_err) in &extra_xml_results {
-                let (clean_xml, xml_spilled) =
-                    sanitize_mcp_tool_result_text(xml_out, "xml_tool", spill_store);
+                let (clean_xml, xml_spilled) = sanitize_mcp_tool_result_text_with_policy(
+                    xml_out,
+                    "xml_tool",
+                    spill_store,
+                    optimization,
+                );
                 total_results = total_results.saturating_add(1);
                 if xml_spilled {
                     spilled_results = spilled_results.saturating_add(1);

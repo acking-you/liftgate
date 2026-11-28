@@ -1,10 +1,10 @@
 //! Multi-provider runtime registry, credential vault, stateless native 0-RTT turn runner,
 //! and stateful stdio dialect dispatcher.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, atomic::Ordering};
+use std::sync::{Arc, Mutex, RwLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -13,21 +13,25 @@ use liftgate_provider_http::{
     execute_driver_sse_step, probe_http_provider,
 };
 use liftgate_provider_stateful::{
-    adapters::{StatefulDialect, StatefulStreamEvent, StatefulTurnInput, run_turn_on_spawned_peer},
+    adapters::{
+        DynamicToolDisposition, StatefulClientToolSpec, StatefulDialect, StatefulStreamEvent,
+        StatefulTurnInput, run_turn_on_spawned_peer_with_handler,
+    },
     stdio_rpc::{StatefulRpcError, StdioSpawnConfig},
 };
 use liftgate_tool_virtualizer::{
-    LocalReplyKind, McpSessionCatalog, ProtocolHint, VirtualizedCallDecision,
-    normalize_mcp_object_schema, partition_tools_for_native_api,
+    LocalReplyKind, McpSessionCatalog, McpSessionOptions, ProtocolHint, VirtualizationTargetMode,
+    VirtualizedCallDecision, VirtualizerBudget, VirtualizerPlanConfig, normalize_mcp_object_schema,
+    partition_tools_with_config,
 };
 use liftgate_types::{
     acp::{AcpUsage, AvailableModel},
     canonical::{
         AuxiliaryTaskKind, CanonicalMessage, CanonicalPart, CanonicalRole, CanonicalToolKind,
-        CanonicalToolSpec, NormalizedTurnRequest,
+        CanonicalToolSpec, NormalizedTurnRequest, ProtocolDeveloperSlot,
     },
     config::{ModelId, ProxyUrl},
-    harness_prompt::detect_harness_by_tools,
+    harness_prompt::{DetectedHarness, detect_harness_by_tools},
     model::resolve_model_id,
     provider::{
         ApiKeySource, OptimizationMode, OptimizationPolicy, PromptCacheSemantics,
@@ -35,8 +39,10 @@ use liftgate_types::{
         ProviderRegistryConfig, build_native_api_bridge_rules, parse_route_provider_spec,
     },
     session_key::{
-        NoopSpillSink, WebToolBridgeConfig, format_conversation_hash_hex, hash_conversation_state,
-        is_code_mode_orchestrator_tool, scrub_terminal_control_noise, strip_billing_noise,
+        McpBridgePromptSpec, NoopSpillSink, WebToolBridgeConfig,
+        build_session_system_append_for_mcp_with_spill_sink, format_conversation_hash_hex,
+        hash_conversation_state, is_code_mode_orchestrator_tool, scrub_terminal_control_noise,
+        strip_billing_noise,
     },
     telemetry::{
         LowCacheRoutingStrategy, ProviderTelemetrySummary, TaskProtocol, ToolCallErrorKind,
@@ -51,6 +57,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     acp_client::AcpBackend,
     error::{AcpError, GatewayError},
+    mcp_bridge::{McpContentItem, McpSessionHandle, McpToolCallReply, ResolvedMcpIncoming},
     session_pool::SessionPool,
     telemetry::{TelemetryHub, TurnCompletionDiagnostics, unix_timestamp_ms},
     tool_calls::{ToolCallOutcome, ToolCallStart},
@@ -63,6 +70,39 @@ use crate::{
 pub const HEADER_PROVIDER_ID: &str = "x-liftgate-provider";
 pub const HEADER_OPTIMIZATION_MODE: &str = "x-liftgate-optimization";
 const MAX_LOCAL_CONTINUATION_STEPS: usize = 8;
+const MAX_CACHED_CONTINUATIONS: usize = 256;
+
+#[derive(Clone, Debug)]
+struct StoredResponseContinuation {
+    messages: Vec<CanonicalMessage>,
+    developer_slots: Vec<ProtocolDeveloperSlot>,
+    client_tools: Vec<CanonicalToolSpec>,
+    detected_harness: Option<DetectedHarness>,
+}
+
+#[derive(Debug, Default)]
+struct ResponseContinuationCache {
+    order: VecDeque<String>,
+    by_id: HashMap<String, StoredResponseContinuation>,
+}
+
+impl ResponseContinuationCache {
+    fn insert(&mut self, response_id: String, entry: StoredResponseContinuation) {
+        if !self.by_id.contains_key(&response_id) {
+            if self.order.len() >= MAX_CACHED_CONTINUATIONS
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.by_id.remove(&evicted);
+            }
+            self.order.push_back(response_id.clone());
+        }
+        self.by_id.insert(response_id, entry);
+    }
+
+    fn get(&self, response_id: &str) -> Option<StoredResponseContinuation> {
+        self.by_id.get(response_id).cloned()
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct StoredCredentialsFile {
@@ -92,6 +132,7 @@ pub struct ResolvedRequestProvider {
 /// Thread-safe multi-provider configuration and mode-0600 credential registry.
 pub struct ProviderRuntimeRegistry {
     inner: RwLock<RegistryInner>,
+    continuations: Mutex<ResponseContinuationCache>,
 }
 
 impl std::fmt::Debug for ProviderRuntimeRegistry {
@@ -118,6 +159,7 @@ impl ProviderRuntimeRegistry {
                 credentials_path: None,
                 default_proxy,
             }),
+            continuations: Mutex::new(ResponseContinuationCache::default()),
         }
     }
 
@@ -150,6 +192,46 @@ impl ProviderRuntimeRegistry {
                 credentials_path: Some(credentials_path),
                 default_proxy,
             }),
+            continuations: Mutex::new(ResponseContinuationCache::default()),
+        }
+    }
+
+    fn restore_continuation_into_request(&self, req: &mut NormalizedTurnRequest) {
+        if req.auxiliary_task.is_some() {
+            return;
+        }
+        let Some(prev_id) = req.previous_response_id.as_deref() else {
+            return;
+        };
+        let prior_opt = match self.continuations.lock() {
+            Ok(guard) => guard.get(prev_id),
+            Err(poisoned) => poisoned.into_inner().get(prev_id),
+        };
+        let Some(prior) = prior_opt else {
+            return;
+        };
+        let has_prior_base_dev = !prior.developer_slots.is_empty()
+            || prior.messages.iter().any(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(p, CanonicalPart::Text(t) if t.contains("<developer_instructions>"))
+                })
+            });
+        if has_prior_base_dev {
+            req.system_instructions = None;
+        }
+        req.prepend_history_with_slots(prior.messages, prior.developer_slots);
+        if req.client_tools.is_empty() && !prior.client_tools.is_empty() {
+            req.client_tools = prior.client_tools;
+        }
+        if req.detected_harness.is_none() {
+            req.detected_harness = prior.detected_harness;
+        }
+    }
+
+    fn save_continuation(&self, response_id: String, entry: StoredResponseContinuation) {
+        match self.continuations.lock() {
+            Ok(mut guard) => guard.insert(response_id, entry),
+            Err(poisoned) => poisoned.into_inner().insert(response_id, entry),
         }
     }
 
@@ -930,6 +1012,9 @@ fn execute_stateless_http_turn(
             req.enable_native_web_fetch = false;
         }
     }
+    telemetry
+        .provider_registry()
+        .restore_continuation_into_request(&mut req);
     req.materialize_system_instructions();
 
     let endpoint = resolved
@@ -993,18 +1078,28 @@ fn execute_stateless_http_turn(
     };
 
     let mut noop_spill = NoopSpillSink;
-    let native_catalog: Option<McpSessionCatalog> =
-        if resolved.optimization.tool_virtualization && !req.client_tools.is_empty() {
-            Some(partition_tools_for_native_api(
-                proto_hint,
-                &req.client_tools,
-                req.enable_native_web_fetch,
-                None,
-                &mut noop_spill,
-            ))
-        } else {
-            None
-        };
+    let native_catalog: Option<McpSessionCatalog> = if (resolved.optimization.tool_virtualization
+        || resolved.optimization.code_mode_enhancements)
+        && !req.client_tools.is_empty()
+    {
+        Some(partition_tools_with_config(
+            proto_hint,
+            &req.client_tools,
+            VirtualizerPlanConfig {
+                session: McpSessionOptions {
+                    enable_gateway_web_fetch: req.enable_native_web_fetch,
+                    enable_context_spill_reader: false,
+                },
+                target_mode: VirtualizationTargetMode::NativeApiTools,
+                budget_override: Some(VirtualizerBudget::NATIVE_PLATFORM_API),
+                disable_virtualization: !resolved.optimization.tool_virtualization,
+                disable_code_mode_enhancements: !resolved.optimization.code_mode_enhancements,
+            },
+            &mut noop_spill,
+        ))
+    } else {
+        None
+    };
 
     let harness_id = native_catalog
         .as_ref()
@@ -1125,18 +1220,32 @@ fn execute_stateless_http_turn(
     let timeout_secs = cfg.limits.turn_timeout_secs().get();
     let spill_dir = cfg.spill_dir.clone();
     let resolved_model_for_worker = resolved_model.clone();
+    let response_id_for_store = response_id.clone();
+    let telemetry_for_worker = Arc::clone(telemetry);
 
     let worker = tokio::spawn(async move {
+        let turn_deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut total_usage = AcpUsage::default();
         let mut continuations: usize = 0;
         let mut last_wire_bytes: usize = 0;
         let mut last_breakpoints: usize = 0;
         let mut final_stop_reason = "end_turn".to_owned();
+        let mut accumulated_messages = req.messages.clone();
+        let mut final_assistant_parts: Vec<CanonicalPart> = Vec::new();
 
         let prompt_cache_key = Some(format!("lg:{provider_id_str}:{harness_id}"));
 
         for _step in 0..=MAX_LOCAL_CONTINUATION_STEPS {
             if cancel_child.is_cancelled() {
+                return;
+            }
+            let remaining_timeout = turn_deadline.saturating_duration_since(Instant::now());
+            if remaining_timeout.is_zero() {
+                let acp_err = AcpError::TurnTimeout {
+                    seconds: timeout_secs,
+                };
+                task_guard.fail(acp_err.to_string());
+                let _ = events_tx.send(TurnEvent::Failed(Arc::new(acp_err))).await;
                 return;
             }
             let driver_input = NativeDriverInput {
@@ -1159,8 +1268,8 @@ fn execute_stateless_http_turn(
                     resolved.capabilities.cache_semantics,
                     PromptCacheSemantics::ExplicitBreakpoints
                 ),
-                connect_timeout: Duration::from_secs(25),
-                total_timeout: Duration::from_secs(timeout_secs),
+                connect_timeout: Duration::from_secs(25).min(remaining_timeout),
+                total_timeout: remaining_timeout,
             };
 
             let (step_tx, mut step_rx) =
@@ -1172,6 +1281,7 @@ fn execute_stateless_http_turn(
             tokio::pin!(step_fut);
 
             let mut step_done = false;
+            let mut step_reasoning = String::new();
             let mut step_text = String::new();
             let mut emitted_raw_calls: Vec<(String, String, String, bool)> = Vec::new();
             let mut stream_err: Option<PlatformApiError> = None;
@@ -1184,6 +1294,7 @@ fn execute_stateless_http_turn(
                         match maybe_ev {
                             Some(Ok(ev)) => match ev {
                                 NativeStreamEvent::ReasoningDelta(d) => {
+                                    step_reasoning.push_str(&d);
                                     task_guard.record_thought(&d);
                                     let _ = events_tx.send(TurnEvent::ThoughtDelta(d)).await;
                                 }
@@ -1248,14 +1359,26 @@ fn execute_stateless_http_turn(
             }
 
             if emitted_raw_calls.is_empty() {
+                if !step_reasoning.is_empty() {
+                    final_assistant_parts.push(CanonicalPart::Reasoning(step_reasoning));
+                }
+                if !step_text.is_empty() {
+                    final_assistant_parts.push(CanonicalPart::Text(step_text));
+                }
                 break;
             }
 
             let mut local_continuation_parts: Vec<CanonicalPart> = Vec::new();
             let mut local_result_parts: Vec<CanonicalPart> = Vec::new();
+            let mut client_forwarded_parts: Vec<CanonicalPart> = Vec::new();
             let mut forwarded_any_to_client = false;
 
+            if !step_reasoning.is_empty() {
+                local_continuation_parts.push(CanonicalPart::Reasoning(step_reasoning.clone()));
+                client_forwarded_parts.push(CanonicalPart::Reasoning(step_reasoning));
+            }
             if !step_text.is_empty() {
+                client_forwarded_parts.push(CanonicalPart::Text(step_text.clone()));
                 local_continuation_parts.push(CanonicalPart::Text(step_text));
             }
 
@@ -1457,6 +1580,12 @@ fn execute_stateless_http_turn(
                             });
                             forwarded_any_to_client = true;
                             final_stop_reason = "tool_use".to_owned();
+                            client_forwarded_parts.push(CanonicalPart::ToolCall {
+                                call_id: call_id.clone(),
+                                name: client_name.clone(),
+                                arguments: arguments.clone(),
+                                is_custom,
+                            });
                             let _ = events_tx
                                 .send(TurnEvent::ClientToolCall {
                                     call_id,
@@ -1502,6 +1631,12 @@ fn execute_stateless_http_turn(
                     });
                     forwarded_any_to_client = true;
                     final_stop_reason = "tool_use".to_owned();
+                    client_forwarded_parts.push(CanonicalPart::ToolCall {
+                        call_id: call_id.clone(),
+                        name: wire_name.clone(),
+                        arguments: unwrapped_args.clone(),
+                        is_custom,
+                    });
                     let _ = events_tx
                         .send(TurnEvent::ClientToolCall {
                             call_id,
@@ -1514,11 +1649,20 @@ fn execute_stateless_http_turn(
             }
 
             if forwarded_any_to_client || local_result_parts.is_empty() {
+                final_assistant_parts = client_forwarded_parts;
                 break;
             }
 
             // Gateway answered 100% of this step's tool calls locally in 0-RTT; continue seamlessly!
             continuations = continuations.saturating_add(1);
+            accumulated_messages.push(CanonicalMessage {
+                role: CanonicalRole::Assistant,
+                parts: local_continuation_parts.clone(),
+            });
+            accumulated_messages.push(CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: local_result_parts.clone(),
+            });
             working_messages.push(CanonicalMessage {
                 role: CanonicalRole::Assistant,
                 parts: local_continuation_parts,
@@ -1527,6 +1671,24 @@ fn execute_stateless_http_turn(
                 role: CanonicalRole::User,
                 parts: local_result_parts,
             });
+        }
+
+        if req.auxiliary_task.is_none() {
+            if !final_assistant_parts.is_empty() {
+                accumulated_messages.push(CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    parts: final_assistant_parts,
+                });
+            }
+            telemetry_for_worker.provider_registry().save_continuation(
+                response_id_for_store,
+                StoredResponseContinuation {
+                    messages: accumulated_messages,
+                    developer_slots: req.developer_slots.clone(),
+                    client_tools: req.client_tools.clone(),
+                    detected_harness,
+                },
+            );
         }
 
         let upstream_wire = UpstreamWireSummary {
@@ -1612,6 +1774,16 @@ fn execute_stateful_dialect_turn(
     mut req: NormalizedTurnRequest,
     response_id: String,
 ) -> Result<ActiveTurnStream, GatewayError> {
+    if let Some(aux_kind) = req.auxiliary_task {
+        req.client_tools.clear();
+        if !matches!(aux_kind, AuxiliaryTaskKind::WebSearchSubrequest) {
+            req.enable_native_web_search = false;
+            req.enable_native_web_fetch = false;
+        }
+    }
+    telemetry
+        .provider_registry()
+        .restore_continuation_into_request(&mut req);
     req.materialize_system_instructions();
 
     let dialect = match resolved.profile.driver {
@@ -1674,10 +1846,13 @@ fn execute_stateful_dialect_turn(
     let raw_system_bytes = measure_system_slot_bytes(&req.messages);
     let raw_tool_count = req.client_tools.len();
     let raw_tool_bytes = estimate_raw_tool_bytes(&req.client_tools);
+    let detected_harness = req
+        .detected_harness
+        .or_else(|| detect_harness_by_tools(&req.client_tools));
 
     let rendered = req.render_messages_for_outbound(0, None);
     let forwarded_system_bytes = measure_system_slot_bytes(&rendered);
-    let (sys_blocks, conv_msgs) = split_system_and_conversation_messages(
+    let (mut sys_blocks, conv_msgs) = split_system_and_conversation_messages(
         &rendered,
         resolved.optimization.strip_billing_noise,
     );
@@ -1689,8 +1864,38 @@ fn execute_stateful_dialect_turn(
             CanonicalRole::Assistant => "assistant",
         };
         for p in &m.parts {
-            if let CanonicalPart::Text(t) = p {
-                prompt_buf.push_str(&format!("<{tag}>\n{t}\n</{tag}>\n"));
+            match p {
+                CanonicalPart::Text(t) => {
+                    prompt_buf.push_str(&format!("<{tag}>\n{t}\n</{tag}>\n"));
+                }
+                CanonicalPart::Reasoning(r) => {
+                    prompt_buf.push_str(&format!(
+                        "<{tag}>\n<thinking>\n{r}\n</thinking>\n</{tag}>\n"
+                    ));
+                }
+                CanonicalPart::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    prompt_buf.push_str(&format!(
+                        "<assistant>\n<tool_call id=\"{call_id}\" name=\"{name}\">\n{arguments}\n</tool_call>\n</assistant>\n"
+                    ));
+                }
+                CanonicalPart::ToolResult {
+                    call_id,
+                    output,
+                    is_error,
+                } => {
+                    prompt_buf.push_str(&format!(
+                        "<user>\n<tool_result call_id=\"{call_id}\" is_error=\"{is_error}\">\n{output}\n</tool_result>\n</user>\n"
+                    ));
+                }
+                CanonicalPart::ImageBase64 { media_type, .. } => {
+                    prompt_buf
+                        .push_str(&format!("<{tag}>[attached image: {media_type}]</{tag}>\n"));
+                }
             }
         }
     }
@@ -1713,6 +1918,163 @@ fn execute_stateful_dialect_turn(
         env,
         max_line_bytes: cfg.limits.max_line_bytes().get(),
     };
+
+    let proto_hint = match protocol {
+        TaskProtocol::OpenaiResponses => ProtocolHint::OpenAiResponses,
+        TaskProtocol::AnthropicMessages => ProtocolHint::AnthropicMessages,
+    };
+    let mcp_enabled = cfg.mcp_tool_bridge.load(Ordering::Relaxed);
+    let use_loopback_mcp = matches!(dialect, StatefulDialect::GrokAcp)
+        && !req.client_tools.is_empty()
+        && mcp_enabled
+        && cfg.mcp_server.is_some();
+
+    let mut noop_spill = NoopSpillSink;
+    let mut mcp_session_handle: Option<Arc<McpSessionHandle>> = None;
+    let mut dynamic_catalog: Option<McpSessionCatalog> = None;
+    let mut mcp_servers = Vec::new();
+    let mut dynamic_tools = Vec::new();
+
+    if use_loopback_mcp && let Some(ref mcp_srv) = cfg.mcp_server {
+        let catalog = partition_tools_with_config(
+            proto_hint,
+            &req.client_tools,
+            VirtualizerPlanConfig {
+                session: McpSessionOptions {
+                    enable_gateway_web_fetch: req.enable_native_web_fetch,
+                    enable_context_spill_reader: false,
+                },
+                target_mode: VirtualizationTargetMode::AcpLoopbackMcp,
+                budget_override: None,
+                disable_virtualization: !resolved.optimization.tool_virtualization,
+                disable_code_mode_enhancements: !resolved.optimization.code_mode_enhancements,
+            },
+            &mut noop_spill,
+        );
+        if !matches!(resolved.optimization.mode(), OptimizationMode::Passthrough) {
+            let (append_str, _) = build_session_system_append_for_mcp_with_spill_sink(
+                None,
+                McpBridgePromptSpec {
+                    bridged_tools: &catalog.bridged_pairs,
+                    virtualized_hubs: &catalog.virtualized_hubs,
+                    has_virtualized_dispatch: catalog.has_virtualized_dispatch,
+                    has_gateway_web_fetch: catalog.has_gateway_web_fetch,
+                    has_context_spill_reader: catalog.has_context_spill_reader,
+                    orchestrator: catalog.orchestrator_contract(),
+                },
+                WebToolBridgeConfig::default(),
+                "stateful",
+                &mut noop_spill,
+            );
+            if !append_str.trim().is_empty() {
+                sys_blocks.push(append_str);
+            }
+        }
+        let handle = mcp_srv.register_session(catalog);
+        mcp_servers.push(handle.server_config().clone());
+        mcp_session_handle = Some(handle);
+    } else if !req.client_tools.is_empty() {
+        if resolved.optimization.tool_virtualization || resolved.optimization.code_mode_enhancements
+        {
+            let cat = partition_tools_with_config(
+                proto_hint,
+                &req.client_tools,
+                VirtualizerPlanConfig {
+                    session: McpSessionOptions {
+                        enable_gateway_web_fetch: req.enable_native_web_fetch,
+                        enable_context_spill_reader: false,
+                    },
+                    target_mode: VirtualizationTargetMode::NativeApiTools,
+                    budget_override: Some(VirtualizerBudget::NATIVE_PLATFORM_API),
+                    disable_virtualization: !resolved.optimization.tool_virtualization,
+                    disable_code_mode_enhancements: !resolved.optimization.code_mode_enhancements,
+                },
+                &mut noop_spill,
+            );
+            if let Some(rules) = build_native_api_bridge_rules(
+                &resolved.capabilities,
+                cat.orchestrator_contract(),
+                &cat.virtualized_hubs,
+                cat.has_virtualized_dispatch,
+                cat.has_gateway_web_fetch,
+            ) {
+                sys_blocks.push(rules);
+            }
+            dynamic_tools = cat
+                .wire_tools
+                .iter()
+                .map(|wt| {
+                    let orig_spec = cat
+                        .lookup(&wt.name)
+                        .and_then(|b| req.client_tools.iter().find(|s| s.name == b.client_name));
+                    StatefulClientToolSpec {
+                        name: wt.name.clone(),
+                        description: wt.description.clone().unwrap_or_default(),
+                        input_schema: wt.input_schema.clone(),
+                        is_custom_freeform: orig_spec
+                            .is_some_and(|s| matches!(s.kind, CanonicalToolKind::Custom { .. })),
+                    }
+                })
+                .collect();
+            dynamic_catalog = Some(cat);
+        } else {
+            dynamic_tools = req
+                .client_tools
+                .iter()
+                .map(|t| match &t.kind {
+                    CanonicalToolKind::Function { parameters_json } => StatefulClientToolSpec {
+                        name: t.name.clone(),
+                        description: t.description.clone().unwrap_or_default(),
+                        input_schema: normalize_mcp_object_schema(parameters_json),
+                        is_custom_freeform: false,
+                    },
+                    CanonicalToolKind::Custom { .. } => StatefulClientToolSpec {
+                        name: t.name.clone(),
+                        description: t.description.clone().unwrap_or_default(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "input": { "type": "string", "description": "Raw tool input text." }
+                            },
+                            "required": ["input"]
+                        }),
+                        is_custom_freeform: true,
+                    },
+                })
+                .collect();
+        }
+    }
+
+    let forwarded_tool_count = if let Some(ref h) = mcp_session_handle {
+        h.catalog().wire_tools.len()
+    } else {
+        dynamic_tools.len()
+    };
+    let forwarded_tool_bytes = if let Some(ref h) = mcp_session_handle {
+        h.catalog().wire_tool_bytes
+    } else {
+        dynamic_tools.iter().fold(0usize, |acc, t| {
+            acc.saturating_add(t.name.len())
+                .saturating_add(t.description.len())
+                .saturating_add(t.input_schema.to_string().len())
+        })
+    };
+    let harness_id = mcp_session_handle
+        .as_ref()
+        .map(|h| h.catalog().profile_id)
+        .or_else(|| dynamic_catalog.as_ref().map(|c| c.profile_id))
+        .or_else(|| detected_harness.map(|h| h.id()))
+        .unwrap_or("generic");
+    let orch_mode = mcp_session_handle
+        .as_ref()
+        .and_then(|h| h.catalog().orchestrator_contract().map(|o| o.mode_id()))
+        .or_else(|| {
+            dynamic_catalog
+                .as_ref()
+                .and_then(|c| c.orchestrator_contract().map(|o| o.mode_id()))
+        });
+    task_guard.set_tool_context(harness_id, orch_mode, 1);
+
     let turn_input = StatefulTurnInput {
         dialect,
         model: resolved_model.as_str().to_owned(),
@@ -1720,7 +2082,8 @@ fn execute_stateful_dialect_turn(
         system_instructions: (!sys_blocks.is_empty()).then(|| sys_blocks.join("\n\n")),
         prompt_text: prompt_buf,
         cwd: spawn_cfg.cwd.clone(),
-        mcp_servers: Vec::new(),
+        mcp_servers,
+        dynamic_tools,
     };
 
     let cap = cfg.limits.channel_capacity().get();
@@ -1729,15 +2092,47 @@ fn execute_stateful_dialect_turn(
     let cancel_child = turn_cancel.clone();
     let cancel_guard = turn_cancel.drop_guard();
     let resolved_model_worker = resolved_model.clone();
-    let mcp_enabled = cfg.mcp_tool_bridge.load(Ordering::Relaxed);
+    let response_id_for_store = response_id.clone();
+    let telemetry_for_worker = Arc::clone(telemetry);
+    let spill_dir = cfg.spill_dir.clone();
+    let timeout_secs = cfg.limits.turn_timeout_secs().get();
+    let custom_tool_names: std::collections::HashSet<String> = req
+        .client_tools
+        .iter()
+        .filter(|t| matches!(t.kind, CanonicalToolKind::Custom { .. }))
+        .map(|t| t.name.clone())
+        .collect();
 
     let worker = tokio::spawn(async move {
-        let _ = mcp_enabled;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let (st_tx, mut st_rx) =
             mpsc::channel::<Result<StatefulStreamEvent, StatefulRpcError>>(128);
+        let dyn_cat_for_peer = dynamic_catalog.clone();
+        let tools_for_peer = req.client_tools.clone();
         let run_fut = async {
             let st_tx = st_tx;
-            run_turn_on_spawned_peer(&spawn_cfg, &turn_input, &st_tx).await
+            tokio::time::timeout_at(
+                deadline,
+                run_turn_on_spawned_peer_with_handler(
+                    &spawn_cfg,
+                    &turn_input,
+                    &st_tx,
+                    |wire_name, args_val| {
+                        if let Some(ref cat) = dyn_cat_for_peer
+                            && let VirtualizedCallDecision::LocalReply { text, is_error, .. } = cat
+                                .routing_table
+                                .resolve_call(wire_name, args_val, &tools_for_peer)
+                        {
+                            return DynamicToolDisposition::LocalReply { text, is_error };
+                        }
+                        DynamicToolDisposition::SuspendToClient
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| StatefulRpcError::Timeout {
+                elapsed_ms: timeout_secs.saturating_mul(1_000),
+            })?
         };
         tokio::pin!(run_fut);
 
@@ -1745,21 +2140,183 @@ fn execute_stateful_dialect_turn(
         let mut usage = AcpUsage::default();
         let mut stop_reason = "end_turn".to_owned();
         let mut rpc_err: Option<StatefulRpcError> = None;
+        let mut assistant_reasoning = String::new();
+        let mut assistant_text = String::new();
+        let mut assistant_tool_calls: Vec<CanonicalPart> = Vec::new();
+        let mut zero_rtt_count = 0usize;
 
         loop {
+            let has_mcp = mcp_session_handle.is_some();
+            let mcp_recv_fut = async {
+                match mcp_session_handle.as_ref() {
+                    Some(handle) => {
+                        let mut rx_guard = handle.call_rx().lock().await;
+                        rx_guard.recv().await
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 () = cancel_child.cancelled() => return,
+                Some(incoming) = mcp_recv_fut, if has_mcp => {
+                    let Some(ref handle) = mcp_session_handle else { continue };
+                    match handle.resolve_incoming_call(incoming, &req.client_tools) {
+                        ResolvedMcpIncoming::ImmediateLocalReply { reply_tx, reply, .. } => {
+                            zero_rtt_count = zero_rtt_count.saturating_add(1);
+                            let _ = reply_tx.send(reply);
+                        }
+                        ResolvedMcpIncoming::GatewayWebFetch { url, pattern, reply_tx } => {
+                            zero_rtt_count = zero_rtt_count.saturating_add(1);
+                            task_guard.record_web_fetch();
+                            let outcome = fetch_url_sanitized_with_options_and_pattern(
+                                &url,
+                                &req.web_fetch_allowed_domains,
+                                &req.web_fetch_blocked_domains,
+                                resolved.effective_proxy.as_ref(),
+                                spill_dir.as_deref(),
+                                pattern.as_deref(),
+                            )
+                            .await;
+                            let (text, is_error) = match outcome {
+                                WebFetchOutcome::Success { content, .. } => (content, false),
+                                WebFetchOutcome::Error { error_code, message, .. } => {
+                                    (format!("[{error_code}] {message}"), true)
+                                }
+                            };
+                            let _ = reply_tx.send(McpToolCallReply {
+                                content: vec![McpContentItem::Text { text }],
+                                is_error,
+                            });
+                        }
+                        ResolvedMcpIncoming::ReadContextSpill { path, reply_tx, .. } => {
+                            let _ = reply_tx.send(McpToolCallReply {
+                                content: vec![McpContentItem::Text {
+                                    text: format!("Spill file `{path}` unavailable."),
+                                }],
+                                is_error: true,
+                            });
+                        }
+                        ResolvedMcpIncoming::ForwardToClient {
+                            client_name,
+                            arguments,
+                            is_custom,
+                            patch_repaired,
+                            reply_tx: _,
+                        } => {
+                            let call_id = format!("call_{}", unix_timestamp_ms());
+                            task_guard.record_client_tool(&client_name);
+                            task_guard.begin_tool_call(ToolCallStart {
+                                call_id: call_id.clone(),
+                                route: ToolCallRoute::ClientRoundtrip,
+                                wire_tool_name: client_name.clone(),
+                                client_tool_name: Some(client_name.clone()),
+                                is_orchestrator: false,
+                                code_language: None,
+                                wire_arguments: arguments.clone(),
+                                client_arguments: Some(arguments.clone()),
+                                v4a_auto_repaired: patch_repaired,
+                            });
+                            assistant_tool_calls.push(CanonicalPart::ToolCall {
+                                call_id: call_id.clone(),
+                                name: client_name.clone(),
+                                arguments: arguments.clone(),
+                                is_custom,
+                            });
+                            stop_reason = "tool_use".to_owned();
+                            let _ = events_tx
+                                .send(TurnEvent::ClientToolCall {
+                                    call_id,
+                                    name: client_name,
+                                    arguments,
+                                    is_custom,
+                                })
+                                .await;
+                            break;
+                        }
+                    }
+                }
                 maybe_ev = st_rx.recv() => {
                     match maybe_ev {
                         Some(Ok(ev)) => match ev {
                             StatefulStreamEvent::ReasoningDelta(d) => {
+                                assistant_reasoning.push_str(&d);
                                 task_guard.record_thought(&d);
                                 let _ = events_tx.send(TurnEvent::ThoughtDelta(d)).await;
                             }
                             StatefulStreamEvent::TextDelta(d) => {
+                                assistant_text.push_str(&d);
                                 task_guard.record_text(&d);
                                 let _ = events_tx.send(TurnEvent::TextDelta(d)).await;
+                            }
+                            StatefulStreamEvent::ToolCall {
+                                id,
+                                name: wire_name,
+                                arguments_json: raw_args,
+                                is_custom: raw_is_custom,
+                            } => {
+                                let (client_name, client_args, is_custom, patch_repaired) =
+                                    if let Some(ref cat) = dynamic_catalog {
+                                        let parsed = if raw_is_custom {
+                                            json!({ "code": raw_args, "patch": raw_args, "input": raw_args })
+                                        } else {
+                                            serde_json::from_str::<Value>(&raw_args)
+                                                .unwrap_or_else(|_| json!({}))
+                                        };
+                                        match cat.routing_table.resolve_call(
+                                            &wire_name,
+                                            &parsed,
+                                            &req.client_tools,
+                                        ) {
+                                            VirtualizedCallDecision::ForwardToClient {
+                                                client_name,
+                                                arguments,
+                                                is_custom,
+                                                patch_repaired,
+                                            } => (client_name, arguments, is_custom, patch_repaired),
+                                            _ => (
+                                                wire_name.clone(),
+                                                raw_args.clone(),
+                                                raw_is_custom
+                                                    || custom_tool_names.contains(&wire_name),
+                                                false,
+                                            ),
+                                        }
+                                    } else {
+                                        (
+                                            wire_name.clone(),
+                                            raw_args.clone(),
+                                            raw_is_custom || custom_tool_names.contains(&wire_name),
+                                            false,
+                                        )
+                                    };
+                                task_guard.record_client_tool(&client_name);
+                                task_guard.begin_tool_call(ToolCallStart {
+                                    call_id: id.clone(),
+                                    route: ToolCallRoute::ClientRoundtrip,
+                                    wire_tool_name: wire_name,
+                                    client_tool_name: Some(client_name.clone()),
+                                    is_orchestrator: false,
+                                    code_language: None,
+                                    wire_arguments: raw_args,
+                                    client_arguments: Some(client_args.clone()),
+                                    v4a_auto_repaired: patch_repaired,
+                                });
+                                assistant_tool_calls.push(CanonicalPart::ToolCall {
+                                    call_id: id.clone(),
+                                    name: client_name.clone(),
+                                    arguments: client_args.clone(),
+                                    is_custom,
+                                });
+                                stop_reason = "tool_use".to_owned();
+                                let _ = events_tx
+                                    .send(TurnEvent::ClientToolCall {
+                                        call_id: id,
+                                        name: client_name,
+                                        arguments: client_args,
+                                        is_custom,
+                                    })
+                                    .await;
                             }
                             StatefulStreamEvent::Usage(u) => {
                                 usage = u;
@@ -1805,6 +2362,33 @@ fn execute_stateful_dialect_turn(
             return;
         }
 
+        if req.auxiliary_task.is_none() {
+            let mut accumulated = req.messages.clone();
+            let mut final_parts = Vec::new();
+            if !assistant_reasoning.is_empty() {
+                final_parts.push(CanonicalPart::Reasoning(assistant_reasoning));
+            }
+            if !assistant_text.is_empty() {
+                final_parts.push(CanonicalPart::Text(assistant_text));
+            }
+            final_parts.extend(assistant_tool_calls);
+            if !final_parts.is_empty() {
+                accumulated.push(CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    parts: final_parts,
+                });
+            }
+            telemetry_for_worker.provider_registry().save_continuation(
+                response_id_for_store,
+                StoredResponseContinuation {
+                    messages: accumulated,
+                    developer_slots: req.developer_slots.clone(),
+                    client_tools: req.client_tools.clone(),
+                    detected_harness,
+                },
+            );
+        }
+
         task_guard.set_upstream_wire_summary(UpstreamWireSummary {
             provider_id: provider_id_str,
             driver: resolved.profile.driver,
@@ -1815,11 +2399,11 @@ fn execute_stateful_dialect_turn(
             forwarded_system_bytes,
             raw_tool_count,
             raw_tool_bytes,
-            forwarded_tool_count: raw_tool_count,
-            forwarded_tool_bytes: raw_tool_bytes,
+            forwarded_tool_count,
+            forwarded_tool_bytes,
             spill_enabled: false,
             cache_breakpoints_aligned: 0,
-            zero_rtt_continuations: 0,
+            zero_rtt_continuations: zero_rtt_count,
         });
 
         let web_cfg = WebToolBridgeConfig::default();

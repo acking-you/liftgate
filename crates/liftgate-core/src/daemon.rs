@@ -760,15 +760,30 @@ pub async fn ensure_gateway_ready_for_provider_target(
         .is_none()
         && (target.route_spec.is_some() || allow_missing_agy)
     {
-        if let Ok(models) = target
+        let server_provider_default = target
+            .client
+            .fetch_telemetry()
+            .await
+            .ok()
+            .and_then(|snap| {
+                snap.providers
+                    .into_iter()
+                    .find(|p| p.id.eq_ignore_ascii_case(target_prov_id.as_str()))
+            })
+            .map(|p| p.default_model)
+            .filter(|s| !s.trim().is_empty());
+
+        if let Some(srv_default) = server_provider_default {
+            target.default_model = srv_default;
+        } else if let Some(fallback_m) = registry_model_fallback.filter(|s| !s.trim().is_empty()) {
+            target.default_model = fallback_m;
+        } else if let Ok(models) = target
             .client
             .fetch_models_for_route(target.route_spec.as_deref())
             .await
             && let Some(first) = models.first()
         {
             target.default_model = first.id.clone();
-        } else if let Some(fallback_m) = registry_model_fallback {
-            target.default_model = fallback_m;
         }
     }
     if let Some(pref) = preferred_model.map(str::trim).filter(|s| !s.is_empty()) {

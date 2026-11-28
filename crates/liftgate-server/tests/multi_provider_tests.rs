@@ -335,7 +335,7 @@ async fn native_openai_provider_runs_0rtt_search_continuation_and_unwraps_namesp
         .find(|p| p.provider_id == "openai")
         .expect("openai usage recorded");
     assert_eq!(oai_usage.calls, 1);
-    assert_eq!(oai_usage.tokens.input, 1100);
+    assert_eq!(oai_usage.tokens.input, 200);
     assert_eq!(oai_usage.tokens.cached_input, 900);
 }
 
@@ -593,4 +593,487 @@ async fn cross_protocol_codex_to_anthropic_aligns_cache_breakpoints_and_never_re
         2,
         "429 must never retry or fail over"
     );
+}
+
+#[tokio::test]
+async fn openai_previous_response_id_restores_history_and_custom_tool_call_output() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured_bodies);
+
+    tokio::spawn(async move {
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let req1 = read_raw_http_body(&mut s1).await;
+        captured_srv.lock().unwrap().push(req1);
+        let sse1 = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_exec_9\",\"name\":\"exec\",\"input\":\"text(21*2)\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":300,\"output_tokens\":15,\"input_tokens_details\":{\"cached_tokens\":200}}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        s1.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse1}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(s1);
+
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let req2 = read_raw_http_body(&mut s2).await;
+        captured_srv.lock().unwrap().push(req2);
+        let sse2 = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Result is 42.\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":350,\"output_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":300}}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        s2.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse2}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(s2);
+    });
+
+    let mut reg_cfg = ProviderRegistryConfig::default();
+    let mut oai =
+        ProviderProfileConfig::builtin(ProviderId::openai(), ProviderDriverKind::OpenAiResponses);
+    oai.endpoint = Some(format!("http://{addr}/v1"));
+    oai.auth = ApiKeySource::None;
+    reg_cfg.upsert(oai);
+
+    let (router, _) = build_test_router(ProviderRuntimeRegistry::in_memory(reg_cfg, None), None);
+
+    let resp1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/openai/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "instructions": "Keep exact math.",
+                        "input": "Compute 21 * 2 via exec.",
+                        "tools": [{
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Execute JS"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let body1: Value =
+        serde_json::from_slice(&to_bytes(resp1.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let resp1_id = body1["id"].as_str().expect("response id").to_owned();
+
+    let resp2 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/openai/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "previous_response_id": resp1_id,
+                        "input": [{
+                            "type": "custom_tool_call_output",
+                            "call_id": "call_exec_9",
+                            "output": "42"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2: Value =
+        serde_json::from_slice(&to_bytes(resp2.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert!(body2.to_string().contains("Result is 42."));
+
+    let seen = captured_bodies.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let req2_json = &seen[1];
+    assert!(
+        req2_json["instructions"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Keep exact math.")
+    );
+    let items = req2_json["input"].as_array().expect("input array");
+    assert!(
+        items
+            .iter()
+            .any(|i| i.to_string().contains("Compute 21 * 2 via exec."))
+    );
+    assert!(
+        items
+            .iter()
+            .any(|i| i["type"] == "custom_tool_call" && i["call_id"] == "call_exec_9")
+    );
+    assert!(
+        items
+            .iter()
+            .any(|i| i["type"] == "custom_tool_call_output" && i["call_id"] == "call_exec_9")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_app_server_provider_executes_client_tools_and_restores_continuation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lg-codex-app-srv-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let script_path = tmp_dir.join("mock_codex_app_server.py");
+    let log_path = tmp_dir.join("prompts.log");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+log_file = {log_lit}
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method", "")
+    mid = msg.get("id")
+    if method == "initialize":
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"userAgent":"mock"}}}}) + "\n")
+        sys.stdout.flush()
+    elif method == "thread/start":
+        dyn_tools = [t["name"] for t in (msg["params"].get("dynamicTools") or [])]
+        with open(log_file, "a") as f:
+            f.write("TOOLS:" + ",".join(dyn_tools) + "\n")
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"thread":{{"id":"thr_mock"}}}}}}) + "\n")
+        sys.stdout.flush()
+    elif method == "turn/start":
+        prompt_txt = msg["params"]["input"][0]["text"]
+        with open(log_file, "a") as f:
+            f.write("PROMPT:" + json.dumps(prompt_txt) + "\n")
+        sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"turn":{{"id":"t_mock"}}}}}}) + "\n")
+        sys.stdout.flush()
+        if "<tool_result" not in prompt_txt:
+            call = {{"jsonrpc":"2.0","id":77,"method":"item/tool/call","params":{{"callId":"call_read_1","threadId":"thr_mock","turnId":"t_mock","tool":"read_file","arguments":{{"path":"README.md"}}}}}}
+            sys.stdout.write(json.dumps(call) + "\n")
+            sys.stdout.flush()
+            break
+        else:
+            delta = {{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"delta":"Read README successfully."}}}}
+            done = {{"jsonrpc":"2.0","method":"turn/completed","params":{{"turn":{{"status":"completed"}}}}}}
+            sys.stdout.write(json.dumps(delta) + "\n" + json.dumps(done) + "\n")
+            sys.stdout.flush()
+            break
+"#,
+        log_lit = serde_json::to_string(&log_path.to_string_lossy().into_owned()).unwrap()
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut reg_cfg = ProviderRegistryConfig::default();
+    let mut codex_prov = ProviderProfileConfig::builtin(
+        ProviderId::try_new("codex-app-server").unwrap(),
+        ProviderDriverKind::CodexAppServer,
+    );
+    codex_prov.command = Some(script_path);
+    codex_prov.command_args = Vec::new();
+    reg_cfg.upsert(codex_prov);
+
+    let (router, _) = build_test_router(ProviderRuntimeRegistry::in_memory(reg_cfg, None), None);
+
+    let r1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/codex-app-server/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": "Inspect README.md",
+                        "tools": [{
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&to_bytes(r1.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let r1_id = b1["id"].as_str().unwrap().to_owned();
+    let out1 = b1["output"].as_array().unwrap();
+    assert!(out1.iter().any(|i| i["type"] == "function_call"
+        && i["name"] == "read_file"
+        && i["call_id"] == "call_read_1"));
+
+    let r2 = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/codex-app-server/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "previous_response_id": r1_id,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": "call_read_1",
+                            "output": "# Liftgate"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let b2: Value =
+        serde_json::from_slice(&to_bytes(r2.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert!(b2.to_string().contains("Read README successfully."));
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        logged.contains("read_file"),
+        "dynamicTools must include read_file: {logged}"
+    );
+    assert!(
+        logged.contains("<tool_call id=\\\"call_read_1\\\" name=\\\"read_file\\\">")
+            && logged.contains("<tool_result call_id=\\\"call_read_1\\\""),
+        "Turn 2 prompt must carry restored tool_call and tool_result history: {logged}"
+    );
+}
+
+#[tokio::test]
+async fn agy_passthrough_mode_disables_tool_virtualization_spill_and_billing_noise_stripping() {
+    use liftgate_server::mcp_bridge::LoopbackMcpServer;
+    use liftgate_types::acp::{AcpChunkContent, AcpUsage, McpServerConfig};
+
+    struct RecordingAcpBackend {
+        prompts: Mutex<Vec<String>>,
+        mcp_urls: Mutex<Vec<String>>,
+    }
+
+    impl AcpBackend for RecordingAcpBackend {
+        fn available_models(&self) -> Vec<AvailableModel> {
+            vec![AvailableModel {
+                model_id: "gemini-4-carbon-high".to_owned(),
+                name: "Gemini 4 Carbon (High)".to_owned(),
+            }]
+        }
+
+        async fn create_session(&self, _system_append: &str) -> Result<SessionNewResult, AcpError> {
+            Ok(SessionNewResult {
+                session_id: SessionId::try_new("agy_pass_sess").unwrap(),
+                modes: ModesCatalog::default(),
+                models: ModelsCatalog {
+                    available_models: Vec::new(),
+                    current_model_id: None,
+                },
+            })
+        }
+
+        async fn create_session_with_mcp(
+            &self,
+            _system_append: &str,
+            mcp_servers: &[McpServerConfig],
+        ) -> Result<SessionNewResult, AcpError> {
+            for s in mcp_servers {
+                if let Some(ref u) = s.url {
+                    self.mcp_urls.lock().unwrap().push(u.clone());
+                }
+            }
+            self.create_session(_system_append).await
+        }
+
+        async fn set_session_mode(
+            &self,
+            _session_id: &SessionId,
+            _mode_id: &AcpModeId,
+        ) -> Result<(), AcpError> {
+            Ok(())
+        }
+
+        async fn set_session_model(
+            &self,
+            _session_id: &SessionId,
+            _model_id: &ModelId,
+        ) -> Result<(), AcpError> {
+            Ok(())
+        }
+
+        async fn start_prompt(
+            &self,
+            _session_id: &SessionId,
+            prompt: &[AcpPromptBlock],
+            updates_tx: mpsc::Sender<SessionUpdatePayload>,
+        ) -> Result<PromptTurnResult, AcpError> {
+            let mut combined = String::new();
+            for b in prompt {
+                if let AcpPromptBlock::Text { text } = b {
+                    combined.push_str(text);
+                    combined.push('\n');
+                }
+            }
+            self.prompts.lock().unwrap().push(combined);
+            let _ = updates_tx
+                .send(SessionUpdatePayload::AgentMessageChunk {
+                    content: AcpChunkContent {
+                        content_type: "text".to_owned(),
+                        text: "Passthrough OK".to_owned(),
+                    },
+                })
+                .await;
+            Ok(PromptTurnResult {
+                stop_reason: "end_turn".to_owned(),
+                usage: AcpUsage {
+                    input_tokens: 120,
+                    output_tokens: 10,
+                    total_tokens: 130,
+                    ..AcpUsage::default()
+                },
+                error: None,
+            })
+        }
+
+        fn abort_session_nonblocking(&self, _session_id: &SessionId) {}
+
+        async fn close_session(&self, _session_id: &SessionId) -> Result<(), AcpError> {
+            Ok(())
+        }
+
+        fn process_telemetry(&self, default_model: &str, acp_mode: &str) -> AcpProcessTelemetry {
+            DummyAcpBackend.process_telemetry(default_model, acp_mode)
+        }
+    }
+
+    let limits = GatewayLimits::default();
+    let mcp_server = LoopbackMcpServer::bind(limits.max_body_bytes(), limits.channel_capacity())
+        .await
+        .unwrap();
+    let spill_dir =
+        std::env::temp_dir().join(format!("lg-agy-pass-spill-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&spill_dir).unwrap();
+
+    let backend = Arc::new(RecordingAcpBackend {
+        prompts: Mutex::new(Vec::new()),
+        mcp_urls: Mutex::new(Vec::new()),
+    });
+    let telemetry = Arc::new(TelemetryHub::new());
+    telemetry.set_provider_registry(Arc::new(ProviderRuntimeRegistry::default()));
+    let pool = Arc::new(SessionPool::new(limits));
+    let router = build_router(AppState {
+        backend: Arc::clone(&backend),
+        pool: Arc::clone(&pool),
+        telemetry: Arc::clone(&telemetry),
+        config: GatewayRuntimeConfig {
+            title_model_file: None,
+            spill_dir: Some(spill_dir.clone()),
+            settings_path: None,
+            default_model: ModelId::fallback_primary(),
+            acp_mode: AcpModeId::try_new("agent").unwrap(),
+            api_key: None,
+            limits,
+            vision_offload: Arc::new(AtomicBool::new(false)),
+            mcp_tool_bridge: Arc::new(AtomicBool::new(true)),
+            mcp_server: Some(mcp_server),
+        },
+        ui_dist_dir: None,
+        embedded_ui: &[],
+        admin_shutdown: None,
+    });
+
+    let mut tools = Vec::new();
+    for i in 0..40 {
+        tools.push(json!({
+            "name": format!("mcp__svc__op_{i}"),
+            "description": format!("Detailed uncompacted tool description #{i}"),
+            "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}}
+        }));
+    }
+
+    let large_tool_out = "LINE_DATA_1234567890\n".repeat(700); // ~14.7 KB (> 9.6 KB agy spill wall)
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/agy@passthrough/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-4-carbon-high",
+                        "max_tokens": 1024,
+                        "stream": false,
+                        "system": "x-anthropic-billing-header: cc_version=2.1.80; cch=abc12;\nYou are a Claude agent, built on Anthropic's Claude Agent SDK.",
+                        "tools": tools,
+                        "messages": [
+                            {"role": "user", "content": "Run check"},
+                            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "mcp__svc__op_0", "input": {"id": "1"}}]},
+                            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": large_tool_out}]}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {status}: {}",
+        String::from_utf8_lossy(&resp_bytes)
+    );
+
+    // 1. Billing noise & raw Claude SDK preamble must be preserved verbatim on passthrough!
+    let seen_prompts = backend.prompts.lock().unwrap().clone();
+    assert_eq!(seen_prompts.len(), 1);
+    assert!(
+        seen_prompts[0].contains("x-anthropic-billing-header: cc_version=2.1.80"),
+        "passthrough must preserve billing header when strip_billing_noise is false"
+    );
+    assert!(
+        seen_prompts[0].contains("built on Anthropic's Claude Agent SDK"),
+        "passthrough must preserve raw SDK preamble"
+    );
+
+    // 2. Spill directory must remain completely empty (spill_truncation = false in passthrough)!
+    let spill_entries: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().collect();
+    assert!(
+        spill_entries.is_empty(),
+        "passthrough on agy must not spill tool results to disk"
+    );
+
+    // 3. SessionPool MCP summary must report passthrough (zero virtualized hubs, 40 direct tools)!
+    let pool_tel = pool.snapshot();
+    assert_eq!(pool_tel.sessions.len(), 1);
+    let mcp_summary = pool_tel.sessions[0].mcp.as_ref().expect("mcp summary");
+    assert!(mcp_summary.is_passthrough);
+    assert_eq!(mcp_summary.virtualized_hubs, 0);
+    assert_eq!(
+        mcp_summary.eager_tools, 40,
+        "passthrough must expose all 40 client tools directly without search_client_tools/call_client_tool"
+    );
+    let urls = backend.mcp_urls.lock().unwrap().clone();
+    assert_eq!(urls.len(), 1);
 }

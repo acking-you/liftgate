@@ -14,7 +14,7 @@ use tokio::{
     net::TcpStream,
     process::Command,
     sync::mpsc,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,6 +27,8 @@ use crate::{
 const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_HTTP_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const STREAM_READ_SCRATCH_BYTES: usize = 8 * 1024;
 
 /// Outbound HTTP request descriptor.
 #[derive(Clone, Debug)]
@@ -224,6 +226,8 @@ async fn read_http_response_headers<R: AsyncRead + Unpin>(
                 message: format!("malformed HTTP status line: {trimmed}"),
             });
         };
+        let is_connect_tunnel =
+            status == 200 && rest.to_ascii_lowercase().contains("connection established");
         headers = ParsedResponseHeaders {
             status,
             ..ParsedResponseHeaders::default()
@@ -255,6 +259,11 @@ async fn read_http_response_headers<R: AsyncRead + Unpin>(
             }
         }
         if (100..200).contains(&headers.status) {
+            continue;
+        }
+        // Skip HTTP CONNECT proxy tunnel establishment blocks (`HTTP/1.1 200 Connection established`)
+        // if emitted ahead of the upstream TLS response headers.
+        if is_connect_tunnel {
             continue;
         }
         return Ok(headers);
@@ -337,19 +346,34 @@ async fn read_http_body_bounded<R: AsyncRead + Unpin>(
                 let _ = read_bounded_line(reader, &mut size_line, 256).await;
                 break;
             }
-            let remaining_cap = max_bytes.saturating_sub(buf.len());
-            let mut chunk = vec![0u8; chunk_len];
-            reader
-                .read_exact(&mut chunk)
-                .await
-                .map_err(|e| PlatformApiError::Transport {
-                    message: "truncated HTTP chunk".to_owned(),
-                    source: Some(e),
-                })?;
-            if remaining_cap > 0
-                && let Some(slice) = chunk.get(..chunk_len.min(remaining_cap))
-            {
-                buf.extend_from_slice(slice);
+            if chunk_len > MAX_HTTP_CHUNK_BYTES {
+                return Err(PlatformApiError::Protocol {
+                    message: format!(
+                        "HTTP chunk size {chunk_len} exceeded {MAX_HTTP_CHUNK_BYTES} byte safety bound"
+                    ),
+                });
+            }
+            let mut scratch = [0u8; STREAM_READ_SCRATCH_BYTES];
+            let mut remaining = chunk_len;
+            while remaining > 0 {
+                let step = remaining.min(scratch.len());
+                let Some(buf_slice) = scratch.get_mut(..step) else {
+                    break;
+                };
+                reader
+                    .read_exact(buf_slice)
+                    .await
+                    .map_err(|e| PlatformApiError::Transport {
+                        message: "truncated HTTP chunk".to_owned(),
+                        source: Some(e),
+                    })?;
+                let remaining_cap = max_bytes.saturating_sub(buf.len());
+                if remaining_cap > 0
+                    && let Some(keep) = buf_slice.get(..step.min(remaining_cap))
+                {
+                    buf.extend_from_slice(keep);
+                }
+                remaining -= step;
             }
             let mut crlf = [0u8; 2];
             let _ = reader.read_exact(&mut crlf).await;
@@ -435,11 +459,14 @@ async fn open_tokio_http1_sse(
     parsed: &ParsedHttpUrl,
     req: HttpRequestSpec,
 ) -> Result<HttpSseStream, PlatformApiError> {
+    let total_timeout_ms = u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX);
+    let deadline = Instant::now() + req.total_timeout;
+    let connect_limit = req.connect_timeout.min(req.total_timeout);
     let connect_fut = TcpStream::connect((parsed.host.as_str(), parsed.port));
-    let mut stream = timeout(req.connect_timeout, connect_fut)
+    let mut stream = timeout(connect_limit, connect_fut)
         .await
         .map_err(|_| PlatformApiError::Timeout {
-            elapsed_ms: u64::try_from(req.connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms: u64::try_from(connect_limit.as_millis()).unwrap_or(u64::MAX),
         })?
         .map_err(|e| PlatformApiError::Transport {
             message: format!("connect failed to {}:{}", parsed.host, parsed.port),
@@ -447,19 +474,31 @@ async fn open_tokio_http1_sse(
         })?;
     let _ = stream.set_nodelay(true);
 
-    write_http1_request(&mut stream, parsed, &req).await?;
-
-    let mut reader = BufReader::new(stream);
-    let headers = timeout(req.connect_timeout, read_http_response_headers(&mut reader))
+    timeout_at(deadline, write_http1_request(&mut stream, parsed, &req))
         .await
         .map_err(|_| PlatformApiError::Timeout {
-            elapsed_ms: u64::try_from(req.connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms: total_timeout_ms,
+        })??;
+
+    let mut reader = BufReader::new(stream);
+    let header_deadline = Instant::now() + req.connect_timeout;
+    let eff_header_deadline = header_deadline.min(deadline);
+    let headers = timeout_at(eff_header_deadline, read_http_response_headers(&mut reader))
+        .await
+        .map_err(|_| PlatformApiError::Timeout {
+            elapsed_ms: u64::try_from(req.connect_timeout.min(req.total_timeout).as_millis())
+                .unwrap_or(u64::MAX),
         })??;
 
     if !(200..300).contains(&headers.status) {
-        let err_body = read_http_body_bounded(&mut reader, &headers, MAX_ERROR_BODY_BYTES)
-            .await
-            .unwrap_or_default();
+        let err_body = timeout_at(
+            deadline,
+            read_http_body_bounded(&mut reader, &headers, MAX_ERROR_BODY_BYTES),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
         return Err(PlatformApiError::from_http_status(
             headers.status,
             headers.retry_after_ms,
@@ -474,7 +513,15 @@ async fn open_tokio_http1_sse(
     let is_chunked = headers.chunked;
 
     tokio::spawn(async move {
-        let res = pump_http1_sse_body(&mut reader, is_chunked, &tx, &cancel_child).await;
+        let res = pump_http1_sse_body(
+            &mut reader,
+            is_chunked,
+            deadline,
+            total_timeout_ms,
+            &tx,
+            &cancel_child,
+        )
+        .await;
         if let Err(err) = res {
             let _ = tx.send(Err(err)).await;
         }
@@ -490,6 +537,8 @@ async fn open_tokio_http1_sse(
 async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     is_chunked: bool,
+    deadline: Instant,
+    total_timeout_ms: u64,
     tx: &mpsc::Sender<Result<SseFrame, PlatformApiError>>,
     cancel: &CancellationToken,
 ) -> Result<(), PlatformApiError> {
@@ -497,13 +546,14 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
     if is_chunked {
         let mut size_line = String::new();
         let mut carry = Vec::<u8>::new();
+        let mut scratch = [0u8; STREAM_READ_SCRATCH_BYTES];
         loop {
             size_line.clear();
-            let read_fut = read_bounded_line(reader, &mut size_line, 256);
+            let read_fut = timeout_at(deadline, read_bounded_line(reader, &mut size_line, 256));
             let n = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
-                r = read_fut => r?,
+                r = read_fut => r.map_err(|_| PlatformApiError::Timeout { elapsed_ms: total_timeout_ms })??,
             };
             if n == 0 {
                 break;
@@ -519,35 +569,52 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
             if chunk_len == 0 {
                 break;
             }
-            let mut chunk = vec![0u8; chunk_len];
-            reader
-                .read_exact(&mut chunk)
-                .await
-                .map_err(|e| PlatformApiError::Transport {
+            if chunk_len > MAX_HTTP_CHUNK_BYTES {
+                return Err(PlatformApiError::Protocol {
+                    message: format!(
+                        "SSE chunk size {chunk_len} exceeded {MAX_HTTP_CHUNK_BYTES} byte safety bound"
+                    ),
+                });
+            }
+            let mut remaining = chunk_len;
+            while remaining > 0 {
+                let step = remaining.min(scratch.len());
+                let Some(buf_slice) = scratch.get_mut(..step) else {
+                    break;
+                };
+                let read_chunk = timeout_at(deadline, reader.read_exact(buf_slice));
+                let read_res = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Ok(()),
+                    r = read_chunk => r.map_err(|_| PlatformApiError::Timeout { elapsed_ms: total_timeout_ms })?,
+                };
+                read_res.map_err(|e| PlatformApiError::Transport {
                     message: "truncated SSE chunk".to_owned(),
                     source: Some(e),
                 })?;
-            let mut crlf = [0u8; 2];
-            let _ = reader.read_exact(&mut crlf).await;
+                remaining -= step;
 
-            carry.extend_from_slice(&chunk);
-            while let Some(pos) = carry.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = carry.drain(..=pos).collect();
-                let mut line_str = String::from_utf8_lossy(&line_bytes).into_owned();
-                if line_str.ends_with('\n') {
-                    line_str.pop();
+                carry.extend_from_slice(buf_slice);
+                while let Some(pos) = carry.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = carry.drain(..=pos).collect();
+                    let mut line_str = String::from_utf8_lossy(&line_bytes).into_owned();
+                    if line_str.ends_with('\n') {
+                        line_str.pop();
+                    }
+                    if let Some(frame) = decoder.push_line(&line_str)
+                        && tx.send(Ok(frame)).await.is_err()
+                    {
+                        return Ok(());
+                    }
                 }
-                if let Some(frame) = decoder.push_line(&line_str)
-                    && tx.send(Ok(frame)).await.is_err()
-                {
-                    return Ok(());
+                if carry.len() > MAX_SSE_LINE_BYTES {
+                    return Err(PlatformApiError::Protocol {
+                        message: "SSE line exceeded safety bound".to_owned(),
+                    });
                 }
             }
-            if carry.len() > MAX_SSE_LINE_BYTES {
-                return Err(PlatformApiError::Protocol {
-                    message: "SSE line exceeded safety bound".to_owned(),
-                });
-            }
+            let mut crlf = [0u8; 2];
+            let _ = timeout_at(deadline, reader.read_exact(&mut crlf)).await;
         }
         if !carry.is_empty() {
             let tail = String::from_utf8_lossy(&carry);
@@ -559,11 +626,14 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
         let mut line = String::new();
         loop {
             line.clear();
-            let read_fut = read_bounded_line(reader, &mut line, MAX_SSE_LINE_BYTES);
+            let read_fut = timeout_at(
+                deadline,
+                read_bounded_line(reader, &mut line, MAX_SSE_LINE_BYTES),
+            );
             let n = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
-                r = read_fut => r?,
+                r = read_fut => r.map_err(|_| PlatformApiError::Timeout { elapsed_ms: total_timeout_ms })??,
             };
             if n == 0 {
                 break;
@@ -585,24 +655,38 @@ async fn send_tokio_http1_buffered(
     parsed: &ParsedHttpUrl,
     req: HttpRequestSpec,
 ) -> Result<HttpJsonResponse, PlatformApiError> {
+    let total_timeout_ms = u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX);
+    let deadline = Instant::now() + req.total_timeout;
+    let connect_limit = req.connect_timeout.min(req.total_timeout);
     let connect_fut = TcpStream::connect((parsed.host.as_str(), parsed.port));
-    let mut stream = timeout(req.connect_timeout, connect_fut)
+    let mut stream = timeout(connect_limit, connect_fut)
         .await
         .map_err(|_| PlatformApiError::Timeout {
-            elapsed_ms: u64::try_from(req.connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms: u64::try_from(connect_limit.as_millis()).unwrap_or(u64::MAX),
         })?
         .map_err(|e| PlatformApiError::Transport {
             message: format!("connect failed to {}:{}", parsed.host, parsed.port),
             source: Some(e),
         })?;
-    write_http1_request(&mut stream, parsed, &req).await?;
-    let mut reader = BufReader::new(stream);
-    let headers = timeout(req.total_timeout, read_http_response_headers(&mut reader))
+    timeout_at(deadline, write_http1_request(&mut stream, parsed, &req))
         .await
         .map_err(|_| PlatformApiError::Timeout {
-            elapsed_ms: u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms: total_timeout_ms,
         })??;
-    let body = read_http_body_bounded(&mut reader, &headers, 4 * 1024 * 1024).await?;
+    let mut reader = BufReader::new(stream);
+    let headers = timeout_at(deadline, read_http_response_headers(&mut reader))
+        .await
+        .map_err(|_| PlatformApiError::Timeout {
+            elapsed_ms: total_timeout_ms,
+        })??;
+    let body = timeout_at(
+        deadline,
+        read_http_body_bounded(&mut reader, &headers, 4 * 1024 * 1024),
+    )
+    .await
+    .map_err(|_| PlatformApiError::Timeout {
+        elapsed_ms: total_timeout_ms,
+    })??;
     Ok(HttpJsonResponse {
         status: headers.status,
         retry_after_ms: headers.retry_after_ms,
@@ -699,6 +783,8 @@ fn build_curl_stdin_config(req: &HttpRequestSpec, body_file: Option<&std::path::
 }
 
 async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformApiError> {
+    let total_timeout_ms = u64::try_from(req.total_timeout.as_millis()).unwrap_or(u64::MAX);
+    let deadline = Instant::now() + req.total_timeout;
     let temp_body = match req.body.as_deref() {
         Some(b) if !b.is_empty() => Some(write_temp_request_body(b)?),
         _ => None,
@@ -716,6 +802,7 @@ async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformAp
         "--http1.1",
         "--proto",
         "=http,https",
+        "--suppress-connect-headers",
         "--connect-timeout",
         &connect_secs,
         "--max-time",
@@ -773,8 +860,7 @@ async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformAp
     let mut stderr = child.stderr.take();
     let mut reader = BufReader::new(stdout);
 
-    let headers = match timeout(req.connect_timeout, read_http_response_headers(&mut reader)).await
-    {
+    let headers = match timeout_at(deadline, read_http_response_headers(&mut reader)).await {
         Ok(Ok(h)) => h,
         Ok(Err(err)) => {
             let mut err_buf = String::new();
@@ -791,7 +877,7 @@ async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformAp
         }
         Err(_) => {
             return Err(PlatformApiError::Timeout {
-                elapsed_ms: u64::try_from(req.connect_timeout.as_millis()).unwrap_or(u64::MAX),
+                elapsed_ms: total_timeout_ms,
             });
         }
     };
@@ -817,7 +903,15 @@ async fn open_curl_sse(req: HttpRequestSpec) -> Result<HttpSseStream, PlatformAp
     tokio::spawn(async move {
         let _keep_group = group_guard;
         let _keep_body = temp_body;
-        let res = pump_http1_sse_body(&mut reader, false, &tx, &cancel_child).await;
+        let res = pump_http1_sse_body(
+            &mut reader,
+            false,
+            deadline,
+            total_timeout_ms,
+            &tx,
+            &cancel_child,
+        )
+        .await;
         if let Err(err) = res {
             let _ = tx.send(Err(err)).await;
         }
@@ -848,6 +942,7 @@ async fn send_curl_buffered(req: HttpRequestSpec) -> Result<HttpJsonResponse, Pl
         "--http1.1",
         "--proto",
         "=http,https",
+        "--suppress-connect-headers",
         "--connect-timeout",
         &connect_secs,
         "--max-time",
@@ -860,6 +955,18 @@ async fn send_curl_buffered(req: HttpRequestSpec) -> Result<HttpJsonResponse, Pl
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    if req.force_direct_proxy && req.proxy.is_none() {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
     configure_command_group(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| PlatformApiError::Transport {
