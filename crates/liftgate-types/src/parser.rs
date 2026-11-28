@@ -1484,6 +1484,317 @@ pub fn normalize_apply_patch_text(raw: &str) -> String {
     coalesce_and_repair_v4a_patch(&framed)
 }
 
+/// Normalizes JavaScript source passed to a Code Mode `exec` custom tool:
+/// 1. Strips accidental outer markdown code fences (` ```js ... ``` `).
+/// 2. Auto-escapes unescaped literal backticks (`` ` `` -> `` \` ``) at `${...}` depth 0 inside
+///    embedded V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``),
+///    preventing `SyntaxError: missing ) after argument list` in V8 while leaving `${...}`
+///    interpolations and already-escaped `` \` `` sequences untouched.
+#[must_use]
+pub fn normalize_code_mode_exec_js(raw: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = raw.trim();
+    let (base, stripped_fence) =
+        if trimmed.starts_with("```") && trimmed.ends_with("```") && trimmed.len() >= 6 {
+            (strip_optional_code_fence(trimmed), true)
+        } else {
+            (raw, false)
+        };
+
+    if !base.contains("*** Begin Patch") {
+        return if stripped_fence {
+            std::borrow::Cow::Owned(base.to_owned())
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
+    }
+
+    match heal_v4a_template_backticks(base) {
+        std::borrow::Cow::Borrowed(_) if !stripped_fence => std::borrow::Cow::Borrowed(raw),
+        std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Owned(s.to_owned()),
+        std::borrow::Cow::Owned(healed) => std::borrow::Cow::Owned(healed),
+    }
+}
+
+/// Advances past a quoted JS string (`'` or `"`), returning the byte index right after the
+/// closing quote (or `src.len()` if unclosed).
+fn skip_js_quoted_string(src: &str, open_quote_pos: usize, quote: char) -> usize {
+    let mut pos = open_quote_pos.saturating_add(quote.len_utf8());
+    let mut escaped = false;
+    while let Some(tail) = src.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        pos = pos.saturating_add(ch.len_utf8());
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            break;
+        }
+    }
+    pos
+}
+
+/// Advances past an ordinary JS template literal starting at `open_tick_pos`, handling `\` escapes
+/// and nested `${ ... }` expressions.
+fn skip_js_template_literal(src: &str, open_tick_pos: usize) -> usize {
+    let mut pos = open_tick_pos.saturating_add(1);
+    let mut escaped = false;
+    let mut interp_depth = 0_usize;
+    while let Some(tail) = src.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        if interp_depth == 0 {
+            pos = pos.saturating_add(ch.len_utf8());
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '`' {
+                break;
+            } else if ch == '$' && src.get(pos..).is_some_and(|r| r.starts_with('{')) {
+                pos = pos.saturating_add(1);
+                interp_depth = 1;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => {
+                    pos = skip_js_quoted_string(src, pos, ch);
+                }
+                '`' => {
+                    pos = skip_js_template_literal(src, pos);
+                }
+                '/' if src.get(pos..).is_some_and(|r| r.starts_with("//")) => {
+                    pos = src
+                        .get(pos..)
+                        .and_then(|r| r.find('\n').map(|nl| pos.saturating_add(nl + 1)))
+                        .unwrap_or(src.len());
+                }
+                '/' if src.get(pos..).is_some_and(|r| r.starts_with("/*")) => {
+                    pos = src
+                        .get(pos.saturating_add(2)..)
+                        .and_then(|r| r.find("*/").map(|end| pos.saturating_add(end + 4)))
+                        .unwrap_or(src.len());
+                }
+                '{' => {
+                    interp_depth = interp_depth.saturating_add(1);
+                    pos = pos.saturating_add(1);
+                }
+                '}' => {
+                    interp_depth = interp_depth.saturating_sub(1);
+                    pos = pos.saturating_add(1);
+                }
+                _ => {
+                    pos = pos.saturating_add(ch.len_utf8());
+                }
+            }
+        }
+    }
+    pos
+}
+
+/// Checks whether the template literal opening at `open_tick_pos` begins with `*** Begin Patch`
+/// and, if so, locates the matching closing `` ` `` right after the nearest line-leading
+/// `*** End Patch`.
+fn find_v4a_template_bounds(src: &str, open_tick_pos: usize) -> Option<usize> {
+    let body_start = open_tick_pos.saturating_add(1);
+    let after_open = src.get(body_start..)?;
+    let mut trim_ws = after_open;
+    loop {
+        if let Some(rest) = trim_ws.strip_prefix("\\n") {
+            trim_ws = rest;
+        } else if let Some(rest) = trim_ws.strip_prefix("\\r") {
+            trim_ws = rest;
+        } else {
+            let next = trim_ws.trim_start_matches([' ', '\t', '\r', '\n']);
+            if next.len() == trim_ws.len() {
+                break;
+            }
+            trim_ws = next;
+        }
+    }
+    let after_begin = trim_ws.strip_prefix("*** Begin Patch")?;
+    if !(after_begin.starts_with('\n')
+        || after_begin.starts_with("\r\n")
+        || after_begin.starts_with("\\n")
+        || after_begin.starts_with("\\r\\n"))
+    {
+        return None;
+    }
+
+    let mut search_from = src.len().saturating_sub(after_begin.len());
+    while let Some(rem) = src.get(search_from..) {
+        let rel = rem.find("*** End Patch")?;
+        let marker_pos = search_from.saturating_add(rel);
+        let marker_end = marker_pos.saturating_add("*** End Patch".len());
+        let line_leading = src
+            .get(..marker_pos)
+            .is_some_and(|prefix| prefix.ends_with('\n') || prefix.ends_with("\\n"));
+        if line_leading && let Some(mut tail) = src.get(marker_end..) {
+            let mut consumed = 0_usize;
+            loop {
+                if let Some(r) = tail.strip_prefix("\\n") {
+                    tail = r;
+                    consumed = consumed.saturating_add(2);
+                } else if let Some(r) = tail.strip_prefix("\\r") {
+                    tail = r;
+                    consumed = consumed.saturating_add(2);
+                } else if let Some(ch) = tail.chars().next()
+                    && matches!(ch, ' ' | '\t' | '\r' | '\n')
+                {
+                    tail = tail.get(ch.len_utf8()..).unwrap_or_default();
+                    consumed = consumed.saturating_add(ch.len_utf8());
+                } else {
+                    break;
+                }
+            }
+            if tail.starts_with('`') {
+                return Some(marker_end.saturating_add(consumed));
+            }
+        }
+        search_from = marker_end;
+    }
+    None
+}
+
+/// Escapes unescaped literal `` ` `` characters at `${...}` depth 0 inside V4A patch template
+/// literals while preserving `${...}` interpolations and valid JS expressions verbatim.
+fn heal_v4a_template_backticks(src: &str) -> std::borrow::Cow<'_, str> {
+    let mut out: Option<String> = None;
+    let mut copied_until = 0_usize;
+    let mut pos = 0_usize;
+
+    while let Some(tail) = src.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        match ch {
+            '\'' | '"' => {
+                pos = skip_js_quoted_string(src, pos, ch);
+            }
+            '/' if tail.starts_with("//") => {
+                pos = tail
+                    .find('\n')
+                    .map_or(src.len(), |nl| pos.saturating_add(nl + 1));
+            }
+            '/' if tail.starts_with("/*") => {
+                pos = src
+                    .get(pos.saturating_add(2)..)
+                    .and_then(|r| r.find("*/").map(|end| pos.saturating_add(end + 4)))
+                    .unwrap_or(src.len());
+            }
+            '`' => {
+                if let Some(close_tick_pos) = find_v4a_template_bounds(src, pos) {
+                    let body_start = pos.saturating_add(1);
+                    if let Some(body) = src.get(body_start..close_tick_pos)
+                        && let Some(healed_body) = escape_unescaped_template_backticks(body)
+                    {
+                        let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 16));
+                        if let Some(prefix) = src.get(copied_until..body_start) {
+                            buf.push_str(prefix);
+                        }
+                        buf.push_str(&healed_body);
+                        buf.push('`');
+                        copied_until = close_tick_pos.saturating_add(1);
+                    }
+                    pos = close_tick_pos.saturating_add(1);
+                } else {
+                    pos = skip_js_template_literal(src, pos);
+                }
+            }
+            _ => {
+                pos = pos.saturating_add(ch.len_utf8());
+            }
+        }
+    }
+
+    if let Some(mut buf) = out {
+        if let Some(rest) = src.get(copied_until..) {
+            buf.push_str(rest);
+        }
+        std::borrow::Cow::Owned(buf)
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
+/// Escapes unescaped `` ` `` characters at `${...}` depth 0 within a single V4A template body,
+/// returning `None` if every backtick was already escaped or inside `${...}`.
+fn escape_unescaped_template_backticks(body: &str) -> Option<String> {
+    let mut out: Option<String> = None;
+    let mut copied_until = 0_usize;
+    let mut pos = 0_usize;
+    let mut escaped = false;
+    let mut interp_depth = 0_usize;
+
+    while let Some(tail) = body.get(pos..)
+        && let Some(ch) = tail.chars().next()
+    {
+        if interp_depth == 0 {
+            if escaped {
+                escaped = false;
+                pos = pos.saturating_add(ch.len_utf8());
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                pos = pos.saturating_add(1);
+                continue;
+            }
+            if ch == '$'
+                && body
+                    .get(pos.saturating_add(1)..)
+                    .is_some_and(|r| r.starts_with('{'))
+            {
+                pos = pos.saturating_add(2);
+                interp_depth = 1;
+                continue;
+            }
+            if ch == '`' {
+                let buf = out.get_or_insert_with(|| String::with_capacity(body.len() + 8));
+                if let Some(prefix) = body.get(copied_until..pos) {
+                    buf.push_str(prefix);
+                }
+                buf.push_str("\\`");
+                pos = pos.saturating_add(1);
+                copied_until = pos;
+                continue;
+            }
+            pos = pos.saturating_add(ch.len_utf8());
+        } else {
+            match ch {
+                '\'' | '"' => {
+                    pos = skip_js_quoted_string(body, pos, ch);
+                }
+                '`' => {
+                    pos = skip_js_template_literal(body, pos);
+                }
+                '{' => {
+                    interp_depth = interp_depth.saturating_add(1);
+                    pos = pos.saturating_add(1);
+                }
+                '}' => {
+                    interp_depth = interp_depth.saturating_sub(1);
+                    pos = pos.saturating_add(1);
+                }
+                _ => {
+                    pos = pos.saturating_add(ch.len_utf8());
+                }
+            }
+        }
+    }
+
+    out.map(|mut buf| {
+        if let Some(rest) = body.get(copied_until..) {
+            buf.push_str(rest);
+        }
+        buf
+    })
+}
+
 /// Structured 0-RTT structural preflight failure for V4A `apply_patch` payloads.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ApplyPatchPreflightError {
@@ -2798,6 +3109,33 @@ mod tests {
         assert!(matches!(
             validate_apply_patch_preflight(bad_eof_mid),
             Err(ApplyPatchPreflightError::TrailingLinesAfterEof { line_no: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn normalize_code_mode_exec_js_heals_unescaped_backticks_in_v4a_templates_and_fences() {
+        // 1. Plain JS without V4A patches stays borrowed with trailing whitespace preserved.
+        let plain =
+            "const r = await tools.exec_command({ cmd: `echo ${1 + 1}` });\ntext(r.output);\n";
+        assert!(matches!(
+            normalize_code_mode_exec_js(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // 2. Accidental outer markdown fence is stripped cleanly.
+        let fenced = "```javascript\ntext('ok');\n```";
+        assert_eq!(normalize_code_mode_exec_js(fenced).as_ref(), "text('ok');");
+
+        // 3. Unescaped backticks inside a V4A template literal are escaped while `${wt}` and
+        //    already-escaped `\`exec\`` remain intact, across multi-patch arrays too.
+        let broken = "const patches = [\n  `*** Begin Patch\n*** Update File: ${wt}/CHANGELOG.md\n@@\n+- **Codex `exec` `JSON.parse` fix**: keep \\`escaped\\` intact\n*** End Patch`,\n  `*** Begin Patch\n*** Update File: ${wt}/README.md\n@@\n+- Run `lg cx`\n*** End Patch`\n];\nawait Promise.allSettled(patches.map(p => tools.apply_patch(p)));";
+        let expected = "const patches = [\n  `*** Begin Patch\n*** Update File: ${wt}/CHANGELOG.md\n@@\n+- **Codex \\`exec\\` \\`JSON.parse\\` fix**: keep \\`escaped\\` intact\n*** End Patch`,\n  `*** Begin Patch\n*** Update File: ${wt}/README.md\n@@\n+- Run \\`lg cx\\`\n*** End Patch`\n];\nawait Promise.allSettled(patches.map(p => tools.apply_patch(p)));";
+        let healed = normalize_code_mode_exec_js(broken);
+        assert_eq!(healed.as_ref(), expected);
+        // Idempotent when already valid.
+        assert!(matches!(
+            normalize_code_mode_exec_js(expected),
+            std::borrow::Cow::Borrowed(_)
         ));
     }
 }

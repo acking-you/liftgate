@@ -193,7 +193,7 @@ function ContextSheet({
                         {
                           value: "rewrites" as const,
                           label: t.tabRewrites,
-                          count: payload?.rewrites?.length ?? record.rewrite_count,
+                          count: payload ? rewrites.length : record.rewrite_count,
                         },
                       ]
                     : []),

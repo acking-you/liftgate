@@ -115,11 +115,11 @@ pub fn orchestrator_contract_rules(contract: McpOrchestratorContract<'_>) -> Str
             has_apply_patch,
         } => {
             out.push_str(&format!(
-                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, call `mcp_lg_wait` on `cell_id`, and invoke `mcp_lg_*` tools directly without routine pre-tool preamble text."
+                "- Codex Code Mode & Elastic I/O (`mcp_lg_{mcp_name}`): pass raw JS in `{{\"code\": \"...\"}}` (no markdown fences), fan out parallel reads via `await Promise.all([tools.exec_command(...), ...])`, cache raw state in `store`/`load`, emit `<= 8 KB` via `text(...)`, call `mcp_lg_wait` on `cell_id`, and invoke `mcp_lg_*` tools directly without routine pre-tool preamble text. `tools.exec_command(...)` resolves to `{{ output, exit_code, session_id, wall_time_seconds }}` where `output` merges `stdout` + `stderr` and prepends truncation headers past `max_output_tokens`: before calling `JSON.parse(r.output)`, redirect `2>/dev/null` and emit a single JSON document (never NDJSON like `--jq '.[]'` or chained `&&` banners)."
             ));
             if has_apply_patch {
                 out.push_str(&format!(
-                    " For 5+ file patches needing fault isolation, use `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` in `mcp_lg_{mcp_name}`; when permissions allow non-interactive writes (never in `Plan Mode` or `read-only`), stream large new files + checks in one `exec_command`."
+                    " Always call top-level `mcp_lg_apply_patch` directly for 1-4 file edits (never wrap 1-4 file patches in `tools.apply_patch` inside `mcp_lg_{mcp_name}`, avoiding JS template-literal backtick/`${{...}}` escaping errors and preserving 0-RTT V4A preflight). Only for 5+ file patches needing fault isolation after reading exact target lines, use `await Promise.allSettled(patches.map(p => tools.apply_patch(p)))` in `mcp_lg_{mcp_name}` (never `Promise.all` with `tools.apply_patch`, and escape inner backticks); when permissions allow non-interactive writes (never in `Plan Mode` or `read-only`), stream large new files + checks in one `exec_command`."
                 ));
             }
             out.push('\n');

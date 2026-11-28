@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -13,11 +13,12 @@ import {
   Wrench,
 } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
+import { DiffBlock, sizeChange } from "@/components/ContextRewrites";
 import { RouteFlow, ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
 import { Button, Figure, HarnessBadge, Latency, Note, Pill, Segmented } from "@/components/ui";
 import { useGateway } from "@/hooks/gateway";
 import { useResource } from "@/hooks/useResource";
-import { formatBytes, formatNumber, formatSmartTime, shortId } from "@/lib/format";
+import { byteLength, formatBytes, formatNumber, formatSmartTime, shortId } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import {
   displayToolName,
@@ -130,6 +131,13 @@ export function ToolCallInspector({
     `${record.call_id}|${record.status}`,
   );
   const [argView, setArgView] = useState<"client" | "wire">("client");
+  const [outView, setOutView] = useState<"raw" | "diff" | "forwarded">(
+    record.output_spilled ? "diff" : "raw",
+  );
+  const outputSectionRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (record.output_spilled) setOutView("diff");
+  }, [record.output_spilled]);
 
   const full = detail.status === "ready" ? detail.data : null;
   const shown = full ?? previewDetail(record);
@@ -143,6 +151,21 @@ export function ToolCallInspector({
   const inputRaw = showWire ? shown.wire_arguments : (shown.client_arguments ?? shown.wire_arguments);
   const inputTool = showWire ? record.wire_tool_name : displayToolName(record);
   const failed = isFailure(record);
+  const primaryOutputText = shown.output_blocks
+    .filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  const forwardedOutput = full?.forwarded_output ?? null;
+  const hasForwardedDiff =
+    forwardedOutput !== null && forwardedOutput !== primaryOutputText;
+  const effectiveOutView = hasForwardedDiff ? outView : "raw";
+  const forwardedBytes =
+    full?.forwarded_output_bytes ?? (forwardedOutput !== null ? byteLength(forwardedOutput) : null);
+  const spillChange =
+    hasForwardedDiff && forwardedBytes !== null
+      ? sizeChange(record.output_bytes, forwardedBytes)
+      : null;
+  const imageBlocks = shown.output_blocks.filter((b) => b.type === "image");
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -177,9 +200,25 @@ export function ToolCallInspector({
             </Pill>
           )}
           {record.output_spilled && (
-            <Pill tone="warn" icon={<Scissors />} title={t.spilledHint}>
-              {t.spilled}
-            </Pill>
+            hasForwardedDiff ? (
+              <button
+                type="button"
+                className="lg-pill-btn"
+                title={t.spilledJumpHint}
+                onClick={() => {
+                  setOutView("diff");
+                  outputSectionRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+                }}
+              >
+                <Pill tone="warn" icon={<Scissors />}>
+                  {t.spilled}
+                </Pill>
+              </button>
+            ) : (
+              <Pill tone="warn" icon={<Scissors />} title={t.spilledHint}>
+                {t.spilled}
+              </Pill>
+            )
           )}
         </div>
       )}
@@ -222,17 +261,55 @@ export function ToolCallInspector({
         />
         {full?.input_truncated && <p className="lg-hint m-0">{t.inputTruncated}</p>}
 
-        <section className="flex min-w-0 flex-col gap-2">
-          <h3 className="lg-section-title m-0">{t.output}</h3>
+        <section ref={outputSectionRef} className="flex min-w-0 flex-col gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <h3 className="lg-section-title m-0">{t.output}</h3>
+              {hasForwardedDiff && forwardedBytes !== null && (
+                <span className="lg-num text-[12px] text-fg-3">
+                  {formatBytes(record.output_bytes)} → {formatBytes(forwardedBytes)}
+                  {spillChange && (
+                    <span className={spillChange.shrank ? "ml-1.5 text-ok-fg" : "ml-1.5 text-warn-fg"}>
+                      {spillChange.shrank ? "−" : "+"}
+                      {spillChange.pct}
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+            {hasForwardedDiff && record.status !== "pending" && (
+              <Segmented<"raw" | "diff" | "forwarded">
+                ariaLabel={t.outputView}
+                value={effectiveOutView}
+                onChange={setOutView}
+                options={[
+                  { value: "raw", label: t.outOriginal },
+                  { value: "diff", label: t.outDiff },
+                  { value: "forwarded", label: t.outForwarded },
+                ]}
+              />
+            )}
+          </div>
           {record.status === "pending" ? (
             <p className="lg-hint m-0 flex items-center gap-1.5">
               <LoaderCircle className="lg-spin h-3.5 w-3.5" />
               {t.waiting}
             </p>
+          ) : effectiveOutView === "diff" && forwardedOutput !== null ? (
+            <DiffBlock original={primaryOutputText} rewritten={forwardedOutput} maxHeight={460} />
+          ) : effectiveOutView === "forwarded" && forwardedOutput !== null ? (
+            <ToolOutputView
+              blocks={[
+                { type: "text", bytes: forwardedBytes ?? byteLength(forwardedOutput), text: forwardedOutput },
+                ...imageBlocks,
+              ]}
+              failed={failed}
+            />
           ) : (
             <ToolOutputView blocks={shown.output_blocks} failed={failed} />
           )}
           {full?.output_truncated && <p className="lg-hint m-0">{t.outputTruncated}</p>}
+          {full?.forwarded_output_truncated && <p className="lg-hint m-0">{t.forwardedTruncated}</p>}
         </section>
         </>
       )}

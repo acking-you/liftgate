@@ -11783,6 +11783,179 @@ async fn tool_call_io_catalog_and_full_context_capture_follow_an_mcp_cascade() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn resumed_mcp_continuation_without_tools_preserves_distill_harness_and_records_spill_diff() {
+    let backend = Arc::new(MockAcpBackend::new(vec![MockScript::McpInteractive {
+        steps: vec![
+            McpMockStep::CallTool {
+                usage_used: 5_000,
+                thoughts: vec![],
+                pre_text_templates: vec![],
+                mcp_name: "exec_command".to_owned(),
+                arguments: json!({ "cmd": "cat large.log" }),
+                expect_reply_substrings: vec!["Gateway truncated tool_result:exec_command:"],
+            },
+            McpMockStep::FinalReply {
+                usage_used: 6_200,
+                thoughts: vec![],
+                chunks_template: vec!["Summarized spilled log.".to_owned()],
+                final_usage: AcpUsage {
+                    input_tokens: 1_500,
+                    output_tokens: 80,
+                    cached_read_tokens: 4_500,
+                    cached_write_tokens: 0,
+                    thought_tokens: 20,
+                    total_tokens: 6_100,
+                },
+            },
+        ],
+        cancelled_usage: AcpUsage::default(),
+    }]));
+
+    let root = std::env::temp_dir().join(format!(
+        "liftgate-spill-rewrite-e2e-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let spill_dir = root.join("spills");
+    let capture_dir = root.join("captures");
+    std::fs::create_dir_all(&spill_dir).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+
+    let mut state = test_state_with_mcp(Arc::clone(&backend), 30, Some(spill_dir.clone())).await;
+    state.telemetry = Arc::new(TelemetryHub::with_telemetry_config(
+        liftgate_server::telemetry::TelemetryConfig {
+            cache: CacheTelemetryConfig::default(),
+            tool_calls: liftgate_server::tool_calls::ToolCallLimits::default(),
+            context_capture: liftgate_server::context_capture::ContextCaptureConfig {
+                enabled: true,
+                dir: Some(capture_dir.clone()),
+                ..liftgate_server::context_capture::ContextCaptureConfig::default()
+            },
+            pricing_path: None,
+            usage_path: None,
+        },
+    ));
+    let app = build_router(state);
+
+    let codex_tools = json!([
+        { "type": "custom", "name": "exec", "description": "Run JavaScript in Code Mode" },
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run shell command",
+            "parameters": {
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            }
+        },
+        { "type": "custom", "name": "apply_patch", "description": "Apply V4A patch" }
+    ]);
+    let codex_base_prompt = format!(
+        "You are Codex, a coding agent.\n{}",
+        "Follow the built-in harness instructions carefully. ".repeat(60)
+    );
+
+    let (status, r1) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "instructions": codex_base_prompt,
+            "tools": codex_tools,
+            "input": "Inspect large.log"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let call_id = r1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("exec_command call")["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Continuation omits `tools` so `req.detected_harness` is `None`; outbound distillation must
+    // still use the suspended session's Codex harness, and >10 KB output must record spill diff.
+    let big_output = (1..=300)
+        .map(|i| format!("log line {i:03}: {}", "payload ".repeat(6)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (status, r2) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model": "gpt-5.4",
+            "stream": false,
+            "store": true,
+            "previous_response_id": r1["id"],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": big_output,
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, call_detail) =
+        get_json(&app, &format!("/api/telemetry/tool-calls/{call_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(call_detail["output_spilled"], true);
+    let raw_stored = call_detail["output_blocks"][0]["text"].as_str().unwrap();
+    let fwd_stored = call_detail["forwarded_output"].as_str().unwrap();
+    assert_eq!(raw_stored, big_output);
+    assert!(fwd_stored.contains("Gateway truncated tool_result:exec_command:"));
+    assert!(
+        call_detail["forwarded_output_bytes"].as_u64().unwrap()
+            < call_detail["output_bytes"].as_u64().unwrap()
+    );
+
+    let mut r2_capture_ready = false;
+    for _ in 0..250 {
+        let (_, listed) = get_json(&app, "/api/telemetry/context-captures").await;
+        if listed["records"].as_array().is_some_and(|recs| {
+            recs.iter()
+                .any(|rec| rec["task_id"] == r2["id"] && rec["rewrite_count"] == 2)
+        }) {
+            r2_capture_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(r2_capture_ready, "expected r2 capture with 2 rewrites");
+
+    let (status, ctx_detail) = get_json(
+        &app,
+        &format!(
+            "/api/telemetry/context-captures/{}",
+            r2["id"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rewrites = ctx_detail["payload"]["rewrites"].as_array().unwrap();
+    assert_eq!(rewrites.len(), 2);
+    assert_eq!(rewrites[0]["kind"], "prompt_distilled");
+    assert_eq!(rewrites[0]["slot"], "primary_base");
+    assert_eq!(rewrites[1]["kind"], "tool_result_spilled");
+    assert_eq!(rewrites[1]["tool_name"], "exec_command");
+    assert!(
+        rewrites[1]["rewritten"]
+            .as_str()
+            .unwrap()
+            .contains("Gateway truncated tool_result:exec_command:")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test(start_paused = true)]
 async fn xml_tool_calls_are_recorded_and_completed_by_the_next_request() {
     let backend = Arc::new(MockAcpBackend::new(vec![

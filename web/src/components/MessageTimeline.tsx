@@ -2,6 +2,7 @@ import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CircleAlert, FilterX, GitCompare, Image as ImageIcon } from "lucide-react";
 import { ProseBlock } from "@/components/CodeBlock";
+import { DiffBlock, sizeChange } from "@/components/ContextRewrites";
 import { SegmentedBar } from "@/components/charts";
 import { ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
 import { Button, Disclosure, Pill, SearchInput, Segmented, Select } from "@/components/ui";
@@ -44,10 +45,30 @@ function partFailed(part: CapturedFullPart): boolean {
   return part.kind === "tool_result" && (part.is_error || outputReportsFailure(part.output));
 }
 
+function stripCallPrefix(id: string): string {
+  return id.trim().replace(/^(?:call_|toolu_)/, "");
+}
+
+interface IndexedRewrite {
+  index: number;
+  rewrite: ContextRewrite;
+}
+
 /** Tool a call invokes or a result answers; `null` for every other part. */
-function partToolName(part: CapturedFullPart, toolNames: ReadonlyMap<string, string>): string | null {
+function partToolName(
+  part: CapturedFullPart,
+  toolNames: ReadonlyMap<string, string>,
+  partRewrite?: IndexedRewrite,
+): string | null {
   if (part.kind === "tool_call") return part.name;
-  if (part.kind === "tool_result") return toolNames.get(part.call_id) ?? null;
+  if (part.kind === "tool_result") {
+    return (
+      toolNames.get(part.call_id) ??
+      toolNames.get(stripCallPrefix(part.call_id)) ??
+      partRewrite?.rewrite.tool_name ??
+      null
+    );
+  }
   return null;
 }
 
@@ -67,7 +88,7 @@ function searchableText(part: CapturedFullPart, toolNames: ReadonlyMap<string, s
       text = `${part.name}\n${part.call_id}\n${part.arguments}`;
       break;
     case "tool_result":
-      text = `${toolNames.get(part.call_id) ?? ""}\n${part.call_id}\n${part.output}`;
+      text = `${toolNames.get(part.call_id) ?? toolNames.get(stripCallPrefix(part.call_id)) ?? ""}\n${part.call_id}\n${part.output}`;
       break;
     case "image":
       text = part.media_type;
@@ -82,17 +103,25 @@ function PartView({
   part,
   open,
   toolNames,
+  partRewrite,
+  onShowRewrite,
 }: {
   part: CapturedFullPart;
   open: boolean;
   /** call_id → tool name, so a result can say which call it answers. */
   toolNames: ReadonlyMap<string, string>;
+  partRewrite?: IndexedRewrite;
+  onShowRewrite?: (rewriteIndex: number) => void;
 }): React.JSX.Element {
   const { m } = useI18n();
   const t = m.context.timeline;
   const kind = partKindOf(part);
-  const toolName = partToolName(part, toolNames);
+  const toolName = partToolName(part, toolNames, partRewrite);
   const failed = partFailed(part);
+  const rw = partRewrite?.rewrite;
+  const canCompare = rw != null && rw.rewritten != null;
+  const [partMode, setPartMode] = useState<"original" | "diff" | "forwarded">("original");
+  const rwChange = rw ? sizeChange(rw.original_bytes, rw.rewritten_bytes) : null;
 
   const head = (
     <>
@@ -104,6 +133,11 @@ function PartView({
       <span className="flex-none font-medium text-fg-2">{partKindLabel(kind)}</span>
       {toolName !== null && <span className="lg-num flex-none text-fg">{toolName}</span>}
       {failed && <Pill tone="err">{t.error}</Pill>}
+      {rw && (
+        <Pill tone="warn">
+          {rw.kind === "tool_result_spilled" ? t.partSpilled : t.partRewritten}
+        </Pill>
+      )}
       <span className="lg-clip lg-num min-w-0 flex-1 text-[11.5px] text-fg-4">{excerptOf(part)}</span>
     </>
   );
@@ -159,7 +193,62 @@ function PartView({
       tone={failed ? "err" : undefined}
       defaultOpen={open}
     >
-      {body}
+      {canCompare || (partRewrite && onShowRewrite) ? (
+        <div className="flex min-w-0 flex-col gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="lg-num text-[11.5px] text-fg-3">
+              {rw && (
+                <>
+                  {formatBytes(rw.original_bytes)} → {rw.rewritten == null ? "0 B" : formatBytes(rw.rewritten_bytes)}
+                  {rwChange && (
+                    <span className={rwChange.shrank ? "ml-1.5 text-ok-fg" : "ml-1.5 text-warn-fg"}>
+                      {rwChange.shrank ? "−" : "+"}
+                      {rwChange.pct}
+                    </span>
+                  )}
+                </>
+              )}
+            </span>
+            <span className="flex flex-wrap items-center gap-1.5">
+              {canCompare && (
+                <Segmented<"original" | "diff" | "forwarded">
+                  ariaLabel={t.partViewAria}
+                  value={partMode}
+                  onChange={setPartMode}
+                  options={[
+                    { value: "original", label: t.partOriginal },
+                    { value: "diff", label: t.partDiff },
+                    { value: "forwarded", label: t.partForwarded },
+                  ]}
+                />
+              )}
+              {partRewrite && onShowRewrite && (
+                <Button size="sm" variant="ghost" onClick={() => onShowRewrite(partRewrite.index)}>
+                  <GitCompare />
+                  {t.openRewrite}
+                </Button>
+              )}
+            </span>
+          </div>
+          {canCompare && partMode === "diff" ? (
+            <DiffBlock original={rw.original} rewritten={rw.rewritten ?? ""} maxHeight={360} />
+          ) : canCompare && partMode === "forwarded" ? (
+            part.kind === "tool_result" ? (
+              <ToolOutputView
+                blocks={[{ type: "text", bytes: rw.rewritten_bytes, text: rw.rewritten ?? "" }]}
+                failed={failed}
+                maxHeight={360}
+              />
+            ) : (
+              <ProseBlock text={rw.rewritten ?? ""} title={t.partForwarded} maxHeight={360} />
+            )
+          ) : (
+            body
+          )}
+        </div>
+      ) : (
+        body
+      )}
     </Disclosure>
   );
 }
@@ -217,11 +306,15 @@ export function MessageTimeline({
   const f = t.filters;
   const rootRef = useRef<HTMLDivElement>(null);
   const deltaCount = useMemo(() => messages.filter((msg) => msg.in_delta).length, [messages]);
+  const focusPos = useMemo(
+    () => (focus !== null ? messages.findIndex((msg) => msg.index === focus) : -1),
+    [focus, messages],
+  );
   // A focus request opens on everything, deep enough to include the focused message.
   const [scope, setScope] = useState<Scope>(
     focus !== null ? "all" : (initialScope ?? (deltaCount > 0 && messages.length > PAGE ? "delta" : "all")),
   );
-  const [limit, setLimit] = useState(focus !== null ? Math.max(PAGE, messages.length - focus) : PAGE);
+  const [limit, setLimit] = useState(focusPos >= 0 ? Math.max(PAGE, messages.length - focusPos) : PAGE);
   const [filter, setFilter] = useState<TimelineFilter>(EMPTY_FILTER);
   const patchFilter = (patch: Partial<TimelineFilter>): void => {
     setFilter((prev) => ({ ...prev, ...patch }));
@@ -230,18 +323,32 @@ export function MessageTimeline({
 
   useEffect(() => {
     if (focus === null) return;
+    setScope("all");
+    setFilter(EMPTY_FILTER);
+    if (focusPos >= 0) {
+      setLimit((prev) => Math.max(prev, messages.length - focusPos));
+    }
     rootRef.current?.querySelector(`[data-msg="${focus}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [focus]);
+  }, [focus, focusPos, messages.length]);
 
   const toolNames = useMemo(() => {
     const names = new Map<string, string>();
     for (const msg of messages) {
       for (const part of msg.parts) {
-        if (part.kind === "tool_call") names.set(part.call_id, part.name);
+        if (part.kind === "tool_call") {
+          names.set(part.call_id, part.name);
+          names.set(stripCallPrefix(part.call_id), part.name);
+        }
+      }
+    }
+    for (const rw of rewrites) {
+      if (rw.call_id && rw.tool_name) {
+        names.set(rw.call_id, rw.tool_name);
+        names.set(stripCallPrefix(rw.call_id), rw.tool_name);
       }
     }
     return names;
-  }, [messages]);
+  }, [messages, rewrites]);
 
   const rewritesByMessage = useMemo(() => {
     const out = new Map<number, { first: number; count: number }>();
@@ -250,6 +357,17 @@ export function MessageTimeline({
       const entry = out.get(rw.message_index);
       if (entry) entry.count += 1;
       else out.set(rw.message_index, { first: idx, count: 1 });
+    });
+    return out;
+  }, [rewrites]);
+
+  const rewritesByPart = useMemo(() => {
+    const out = new Map<string, IndexedRewrite>();
+    rewrites.forEach((rewrite, index) => {
+      if (rewrite.message_index != null && rewrite.part_index != null) {
+        const key = `${rewrite.message_index}:${rewrite.part_index}`;
+        if (!out.has(key)) out.set(key, { index, rewrite });
+      }
     });
     return out;
   }, [rewrites]);
@@ -277,15 +395,16 @@ export function MessageTimeline({
     for (const msg of scoped) {
       roles.set(msg.role, (roles.get(msg.role) ?? 0) + 1);
       if (rewritesByMessage.has(msg.index)) rewritten += 1;
-      for (const part of msg.parts) {
+      msg.parts.forEach((part, partIdx) => {
         const kind = partKindOf(part);
         kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
-        if (part.kind === "tool_call") tools.set(part.name, (tools.get(part.name) ?? 0) + 1);
+        const tool = partToolName(part, toolNames, rewritesByPart.get(`${msg.index}:${partIdx}`));
+        if (tool !== null) tools.set(tool, (tools.get(tool) ?? 0) + 1);
         if (partFailed(part)) errors += 1;
-      }
+      });
     }
     return { roles, kinds, tools, errors, rewritten };
-  }, [scoped, rewritesByMessage]);
+  }, [scoped, rewritesByMessage, rewritesByPart, toolNames]);
 
   const query = filter.query.trim().toLowerCase();
   const partFilterActive = filter.kind !== "all" || filter.tool !== "all" || filter.errorsOnly || query !== "";
@@ -298,17 +417,22 @@ export function MessageTimeline({
       if (filter.rewrittenOnly && !rewritesByMessage.has(msg.index)) continue;
       const parts = msg.parts
         .map((part, idx) => ({ part, idx }))
-        .filter(({ part }) => {
+        .filter(({ part, idx }) => {
           if (!partFilterActive) return true;
           if (filter.kind !== "all" && partKindOf(part) !== filter.kind) return false;
-          if (filter.tool !== "all" && partToolName(part, toolNames) !== filter.tool) return false;
+          if (
+            filter.tool !== "all" &&
+            partToolName(part, toolNames, rewritesByPart.get(`${msg.index}:${idx}`)) !== filter.tool
+          ) {
+            return false;
+          }
           if (filter.errorsOnly && !partFailed(part)) return false;
           return query === "" || searchableText(part, toolNames).includes(query);
         });
       if (parts.length > 0 || !partFilterActive) out.push({ msg, parts });
     }
     return out;
-  }, [scoped, filter, query, partFilterActive, rewritesByMessage, toolNames]);
+  }, [scoped, filter, query, partFilterActive, rewritesByMessage, rewritesByPart, toolNames]);
 
   // The newest messages matter most, so paging reveals older ones upward.
   const hidden = Math.max(0, filtered.length - limit);
@@ -494,6 +618,8 @@ export function MessageTimeline({
                   part={part}
                   open={(msg.in_delta && msg.parts.length <= 6) || (partFilterActive && parts.length <= 3)}
                   toolNames={toolNames}
+                  partRewrite={rewritesByPart.get(`${msg.index}:${idx}`)}
+                  onShowRewrite={onShowRewrite}
                 />
               ))}
               {parts.length < msg.parts.length && (

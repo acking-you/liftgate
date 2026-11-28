@@ -16,7 +16,7 @@ type View = "diff" | "split";
 
 function kindTone(kind: string): Tone {
   if (kind === "prompt_distilled") return "accent";
-  if (kind === "prompt_dropped") return "warn";
+  if (kind === "prompt_dropped" || kind === "tool_result_spilled") return "warn";
   return "neutral";
 }
 
@@ -25,13 +25,21 @@ function isPrompt(kind: string): boolean {
 }
 
 /** Size change in whole percent, e.g. "92%" for a distilled prompt; `null` below 0.5% either way. */
-function sizeChange(before: number, after: number): { pct: string; shrank: boolean } | null {
+export function sizeChange(before: number, after: number): { pct: string; shrank: boolean } | null {
   const ratio = before === 0 ? 0 : Math.abs(before - after) / before;
   if (ratio < 0.005) return null;
   return { pct: formatPct(ratio), shrank: after < before };
 }
 
-function DiffBlock({ original, rewritten }: { original: string; rewritten: string }): React.JSX.Element {
+export function DiffBlock({
+  original,
+  rewritten,
+  maxHeight = 560,
+}: {
+  original: string;
+  rewritten: string;
+  maxHeight?: number | null;
+}): React.JSX.Element {
   const { m } = useI18n();
   const t = m.context.rewrites;
   const diff = useMemo(
@@ -41,6 +49,10 @@ function DiffBlock({ original, rewritten }: { original: string; rewritten: strin
   const [wrap, setWrap] = useState(true);
   const [unfolded, setUnfolded] = useState(false);
   const [limit, setLimit] = useState(ROW_PAGE);
+  useEffect(() => {
+    setUnfolded(false);
+    setLimit(ROW_PAGE);
+  }, [original, rewritten]);
   const rows = useMemo(
     () =>
       unfolded ? diff.lines.map((line) => ({ kind: "line" as const, line })) : foldContext(diff.lines),
@@ -84,7 +96,12 @@ function DiffBlock({ original, rewritten }: { original: string; rewritten: strin
             />
           </span>
         </figcaption>
-        <pre className="lg-code" data-wrap={wrap} style={{ maxHeight: 560 }} tabIndex={0}>
+        <pre
+          className="lg-code"
+          data-wrap={wrap}
+          style={maxHeight === null ? undefined : { maxHeight }}
+          tabIndex={0}
+        >
           <code className="lg-diff-lines">
             {shown.map((row, idx) =>
               row.kind === "gap" ? (
@@ -145,6 +162,7 @@ function RewriteItem({
   ].filter((s): s is string => Boolean(s));
   // Texts past the per-part capture cap were head/tail trimmed on the gateway.
   const cut =
+    Boolean(rewrite.truncated) ||
     byteLength(rewrite.original) < rewrite.original_bytes ||
     (rewrite.rewritten != null && byteLength(rewrite.rewritten) < rewrite.rewritten_bytes);
 
@@ -237,6 +255,11 @@ export function ContextRewritesView({
   const { m } = useI18n();
   const t = m.context.rewrites;
   const [kind, setKind] = useState<string>("all");
+  const [activeFocus, setActiveFocus] = useState<number | null>(focus ?? null);
+  useEffect(() => {
+    setActiveFocus(focus ?? null);
+    if (focus != null) setKind("all");
+  }, [focus]);
   const kinds = useMemo(() => {
     const counts = new Map<string, number>();
     for (const rw of rewrites) counts.set(rw.kind, (counts.get(rw.kind) ?? 0) + 1);
@@ -245,11 +268,9 @@ export function ContextRewritesView({
   const before = rewrites.reduce((sum, rw) => sum + rw.original_bytes, 0);
   const after = rewrites.reduce((sum, rw) => sum + rw.rewritten_bytes, 0);
   const change = sizeChange(before, after);
-  // A focus request always shows the focused rewrite, whatever the filter.
-  const activeKind = focus != null ? "all" : kind;
   const listed = rewrites
     .map((rewrite, idx) => ({ rewrite, idx }))
-    .filter(({ rewrite }) => activeKind === "all" || rewrite.kind === activeKind);
+    .filter(({ rewrite }) => kind === "all" || rewrite.kind === kind);
 
   if (rewrites.length === 0) {
     return <p className="lg-hint m-0">{t.none}</p>;
@@ -272,8 +293,11 @@ export function ContextRewritesView({
         {kinds.length > 1 && (
           <Segmented<string>
             ariaLabel={t.kindFilter}
-            value={activeKind}
-            onChange={setKind}
+            value={kind}
+            onChange={(next) => {
+              setKind(next);
+              setActiveFocus(null);
+            }}
             options={[
               { value: "all", label: t.all, count: rewrites.length },
               ...kinds.map(([value, count]) => ({ value, label: t.kind[value] ?? value, count })),
@@ -283,11 +307,10 @@ export function ContextRewritesView({
       </div>
       {listed.map(({ rewrite, idx }) => (
         <RewriteItem
-          // A focus request remounts the item so it opens even if the reader closed it.
-          key={`${idx}:${focus === idx ? "focus" : ""}`}
+          key={idx}
           rewrite={rewrite}
-          focused={focus === idx}
-          defaultOpen={rewrites.length <= 3}
+          focused={activeFocus === idx}
+          defaultOpen={rewrites.length <= 3 || activeFocus === idx}
           onLocate={onLocate}
         />
       ))}

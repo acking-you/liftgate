@@ -617,9 +617,29 @@ function taskIdFor(session: DemoSession, turn: number): string {
   return id;
 }
 
+function spillExcerpt(raw: string, toolName: string): string {
+  const lines = raw.split("\n");
+  if (lines.length <= 36) {
+    const half = Math.max(80, Math.floor(raw.length / 3));
+    return `${raw.slice(0, half)}\n... [Gateway truncated tool_result:${toolName}: ${bytes(raw)} bytes total; full lossless content saved locally at ~/.liftgate/spills/tool-result-${hex(12)}.txt] ...\n${raw.slice(-half)}`;
+  }
+  const head = lines.slice(0, 18).join("\n");
+  const tail = lines.slice(-14).join("\n");
+  const omitted = lines.length - 32;
+  const omittedBytes = Math.max(0, bytes(raw) - bytes(head) - bytes(tail));
+  return `${head}\n... [Gateway truncated tool_result:${toolName}: ${bytes(raw)} bytes (${lines.length} lines) total; omitted middle ${omittedBytes} bytes (${omitted} lines, lines 19..=${lines.length - 14}) to fit single-turn limit. Full lossless content saved locally at \`~/.liftgate/spills/tool-result-${hex(12)}.txt\` — inspect in 0-RTT via \`mcp_lg_read_context_spill\`.] ...\n${tail}`;
+}
+
 function outputFields(draft: Draft): Pick<
   ToolCallDetail,
-  "status" | "error_kind" | "output_bytes" | "output_tokens_est" | "output_preview" | "output_blocks"
+  | "status"
+  | "error_kind"
+  | "output_bytes"
+  | "output_tokens_est"
+  | "output_preview"
+  | "output_blocks"
+  | "forwarded_output"
+  | "forwarded_output_bytes"
 > {
   const outputBytes = draft.blocks.reduce(
     (sum, b) => sum + (b.type === "image" ? b.base64_bytes : b.bytes),
@@ -627,6 +647,10 @@ function outputFields(draft: Draft): Pick<
   );
   const firstText = draft.blocks.find((b) => b.type === "text");
   const preview = firstText?.type === "text" ? firstText.text.slice(0, 240) : "";
+  const forwarded =
+    draft.spilled && firstText?.type === "text"
+      ? spillExcerpt(firstText.text, draft.client ?? draft.wire)
+      : null;
   return {
     status: draft.status ?? "ok",
     error_kind: draft.errorKind ?? null,
@@ -634,6 +658,8 @@ function outputFields(draft: Draft): Pick<
     output_tokens_est: Math.round(outputBytes / 4),
     output_preview: preview.replace(/\s+/g, " "),
     output_blocks: draft.blocks,
+    forwarded_output: forwarded,
+    forwarded_output_bytes: forwarded !== null ? bytes(forwarded) : null,
   };
 }
 
@@ -650,7 +676,16 @@ function materialize(
 ): ToolCallDetail {
   const inputBytes = bytes(draft.wireArgs);
   const output: ReturnType<typeof outputFields> = pending
-    ? { status: "pending", error_kind: null, output_bytes: 0, output_tokens_est: 0, output_preview: "", output_blocks: [] }
+    ? {
+        status: "pending",
+        error_kind: null,
+        output_bytes: 0,
+        output_tokens_est: 0,
+        output_preview: "",
+        output_blocks: [],
+        forwarded_output: null,
+        forwarded_output_bytes: null,
+      }
     : outputFields(draft);
   const detail: ToolCallDetail = {
     call_id: `call_${hex(12)}`,
@@ -699,7 +734,17 @@ for (const session of SESSIONS) {
 }
 
 const toRecord = (d: ToolCallDetail): ToolCallRecord => {
-  const { wire_arguments: _w, client_arguments: _c, output_blocks: _o, input_truncated: _i, output_truncated: _t, ...record } = d;
+  const {
+    wire_arguments: _w,
+    client_arguments: _c,
+    output_blocks: _o,
+    forwarded_output: _fo,
+    forwarded_output_bytes: _fb,
+    input_truncated: _i,
+    output_truncated: _t,
+    forwarded_output_truncated: _ft,
+    ...record
+  } = d;
   return record;
 };
 
@@ -1077,24 +1122,45 @@ function buildPayload(session: DemoSession, turn: number, taskId: string): FullC
     },
   ];
   // The first tool result of the turn arrived with terminal colors that lg stripped.
+  let markedSanitized = false;
   for (const msg of messages) {
-    const partIndex = msg.in_delta ? msg.parts.findIndex((p) => p.kind === "tool_result") : -1;
-    const part = msg.parts[partIndex];
-    if (part?.kind !== "tool_result") continue;
-    const original = `\u001b[32m${part.output}\u001b[0m`;
-    part.output = original;
-    rewrites.push({
-      kind: "tool_result_sanitized",
-      message_index: msg.index,
-      part_index: partIndex,
-      call_id: part.call_id,
-      tool_name: details.get(part.call_id)?.client_tool_name ?? null,
-      original_bytes: bytes(original),
-      rewritten_bytes: part.bytes,
-      original,
-      rewritten: original.slice(5, -4),
+    msg.parts.forEach((part, partIndex) => {
+      if (part.kind !== "tool_result") return;
+      const callDetail = details.get(part.call_id);
+      if (callDetail?.output_spilled && callDetail.forwarded_output != null) {
+        rewrites.push({
+          kind: "tool_result_spilled",
+          message_index: msg.index,
+          part_index: partIndex,
+          call_id: part.call_id,
+          tool_name: callDetail.client_tool_name ?? callDetail.wire_tool_name,
+          original_bytes: part.bytes,
+          rewritten_bytes: callDetail.forwarded_output_bytes ?? bytes(callDetail.forwarded_output),
+          original: part.output,
+          rewritten: callDetail.forwarded_output,
+        });
+      } else if (msg.in_delta && !markedSanitized) {
+        markedSanitized = true;
+        const cleaned = part.output;
+        const cleanedBytes = part.bytes;
+        const original = `\u001b[32m${cleaned}\u001b[0m`;
+        const origBytes = bytes(original);
+        part.output = original;
+        part.bytes = origBytes;
+        msg.total_bytes += origBytes - cleanedBytes;
+        rewrites.push({
+          kind: "tool_result_sanitized",
+          message_index: msg.index,
+          part_index: partIndex,
+          call_id: part.call_id,
+          tool_name: callDetail?.client_tool_name ?? callDetail?.wire_tool_name ?? null,
+          original_bytes: origBytes,
+          rewritten_bytes: cleanedBytes,
+          original,
+          rewritten: cleaned,
+        });
+      }
     });
-    break;
   }
   const catalog = buildCatalog(session);
   const delta = messages.filter((m) => m.in_delta);

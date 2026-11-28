@@ -347,10 +347,7 @@ impl NormalizedTurnRequest {
         let Some(slice) = self.messages.get(range_start..) else {
             return std::borrow::Cow::Borrowed(&[]);
         };
-        if !self.allow_prompt_distillation || self.auxiliary_task.is_some() {
-            return std::borrow::Cow::Borrowed(slice);
-        }
-        let Some(harness) = harness_override.or(self.detected_harness) else {
+        let Some(harness) = self.distillation_harness_with(harness_override) else {
             return std::borrow::Cow::Borrowed(slice);
         };
         if crate::harness_prompt::distilled_harness_system_prompt(harness).is_none() {
@@ -373,14 +370,24 @@ impl NormalizedTurnRequest {
         std::borrow::Cow::Owned(rendered)
     }
 
+    /// Effective harness whose developer slots [`Self::render_messages_for_outbound`] distills
+    /// under `harness_override`, or `None` when developer slots are forwarded verbatim.
+    #[must_use]
+    pub fn distillation_harness_with(
+        &self,
+        harness_override: Option<crate::harness_prompt::DetectedHarness>,
+    ) -> Option<crate::harness_prompt::DetectedHarness> {
+        if !self.allow_prompt_distillation || self.auxiliary_task.is_some() {
+            return None;
+        }
+        harness_override.or(self.detected_harness)
+    }
+
     /// Harness whose developer slots [`Self::render_messages_for_outbound`] distills, or `None`
     /// when this turn forwards every developer slot verbatim.
     #[must_use]
     pub fn distillation_harness(&self) -> Option<crate::harness_prompt::DetectedHarness> {
-        if !self.allow_prompt_distillation || self.auxiliary_task.is_some() {
-            return None;
-        }
-        self.detected_harness
+        self.distillation_harness_with(None)
     }
 }
 

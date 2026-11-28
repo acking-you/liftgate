@@ -22,17 +22,18 @@ export interface LineDiff {
 /** LCS table cells allowed before falling back to a whole-block replacement (~10 MB). */
 const MAX_CELLS = 2_500_000;
 
-function splitLines(text: string): string[] {
+function splitLines(text: string, stripTrailingLf: boolean): string[] {
   if (text === "") return [];
-  const lines = text.split("\n");
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
+  const body = stripTrailingLf && text.endsWith("\n") ? text.slice(0, -1) : text;
+  return body.split("\n");
 }
 
 /** Diffs `before` against `after` line by line (common prefix/suffix + LCS on the middle). */
 export function diffLines(before: string, after: string): LineDiff {
-  const a = splitLines(before);
-  const b = splitLines(after);
+  const trailingLfDiffers =
+    before !== "" && after !== "" && before.endsWith("\n") !== after.endsWith("\n");
+  const a = splitLines(before, !trailingLfDiffers);
+  const b = splitLines(after, !trailingLfDiffers);
   let head = 0;
   while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
   let tail = 0;
@@ -124,12 +125,18 @@ export type DiffRow = { kind: "line"; line: DiffLine } | { kind: "gap"; hidden: 
 /** Keeps `context` unchanged lines around each change and folds the rest into gap rows. */
 export function foldContext(lines: readonly DiffLine[], context = 3): DiffRow[] {
   const keep = new Uint8Array(lines.length);
+  let hasChange = false;
   lines.forEach((line, idx) => {
     if (line.op === "ctx") return;
+    hasChange = true;
     const from = Math.max(0, idx - context);
     const to = Math.min(lines.length - 1, idx + context);
     for (let k = from; k <= to; k += 1) keep[k] = 1;
   });
+  if (!hasChange && lines.length > 0) {
+    const head = Math.min(lines.length, context * 2);
+    for (let k = 0; k < head; k += 1) keep[k] = 1;
+  }
   const rows: DiffRow[] = [];
   let hidden = 0;
   lines.forEach((line, idx) => {

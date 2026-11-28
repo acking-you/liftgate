@@ -119,6 +119,8 @@ pub struct ToolCallOutcome {
     pub raw_bytes: usize,
     pub sanitized: bool,
     pub spilled: bool,
+    /// Exact text handed back to the model when the gateway spilled or annotated the output.
+    pub forwarded_output: Option<String>,
     pub images: Vec<ToolOutputImage>,
 }
 
@@ -146,6 +148,7 @@ impl ToolCallOutcome {
             raw_bytes: raw.len(),
             sanitized,
             spilled: false,
+            forwarded_output: None,
             images: Vec::new(),
         }
     }
@@ -164,6 +167,7 @@ impl ToolCallOutcome {
             text,
             sanitized: false,
             spilled: false,
+            forwarded_output: None,
             images: Vec::new(),
         }
     }
@@ -299,8 +303,11 @@ struct ToolCallEntry {
     wire_arguments: String,
     client_arguments: Option<String>,
     output_blocks: Vec<ToolOutputBlock>,
+    forwarded_output: Option<String>,
+    forwarded_output_bytes: Option<usize>,
     input_truncated: bool,
     output_truncated: bool,
+    forwarded_output_truncated: bool,
     retained_bytes: usize,
 }
 
@@ -361,6 +368,7 @@ impl ToolCallEntry {
         self.retained_bytes = RECORD_OVERHEAD_BYTES
             .saturating_add(self.wire_arguments.len())
             .saturating_add(self.client_arguments.as_deref().map_or(0, str::len))
+            .saturating_add(self.forwarded_output.as_deref().map_or(0, str::len))
             .saturating_add(self.record.input_preview.len())
             .saturating_add(self.record.output_preview.len())
             .saturating_add(labels)
@@ -449,8 +457,11 @@ impl ToolCallStore {
             wire_arguments: entry.wire_arguments.clone(),
             client_arguments: entry.client_arguments.clone(),
             output_blocks: entry.output_blocks.clone(),
+            forwarded_output: entry.forwarded_output.clone(),
+            forwarded_output_bytes: entry.forwarded_output_bytes,
             input_truncated: entry.input_truncated,
             output_truncated: entry.output_truncated,
+            forwarded_output_truncated: entry.forwarded_output_truncated,
         })
     }
 
@@ -482,6 +493,34 @@ impl ToolCallStore {
         } else {
             (
                 truncate_head_tail_lines(raw, self.limits.max_field_bytes, label),
+                true,
+            )
+        }
+    }
+
+    fn clip_forwarded(
+        max_field: usize,
+        readable_text: &str,
+        forwarded: Option<&str>,
+        spilled: bool,
+    ) -> (Option<String>, Option<usize>, bool) {
+        let Some(fwd) = forwarded else {
+            return (None, None, false);
+        };
+        if !spilled && fwd == readable_text {
+            return (None, None, false);
+        }
+        let bytes = fwd.len();
+        if bytes <= max_field {
+            (Some(fwd.to_owned()), Some(bytes), false)
+        } else {
+            (
+                Some(truncate_head_tail_lines(
+                    fwd,
+                    max_field,
+                    "forwarded tool call output",
+                )),
+                Some(bytes),
                 true,
             )
         }
@@ -558,8 +597,11 @@ impl ToolCallStore {
             wire_arguments: wire_stored,
             client_arguments: client_stored,
             output_blocks: Vec::new(),
+            forwarded_output: None,
+            forwarded_output_bytes: None,
             input_truncated: wire_cut || client_cut,
             output_truncated: false,
+            forwarded_output_truncated: false,
             retained_bytes: 0,
         };
         entry.measure();
@@ -596,8 +638,11 @@ impl ToolCallStore {
             raw_bytes,
             sanitized,
             spilled,
+            forwarded_output,
             images,
         } = outcome;
+        let (fwd_stored, fwd_bytes, fwd_cut) =
+            Self::clip_forwarded(max_field, &text, forwarded_output.as_deref(), spilled);
         let (stored_text, cut) = if text.len() <= max_field {
             (text, false)
         } else {
@@ -626,6 +671,11 @@ impl ToolCallStore {
         entry.record.output_preview = preview(&stored_text);
         entry.record.revision = revision;
         entry.output_truncated = cut;
+        if fwd_stored.is_some() {
+            entry.forwarded_output = fwd_stored;
+            entry.forwarded_output_bytes = fwd_bytes;
+            entry.forwarded_output_truncated = fwd_cut;
+        }
         let mut blocks = Vec::with_capacity(1 + images.len());
         if !stored_text.is_empty() || images.is_empty() {
             blocks.push(ToolOutputBlock::Text {
@@ -664,17 +714,54 @@ impl ToolCallStore {
 
     /// Flags a finished call whose output the gateway spilled before replying to the model.
     pub fn mark_spilled(&mut self, call_id: &str) -> bool {
+        self.record_forwarded_output(call_id, None, true)
+    }
+
+    /// Attaches the gateway-shaped reply text (and spill state) to a call already completed from
+    /// incoming messages.
+    pub fn record_forwarded_output(
+        &mut self,
+        call_id: &str,
+        forwarded: Option<&str>,
+        spilled: bool,
+    ) -> bool {
         let key = call_key(call_id).to_owned();
+        let max_field = self.limits.max_field_bytes;
         let revision = self.revision.saturating_add(1);
         let Some(entry) = self.entry_mut(&key) else {
             return false;
         };
-        if entry.record.output_spilled {
+        let primary_text = entry
+            .output_blocks
+            .iter()
+            .find_map(|b| match b {
+                ToolOutputBlock::Text { text, .. } => Some(text.as_str()),
+                ToolOutputBlock::Image { .. } => None,
+            })
+            .unwrap_or_default();
+        let (fwd_stored, fwd_bytes, fwd_cut) =
+            Self::clip_forwarded(max_field, primary_text, forwarded, spilled);
+        let spill_added = spilled && !entry.record.output_spilled;
+        let fwd_changed = fwd_stored.is_some() && entry.forwarded_output != fwd_stored;
+        if !spill_added && !fwd_changed {
             return false;
         }
-        entry.record.output_spilled = true;
+        entry.record.output_spilled |= spilled;
+        if fwd_stored.is_some() {
+            entry.forwarded_output = fwd_stored;
+            entry.forwarded_output_bytes = fwd_bytes;
+            entry.forwarded_output_truncated = fwd_cut;
+        }
         entry.record.revision = revision;
+        let before = entry.retained_bytes;
+        entry.measure();
+        let after = entry.retained_bytes;
         self.revision = revision;
+        self.stored_bytes = self
+            .stored_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        self.evict_over_budget();
         true
     }
 
@@ -1290,5 +1377,35 @@ mod tests {
         assert_eq!(preview("  a\n\n  b\tc  "), "a b c");
         let long = "x".repeat(PREVIEW_CHARS + 50);
         assert_eq!(preview(&long).chars().count(), PREVIEW_CHARS + 1);
+    }
+
+    #[test]
+    fn record_forwarded_output_retains_post_spill_text_and_tracks_bytes() {
+        let mut store = ToolCallStore::new(ToolCallLimits::default());
+        store.begin(&ctx(), 0, start("call_spill_1", r#"{"path":"big.rs"}"#), 10);
+        let raw = "line\n".repeat(4_000);
+        let messages = vec![CanonicalMessage {
+            role: CanonicalRole::User,
+            parts: vec![CanonicalPart::ToolResult {
+                call_id: "toolu_spill_1".to_owned(),
+                output: raw.clone(),
+                is_error: false,
+            }],
+        }];
+        assert_eq!(store.complete_from_messages(&messages, 25), 1);
+        let before_bytes = store.summary().stored_bytes;
+
+        let forwarded = "line\n... [Gateway truncated tool_result:Read] ...\nline\n";
+        assert!(store.record_forwarded_output("call_spill_1", Some(forwarded), true));
+        let detail = store.detail("call_spill_1").expect("detail");
+        assert!(detail.record.output_spilled);
+        assert_eq!(detail.forwarded_output.as_deref(), Some(forwarded));
+        assert_eq!(detail.forwarded_output_bytes, Some(forwarded.len()));
+        assert!(!detail.forwarded_output_truncated);
+        assert_eq!(store.summary().stored_bytes, before_bytes + forwarded.len());
+        // Idempotent repeat does not bump revision or double-charge bytes.
+        let rev = store.summary().revision;
+        assert!(!store.record_forwarded_output("call_spill_1", Some(forwarded), true));
+        assert_eq!(store.summary().revision, rev);
     }
 }

@@ -953,6 +953,11 @@ pub enum ToolOutputBlock {
     },
 }
 
+/// Predicate for `#[serde(skip_serializing_if = "is_false")]` on boolean flags.
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Full record served by `GET /api/telemetry/tool-calls/{call_id}`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolCallDetail {
@@ -965,12 +970,22 @@ pub struct ToolCallDetail {
     pub client_arguments: Option<String>,
     #[serde(default)]
     pub output_blocks: Vec<ToolOutputBlock>,
+    /// Output text actually handed back to the model when the gateway spilled or annotated the
+    /// client tool result (`None` when forwarded unchanged after basic control-noise scrubbing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_output: Option<String>,
+    /// UTF-8 byte length of the forwarded text before any per-field storage cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_output_bytes: Option<usize>,
     /// The per-field byte cap clipped the stored input.
     #[serde(default)]
     pub input_truncated: bool,
     /// The per-field byte cap clipped the stored output.
     #[serde(default)]
     pub output_truncated: bool,
+    /// The per-field byte cap clipped [`Self::forwarded_output`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forwarded_output_truncated: bool,
 }
 
 /// Ring-buffer status carried on the snapshot as `tool_call_telemetry`.
@@ -1203,9 +1218,9 @@ pub struct ContextCaptureRecord {
     #[serde(default)]
     pub prompt_preview: String,
     /// Places where the gateway changed the harness's context before forwarding it
-    /// ([`FullContextPayload::rewrites`]); `0` on captures that predate rewrite tracking.
-    #[serde(default)]
-    pub rewrite_count: usize,
+    /// ([`FullContextPayload::rewrites`]); `None` on captures written before rewrite tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_count: Option<usize>,
 }
 
 /// Why the gateway changed a piece of harness context before forwarding it upstream.
@@ -1216,9 +1231,15 @@ pub enum ContextRewriteKind {
     PromptDistilled,
     /// A harness developer item dropped as redundant harness-internal boilerplate.
     PromptDropped,
-    /// A client tool result cleaned (billing noise, terminal control sequences) or head/tail
-    /// truncated into a spill before being handed back to the model.
+    /// A client tool result cleaned (billing noise, terminal control sequences) or annotated with
+    /// a gateway recovery hint before being handed back to the model.
     ToolResultSanitized,
+    /// A client tool result exceeded the inline byte limit; the model received a head/tail excerpt
+    /// plus a local spill file reference.
+    ToolResultSpilled,
+    /// Unrecognized rewrite kind written by a newer gateway version.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One gateway change to the harness context: what the harness sent and what went upstream.
@@ -1247,6 +1268,9 @@ pub struct ContextRewrite {
     /// Forwarded text; `None` when the gateway dropped the part entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewritten: Option<String>,
+    /// `true` when `original` or `rewritten` was clipped to the capture safety budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// Response served by `GET /api/telemetry/context-captures` (newest first).
@@ -1330,8 +1354,11 @@ mod tests {
                 width: Some(2),
                 height: None,
             }],
+            forwarded_output: None,
+            forwarded_output_bytes: None,
             input_truncated: false,
             output_truncated: false,
+            forwarded_output_truncated: false,
         };
         let json = serde_json::to_value(&detail).unwrap();
         assert_eq!(json["call_id"], "call_abc");
@@ -1345,6 +1372,8 @@ mod tests {
         assert_eq!(route, ToolCallRoute::Unknown);
         let status: ToolCallStatus = serde_json::from_str("\"exploded\"").unwrap();
         assert_eq!(status, ToolCallStatus::Unknown);
+        let kind: ContextRewriteKind = serde_json::from_str("\"future_rewrite_v2\"").unwrap();
+        assert_eq!(kind, ContextRewriteKind::Unknown);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use liftgate_types::{
     canonical::{CanonicalToolKind, CanonicalToolSpec},
-    parser::ApplyPatchPreflightError,
+    parser::{ApplyPatchPreflightError, normalize_code_mode_exec_js},
     session_key::{is_code_mode_custom_exec, is_code_mode_orchestrator_tool},
     telemetry::{CatalogToolEntry, CatalogToolTier, CatalogWireRole, CatalogWireTool},
 };
@@ -1218,6 +1218,16 @@ fn resolve_custom_tool_call(
             client_name: client_name.to_owned(),
             patch_repaired: normalized != extracted,
             arguments: normalized,
+            is_custom: true,
+        };
+    }
+    if unwrap_custom_key == Some("code") {
+        let normalized = normalize_code_mode_exec_js(&extracted);
+        let repaired = normalized.as_ref() != extracted && extracted.contains("*** Begin Patch");
+        return VirtualizedCallDecision::ForwardToClient {
+            client_name: client_name.to_owned(),
+            patch_repaired: repaired,
+            arguments: normalized.into_owned(),
             is_custom: true,
         };
     }

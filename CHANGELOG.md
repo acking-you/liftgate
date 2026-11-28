@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.21] - 2026-11-28
+
+### Added
+- **What lg changed in each captured context**: full-context captures now record every place the gateway rewrote the harness context before forwarding it (`prompt_distilled`, `prompt_dropped`, `tool_result_sanitized`, `tool_result_spilled`, plus an `Unknown` catch-all for forward/rollback compatibility), retaining the harness's original text alongside what went upstream (`rewrites` on `FullContextPayload`, `rewrite_count` on `ContextCaptureRecord`, and effective warm/resumed `distill_harness` propagation). A new "lg rewrites" tab and inline timeline part comparisons show each change as a line diff or side by side with size deltas and cross-links.
+- **Before/after diff for spilled tool outputs**: per-call tool telemetry (`ToolCallDetail`) now retains `forwarded_output` and `forwarded_output_bytes` whenever the gateway spills or annotates a client tool result, adding an `Original / Spill diff / Forwarded` switcher (and a "Spilled only" stream filter) to the Tool Calls inspector so operators can inspect exact head/tail boundaries and omitted ranges before and after each spill.
+- **Full-context filters**: saved contexts filter by harness, session, and model, plus "rewritten by lg" and "hit rate below threshold" toggles and a search over ids, models, and prompt previews, each option showing its match count. Inside a capture, the timeline filters by role, part kind, and tool (including tool-result continuations whose calls sit in the resident prefix), shows only failed tool results or rewritten messages, and searches part text, tool names, and call ids.
+
+### Fixed
+- **Codex `exec` script reliability (`JSON.parse`, template-literal backticks, and nested `apply_patch`)**:
+  - Clarified in `CodexExec` `<api_gateway_bridge_rules>` and `mcp_lg_exec`'s input schema that `tools.exec_command(...).output` merges `stdout` + `stderr` and prepends truncation headers past `max_output_tokens` (requiring `2>/dev/null` and single-document JSON before `JSON.parse`), and steered 1-4 file edits to top-level `mcp_lg_apply_patch` rather than `tools.apply_patch` inside `exec` (reserving `Promise.allSettled` for 5+ file patches after reading exact target lines).
+  - Added 0-RTT `normalize_code_mode_exec_js` normalization on `mcp_lg_exec` to strip accidental outer markdown code fences and auto-escape unescaped literal backticks inside embedded V4A patch template literals (`` `*** Begin Patch\n...\n*** End Patch` ``) while preserving `${...}` interpolations, eliminating `SyntaxError: missing ) after argument list` failures.
+  - Added targeted recovery hints when `exec` fails with `JSON.parse` `SyntaxError`, JS template-literal `SyntaxError`, or uncaught `apply_patch verification failed:` rejections.
+
 ## [0.2.20] - 2026-11-28
 
 ### Fixed
@@ -21,8 +34,6 @@ All notable changes to this project will be documented in this file.
 - **Harness on every request**: each recent and in-flight request records the harness it came from (`harness_profile` on `TaskSnapshot`: Codex, Claude Code, OpenCode, Oh My Pi, or generic), and the overview's recent-requests table, the running-request cards, and the request detail sheet show it.
 - **Recent-request filters**: the overview's recent requests filter by harness, session, model, and protocol, plus "problems only" (failed, cancelled, or with failed / rejected tool calls) and "hit rate below threshold" toggles. Every option shows how many requests it would match, clicking a row's harness or session filters to it (click again to clear), and one button clears all filters.
 - **Recent-request search and scope summary**: a search box matches task / session ids, models, and prompt, output, or error previews; while filters are active a strip summarizes the matching requests (count and sessions, problems, token-weighted hit rate, TTFT p50 / p90, total cost), the cache-trend chart plots only the matching requests, and the filter survives switching views and reloads within the tab.
-- **What lg changed in each captured context**: full-context captures now record every place the gateway rewrote the harness context before forwarding it (distilled or dropped harness prompts, cleaned or spilled tool results), with the harness's original text and what went upstream (`rewrites` on the capture payload, `rewrite_count` on each record). A new "lg rewrites" tab shows each change as a line diff or side by side with a size delta and an explanation; rewritten messages are tagged in the timeline, and each rewrite and its message link to each other.
-- **Full-context filters**: saved contexts filter by harness, session, and model, plus "rewritten by lg" and "hit rate below threshold" toggles and a search over ids, models, and prompt previews, each option showing its match count. Inside a capture, the timeline filters by role, part kind, and tool, shows only failed tool results or rewritten messages, and searches part text, tool names, and call ids.
 
 ### Fixed
 - **ACP `session/update` `RawValue` deserialization**: replaced `#[serde(tag = "sessionUpdate")]` internal-tag buffering on `SessionUpdatePayload` with a two-step `RawValue` slice deserializer so `tool_call`, `tool_call_update`, and `error` notifications carrying non-null `args`, `rawInput`, or `error` payloads decode losslessly instead of failing `serde`'s `Content` buffer and dropping native `search_web` (`web_search_call` / `server_tool_use`) events.

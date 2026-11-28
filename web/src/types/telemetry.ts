@@ -501,9 +501,13 @@ export interface ToolCallDetail extends ToolCallRecord {
   /** Arguments forwarded to the client after unwrapping or repair (null when unchanged). */
   client_arguments?: string | null;
   output_blocks: ToolOutputBlock[];
+  /** Output text handed back to the model after spill or gateway annotation. */
+  forwarded_output?: string | null;
+  forwarded_output_bytes?: number | null;
   /** True when the per-field byte cap clipped the stored input or output. */
   input_truncated?: boolean;
   output_truncated?: boolean;
+  forwarded_output_truncated?: boolean;
 }
 
 /** Ring-buffer status carried on the snapshot as `tool_call_telemetry`. */
@@ -640,7 +644,11 @@ export interface ContextCaptureRecord {
   rewrite_count?: number;
 }
 
-export type ContextRewriteKind = "prompt_distilled" | "prompt_dropped" | "tool_result_sanitized";
+export type ContextRewriteKind =
+  | "prompt_distilled"
+  | "prompt_dropped"
+  | "tool_result_sanitized"
+  | "tool_result_spilled";
 
 /** One gateway change to the harness context: what the harness sent and what went upstream. */
 export interface ContextRewrite {
@@ -658,6 +666,8 @@ export interface ContextRewrite {
   original: string;
   /** Absent when the gateway dropped the part entirely. */
   rewritten?: string | null;
+  /** `true` when `original` or `rewritten` hit the per-part or total capture cap. */
+  truncated?: boolean;
 }
 
 export interface ContextCapturesResponse {

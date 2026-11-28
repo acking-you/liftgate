@@ -451,6 +451,10 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
     () => filterToolCalls(records, { ...filter, errorsOnly: false }).filter(isFailure).length,
     [records, filter],
   );
+  const spilledCount = useMemo(
+    () => filterToolCalls(records, { ...filter, spilledOnly: false }).filter((r) => r.output_spilled).length,
+    [records, filter],
+  );
   const sessionOptions = useMemo(() => {
     const harnessOf = new Map<string, string>();
     for (const rec of records) {
@@ -719,6 +723,18 @@ export function ToolCallsView({ arg, navigate }: ViewProps): React.JSX.Element {
               {t.errorsOnly}
               <span className="lg-seg-count">{failureCount}</span>
             </button>
+            {(spilledCount > 0 || filter.spilledOnly) && (
+              <button
+                type="button"
+                className="lg-chip"
+                aria-pressed={filter.spilledOnly}
+                onClick={() => patchFilter({ spilledOnly: !filter.spilledOnly })}
+              >
+                <Scissors />
+                {t.spilledOnly}
+                <span className="lg-seg-count">{spilledCount}</span>
+              </button>
+            )}
           </div>
 
           {pageRecords.length === 0 ? (
