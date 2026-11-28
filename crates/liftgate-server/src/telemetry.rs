@@ -64,20 +64,30 @@ const MAX_INLINE_MESSAGE_EXCERPT_CHARS: usize = 600;
 struct PayloadBudget {
     per_part: usize,
     total: usize,
+    /// Largest single base64 image kept as a preview.
+    per_image: usize,
+    /// Base64 image bytes kept per payload, separate from the text budget.
+    images_total: usize,
 }
 
 const LOW_CACHE_PAYLOAD_BUDGET: PayloadBudget = PayloadBudget {
     per_part: 256 * 1024,
     total: 2 * 1024 * 1024,
+    per_image: 256 * 1024,
+    images_total: 1024 * 1024,
 };
 const CONTEXT_CAPTURE_PAYLOAD_BUDGET: PayloadBudget = PayloadBudget {
     per_part: 1024 * 1024,
     total: 16 * 1024 * 1024,
+    per_image: 2 * 1024 * 1024,
+    images_total: 8 * 1024 * 1024,
 };
 /// Bounds for the before / after texts kept per gateway context rewrite.
 const CONTEXT_REWRITE_BUDGET: PayloadBudget = PayloadBudget {
     per_part: 256 * 1024,
     total: 4 * 1024 * 1024,
+    per_image: 0,
+    images_total: 0,
 };
 /// Reasoning / output text retained per turn for full-context capture.
 const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 1024 * 1024;
@@ -89,7 +99,9 @@ const IMAGE_TOKENS_ESTIMATE: u64 = 1_000;
 const _: () = assert!(
     LOW_CACHE_PAYLOAD_BUDGET.per_part <= LOW_CACHE_PAYLOAD_BUDGET.total
         && CONTEXT_CAPTURE_PAYLOAD_BUDGET.per_part <= CONTEXT_CAPTURE_PAYLOAD_BUDGET.total
-        && CONTEXT_REWRITE_BUDGET.per_part <= CONTEXT_REWRITE_BUDGET.total,
+        && CONTEXT_REWRITE_BUDGET.per_part <= CONTEXT_REWRITE_BUDGET.total
+        && LOW_CACHE_PAYLOAD_BUDGET.per_image <= LOW_CACHE_PAYLOAD_BUDGET.images_total
+        && CONTEXT_CAPTURE_PAYLOAD_BUDGET.per_image <= CONTEXT_CAPTURE_PAYLOAD_BUDGET.images_total,
     "a single payload part must fit inside its payload budget"
 );
 
@@ -3323,6 +3335,22 @@ fn bound_part_string(
     }
 }
 
+/// Keeps a raster image's base64 payload while it fits the per-image and remaining image budgets.
+fn bound_image_data(
+    media_type: &str,
+    data: &str,
+    budget_remaining: &mut usize,
+    per_image: usize,
+) -> Option<String> {
+    let kept = crate::tool_calls::previewable_image_data(
+        media_type,
+        data,
+        per_image.min(*budget_remaining),
+    )?;
+    *budget_remaining = budget_remaining.saturating_sub(kept.len());
+    Some(kept)
+}
+
 fn build_full_request_payload(
     task_id: &str,
     recorded_at_unix_ms: u64,
@@ -3333,6 +3361,7 @@ fn build_full_request_payload(
 ) -> LowCacheFullRequestPayload {
     let mut budget = limits.total;
     let per_part = limits.per_part;
+    let mut image_budget = limits.images_total;
     let mut truncated = false;
 
     let acp_system_append = diag
@@ -3355,6 +3384,7 @@ fn build_full_request_payload(
                 outbound_acp_prompt_blocks.push(CapturedAcpPromptBlock::Image {
                     mime_type: mime_type.clone(),
                     base64_bytes: data.len(),
+                    data: bound_image_data(mime_type, data, &mut image_budget, limits.per_image),
                 });
             }
         }
@@ -3404,6 +3434,12 @@ fn build_full_request_payload(
                     parts.push(CapturedFullPart::Image {
                         media_type: media_type.clone(),
                         base64_bytes: data.len(),
+                        data: bound_image_data(
+                            media_type,
+                            data,
+                            &mut image_budget,
+                            limits.per_image,
+                        ),
                     });
                 }
                 CanonicalPart::ToolCall {

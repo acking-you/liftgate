@@ -1,9 +1,10 @@
 import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CircleAlert, FilterX, GitCompare, Image as ImageIcon } from "lucide-react";
+import { CircleAlert, FilterX, GitCompare } from "lucide-react";
 import { ProseBlock } from "@/components/CodeBlock";
 import { DiffBlock, sizeChange } from "@/components/ContextRewrites";
 import { SegmentedBar } from "@/components/charts";
+import { ImagePreview, TextPartView } from "@/components/RichContent";
 import { ToolGlyph, ToolInputView, ToolOutputView } from "@/components/ToolExchange";
 import { Button, Disclosure, Pill, SearchInput, Segmented, Select } from "@/components/ui";
 import {
@@ -146,7 +147,7 @@ function PartView({
   switch (part.kind) {
     case "text":
       body = (
-        <ProseBlock
+        <TextPartView
           text={part.text}
           title={part.is_developer_instructions ? "<developer_instructions>" : t.text}
         />
@@ -168,6 +169,7 @@ function PartView({
     case "tool_result":
       body = (
         <ToolOutputView
+          toolName={toolName ?? undefined}
           blocks={[{ type: "text", bytes: part.bytes, text: part.output }]}
           failed={failed}
           maxHeight={360}
@@ -176,12 +178,11 @@ function PartView({
       break;
     case "image":
       body = (
-        <div className="flex items-center gap-2 text-[12.5px] text-fg-3">
-          <ImageIcon className="h-4 w-4" />
-          <span className="lg-num">
-            {part.media_type} · base64 {formatBytes(part.base64_bytes)}
-          </span>
-        </div>
+        <ImagePreview
+          mediaType={part.media_type}
+          data={part.data}
+          base64Bytes={part.base64_bytes}
+        />
       );
       break;
   }
@@ -235,12 +236,13 @@ function PartView({
           ) : canCompare && partMode === "forwarded" ? (
             part.kind === "tool_result" ? (
               <ToolOutputView
+                toolName={toolName ?? undefined}
                 blocks={[{ type: "text", bytes: rw.rewritten_bytes, text: rw.rewritten ?? "" }]}
                 failed={failed}
                 maxHeight={360}
               />
             ) : (
-              <ProseBlock text={rw.rewritten ?? ""} title={t.partForwarded} maxHeight={360} />
+              <TextPartView text={rw.rewritten ?? ""} title={t.partForwarded} />
             )
           ) : (
             body

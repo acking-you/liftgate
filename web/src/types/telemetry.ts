@@ -233,7 +233,7 @@ export interface LowCacheRequestCapture {
 
 export type CapturedAcpPromptBlock =
   | { type: "text"; bytes: number; text: string }
-  | { type: "image"; mime_type: string; base64_bytes: number };
+  | { type: "image"; mime_type: string; base64_bytes: number; data?: string | null };
 
 export type CapturedFullPart =
   | {
@@ -243,7 +243,7 @@ export type CapturedFullPart =
       text: string;
     }
   | { kind: "reasoning"; bytes: number; text: string }
-  | { kind: "image"; media_type: string; base64_bytes: number }
+  | { kind: "image"; media_type: string; base64_bytes: number; data?: string | null }
   | {
       kind: "tool_call";
       call_id: string;
@@ -536,6 +536,7 @@ export type ToolOutputBlock =
       base64_bytes: number;
       width?: number | null;
       height?: number | null;
+      data?: string | null;
     };
 
 /** Full record returned by `GET /api/telemetry/tool-calls/{call_id}`. */

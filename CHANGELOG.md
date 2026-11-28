@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.24] - 2026-11-28
+
+### Added
+- **Overview full-context & cross-view quick jumps**:
+  - Added per-row shortcut buttons in the Overview "Recent requests" table to jump directly to a turn's recorded tool calls (`#/tools/<task_id>`) and captured full context (`#/context/<task_id>`) whenever those records exist.
+  - Added a "Quick jump" action bar inside the request detail sheet (`TaskSheet`) linking directly to Full Context, Tool Calls, and Low-Cache Report, and wired `#/context/<task_id>` deep-link opening (with missing-record fallback notices) in `ContextView`.
+- **Rich visual rendering for images, inline documents, and web search/fetch calls**:
+  - Retained bounded, safe raster-only (`png`/`jpeg`/`gif`/`webp`) base64 previews under dedicated per-image and per-payload budgets across context captures (`2 MiB`/image, `8 MiB`/turn), low-cache captures (`256 KiB`/image, `1 MiB`/turn), and tool-call outputs (`384 KiB`/image) via `data` on `CapturedAcpPromptBlock::Image`, `CapturedFullPart::Image`, and `ToolOutputBlock::Image`.
+  - Rendered zoomable image thumbnails with a fullscreen lightbox modal and direct download link across `MessageTimeline`, `PayloadViews`, and `ToolExchange` (falling back cleanly to aspect-ratio frames when pixels are absent or over budget).
+  - Added structured/raw view switching (`TextPartView`) for inline XML-tagged document blocks (`<environment_context>`, `<system-reminder>`, `<file>`, etc.) in context text parts, and dedicated visual cards (`WebInputCard` / `WebOutputView`) for web search and web fetch tool calls showing queries, clickable source grids, fetched `<gateway_web_fetch_result>` pages, and raw toggles.
+
+### Fixed
+- **Section, file, and nested-call jump buttons in code & terminal outputs**:
+  - Fixed `revealRow` in `CodeBlock` measuring `.lg-code-row` (`display: contents`, which always reports `offsetTop === 0` and an empty bounding box) by anchoring scroll calculations to its first laid-out grid cell via `getBoundingClientRect()`, with smooth scrolling inside clipped scrollers and `scrollIntoView` fallback when unclipped.
+  - Updated terminal output section chips (`分段` / `Sections`), `PatchBlock` file list buttons, and orchestrator `inScript` nested tool chips to auto-expand collapsed blocks beyond 160 lines, re-scroll reliably on repeated clicks, and cycle through multi-occurrence nested tool call sites.
+
 ## [0.2.23] - 2026-11-28
 
 ### Added

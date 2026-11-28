@@ -301,6 +301,7 @@ export function ToolCallInspector({
             <DiffBlock original={primaryOutputText} rewritten={forwardedOutput} maxHeight={460} />
           ) : effectiveOutView === "forwarded" && forwardedOutput !== null ? (
             <ToolOutputView
+              toolName={displayToolName(record)}
               blocks={[
                 { type: "text", bytes: forwardedBytes ?? byteLength(forwardedOutput), text: forwardedOutput },
                 ...imageBlocks,
@@ -308,7 +309,7 @@ export function ToolCallInspector({
               failed={failed}
             />
           ) : (
-            <ToolOutputView blocks={shown.output_blocks} failed={failed} />
+            <ToolOutputView toolName={displayToolName(record)} blocks={shown.output_blocks} failed={failed} />
           )}
           {full?.output_truncated && <p className="lg-hint m-0">{t.outputTruncated}</p>}
           {full?.forwarded_output_truncated && <p className="lg-hint m-0">{t.forwardedTruncated}</p>}

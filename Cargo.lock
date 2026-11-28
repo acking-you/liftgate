@@ -756,7 +756,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "liftgate"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "clap",
  "clap_complete",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-auto-update"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "liftgate-harness",
  "liftgate-types",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-auto-update-tui"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "crossterm",
  "liftgate-auto-update",
@@ -803,11 +803,11 @@ dependencies = [
 
 [[package]]
 name = "liftgate-codemode-js"
-version = "0.2.23"
+version = "0.2.24"
 
 [[package]]
 name = "liftgate-core"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "clap",
  "clap_complete",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-harness"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "dunce",
  "liftgate-types",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-server"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "axum",
  "bytes",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-tool-virtualizer"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "liftgate-types",
  "serde",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "liftgate-types"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "liftgate-codemode-js",
  "serde",

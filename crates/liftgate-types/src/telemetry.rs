@@ -495,7 +495,10 @@ pub struct LowCacheRequestCapture {
     pub payload_file_path: Option<String>,
 }
 
-/// Serialized ACP prompt block stored inside [`LowCacheFullRequestPayload`] (omitting raw base64 image blobs).
+/// Serialized ACP prompt block stored inside [`LowCacheFullRequestPayload`].
+///
+/// Image blocks keep their base64 payload only when it is a small raster image that fits the
+/// capture's image budget, so dashboards can render a preview without bloating captures.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CapturedAcpPromptBlock {
@@ -506,6 +509,9 @@ pub enum CapturedAcpPromptBlock {
     Image {
         mime_type: String,
         base64_bytes: usize,
+        /// Bounded base64 preview; absent on older captures or images over the preview cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
 }
 
@@ -525,6 +531,9 @@ pub enum CapturedFullPart {
     Image {
         media_type: String,
         base64_bytes: usize,
+        /// Bounded base64 preview; absent on older captures or images over the preview cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
     ToolCall {
         call_id: String,
@@ -1011,6 +1020,9 @@ pub enum ToolOutputBlock {
         width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         height: Option<u32>,
+        /// Bounded base64 preview; absent on older records or images over the preview cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
 }
 
@@ -1414,6 +1426,7 @@ mod tests {
                 base64_bytes: 128,
                 width: Some(2),
                 height: None,
+                data: None,
             }],
             forwarded_output: None,
             forwarded_output_bytes: None,

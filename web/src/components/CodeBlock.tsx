@@ -104,12 +104,27 @@ function Frame({
   );
 }
 
-/** Scroll a row into view inside its own scroller, leaving the page where it is. */
+/** Scroll a row into view inside its own scroller (or the enclosing container when unclipped). */
 function revealRow(pre: HTMLPreElement | null, selector: string): void {
   const row = pre?.querySelector<HTMLElement>(selector);
   if (!pre || !row) return;
-  const target = row.offsetTop - pre.offsetTop - pre.clientHeight / 3;
-  pre.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+  // `.lg-code-row` uses `display: contents` so it generates no layout box
+  // (`offsetTop === 0`, empty rect); measure its first rendered grid cell.
+  const rect = row.getBoundingClientRect();
+  const anchor = rect.height > 0 ? row : row.firstElementChild;
+  if (!(anchor instanceof HTMLElement)) return;
+  const anchorRect = anchor.getBoundingClientRect();
+  const preRect = pre.getBoundingClientRect();
+  if (pre.scrollHeight > pre.clientHeight + 1) {
+    const lead = Math.min(pre.clientHeight * 0.2, 64);
+    const target = pre.scrollTop + (anchorRect.top - preRect.top) - lead;
+    pre.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    if (preRect.bottom < 80 || preRect.top > window.innerHeight - 80) {
+      pre.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  } else {
+    anchor.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
 }
 
 /** Source or payload text with line numbers, light syntax tinting, wrap and copy. */
@@ -122,6 +137,8 @@ export function CodeBlock({
   wrap: initialWrap = false,
   tone,
   highlightLines,
+  scrollLine,
+  scrollNonce,
 }: {
   code: string;
   language?: CodeLanguage;
@@ -134,6 +151,10 @@ export function CodeBlock({
   tone?: "err";
   /** 0-based lines to mark; the first one is scrolled into view. */
   highlightLines?: ReadonlySet<number>;
+  /** Explicit 0-based line to scroll into view (overrides the first highlighted line). */
+  scrollLine?: number | null;
+  /** Increment to re-scroll to `scrollLine` even when its line number is unchanged. */
+  scrollNonce?: number;
 }): React.JSX.Element {
   const [wrap, setWrap] = useState(() => initialWrap || prefersWrap());
   const [expanded, setExpanded] = useState(false);
@@ -144,12 +165,17 @@ export function CodeBlock({
     () => (highlightLines && highlightLines.size > 0 ? Math.min(...highlightLines) : null),
     [highlightLines],
   );
-  const showAll = expanded || (firstMarked !== null && firstMarked >= COLLAPSED_LINES);
+  const targetLine = scrollLine ?? firstMarked;
+  const showAll = expanded || (targetLine !== null && targetLine >= COLLAPSED_LINES);
   const visible = showAll ? lines : lines.slice(0, COLLAPSED_LINES);
 
   useEffect(() => {
-    if (firstMarked !== null) revealRow(preRef.current, '[data-hl="true"]');
-  }, [firstMarked, highlightLines]);
+    if (targetLine !== null && targetLine >= COLLAPSED_LINES) setExpanded(true);
+  }, [targetLine]);
+
+  useEffect(() => {
+    if (targetLine !== null) revealRow(preRef.current, `[data-line="${targetLine}"]`);
+  }, [targetLine, scrollNonce, highlightLines]);
 
   return (
     <Frame
@@ -166,7 +192,12 @@ export function CodeBlock({
     >
       {visible.map((tokens, idx) => (
         // Line order is the identity here: the block is immutable text.
-        <span className="lg-code-row" data-hl={highlightLines?.has(idx) ? "true" : undefined} key={idx}>
+        <span
+          className="lg-code-row"
+          data-line={idx}
+          data-hl={highlightLines?.has(idx) ? "true" : undefined}
+          key={idx}
+        >
           <span className="lg-code-ln">{idx + 1}</span>
           <span className="lg-code-text">
             {tokens.map((token, tIdx) =>
@@ -220,7 +251,8 @@ export function PatchBlock({
 }): React.JSX.Element {
   const [wrap, setWrap] = useState(prefersWrap);
   const [expanded, setExpanded] = useState(false);
-  const [focusLine, setFocusLine] = useState<number | null>(null);
+  const [focus, setFocus] = useState<{ line: number; tick: number } | null>(null);
+  const focusLine = focus?.line ?? null;
   const preRef = useRef<HTMLPreElement | null>(null);
   const parsed = useMemo(() => parsePatch(patch), [patch]);
   const files = useMemo(() => patchFiles(parsed), [parsed]);
@@ -228,8 +260,12 @@ export function PatchBlock({
   const visible = showAll ? parsed.lines : parsed.lines.slice(0, COLLAPSED_LINES);
 
   useEffect(() => {
-    if (focusLine !== null) revealRow(preRef.current, `[data-line="${focusLine}"]`);
+    if (focusLine !== null && focusLine >= COLLAPSED_LINES) setExpanded(true);
   }, [focusLine]);
+
+  useEffect(() => {
+    if (focus !== null) revealRow(preRef.current, `[data-line="${focus.line}"]`);
+  }, [focus]);
 
   return (
     <Frame
@@ -251,7 +287,7 @@ export function PatchBlock({
                   type="button"
                   className="lg-filelist-item"
                   aria-pressed={focusLine === file.line}
-                  onClick={() => setFocusLine(file.line)}
+                  onClick={() => setFocus((cur) => ({ line: file.line, tick: (cur?.tick ?? 0) + 1 }))}
                 >
                   <span className="lg-fileop" data-op={file.op}>
                     {msg().common.patchOps[file.op]}

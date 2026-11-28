@@ -268,7 +268,7 @@ export function App(): React.JSX.Element {
           {view === "usage" && <UsageView arg={arg} navigate={navigate} />}
           {view === "tools" && <ToolCallsView arg={arg} navigate={navigate} />}
           {view === "catalog" && <CatalogView arg={arg} navigate={navigate} />}
-          {view === "context" && <ContextView />}
+          {view === "context" && <ContextView arg={arg} navigate={navigate} />}
           {view === "cache" && <CacheView arg={arg} navigate={navigate} />}
           {view === "sessions" && <SessionsView arg={arg} navigate={navigate} />}
           {view === "models" && <ModelsView onProbe={openProbe} onEditPrices={() => navigate("usage")} />}

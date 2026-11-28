@@ -34,6 +34,7 @@ import { harnessMeta, sortHarnessIds } from "@/lib/harness";
 import { useI18n } from "@/lib/i18n";
 import { UNKNOWN_HARNESS } from "@/lib/taskfilter";
 import type { ContextCaptureRecord, ContextCaptureSummary } from "@/types/telemetry";
+import type { ViewProps } from "@/views/types";
 
 const MB = 1024 * 1024;
 
@@ -428,7 +429,7 @@ function ControlCard({
   );
 }
 
-export function ContextView(): React.JSX.Element {
+export function ContextView({ arg, navigate }: ViewProps): React.JSX.Element {
   const { client, snapshot, baseUrl } = useGateway();
   const { m } = useI18n();
   const t = m.context.view;
@@ -444,6 +445,10 @@ export function ContextView(): React.JSX.Element {
   const thresholdBps = snapshot?.cache_telemetry?.low_cache_threshold_bps ?? 5000;
   const summary = live ?? captures.data?.summary;
   const records = useMemo(() => captures.data?.records ?? [], [captures.data]);
+  // `#/context/<task_id>` opens that turn's saved full context directly.
+  const linked = arg !== null ? (records.find((r) => r.task_id === arg) ?? null) : null;
+  const open = selected ?? linked;
+  const linkMissing = arg !== null && captures.status === "ready" && linked === null;
   const fo = m.overview.filters;
   const fv = t.filters;
   const [filter, setFilter] = useState<CaptureFilter>(EMPTY_CAPTURE_FILTER);
@@ -525,6 +530,12 @@ export function ContextView(): React.JSX.Element {
       {banner && (
         <Note tone={banner.tone} icon={banner.tone === "ok" ? <CircleCheck /> : <CircleAlert />}>
           {banner.text}
+        </Note>
+      )}
+
+      {linkMissing && (
+        <Note icon={<CircleAlert />}>
+          {t.linkMissing(arg)}
         </Note>
       )}
 
@@ -730,7 +741,14 @@ export function ContextView(): React.JSX.Element {
         )}
       </Card>
 
-      <ContextSheet record={selected} thresholdBps={thresholdBps} onClose={() => setSelected(null)} />
+      <ContextSheet
+        record={open}
+        thresholdBps={thresholdBps}
+        onClose={() => {
+          setSelected(null);
+          if (arg !== null) navigate("context");
+        }}
+      />
     </>
   );
 }

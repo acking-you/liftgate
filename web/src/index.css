@@ -2791,4 +2791,210 @@
     background: none;
     cursor: pointer;
   }
+
+  /* Rich media previews (captured images & zoom lightbox). */
+  .lg-media {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--lg-line);
+    border-radius: 8px;
+    background: var(--lg-raised);
+  }
+
+  .lg-media-thumb {
+    flex: none;
+    display: block;
+    padding: 0;
+    border: 1px solid var(--lg-line-strong);
+    border-radius: 6px;
+    overflow: hidden;
+    background:
+      linear-gradient(45deg, var(--lg-sunken) 25%, transparent 25% 75%, var(--lg-sunken) 75%) 0 0 / 12px 12px,
+      linear-gradient(45deg, var(--lg-sunken) 25%, transparent 25% 75%, var(--lg-sunken) 75%) 6px 6px / 12px 12px;
+    cursor: zoom-in;
+    transition: border-color 120ms ease;
+  }
+
+  .lg-media-thumb:hover {
+    border-color: var(--lg-accent);
+  }
+
+  .lg-media-thumb img {
+    display: block;
+    max-width: min(260px, 100%);
+    max-height: 220px;
+    object-fit: contain;
+  }
+
+  .lg-dialog.lg-dialog-media {
+    width: fit-content;
+    min-width: min(92vw, 480px);
+    max-width: min(96vw, 1200px);
+  }
+
+  .lg-media-full {
+    display: grid;
+    place-items: center;
+    padding: 10px;
+    border: 1px solid var(--lg-line);
+    border-radius: 8px;
+    overflow: auto;
+    background:
+      linear-gradient(45deg, var(--lg-sunken) 25%, transparent 25% 75%, var(--lg-sunken) 75%) 0 0 / 12px 12px,
+      linear-gradient(45deg, var(--lg-sunken) 25%, transparent 25% 75%, var(--lg-sunken) 75%) 6px 6px / 12px 12px;
+  }
+
+  .lg-media-full img {
+    display: block;
+    max-width: 100%;
+    max-height: 76vh;
+    object-fit: contain;
+  }
+
+  /* Web search & web fetch rich cards. */
+  .lg-web-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--lg-line);
+    border-radius: 8px;
+    background: var(--lg-sunken);
+  }
+
+  .lg-web-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: var(--lg-accent-soft);
+    color: var(--lg-accent-fg);
+  }
+
+  .lg-web-icon svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .lg-web-query {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--lg-fg);
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .lg-web-url {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--lg-accent-fg);
+    text-decoration: none;
+  }
+
+  a.lg-web-url:hover {
+    text-decoration: underline;
+  }
+
+  .lg-web-url svg {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    color: var(--lg-fg-4);
+  }
+
+  .lg-web-sources {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+  }
+
+  .lg-web-source {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--lg-line);
+    border-radius: 8px;
+    background: var(--lg-raised);
+    color: inherit;
+    text-decoration: none;
+    transition: border-color 120ms ease, background-color 120ms ease;
+  }
+
+  .lg-web-source:hover {
+    border-color: var(--lg-line-strong);
+    background: var(--lg-hover);
+  }
+
+  .lg-web-source svg {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    color: var(--lg-fg-4);
+  }
+
+  .lg-web-fav {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    border: 1px solid var(--lg-line);
+    background: var(--lg-sunken);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--lg-fg-2);
+  }
+
+  /* Row shortcut buttons & sheet quick-jump strip. */
+  .lg-rowacts {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+  }
+
+  .lg-rowact {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--lg-line);
+    border-radius: 6px;
+    background: var(--lg-raised);
+    color: var(--lg-fg-3);
+    cursor: pointer;
+    transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
+  }
+
+  .lg-rowact:hover {
+    color: var(--lg-accent-fg);
+    border-color: var(--lg-accent);
+    background: var(--lg-accent-soft);
+  }
+
+  .lg-rowact svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  .lg-jump {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
 }

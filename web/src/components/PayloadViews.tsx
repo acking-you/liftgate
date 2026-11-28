@@ -1,8 +1,8 @@
 import * as React from "react";
 import { useMemo, useState } from "react";
-import { Image as ImageIcon } from "lucide-react";
 import { CodeBlock, ProseBlock } from "@/components/CodeBlock";
 import { RankedBars } from "@/components/charts";
+import { ImagePreview } from "@/components/RichContent";
 import { Disclosure, SearchInput, Tag } from "@/components/ui";
 import { formatBytes } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
@@ -74,12 +74,13 @@ export function AcpRequestView({
                 maxHeight={520}
               />
             ) : (
-              <div key={idx} className="flex items-center gap-2 rounded-lg border border-line p-3 text-[12.5px] text-fg-3">
-                <ImageIcon className="h-4 w-4" />
-                <span className="lg-num">
-                  {t.imageBlock(idx + 1, block.mime_type, formatBytes(block.base64_bytes))}
-                </span>
-              </div>
+              <ImagePreview
+                key={idx}
+                mediaType={block.mime_type}
+                data={block.data}
+                base64Bytes={block.base64_bytes}
+                label={t.imageBlock(idx + 1, block.mime_type, formatBytes(block.base64_bytes))}
+              />
             ),
           )
         : promptExcerpt && <ProseBlock text={promptExcerpt} title={t.excerpt} />}

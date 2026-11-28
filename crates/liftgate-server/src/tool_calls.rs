@@ -35,6 +35,35 @@ const MAX_LABEL_BYTES: usize = 256;
 const RECORD_OVERHEAD_BYTES: usize = 512;
 /// Base64 prefix decoded when probing image dimensions (enough for JPEG SOF markers).
 const IMAGE_PROBE_BASE64_CHARS: usize = 96 * 1024;
+/// Largest base64 tool-result image retained as an inline dashboard preview.
+pub const MAX_TOOL_IMAGE_PREVIEW_BASE64_BYTES: usize = 384 * 1024;
+/// Raster formats safe to render back as `data:` URL previews (no SVG / scriptable formats).
+const PREVIEWABLE_IMAGE_TYPES: [&str; 5] = [
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+];
+
+/// Returns a copy of `data` when it is a raster image small enough to keep as a preview.
+///
+/// Rejects non-raster media types, empty or oversized payloads, and anything outside the
+/// base64 alphabet so the dashboard can safely embed it in a `data:` URL.
+#[must_use]
+pub fn previewable_image_data(media_type: &str, data: &str, max_bytes: usize) -> Option<String> {
+    let media_type = media_type.trim();
+    let raster = PREVIEWABLE_IMAGE_TYPES
+        .iter()
+        .any(|known| media_type.eq_ignore_ascii_case(known));
+    if !raster || data.is_empty() || data.len() > max_bytes {
+        return None;
+    }
+    let base64 = data
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\r' | b'\n'));
+    base64.then(|| data.to_owned())
+}
 
 const _: () = assert!(
     DEFAULT_MAX_TOOL_CALL_FIELD_BYTES * 4 < DEFAULT_MAX_TOOL_CALL_TOTAL_BYTES,
@@ -92,6 +121,8 @@ pub struct ToolOutputImage {
     pub base64_bytes: usize,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Bounded base64 preview (see [`previewable_image_data`]).
+    pub data: Option<String>,
 }
 
 impl ToolOutputImage {
@@ -104,6 +135,11 @@ impl ToolOutputImage {
             base64_bytes: base64_data.len(),
             width: dims.map(|(w, _)| w),
             height: dims.map(|(_, h)| h),
+            data: previewable_image_data(
+                mime_type,
+                base64_data,
+                MAX_TOOL_IMAGE_PREVIEW_BASE64_BYTES,
+            ),
         }
     }
 }
@@ -362,7 +398,12 @@ impl ToolCallEntry {
             .iter()
             .map(|b| match b {
                 ToolOutputBlock::Text { text, .. } => text.len(),
-                ToolOutputBlock::Image { mime_type, .. } => mime_type.len().saturating_add(16),
+                ToolOutputBlock::Image {
+                    mime_type, data, ..
+                } => mime_type
+                    .len()
+                    .saturating_add(16)
+                    .saturating_add(data.as_deref().map_or(0, str::len)),
             })
             .sum();
         self.retained_bytes = RECORD_OVERHEAD_BYTES
@@ -688,6 +729,7 @@ impl ToolCallStore {
             base64_bytes: img.base64_bytes,
             width: img.width,
             height: img.height,
+            data: img.data,
         }));
         entry.output_blocks = blocks;
         let before = entry.retained_bytes;
@@ -1155,6 +1197,25 @@ mod tests {
         }
         assert!(by_bytes.summary().stored_bytes <= 3 * (RECORD_OVERHEAD_BYTES + 4_200));
         assert!(by_bytes.summary().total_evicted >= 3);
+    }
+
+    #[test]
+    fn image_previews_keep_only_small_safe_raster_payloads() {
+        let png = "iVBORw0KGgoAAAANSUhEUg==";
+        assert_eq!(
+            previewable_image_data("image/png", png, 1024).as_deref(),
+            Some(png)
+        );
+        assert_eq!(
+            previewable_image_data(" IMAGE/JPEG ", png, 1024).as_deref(),
+            Some(png)
+        );
+        assert!(previewable_image_data("image/svg+xml", png, 1024).is_none());
+        assert!(previewable_image_data("image/png", png, 4).is_none());
+        assert!(previewable_image_data("image/png", "", 1024).is_none());
+        assert!(previewable_image_data("image/png", "abc\"><script>", 1024).is_none());
+        let probed = ToolOutputImage::probe("image/png", png);
+        assert_eq!(probed.data.as_deref(), Some(png));
     }
 
     #[test]

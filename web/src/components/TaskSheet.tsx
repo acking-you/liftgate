@@ -1,10 +1,22 @@
 import * as React from "react";
-import { ArrowRight, CircleAlert, LoaderCircle } from "lucide-react";
+import { ArrowRight, CircleAlert, LoaderCircle, ScrollText, TrendingDown, Wrench } from "lucide-react";
 import { ProseBlock } from "@/components/CodeBlock";
 import { SegmentedBar } from "@/components/charts";
 import { ToolGlyph } from "@/components/ToolExchange";
 import { Sheet } from "@/components/ui/dialog";
-import { Figure, HarnessBadge, HitRate, KV, Latency, Note, Pill, Tag, type Tone, Usd } from "@/components/ui";
+import {
+  Button,
+  Figure,
+  HarnessBadge,
+  HitRate,
+  KV,
+  Latency,
+  Note,
+  Pill,
+  Tag,
+  type Tone,
+  Usd,
+} from "@/components/ui";
 import {
   formatNumber,
   formatSmartTime,
@@ -123,6 +135,10 @@ export function TaskSheet({
   toolOutcome,
   onClose,
   onOpenToolCalls,
+  hasContext = false,
+  onOpenContext,
+  hasLowCache = false,
+  onOpenLowCache,
 }: {
   task: TaskSnapshot | null;
   thresholdBps: number;
@@ -131,12 +147,25 @@ export function TaskSheet({
   onClose: () => void;
   /** Jump to the tool-call stream filtered to this turn. */
   onOpenToolCalls?: (taskId: string) => void;
+  /** True when the full context capture store holds a record for this turn. */
+  hasContext?: boolean;
+  /** Jump to the captured full context for this turn. */
+  onOpenContext?: (taskId: string) => void;
+  /** True when this turn also appears in the low-cache diagnostic list. */
+  hasLowCache?: boolean;
+  /** Jump to the low-cache diagnostic report for this turn. */
+  onOpenLowCache?: (taskId: string) => void;
 }): React.JSX.Element {
   const { m } = useI18n();
   const t = m.overview.sheet;
   const usage = task?.usage ?? null;
   const toolCounts = task ? countBy(task.client_tool_calls, (n) => n) : [];
   const live = task !== null && task.finished_at_unix_ms === null;
+  const toolCallCount = toolOutcome?.total ?? task?.client_tool_calls.length ?? 0;
+  const canJumpContext = hasContext && onOpenContext !== undefined;
+  const canJumpTools = onOpenToolCalls !== undefined && toolCallCount > 0;
+  const canJumpLowCache = hasLowCache && onOpenLowCache !== undefined;
+  const hasJumps = canJumpContext || canJumpTools || canJumpLowCache;
   return (
     <Sheet
       open={task !== null}
@@ -166,6 +195,54 @@ export function TaskSheet({
             <Note tone="err" icon={<CircleAlert />}>
               {task.error_message}
             </Note>
+          )}
+
+          {hasJumps && (
+            <section>
+              <h3 className="lg-section-title">{t.jump}</h3>
+              <div className="lg-jump">
+                {canJumpContext && (
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    title={t.openContextHint}
+                    onClick={() => {
+                      onClose();
+                      onOpenContext(task.task_id);
+                    }}
+                  >
+                    <ScrollText />
+                    {t.openContext}
+                  </Button>
+                )}
+                {canJumpTools && (
+                  <Button
+                    size="sm"
+                    title={t.openToolsHint}
+                    onClick={() => {
+                      onClose();
+                      onOpenToolCalls(task.task_id);
+                    }}
+                  >
+                    <Wrench />
+                    {t.openTools(toolCallCount)}
+                  </Button>
+                )}
+                {canJumpLowCache && (
+                  <Button
+                    size="sm"
+                    title={t.openLowCacheHint}
+                    onClick={() => {
+                      onClose();
+                      onOpenLowCache(task.task_id);
+                    }}
+                  >
+                    <TrendingDown />
+                    {t.openLowCache}
+                  </Button>
+                )}
+              </div>
+            </section>
           )}
 
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">

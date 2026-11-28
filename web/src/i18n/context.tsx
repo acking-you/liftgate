@@ -28,6 +28,12 @@ const zh = {
     partDiff: "差异",
     partForwarded: "转发给模型",
     openRewrite: "在 lg 改写中展开",
+    docText: "正文片段",
+    docBlocks: (n: number) => `${n} 个文档块`,
+    docEmpty: "空内容。",
+    docViewAria: "文本视图模式",
+    docStructured: "结构化",
+    docRaw: "原文",
     filters: {
       search: "搜索消息内容、工具名或 call id",
       role: "按角色筛选",
@@ -154,6 +160,8 @@ const zh = {
   },
   view: {
     waiting: "等待网关上报状态…",
+    linkMissing: (id: string) =>
+      `未找到任务 ${id} 的已保存上下文（可能当时未开启捕获，或已被滚动淘汰）。`,
     unsupported: "完整上下文捕获",
     unsupportedHint: " 低命中轮次的完整载荷可在「缓存」页查看。",
     loadingState: "读取捕获状态…",
@@ -216,6 +224,12 @@ const en: ContextMessages = {
     partDiff: "Diff",
     partForwarded: "Forwarded",
     openRewrite: "Open in lg rewrites",
+    docText: "Text",
+    docBlocks: (n) => `${n} document block${n === 1 ? "" : "s"}`,
+    docEmpty: "Empty.",
+    docViewAria: "Text view mode",
+    docStructured: "Structured",
+    docRaw: "Raw",
     filters: {
       search: "Search message text, tool names, or call ids",
       role: "Filter by role",
@@ -342,6 +356,8 @@ const en: ContextMessages = {
   },
   view: {
     waiting: "Waiting for the gateway to report its state…",
+    linkMissing: (id) =>
+      `No saved context found for task ${id} (capture may have been off, or it was evicted).`,
     unsupported: "full-context capture",
     unsupportedHint: " Full payloads of low-hit turns are available on the Cache page.",
     loadingState: "Loading capture state…",

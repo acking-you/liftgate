@@ -8,6 +8,7 @@ import {
   FilterX,
   Gauge,
   Layers,
+  ScrollText,
   Sparkles,
   TrendingDown,
   Wrench,
@@ -190,12 +191,26 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const pool = snapshot?.session_pool;
   const cacheSummary = snapshot?.cache_telemetry;
   const toolSummary = snapshot?.tool_call_telemetry;
+  const captureSummary = snapshot?.context_capture;
   const usage = snapshot?.usage;
   const today = useToday();
   const todayUsage = useRevisionResource(
     usage ? () => client.usage({ from: today, to: addDays(today, 1) }) : null,
     `${baseUrl}|${client.demo}|usage-today|${today}`,
     usage?.revision ?? -1,
+  );
+  const contextCaptures = useRevisionResource(
+    captureSummary && captureSummary.stored_records > 0 ? () => client.contextCaptures() : null,
+    `${baseUrl}|${client.demo}|context-captures`,
+    captureSummary?.revision ?? -1,
+  );
+  const capturedTasks = useMemo(
+    () => new Set((contextCaptures.data?.records ?? []).map((r) => r.task_id)),
+    [contextCaptures.data],
+  );
+  const lowCacheTasks = useMemo(
+    () => new Set(lowCacheRecords.map((r) => r.task_id)),
+    [lowCacheRecords],
   );
   const todaySummary = todayUsage.data?.summary;
   const activeTasks = snapshot?.active_tasks ?? [];
@@ -208,6 +223,7 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
   const parked = (pool?.idle_cached_sessions ?? 0) + (pool?.suspended_mcp_sessions ?? 0);
   const failed = metrics?.failed_requests ?? 0;
   const outcomes = useMemo(() => toolOutcomesByTask(toolCalls), [toolCalls]);
+  const hasRowActions = toolSummary !== undefined || capturedTasks.size > 0;
 
   const pulse = useMemo(
     () =>
@@ -552,11 +568,14 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                   </th>
                   <th className="num hide-sm">{t.col.elapsed}</th>
                   {usage && <th className="num">{t.col.cost}</th>}
+                  {hasRowActions && <th className="num">{t.col.actions}</th>}
                 </tr>
               </thead>
               <tbody>
                 {shownTasks.map((task) => {
                   const toolOutcome = outcomes.get(task.task_id);
+                  const hasTools = toolSummary !== undefined && (toolOutcome?.total ?? 0) > 0;
+                  const hasContext = capturedTasks.has(task.task_id);
                   return (
                     <tr
                       key={task.task_id}
@@ -643,6 +662,43 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
                           <Usd value={task.cost_usd} unpricedHint={task.usage !== null} />
                         </td>
                       )}
+                      {hasRowActions && (
+                        <td className="num whitespace-nowrap">
+                          <span className="lg-rowacts">
+                            {hasTools && (
+                              <button
+                                type="button"
+                                className="lg-rowact"
+                                title={t.sheet.rowTools}
+                                aria-label={t.sheet.rowTools}
+                                onClick={(ev) => {
+                                  ev.stopPropagation();
+                                  navigate("tools", task.task_id);
+                                }}
+                                onKeyDown={(ev) => ev.stopPropagation()}
+                              >
+                                <Wrench />
+                              </button>
+                            )}
+                            {hasContext && (
+                              <button
+                                type="button"
+                                className="lg-rowact"
+                                title={t.sheet.rowContext}
+                                aria-label={t.sheet.rowContext}
+                                onClick={(ev) => {
+                                  ev.stopPropagation();
+                                  navigate("context", task.task_id);
+                                }}
+                                onKeyDown={(ev) => ev.stopPropagation()}
+                              >
+                                <ScrollText />
+                              </button>
+                            )}
+                            {!hasTools && !hasContext && <span className="text-fg-4">—</span>}
+                          </span>
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
@@ -659,6 +715,10 @@ export function OverviewView({ navigate }: ViewProps): React.JSX.Element {
         toolOutcome={selectedTask ? outcomes.get(selectedTask.task_id) : undefined}
         onClose={() => setSelectedTask(null)}
         onOpenToolCalls={toolSummary ? (taskId) => navigate("tools", taskId) : undefined}
+        hasContext={selectedTask ? capturedTasks.has(selectedTask.task_id) : false}
+        onOpenContext={captureSummary ? (taskId) => navigate("context", taskId) : undefined}
+        hasLowCache={selectedTask ? lowCacheTasks.has(selectedTask.task_id) : false}
+        onOpenLowCache={(taskId) => navigate("cache", taskId)}
       />
     </>
   );

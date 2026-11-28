@@ -5,15 +5,16 @@ import {
   FileDiff,
   FileText,
   Globe,
-  Image as ImageIcon,
   PackageSearch,
   SquareTerminal,
   Wrench,
 } from "lucide-react";
 import { CodeBlock, PatchBlock, ProseBlock } from "@/components/CodeBlock";
+import { ImagePreview, WebInputCard, WebOutputView } from "@/components/RichContent";
 import { Pill } from "@/components/ui";
-import { formatBytes, formatNumber } from "@/lib/format";
+import { formatNumber } from "@/lib/format";
 import { harnessMeta } from "@/lib/harness";
+import { parseWebInput, webToolMode } from "@/lib/webtools";
 import {
   type ToolKind,
   classifyTool,
@@ -229,26 +230,41 @@ export function ToolInputView({
   const { m } = useI18n();
   const ti = m.tools.input;
   const [showRaw, setShowRaw] = useState(false);
-  const [focusTool, setFocusTool] = useState<string | null>(null);
+  const [focusTool, setFocusTool] = useState<{ name: string; idx: number; tick: number } | null>(null);
   const parsed = useMemo(
     () => parseToolInput(toolName, raw, { isOrchestrator, language }),
     [toolName, raw, isOrchestrator, language],
   );
   const kind = classifyTool(toolName, isOrchestrator);
+  const webMode = webToolMode(toolName);
+  const webInput = useMemo(() => (webMode ? parseWebInput(raw) : null), [webMode, raw]);
   const nested = useMemo(
     () => (parsed.view === "code" && kind === "orchestrator" ? nestedToolUses(parsed.code) : []),
     [parsed, kind],
   );
-  const highlight = useMemo(() => {
-    const lines = nested.find((n) => n.name === focusTool)?.lines;
-    return lines ? new Set(lines) : undefined;
-  }, [nested, focusTool]);
+  const activeNestedLines = useMemo(
+    () => (focusTool ? nested.find((n) => n.name === focusTool.name)?.lines : undefined),
+    [nested, focusTool],
+  );
+  const highlight = useMemo(
+    () => (activeNestedLines ? new Set(activeNestedLines) : undefined),
+    [activeNestedLines],
+  );
+  const scrollLine =
+    activeNestedLines && focusTool ? (activeNestedLines[focusTool.idx % activeNestedLines.length] ?? null) : null;
 
   let body: React.ReactNode;
   if (raw.trim().length === 0) {
     body = <p className="lg-hint m-0">{ti.noArgs}</p>;
   } else if (showRaw) {
     body = <CodeBlock code={raw} language="text" title={ti.rawTitle} wrap maxHeight={maxHeight} />;
+  } else if (webMode && webInput) {
+    body = (
+      <>
+        <WebInputCard mode={webMode} input={webInput} />
+        <ParamChips params={webInput.params} />
+      </>
+    );
   } else if (parsed.view === "code") {
     body = (
       <>
@@ -261,9 +277,15 @@ export function ToolInputView({
                 key={use.name}
                 type="button"
                 className="lg-chip"
-                aria-pressed={focusTool === use.name}
+                aria-pressed={focusTool?.name === use.name}
                 title={ti.locate(use.name, use.lines.length)}
-                onClick={() => setFocusTool((cur) => (cur === use.name ? null : use.name))}
+                onClick={() =>
+                  setFocusTool((cur) => {
+                    if (cur?.name !== use.name) return { name: use.name, idx: 0, tick: (cur?.tick ?? 0) + 1 };
+                    if (cur.idx + 1 < use.lines.length) return { name: use.name, idx: cur.idx + 1, tick: cur.tick + 1 };
+                    return null;
+                  })
+                }
               >
                 <ToolGlyph kind={classifyTool(use.name)} size="sm" />
                 <span className="lg-num">{use.name}</span>
@@ -280,6 +302,8 @@ export function ToolInputView({
           }
           maxHeight={maxHeight}
           highlightLines={highlight}
+          scrollLine={scrollLine}
+          scrollNonce={focusTool?.tick}
         />
       </>
     );
@@ -353,10 +377,11 @@ function TerminalOutput({
   tone?: "err";
   maxHeight: number | null;
 }): React.JSX.Element {
-  const [focus, setFocus] = useState<number | null>(null);
+  const [focus, setFocus] = useState<{ line: number; tick: number } | null>(null);
+  const focusLine = focus?.line ?? null;
   const text = body.replace(/\n$/, "");
   const sections = useMemo(() => outputSections(text), [text]);
-  const highlight = useMemo(() => (focus !== null ? new Set([focus]) : undefined), [focus]);
+  const highlight = useMemo(() => (focusLine !== null ? new Set([focusLine]) : undefined), [focusLine]);
   return (
     <>
       {sections.length > 1 && (
@@ -367,8 +392,9 @@ function TerminalOutput({
               key={`${section.line}-${section.title}`}
               type="button"
               className="lg-chip lg-chip-plain"
-              aria-pressed={focus === section.line}
-              onClick={() => setFocus((cur) => (cur === section.line ? null : section.line))}
+              aria-pressed={focusLine === section.line}
+              title={msg().tools.output.jumpSection(section.line + 1)}
+              onClick={() => setFocus((cur) => ({ line: section.line, tick: (cur?.tick ?? 0) + 1 }))}
             >
               <span className="lg-num">{section.title}</span>
             </button>
@@ -383,6 +409,8 @@ function TerminalOutput({
         wrap={hasLongLines(text)}
         maxHeight={maxHeight}
         highlightLines={highlight}
+        scrollLine={focusLine}
+        scrollNonce={focus?.tick}
       />
     </>
   );
@@ -451,43 +479,19 @@ function TextOutput({
   return <ProseBlock text={block.text} title={title} tone={tone} maxHeight={maxHeight} />;
 }
 
-/** Image results carry no pixels here, so draw the frame at its true aspect ratio. */
-function ImageOutput({
-  block,
-}: {
-  block: Extract<ToolOutputBlock, { type: "image" }>;
-}): React.JSX.Element {
-  const w = block.width ?? null;
-  const h = block.height ?? null;
-  const ratio = w && h ? w / h : 4 / 3;
-  const boxH = 96;
-  const boxW = Math.max(56, Math.min(220, Math.round(boxH * ratio)));
-  return (
-    <div className="flex items-center gap-3 rounded-lg border border-line p-3">
-      <div className="lg-imgframe" style={{ width: boxW, height: boxH }}>
-        <ImageIcon />
-      </div>
-      <div className="min-w-0 text-[12.5px]">
-        <div className="font-medium text-fg">{msg().tools.output.image}</div>
-        <div className="lg-num mt-0.5 text-[12px] text-fg-3">
-          {block.mime_type}
-          {w && h ? ` · ${w} × ${h}` : msg().tools.output.unknownSize}
-        </div>
-        <div className="lg-num text-[12px] text-fg-3">base64 {formatBytes(block.base64_bytes)}</div>
-      </div>
-    </div>
-  );
-}
-
 export function ToolOutputView({
   blocks,
+  toolName,
   failed = false,
   maxHeight = 440,
 }: {
   blocks: ToolOutputBlock[];
+  /** Optional tool name so web search / web fetch outputs render with structured cards. */
+  toolName?: string;
   failed?: boolean;
   maxHeight?: number | null;
 }): React.JSX.Element {
+  const webMode = toolName ? webToolMode(toolName) : null;
   if (blocks.length === 0) {
     return <p className="lg-hint m-0">{msg().tools.output.nothing}</p>;
   }
@@ -496,9 +500,31 @@ export function ToolOutputView({
       {blocks.map((block, idx) => {
         // Output blocks are an ordered, immutable list.
         if (block.type === "text") {
-          return <TextOutput key={idx} block={block} failed={failed} maxHeight={maxHeight} />;
+          const plain = <TextOutput block={block} failed={failed} maxHeight={maxHeight} />;
+          if (webMode !== null) {
+            return (
+              <WebOutputView
+                key={idx}
+                mode={webMode}
+                text={block.text}
+                failed={failed}
+                maxHeight={maxHeight}
+                fallback={plain}
+              />
+            );
+          }
+          return <React.Fragment key={idx}>{plain}</React.Fragment>;
         }
-        return <ImageOutput key={idx} block={block} />;
+        return (
+          <ImagePreview
+            key={idx}
+            mediaType={block.mime_type}
+            data={block.data}
+            base64Bytes={block.base64_bytes}
+            width={block.width}
+            height={block.height}
+          />
+        );
       })}
     </div>
   );
