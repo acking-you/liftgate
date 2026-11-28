@@ -261,7 +261,7 @@ pub fn build_session_system_append_for_mcp_with_spill_sink<S: TruncationSpillSin
         .find(|(client_name, _)| client_name.eq_ignore_ascii_case("apply_patch"))
     {
         header_rules.push_str(&format!(
-            "- File edits (`mcp_lg_{mcp_ap}`): pass `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target lines. Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call (1-3 context lines per `@@` hunk); on failure, re-read and retry only the failed file.\n"
+            "- File edits (`mcp_lg_{mcp_ap}`): pass `{{\"patch\": \"*** Begin Patch\\n...\\n*** End Patch\"}}` after reading exact target lines (single `*** End Patch` at the very end). Coalesce surgical edits across 1-4 files (`*** Add File:` / `*** Update File:`) into a SINGLE `mcp_lg_{mcp_ap}` call (1-3 context lines per `@@` hunk); `apply_patch` is atomic, so on verification failure no files in that call were written—re-read the mismatched file and re-apply.\n"
         ));
     }
     if let Some(contract) = mcp_spec.orchestrator {

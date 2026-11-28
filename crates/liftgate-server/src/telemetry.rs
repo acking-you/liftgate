@@ -1662,7 +1662,8 @@ impl TelemetryHub {
                 .min(cs.file_state.warm_prompt_tokens);
             }
             cs.revision = cs.revision.saturating_add(1);
-            guard.usage.reconcile(
+            guard.usage.reconcile_with_provider(
+                "agy",
                 model_id,
                 usage_epoch,
                 UsageTokens::from_acp(&accounted_sum),

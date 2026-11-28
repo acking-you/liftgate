@@ -347,4 +347,85 @@ mod tests {
             stop_reason: "tool_use".to_owned()
         }));
     }
+
+    #[tokio::test]
+    async fn grok_acp_set_model_failure_propagates_without_running_prompt() {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let saw_prompt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_prompt_srv = std::sync::Arc::clone(&saw_prompt);
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).expect("valid rpc");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => {
+                        let resp =
+                            json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}});
+                        server_write
+                            .write_all(format!("{resp}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "session/new" => {
+                        let resp =
+                            json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "grok_rl"}});
+                        server_write
+                            .write_all(format!("{resp}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    "session/set_model" => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": 429, "message": "429 Too Many Requests: model capacity exhausted" }
+                        });
+                        server_write
+                            .write_all(format!("{resp}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    "session/prompt" => {
+                        saw_prompt_srv.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let peer = StdioRpcPeer::from_io(client_read, client_write, 1024 * 1024, None);
+        let (tx, _rx) = mpsc::channel(16);
+        let res = run_turn_on_peer(
+            &peer,
+            &StatefulTurnInput {
+                dialect: StatefulDialect::GrokAcp,
+                model: "grok-4.20".to_owned(),
+                effort: None,
+                cwd: PathBuf::from("."),
+                system_instructions: None,
+                prompt_text: "Hello".to_owned(),
+                mcp_servers: Vec::new(),
+                dynamic_tools: Vec::new(),
+            },
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(crate::stdio_rpc::StatefulRpcError::RateLimited { .. })
+            ),
+            "expected RateLimited from session/set_model, got {res:?}"
+        );
+        assert!(
+            !saw_prompt.load(std::sync::atomic::Ordering::SeqCst),
+            "must never dispatch session/prompt after session/set_model fails"
+        );
+    }
 }

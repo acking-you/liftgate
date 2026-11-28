@@ -125,6 +125,7 @@ mod tests {
                 },
             ],
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: Some("sess_abc".to_owned()),
             align_cache_breakpoints: true,
             connect_timeout: Duration::from_secs(5),
@@ -211,6 +212,7 @@ mod tests {
                 custom_format: None,
             }],
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: None,
             align_cache_breakpoints: true,
             connect_timeout: Duration::from_secs(5),
@@ -275,6 +277,7 @@ mod tests {
             }],
             tools: Vec::new(),
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: None,
             align_cache_breakpoints: false,
             connect_timeout: Duration::from_secs(5),
@@ -368,6 +371,7 @@ mod tests {
                 },
             ],
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: None,
             align_cache_breakpoints: false,
             connect_timeout: Duration::from_secs(5),
@@ -425,6 +429,7 @@ mod tests {
             }],
             tools: Vec::new(),
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: None,
             align_cache_breakpoints: false,
             connect_timeout: Duration::from_secs(2),
@@ -475,6 +480,7 @@ mod tests {
             }],
             tools: Vec::new(),
             enable_native_web_search: false,
+            thought_signatures: std::collections::HashMap::new(),
             prompt_cache_key: None,
             align_cache_breakpoints: false,
             connect_timeout: Duration::from_secs(2),
@@ -527,5 +533,114 @@ mod tests {
             ),
             "expected upstream 429 past CONNECT headers, got {proxy_res:?}"
         );
+    }
+
+    #[test]
+    fn sse_decoder_rejects_accumulated_multiline_frame_overflow_and_codecs_preserve_web_search_and_gemini_signatures()
+     {
+        // 1. Accumulated `data:` lines without blank separator must fail past MAX_SSE_FRAME_BYTES
+        let mut dec = crate::sse::SseDecoder::new();
+        let one_mib = format!("data: {}", "x".repeat(1024 * 1024));
+        let mut overflowed = false;
+        for _ in 0..10 {
+            if dec.try_push_line(&one_mib).is_err() {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(
+            overflowed,
+            "SseDecoder must reject multi-line frames exceeding MAX_SSE_FRAME_BYTES"
+        );
+
+        // 2. Native Anthropic request must forward `web_search_20250305` when `enable_native_web_search` is true
+        let anth_in = NativeDriverInput {
+            provider_id: "anthropic".to_owned(),
+            driver: ProviderDriverKind::AnthropicMessages,
+            endpoint: "https://api.anthropic.com".to_owned(),
+            api_key: Some("sk-ant-test".to_owned()),
+            proxy: None,
+            force_direct_proxy: true,
+            model: "claude-sonnet-4-6".to_owned(),
+            effort: None,
+            max_output_tokens: Some(2048),
+            system_blocks: Vec::new(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                parts: vec![CanonicalPart::Text("Search latest Rust release".to_owned())],
+            }],
+            tools: Vec::new(),
+            enable_native_web_search: true,
+            thought_signatures: std::collections::HashMap::new(),
+            prompt_cache_key: None,
+            align_cache_breakpoints: true,
+            connect_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(10),
+        };
+        let (anth_spec, _) = crate::build_driver_http_request(&anth_in).expect("anthropic build");
+        let anth_json: Value =
+            serde_json::from_slice(anth_spec.body.as_deref().expect("body")).expect("json");
+        let anth_tools = anth_json["tools"].as_array().expect("tools array");
+        assert!(
+            anth_tools
+                .iter()
+                .any(|t| t["type"] == "web_search_20250305" && t["name"] == "web_search"),
+            "expected web_search_20250305 in Anthropic tools: {anth_tools:?}"
+        );
+
+        // 3. Gemini request must restore `thoughtSignature` alongside `functionCall`
+        let mut sigs = std::collections::HashMap::new();
+        sigs.insert(
+            "call_gem_99_1".to_owned(),
+            "sig_gemini3_opaque_xyz".to_owned(),
+        );
+        let gem_in = NativeDriverInput {
+            provider_id: "gemini".to_owned(),
+            driver: ProviderDriverKind::GoogleGemini,
+            endpoint: "https://generativelanguage.googleapis.com".to_owned(),
+            api_key: Some("AIza-test".to_owned()),
+            proxy: None,
+            force_direct_proxy: true,
+            model: "gemini-3-pro".to_owned(),
+            effort: None,
+            max_output_tokens: None,
+            system_blocks: Vec::new(),
+            messages: vec![
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::Text("Run check".to_owned())],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    parts: vec![CanonicalPart::ToolCall {
+                        call_id: "call_gem_99_1".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
+                        is_custom: false,
+                    }],
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    parts: vec![CanonicalPart::ToolResult {
+                        call_id: "call_gem_99_1".to_owned(),
+                        output: "[workspace]".to_owned(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            enable_native_web_search: false,
+            thought_signatures: sigs,
+            prompt_cache_key: None,
+            align_cache_breakpoints: false,
+            connect_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(10),
+        };
+        let (gem_spec, _) = crate::build_driver_http_request(&gem_in).expect("gemini build");
+        let gem_json: Value =
+            serde_json::from_slice(gem_spec.body.as_deref().expect("body")).expect("json");
+        let model_part = &gem_json["contents"][1]["parts"][0];
+        assert_eq!(model_part["functionCall"]["name"], "read_file");
+        assert_eq!(model_part["thoughtSignature"], "sig_gemini3_opaque_xyz");
     }
 }

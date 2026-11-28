@@ -496,15 +496,16 @@ where
         .unwrap_or("sess_default")
         .to_owned();
 
-    let _ = peer
-        .request::<_, Value>(
+    if !input.model.trim().is_empty() {
+        peer.request::<_, Value>(
             "session/set_model",
             &json!({
                 "sessionId": session_id,
                 "modelId": input.model,
             }),
         )
-        .await;
+        .await?;
+    }
 
     let full_prompt = match input
         .system_instructions

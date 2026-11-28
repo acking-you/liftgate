@@ -3132,6 +3132,7 @@ fn upgrade_gateway_error(err: GatewayError, model: &ModelId) -> GatewayError {
         GatewayError::Unauthorized
         | GatewayError::PayloadTooLarge { .. }
         | GatewayError::NotFound { .. }
+        | GatewayError::ProviderDisabled { .. }
         | GatewayError::InvalidBody { .. }
         | GatewayError::Protocol { .. } => err,
     }
@@ -4749,7 +4750,7 @@ fn sanitize_mcp_tool_result_text_with_policy(
             .starts_with("apply_patch verification failed:")
     {
         sanitized.push_str(
-            "\n[Hint: re-read the failed file's exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated), then retry `mcp_lg_apply_patch` for only the failed file with 1-3 exact unchanged context lines.]",
+            "\n[Hint: `apply_patch` is atomic across files (no files in this call were modified). Re-read the mismatched file's exact target line range verbatim first (or call `mcp_lg_read_context_spill` if prior file output was truncated), then re-apply the patch with 1-3 exact unchanged context lines.]",
         );
     } else if matches!(client_tool_name, "exec" | "execute")
         && crate::tool_calls::reports_script_failure(&sanitized)

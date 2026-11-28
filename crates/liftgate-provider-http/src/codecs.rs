@@ -1,6 +1,7 @@
 //! Streaming wire codecs for OpenAI /v1/responses, Anthropic /v1/messages, and Google Gemini streamGenerateContent.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,6 +21,9 @@ use crate::{
 };
 
 /// Outbound tool definition prepared for a stateless Platform HTTP API.
+/// Outbound tool definition prepared for a stateless Platform HTTP API.
+static NEXT_GEMINI_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
 pub struct NativeWireTool {
     pub name: String,
@@ -46,6 +50,8 @@ pub struct NativeDriverInput {
     pub messages: Vec<CanonicalMessage>,
     pub tools: Vec<NativeWireTool>,
     pub enable_native_web_search: bool,
+    /// Provider-issued `call_id -> thoughtSignature` map preserved across Gemini tool continuations.
+    pub thought_signatures: HashMap<String, String>,
     pub prompt_cache_key: Option<String>,
     pub align_cache_breakpoints: bool,
     pub connect_timeout: Duration,
@@ -782,6 +788,12 @@ fn build_anthropic_messages_request(
             obj
         })
         .collect();
+    if input.enable_native_web_search {
+        tools_json.push(json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+        }));
+    }
     if input.align_cache_breakpoints
         && let Some(last_tool) = tools_json.last_mut().and_then(Value::as_object_mut)
     {
@@ -1053,6 +1065,14 @@ async fn decode_anthropic_sse(
                                 json_buf: String::new(),
                             },
                         );
+                    } else if btype == "server_tool_use"
+                        && blk.get("name").and_then(Value::as_str) == Some("web_search")
+                    {
+                        let _ = tx
+                            .send(Ok(NativeStreamEvent::WebSearch {
+                                query: String::new(),
+                            }))
+                            .await;
                     }
                 }
             }
@@ -1322,10 +1342,10 @@ fn build_google_gemini_request(
                 }
                 CanonicalPart::Reasoning(_) => {}
                 CanonicalPart::ToolCall {
+                    call_id,
                     name,
                     arguments,
                     is_custom,
-                    ..
                 } => {
                     let args_obj = if *is_custom {
                         json!({ "input": arguments })
@@ -1335,16 +1355,19 @@ fn build_google_gemini_request(
                             .filter(Value::is_object)
                             .unwrap_or_else(|| json!({ "input": arguments }))
                     };
-                    push_part(
-                        "model",
-                        json!({
-                            "functionCall": {
-                                "name": name,
-                                "args": args_obj,
-                            }
-                        }),
-                        &mut contents,
-                    );
+                    let mut part_obj = json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": args_obj,
+                        }
+                    });
+                    if let Some(sig) = input.thought_signatures.get(call_id)
+                        && !sig.is_empty()
+                        && let Some(m) = part_obj.as_object_mut()
+                    {
+                        m.insert("thoughtSignature".to_owned(), Value::String(sig.clone()));
+                    }
+                    push_part("model", part_obj, &mut contents);
                 }
                 CanonicalPart::ToolResult {
                     call_id,
@@ -1418,6 +1441,8 @@ fn build_google_gemini_request(
             "tools".to_owned(),
             json!([{ "functionDeclarations": decls }]),
         );
+    } else if input.enable_native_web_search {
+        body.insert("tools".to_owned(), json!([{ "googleSearch": {} }]));
     }
 
     let mut gen_cfg = Map::new();
@@ -1550,6 +1575,17 @@ async fn decode_gemini_sse(
                     if let Some(fc) = part.get("functionCall") {
                         call_seq += 1;
                         saw_tool_call = true;
+                        let call_id = fc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                let global_seq =
+                                    NEXT_GEMINI_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+                                format!("call_gem_{global_seq}_{call_seq}")
+                            });
                         let name = fc
                             .get("name")
                             .and_then(Value::as_str)
@@ -1565,7 +1601,7 @@ async fn decode_gemini_sse(
                             .map(str::to_owned);
                         let _ = tx
                             .send(Ok(NativeStreamEvent::ToolCall {
-                                id: format!("call_gem_{call_seq}"),
+                                id: call_id,
                                 name,
                                 arguments_json: args_json,
                                 is_custom: false,

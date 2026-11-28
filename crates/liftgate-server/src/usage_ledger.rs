@@ -621,23 +621,47 @@ impl UsageLedger {
         authoritative: UsageTokens,
         now_ms: u64,
     ) {
+        self.reconcile_with_provider("agy", model_id, epoch, accounted, authoritative, now_ms);
+    }
+
+    /// Like [`Self::reconcile`], scoped exclusively to `provider_id`'s rows and history buckets
+    /// so Antigravity cascade drift corrections never mutate another provider sharing `model_id`.
+    pub fn reconcile_with_provider(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        epoch: u64,
+        accounted: UsageTokens,
+        authoritative: UsageTokens,
+        now_ms: u64,
+    ) {
         if epoch != self.epoch {
             return;
         }
         let id = bounded_id(model_id);
+        if id.is_empty() {
+            return;
+        }
+        let prov = {
+            let p = bounded_id(provider_id);
+            if p.is_empty() { "agy" } else { p }
+        };
         let period = period_start(id, now_ms);
         let deltas = corrections(accounted, authoritative);
         let mut rows: Vec<&mut LedgerRow> = self
             .rows
             .iter_mut()
-            .filter(|row| row.model_id == id && row.period_start_unix_ms <= period)
+            .filter(|row| {
+                row.provider_id == prov && row.model_id == id && row.period_start_unix_ms <= period
+            })
             .collect();
         if rows.is_empty() {
             return;
         }
         rows.sort_by_key(|row| std::cmp::Reverse(row.period_start_unix_ms));
         apply_correction(rows.into_iter().map(|row| &mut row.tokens), deltas);
-        if let Some(buckets) = self.history.get_mut(id) {
+        let hist_key = encode_history_key(prov, id);
+        if let Some(buckets) = self.history.get_mut(&hist_key) {
             apply_correction(
                 buckets.iter_mut().rev().map(|bucket| &mut bucket.tokens),
                 deltas,
@@ -1652,5 +1676,75 @@ mod tests {
         assert_eq!(fresh.since_unix_ms(), 42);
         assert_eq!(fresh.report(&prices, None).summary.calls, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_scopes_adjustments_to_target_provider_rows_and_history() {
+        let prices = PriceBook::default();
+        let mut ledger = UsageLedger::load(None, 1_000);
+        let epoch = ledger.epoch();
+        let now = 5 * HISTORY_BUCKET_MS + 100;
+
+        // Insert native provider row FIRST for the same model and price period.
+        let native_tok = UsageTokens {
+            input: 500,
+            cached_input: 100,
+            cache_write: 0,
+            output: 50,
+            thought: 0,
+        };
+        let agy_est = UsageTokens {
+            input: 300,
+            cached_input: 0,
+            cache_write: 0,
+            output: 20,
+            thought: 0,
+        };
+        ledger.record_with_provider("gemini", "gemini-3-pro", false, native_tok, now);
+        ledger.record_with_provider("agy", "gemini-3-pro", false, agy_est, now + 10);
+
+        // Reconcile Antigravity upward (+200 input) and downward (-10 output).
+        let agy_auth = UsageTokens {
+            input: 500,
+            cached_input: 50,
+            cache_write: 0,
+            output: 10,
+            thought: 0,
+        };
+        ledger.reconcile("gemini-3-pro", epoch, agy_est, agy_auth, now + 20);
+
+        let all_time = ledger.report(&prices, None);
+        let gem_prov = all_time
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "gemini")
+            .expect("gemini provider summary");
+        let agy_prov = all_time
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "agy")
+            .expect("agy provider summary");
+        assert_eq!(
+            gem_prov.tokens, native_tok,
+            "native provider row must stay untouched"
+        );
+        assert_eq!(
+            agy_prov.tokens, agy_auth,
+            "agy provider row must absorb full delta"
+        );
+
+        let ranged = ledger.report(&prices, Some((0, 10 * HISTORY_BUCKET_MS)));
+        let gem_ranged = ranged
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "gemini")
+            .expect("gemini ranged summary");
+        let agy_ranged = ranged
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "agy")
+            .expect("agy ranged summary");
+        assert_eq!(gem_ranged.tokens, native_tok);
+        assert_eq!(agy_ranged.tokens, agy_auth);
     }
 }

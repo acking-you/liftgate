@@ -1077,3 +1077,213 @@ async fn agy_passthrough_mode_disables_tool_virtualization_spill_and_billing_noi
     let urls = backend.mcp_urls.lock().unwrap().clone();
     assert_eq!(urls.len(), 1);
 }
+
+#[tokio::test]
+async fn disabled_provider_is_rejected_and_gemini_preserves_thought_signatures_across_continuations()
+ {
+    // 1. Disabled provider must be rejected on both explicit `/p/<id>` and active-provider routes
+    let mut disabled_cfg = ProviderRegistryConfig::default();
+    let mut disabled_oai =
+        ProviderProfileConfig::builtin(ProviderId::openai(), ProviderDriverKind::OpenAiResponses);
+    disabled_oai.enabled = false;
+    disabled_oai.auth = ApiKeySource::None;
+    disabled_cfg.upsert(disabled_oai);
+    disabled_cfg.active_provider = ProviderId::openai();
+
+    let (disabled_router, _) =
+        build_test_router(ProviderRuntimeRegistry::in_memory(disabled_cfg, None), None);
+
+    let explicit_resp = disabled_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/openai/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "gpt-5.4", "stream": false, "input": "Hi"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit_resp.status(), StatusCode::BAD_REQUEST);
+    let explicit_body: Value = serde_json::from_slice(
+        &to_bytes(explicit_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(explicit_body["error"]["code"], "provider_disabled");
+
+    let active_resp = disabled_router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.4",
+                        "max_tokens": 256,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "Hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Gemini `thoughtSignature` must survive both 0-RTT local continuations AND client continuations
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_gemini_reqs: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_srv = Arc::clone(&seen_gemini_reqs);
+
+    tokio::spawn(async move {
+        // Step 1: Gemini invokes 0-RTT `search_client_tools` with `thoughtSignature: "sig_0rtt_1"`
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let req1 = read_raw_http_body(&mut s1).await;
+        seen_srv.lock().unwrap().push(req1);
+        let sse1 = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"search_client_tools\",\"args\":{\"namespace\":\"gh\",\"query\":\"pr_0\"}},\"thoughtSignature\":\"sig_0rtt_1\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":200,\"candidatesTokenCount\":15}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        s1.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse1}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(s1);
+
+        // Step 2 (automatic 0-RTT continuation): Gemini receives `sig_0rtt_1` and calls client `exec_command` with `sig_client_2`
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let req2 = read_raw_http_body(&mut s2).await;
+        seen_srv.lock().unwrap().push(req2);
+        let sse2 = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"exec_command\",\"args\":{\"cmd\":\"cargo --version\"}},\"thoughtSignature\":\"sig_client_2\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":240,\"candidatesTokenCount\":18}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        s2.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse2}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(s2);
+
+        // Turn 2 (client `previous_response_id` continuation): Gemini receives BOTH `sig_0rtt_1` and `sig_client_2`
+        let (mut s3, _) = listener.accept().await.unwrap();
+        let req3 = read_raw_http_body(&mut s3).await;
+        seen_srv.lock().unwrap().push(req3);
+        let sse3 = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"cargo 1.100.0 verified.\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":280,\"candidatesTokenCount\":10}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        s3.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse3}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(s3);
+    });
+
+    let mut gem_cfg = ProviderRegistryConfig::default();
+    let mut gem =
+        ProviderProfileConfig::builtin(ProviderId::gemini(), ProviderDriverKind::GoogleGemini);
+    gem.endpoint = Some(format!("http://{addr}"));
+    gem.auth = ApiKeySource::None;
+    gem_cfg.upsert(gem);
+
+    let (gem_router, _) =
+        build_test_router(ProviderRuntimeRegistry::in_memory(gem_cfg, None), None);
+
+    let mut tools = vec![json!({
+        "type": "function",
+        "name": "exec_command",
+        "description": "Run shell",
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}
+    })];
+    for i in 0..50 {
+        tools.push(json!({
+            "type": "function",
+            "name": format!("mcp__gh__pr_{i}"),
+            "description": "GitHub PR action",
+            "parameters": {"type": "object", "properties": {"id": {"type": "number"}}}
+        }));
+    }
+
+    let r1 = gem_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/gemini/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-3-pro",
+                        "stream": false,
+                        "input": "Check cargo version",
+                        "tools": tools
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let b1: Value =
+        serde_json::from_slice(&to_bytes(r1.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let resp1_id = b1["id"].as_str().expect("resp1 id").to_owned();
+    let call_id = b1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .and_then(|i| i["call_id"].as_str())
+        .expect("forwarded call_id")
+        .to_owned();
+
+    let r2 = gem_router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/p/gemini/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini-3-pro",
+                        "stream": false,
+                        "previous_response_id": resp1_id,
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": "cargo 1.100.0"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    let reqs = seen_gemini_reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    let req2_str = reqs[1]["contents"].to_string();
+    assert!(
+        req2_str.contains("\"thoughtSignature\":\"sig_0rtt_1\""),
+        "0-RTT continuation must replay thoughtSignature sig_0rtt_1: {req2_str}"
+    );
+    let req3_str = reqs[2]["contents"].to_string();
+    assert!(
+        req3_str.contains("\"thoughtSignature\":\"sig_0rtt_1\"")
+            && req3_str.contains("\"thoughtSignature\":\"sig_client_2\""),
+        "Client continuation must replay both thoughtSignatures without collision: {req3_str}"
+    );
+}

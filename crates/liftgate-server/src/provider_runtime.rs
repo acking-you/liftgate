@@ -71,6 +71,7 @@ pub const HEADER_PROVIDER_ID: &str = "x-liftgate-provider";
 pub const HEADER_OPTIMIZATION_MODE: &str = "x-liftgate-optimization";
 const MAX_LOCAL_CONTINUATION_STEPS: usize = 8;
 const MAX_CACHED_CONTINUATIONS: usize = 256;
+const MAX_CACHED_THOUGHT_SIGNATURES: usize = 2_048;
 
 #[derive(Clone, Debug)]
 struct StoredResponseContinuation {
@@ -104,6 +105,43 @@ impl ResponseContinuationCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct ThoughtSignatureCache {
+    order: VecDeque<String>,
+    by_call_id: HashMap<String, String>,
+}
+
+impl ThoughtSignatureCache {
+    fn insert(&mut self, call_id: String, signature: String) {
+        if call_id.is_empty() || signature.is_empty() {
+            return;
+        }
+        if !self.by_call_id.contains_key(&call_id) {
+            if self.order.len() >= MAX_CACHED_THOUGHT_SIGNATURES
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.by_call_id.remove(&evicted);
+            }
+            self.order.push_back(call_id.clone());
+        }
+        self.by_call_id.insert(call_id, signature);
+    }
+
+    fn collect_for_messages(&self, messages: &[CanonicalMessage]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for msg in messages {
+            for part in &msg.parts {
+                if let CanonicalPart::ToolCall { call_id, .. } = part
+                    && let Some(sig) = self.by_call_id.get(call_id)
+                {
+                    out.insert(call_id.clone(), sig.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct StoredCredentialsFile {
     #[serde(default)]
@@ -133,6 +171,7 @@ pub struct ResolvedRequestProvider {
 pub struct ProviderRuntimeRegistry {
     inner: RwLock<RegistryInner>,
     continuations: Mutex<ResponseContinuationCache>,
+    thought_signatures: Mutex<ThoughtSignatureCache>,
 }
 
 impl std::fmt::Debug for ProviderRuntimeRegistry {
@@ -160,6 +199,7 @@ impl ProviderRuntimeRegistry {
                 default_proxy,
             }),
             continuations: Mutex::new(ResponseContinuationCache::default()),
+            thought_signatures: Mutex::new(ThoughtSignatureCache::default()),
         }
     }
 
@@ -193,6 +233,7 @@ impl ProviderRuntimeRegistry {
                 default_proxy,
             }),
             continuations: Mutex::new(ResponseContinuationCache::default()),
+            thought_signatures: Mutex::new(ThoughtSignatureCache::default()),
         }
     }
 
@@ -232,6 +273,20 @@ impl ProviderRuntimeRegistry {
         match self.continuations.lock() {
             Ok(mut guard) => guard.insert(response_id, entry),
             Err(poisoned) => poisoned.into_inner().insert(response_id, entry),
+        }
+    }
+
+    fn save_thought_signature(&self, call_id: String, signature: String) {
+        match self.thought_signatures.lock() {
+            Ok(mut guard) => guard.insert(call_id, signature),
+            Err(poisoned) => poisoned.into_inner().insert(call_id, signature),
+        }
+    }
+
+    fn collect_thought_signatures(&self, messages: &[CanonicalMessage]) -> HashMap<String, String> {
+        match self.thought_signatures.lock() {
+            Ok(guard) => guard.collect_for_messages(messages),
+            Err(poisoned) => poisoned.into_inner().collect_for_messages(messages),
         }
     }
 
@@ -430,6 +485,11 @@ impl ProviderRuntimeRegistry {
                 .ok_or_else(|| GatewayError::NotFound {
                     resource: format!("provider:{target_id}"),
                 })?;
+        if !profile.enabled {
+            return Err(GatewayError::ProviderDisabled {
+                provider_id: profile.id.as_str().to_owned(),
+            });
+        }
 
         let optimization = route_opt
             .or(header_opt)
@@ -1232,6 +1292,7 @@ fn execute_stateless_http_turn(
         let mut final_stop_reason = "end_turn".to_owned();
         let mut accumulated_messages = req.messages.clone();
         let mut final_assistant_parts: Vec<CanonicalPart> = Vec::new();
+        let mut local_thought_signatures: HashMap<String, String> = HashMap::new();
 
         let prompt_cache_key = Some(format!("lg:{provider_id_str}:{harness_id}"));
 
@@ -1248,6 +1309,10 @@ fn execute_stateless_http_turn(
                 let _ = events_tx.send(TurnEvent::Failed(Arc::new(acp_err))).await;
                 return;
             }
+            let mut step_thought_signatures = telemetry_for_worker
+                .provider_registry()
+                .collect_thought_signatures(&working_messages);
+            step_thought_signatures.extend(local_thought_signatures.clone());
             let driver_input = NativeDriverInput {
                 provider_id: provider_id_str.clone(),
                 driver: resolved.profile.driver,
@@ -1263,6 +1328,7 @@ fn execute_stateless_http_turn(
                 tools: wire_tools.clone(),
                 enable_native_web_search: req.enable_native_web_search
                     && resolved.capabilities.supports_native_web_search,
+                thought_signatures: step_thought_signatures,
                 prompt_cache_key: prompt_cache_key.clone(),
                 align_cache_breakpoints: matches!(
                     resolved.capabilities.cache_semantics,
@@ -1311,7 +1377,21 @@ fn execute_stateless_http_turn(
                                         query: (!query.is_empty()).then_some(query),
                                     }).await;
                                 }
-                                NativeStreamEvent::ToolCall { id, name, arguments_json, is_custom, .. } => {
+                                NativeStreamEvent::ToolCall {
+                                    id,
+                                    name,
+                                    arguments_json,
+                                    is_custom,
+                                    thought_signature,
+                                } => {
+                                    if let Some(sig) = thought_signature
+                                        && !sig.is_empty()
+                                    {
+                                        local_thought_signatures.insert(id.clone(), sig.clone());
+                                        telemetry_for_worker
+                                            .provider_registry()
+                                            .save_thought_signature(id.clone(), sig);
+                                    }
                                     emitted_raw_calls.push((id, name, arguments_json, is_custom));
                                 }
                                 NativeStreamEvent::Usage(u) => {

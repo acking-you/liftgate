@@ -147,6 +147,9 @@ pub enum GatewayError {
     #[error("requested resource `{resource}` was not found")]
     NotFound { resource: String },
 
+    #[error("provider `{provider_id}` is disabled")]
+    ProviderDisabled { provider_id: String },
+
     #[error("invalid HTTP request body")]
     InvalidBody {
         #[from]
@@ -179,7 +182,9 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::InvalidBody { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
+            Self::ProviderDisabled { .. } | Self::InvalidBody { .. } | Self::Protocol { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Acp { source } => Self::acp_status(source),
             Self::SharedAcp { source } => Self::acp_status(source),
         }
@@ -196,7 +201,9 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::InvalidBody { .. } | Self::Protocol { .. } => StatusCode::BAD_REQUEST,
+            Self::ProviderDisabled { .. } | Self::InvalidBody { .. } | Self::Protocol { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Acp { source } => Self::acp_anthropic_status(source),
             Self::SharedAcp { source } => Self::acp_anthropic_status(source),
         }
@@ -254,6 +261,7 @@ impl GatewayError {
             Self::Unauthorized => ("authentication_error", "invalid_api_key"),
             Self::PayloadTooLarge { .. } => ("invalid_request_error", "request_too_large"),
             Self::NotFound { .. } => ("not_found_error", "not_found"),
+            Self::ProviderDisabled { .. } => ("invalid_request_error", "provider_disabled"),
             Self::InvalidBody { .. } => ("invalid_request_error", "invalid_request"),
             Self::Protocol { source } => {
                 if source.context_overflow_bytes().is_some() {
@@ -274,7 +282,9 @@ impl GatewayError {
             Self::Unauthorized => "authentication_error",
             Self::PayloadTooLarge { .. } => "request_too_large",
             Self::NotFound { .. } => "not_found_error",
-            Self::InvalidBody { .. } | Self::Protocol { .. } => "invalid_request_error",
+            Self::ProviderDisabled { .. } | Self::InvalidBody { .. } | Self::Protocol { .. } => {
+                "invalid_request_error"
+            }
             Self::Acp { source } => Self::acp_anthropic_error_type(source),
             Self::SharedAcp { source } => Self::acp_anthropic_error_type(source),
         }
@@ -344,6 +354,7 @@ impl GatewayError {
             Self::Unauthorized
             | Self::PayloadTooLarge { .. }
             | Self::NotFound { .. }
+            | Self::ProviderDisabled { .. }
             | Self::InvalidBody { .. } => None,
         }
     }
@@ -390,6 +401,9 @@ impl GatewayError {
                 format!("Request body exceeds maximum allowed size ({max_bytes} bytes).")
             }
             Self::NotFound { resource } => format!("Resource `{resource}` was not found."),
+            Self::ProviderDisabled { provider_id } => format!(
+                "Provider `{provider_id}` is disabled. Enable it via `lg providers` or `providers.json`."
+            ),
             Self::InvalidBody { source } => match source {
                 RequestBodyError::MalformedJson { source: json_err } => {
                     format!("Malformed JSON request body: {json_err}")

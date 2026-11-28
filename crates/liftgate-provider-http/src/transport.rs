@@ -601,7 +601,15 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
                     if line_str.ends_with('\n') {
                         line_str.pop();
                     }
-                    if let Some(frame) = decoder.push_line(&line_str)
+                    let maybe_frame = decoder.try_push_line(&line_str).map_err(|e| {
+                        PlatformApiError::Protocol {
+                            message: format!(
+                                "SSE frame exceeded safety bound ({} bytes)",
+                                e.attempted_bytes
+                            ),
+                        }
+                    })?;
+                    if let Some(frame) = maybe_frame
                         && tx.send(Ok(frame)).await.is_err()
                     {
                         return Ok(());
@@ -618,7 +626,16 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
         }
         if !carry.is_empty() {
             let tail = String::from_utf8_lossy(&carry);
-            if let Some(frame) = decoder.push_line(&tail) {
+            let maybe_frame =
+                decoder
+                    .try_push_line(&tail)
+                    .map_err(|e| PlatformApiError::Protocol {
+                        message: format!(
+                            "SSE frame exceeded safety bound ({} bytes)",
+                            e.attempted_bytes
+                        ),
+                    })?;
+            if let Some(frame) = maybe_frame {
                 let _ = tx.send(Ok(frame)).await;
             }
         }
@@ -638,7 +655,16 @@ async fn pump_http1_sse_body<R: AsyncRead + Unpin>(
             if n == 0 {
                 break;
             }
-            if let Some(frame) = decoder.push_line(&line)
+            let maybe_frame =
+                decoder
+                    .try_push_line(&line)
+                    .map_err(|e| PlatformApiError::Protocol {
+                        message: format!(
+                            "SSE frame exceeded safety bound ({} bytes)",
+                            e.attempted_bytes
+                        ),
+                    })?;
+            if let Some(frame) = maybe_frame
                 && tx.send(Ok(frame)).await.is_err()
             {
                 return Ok(());
