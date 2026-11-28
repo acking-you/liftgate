@@ -695,8 +695,20 @@ where
         });
     }
 
-    for (staged_src, dest_path) in &install_targets {
-        replace_executable_atomic(staged_src, dest_path)?;
+    let mut rollback_copies: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(install_targets.len());
+    for (idx, (staged_src, dest_path)) in install_targets.iter().enumerate() {
+        let prev_copy = stage.path.join(format!("rollback-{idx}.bin"));
+        let had_prev =
+            dest_path.is_file() && copy_executable_with_sync(dest_path, &prev_copy).is_ok();
+        if let Err(err) = replace_executable_atomic(staged_src, dest_path) {
+            for (saved_src, orig_dest) in rollback_copies.iter().rev() {
+                let _ = replace_executable_atomic(saved_src, orig_dest);
+            }
+            return Err(err);
+        }
+        if had_prev {
+            rollback_copies.push((prev_copy, dest_path.clone()));
+        }
     }
 
     let liftgate_exe = install_targets

@@ -339,10 +339,26 @@ pub fn reset_to_defaults(state_paths: &StatePaths) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Cached `--version` probe results reused across periodic TUI refreshes so idle polling
+/// spawns zero subprocesses after the initial probe (unless explicitly refreshed).
+#[derive(Clone, Debug, Default)]
+pub struct AutoUpdateProbeCache(Option<[ProbedTargetInfo; 6]>);
+
 /// Inspects all 6 managed targets, combining live gateway telemetry (when online), `settings.json`,
 /// `auto-update-state.json`, and local binary/version probes.
 pub async fn inspect_auto_update_status(
     state_paths: &StatePaths,
+) -> Result<AutoUpdateStatusReport, CliError> {
+    let mut cache = AutoUpdateProbeCache::default();
+    inspect_auto_update_status_cached(state_paths, &mut cache, true).await
+}
+
+/// Inspects fleet auto-update status, only spawning `--version` subprocesses when `cache` is
+/// empty or `force_reprobe` is `true`.
+pub async fn inspect_auto_update_status_cached(
+    state_paths: &StatePaths,
+    cache: &mut AutoUpdateProbeCache,
+    force_reprobe: bool,
 ) -> Result<AutoUpdateStatusReport, CliError> {
     let settings = state_paths.read_settings()?;
     let ledger = state_paths.read_auto_update_ledger().unwrap_or_default();
@@ -376,11 +392,15 @@ pub async fn inspect_auto_update_status(
         ),
     };
 
-    let probed = probe_all_targets_concurrently(state_paths, &settings).await;
+    if force_reprobe || cache.0.is_none() {
+        cache.0 = Some(probe_all_targets_concurrently(state_paths, &settings).await);
+    }
+    let default_probed = std::array::from_fn(|_| ProbedTargetInfo::default());
+    let probed = cache.0.as_ref().unwrap_or(&default_probed);
     let targets = build_target_telemetry_rows(
         &settings,
         &ledger,
-        &probed,
+        probed,
         AutoUpdateCliOverrides::default(),
     );
 

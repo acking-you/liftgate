@@ -3174,7 +3174,7 @@ async fn run_auto_update_loop(
     state_paths: &StatePaths,
 ) -> Result<(), CliError> {
     let mut app = AutoUpdateManagerApp::from_local_disk(state_paths);
-    let (refresh_tx, mut refresh_rx) = watch::channel::<u64>(0);
+    let (refresh_tx, mut refresh_rx) = watch::channel::<(u64, bool)>((0, true));
     let (report_tx, mut report_rx) =
         mpsc::channel::<liftgate_core::auto_update::AutoUpdateStatusReport>(4);
     let (worker_tx, mut worker_rx) = mpsc::channel::<AutoUpdateWorkerCmd>(8);
@@ -3184,18 +3184,26 @@ async fn run_auto_update_loop(
     {
         let poll_paths = state_paths.clone();
         tasks.spawn(async move {
+            let mut probe_cache = liftgate_core::auto_update::AutoUpdateProbeCache::default();
+            let mut force_reprobe = true;
             loop {
-                if let Ok(rep) =
-                    liftgate_core::auto_update::inspect_auto_update_status(&poll_paths).await
+                if let Ok(rep) = liftgate_core::auto_update::inspect_auto_update_status_cached(
+                    &poll_paths,
+                    &mut probe_cache,
+                    force_reprobe,
+                )
+                .await
                 {
                     let _ = report_tx.send(rep).await;
                 }
+                force_reprobe = false;
                 tokio::select! {
                     biased;
                     res = refresh_rx.changed() => {
                         if res.is_err() {
                             break;
                         }
+                        force_reprobe = refresh_rx.borrow().1;
                     }
                     () = tokio::time::sleep(Duration::from_secs(3)) => {}
                 }
@@ -3250,8 +3258,8 @@ async fn run_auto_update_loop(
                         }
                     }
                 }
-                let next = act_refresh.borrow().wrapping_add(1);
-                let _ = act_refresh.send_replace(next);
+                let next = act_refresh.borrow().0.wrapping_add(1);
+                let _ = act_refresh.send_replace((next, true));
             }
         });
     }
@@ -3292,7 +3300,7 @@ async fn run_auto_update_loop(
 fn handle_auto_update_events(
     state_paths: &StatePaths,
     app: &mut AutoUpdateManagerApp,
-    refresh_tx: &watch::Sender<u64>,
+    refresh_tx: &watch::Sender<(u64, bool)>,
     worker_tx: &mpsc::Sender<AutoUpdateWorkerCmd>,
 ) -> Result<bool, CliError> {
     while event::poll(Duration::ZERO).map_err(|source| CliError::TuiIo { source })? {
@@ -3352,8 +3360,8 @@ fn handle_auto_update_events(
                     ),
                     true,
                 );
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, false));
             }
             KeyCode::Char('[') | KeyCode::Char('-') => {
                 let mut settings = state_paths.read_settings()?;
@@ -3367,8 +3375,8 @@ fn handle_auto_update_events(
                     ),
                     true,
                 );
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, false));
             }
             KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
                 let mut settings = state_paths.read_settings()?;
@@ -3382,8 +3390,8 @@ fn handle_auto_update_events(
                     ),
                     true,
                 );
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, false));
             }
             KeyCode::Char('a') => {
                 let mut settings = state_paths.read_settings()?;
@@ -3394,16 +3402,16 @@ fn handle_auto_update_events(
                 liftgate_core::auto_update::sync_daemon_state_toggles(state_paths, &settings);
                 app.sync_switches_from_settings(&settings);
                 app.set_toast("Enabled idle auto-update for all 6 components", true);
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, false));
             }
             KeyCode::Char('d') => {
                 liftgate_core::auto_update::reset_to_defaults(state_paths)?;
                 let settings = state_paths.read_settings()?;
                 app.sync_switches_from_settings(&settings);
                 app.set_toast("Reset to defaults: lg & agy ON, coding harnesses OFF", true);
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, false));
             }
             KeyCode::Char('c') => {
                 if app.running_target.is_none() && !app.running_batch {
@@ -3437,8 +3445,8 @@ fn handle_auto_update_events(
             KeyCode::Char('r') => {
                 app.probing = true;
                 app.set_toast("Refreshing installed versions & live status…", true);
-                let next = refresh_tx.borrow().wrapping_add(1);
-                let _ = refresh_tx.send_replace(next);
+                let next = refresh_tx.borrow().0.wrapping_add(1);
+                let _ = refresh_tx.send_replace((next, true));
             }
             _ => {}
         }

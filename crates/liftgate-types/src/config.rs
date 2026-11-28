@@ -872,6 +872,25 @@ impl AutoUpdateIntervalMins {
     }
 }
 
+const _: () = {
+    let presets = AutoUpdateIntervalMins::PRESETS;
+    let mut i = 0;
+    while i < presets.len() {
+        assert!(
+            presets[i] >= MIN_AUTO_UPDATE_INTERVAL_MINS
+                && presets[i] <= MAX_AUTO_UPDATE_INTERVAL_MINS,
+            "every preset interval must lie inside MIN..=MAX"
+        );
+        if i > 0 {
+            assert!(
+                presets[i] > presets[i - 1],
+                "preset intervals must be strictly ascending"
+            );
+        }
+        i += 1;
+    }
+};
+
 impl Default for AutoUpdateIntervalMins {
     fn default() -> Self {
         Self(
