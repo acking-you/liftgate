@@ -1005,6 +1005,8 @@ fn resolve_non_agy_model(profile: &ProviderProfileConfig, req: &NormalizedTurnRe
                 lower.starts_with("claude-")
                     || lower.starts_with("gemini-")
                     || lower.starts_with("gpt-")
+                    || lower.starts_with("o3")
+                    || lower.starts_with("o4")
             }
             ProviderDriverKind::AgyAcp => false,
         };

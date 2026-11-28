@@ -387,10 +387,10 @@ impl ProviderDriverKind {
     pub const fn default_primary_model(self) -> &'static str {
         match self {
             Self::AgyAcp => "gemini-4-carbon-high",
-            Self::CodexAppServer => "gpt-5.3-codex",
-            Self::GrokAcp => "grok-4",
-            Self::OpenAiResponses => "gpt-5.4",
-            Self::AnthropicMessages => "claude-sonnet-4-6",
+            Self::CodexAppServer => "gpt-6.2-astra",
+            Self::GrokAcp => "grok-4.7",
+            Self::OpenAiResponses => "gpt-6.2-astra",
+            Self::AnthropicMessages => "claude-opus-5-5",
             Self::GoogleGemini => "gemini-4-carbon",
         }
     }
@@ -399,11 +399,11 @@ impl ProviderDriverKind {
     pub const fn default_fast_model(self) -> &'static str {
         match self {
             Self::AgyAcp => "gemini-4-hydrogen-low",
-            Self::CodexAppServer => "gpt-5-mini",
-            Self::GrokAcp => "grok-code-fast-1",
-            Self::OpenAiResponses => "gpt-5-mini",
-            Self::AnthropicMessages => "claude-haiku-4-5",
-            Self::GoogleGemini => "gemini-3.8-flash",
+            Self::CodexAppServer => "gpt-6-luna",
+            Self::GrokAcp => "grok-4-1-fast-non-reasoning",
+            Self::OpenAiResponses => "gpt-6-luna",
+            Self::AnthropicMessages => "claude-haiku-5-5",
+            Self::GoogleGemini => "gemini-3.5-flash-lite",
         }
     }
 
@@ -783,11 +783,65 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
         ],
         ProviderDriverKind::OpenAiResponses => vec![
             ProviderModelEntry {
+                id: "gpt-6.2-astra".to_owned(),
+                display_name: "GPT-6.2 Astra".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-6.2-sol".to_owned(),
+                display_name: "GPT-6.2 Sol".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-6.1-terra".to_owned(),
+                display_name: "GPT-6.1 Terra".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-6-luna".to_owned(),
+                display_name: "GPT-6 Luna".to_owned(),
+                context_window_tokens: 400_000,
+                auto_compact_token_limit: 272_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-5.5".to_owned(),
+                display_name: "GPT-5.5".to_owned(),
+                context_window_tokens: 400_000,
+                auto_compact_token_limit: 272_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
                 id: "gpt-5.4".to_owned(),
                 display_name: "GPT-5.4".to_owned(),
                 context_window_tokens: 400_000,
                 auto_compact_token_limit: 272_000,
                 max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-5.4-mini".to_owned(),
+                display_name: "GPT-5.4 Mini".to_owned(),
+                context_window_tokens: 400_000,
+                auto_compact_token_limit: 272_000,
+                max_output_tokens: 65_536,
                 supports_reasoning: true,
                 supports_vision: true,
             },
@@ -820,6 +874,42 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
             },
         ],
         ProviderDriverKind::AnthropicMessages => vec![
+            ProviderModelEntry {
+                id: "claude-opus-5-5".to_owned(),
+                display_name: "Claude Opus 5.5".to_owned(),
+                context_window_tokens: 1_000_000,
+                auto_compact_token_limit: 850_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "claude-sonnet-5-5".to_owned(),
+                display_name: "Claude Sonnet 5.5".to_owned(),
+                context_window_tokens: 1_000_000,
+                auto_compact_token_limit: 850_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "claude-haiku-5-5".to_owned(),
+                display_name: "Claude Haiku 5.5".to_owned(),
+                context_window_tokens: 1_000_000,
+                auto_compact_token_limit: 850_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "claude-fable-5-2".to_owned(),
+                display_name: "Claude Fable 5.2".to_owned(),
+                context_window_tokens: 1_000_000,
+                auto_compact_token_limit: 850_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
             ProviderModelEntry {
                 id: "claude-opus-4-6".to_owned(),
                 display_name: "Claude Opus 4.6".to_owned(),
@@ -861,6 +951,24 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
             ProviderModelEntry {
                 id: "gemini-4-argon".to_owned(),
                 display_name: "Gemini 4 Argon".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-4-neon".to_owned(),
+                display_name: "Gemini 4 Neon".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gemini-4-hydrogen".to_owned(),
+                display_name: "Gemini 4 Hydrogen".to_owned(),
                 context_window_tokens: 1_048_576,
                 auto_compact_token_limit: 890_000,
                 max_output_tokens: 65_536,
@@ -933,6 +1041,33 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
         ],
         ProviderDriverKind::CodexAppServer => vec![
             ProviderModelEntry {
+                id: "gpt-6.2-astra".to_owned(),
+                display_name: "GPT-6.2 Astra (App-Server)".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-6.2-sol".to_owned(),
+                display_name: "GPT-6.2 Sol (App-Server)".to_owned(),
+                context_window_tokens: 1_048_576,
+                auto_compact_token_limit: 890_000,
+                max_output_tokens: 128_000,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "gpt-6-luna".to_owned(),
+                display_name: "GPT-6 Luna (App-Server)".to_owned(),
+                context_window_tokens: 400_000,
+                auto_compact_token_limit: 272_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
                 id: "gpt-5.3-codex".to_owned(),
                 display_name: "GPT-5.3 Codex (App-Server)".to_owned(),
                 context_window_tokens: 400_000,
@@ -953,6 +1088,42 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
         ],
         ProviderDriverKind::GrokAcp => vec![
             ProviderModelEntry {
+                id: "grok-4.7".to_owned(),
+                display_name: "Grok 4.7 (ACP)".to_owned(),
+                context_window_tokens: 500_000,
+                auto_compact_token_limit: 425_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "grok-4.3".to_owned(),
+                display_name: "Grok 4.3 (ACP)".to_owned(),
+                context_window_tokens: 1_000_000,
+                auto_compact_token_limit: 850_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "grok-4-1-fast-non-reasoning".to_owned(),
+                display_name: "Grok 4.1 Fast (ACP)".to_owned(),
+                context_window_tokens: 2_000_000,
+                auto_compact_token_limit: 1_700_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: false,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
+                id: "grok-4-1-fast-reasoning".to_owned(),
+                display_name: "Grok 4.1 Fast Reasoning (ACP)".to_owned(),
+                context_window_tokens: 2_000_000,
+                auto_compact_token_limit: 1_700_000,
+                max_output_tokens: 65_536,
+                supports_reasoning: true,
+                supports_vision: true,
+            },
+            ProviderModelEntry {
                 id: "grok-4".to_owned(),
                 display_name: "Grok 4 (ACP)".to_owned(),
                 context_window_tokens: 256_000,
@@ -962,10 +1133,10 @@ pub fn builtin_models_for_driver(driver: ProviderDriverKind) -> Vec<ProviderMode
                 supports_vision: true,
             },
             ProviderModelEntry {
-                id: "grok-code-fast-1".to_owned(),
-                display_name: "Grok Code Fast 1 (ACP)".to_owned(),
-                context_window_tokens: 256_000,
-                auto_compact_token_limit: 215_000,
+                id: "grok-3-mini".to_owned(),
+                display_name: "Grok 3 Mini (ACP)".to_owned(),
+                context_window_tokens: 131_072,
+                auto_compact_token_limit: 110_000,
                 max_output_tokens: 65_536,
                 supports_reasoning: true,
                 supports_vision: false,
@@ -1183,15 +1354,41 @@ pub fn context_limits_for_driver(model_id: &str, driver: ProviderDriverKind) -> 
     match driver {
         ProviderDriverKind::AgyAcp => crate::model::context_limits(model_id),
         ProviderDriverKind::OpenAiResponses | ProviderDriverKind::CodexAppServer => {
-            if lower.starts_with("o3") || lower.starts_with("o4") || lower.starts_with("gpt-4.1") {
+            if lower.starts_with("gpt-6") && !lower.contains("luna") {
+                (1_048_576, 890_000)
+            } else if lower.starts_with("o3")
+                || lower.starts_with("o4")
+                || lower.starts_with("gpt-4.1")
+            {
                 (200_000, 170_000)
             } else {
                 (400_000, 272_000)
             }
         }
-        ProviderDriverKind::AnthropicMessages => (200_000, 170_000),
+        ProviderDriverKind::AnthropicMessages => {
+            if lower.contains("-5-") || lower.contains("-5.") || lower.ends_with("-5") {
+                (1_000_000, 850_000)
+            } else {
+                (200_000, 170_000)
+            }
+        }
         ProviderDriverKind::GoogleGemini => (1_048_576, 890_000),
-        ProviderDriverKind::GrokAcp => (256_000, 215_000),
+        ProviderDriverKind::GrokAcp => {
+            if lower.starts_with("grok-4-1-fast") || lower.starts_with("grok-4-fast") {
+                (2_000_000, 1_700_000)
+            } else if lower.starts_with("grok-4.3") {
+                (1_000_000, 850_000)
+            } else if lower.starts_with("grok-4.7")
+                || lower.starts_with("grok-4.6")
+                || lower.starts_with("grok-4.5")
+            {
+                (500_000, 425_000)
+            } else if lower.starts_with("grok-3-mini") {
+                (131_072, 110_000)
+            } else {
+                (256_000, 215_000)
+            }
+        }
     }
 }
 
@@ -1369,9 +1566,13 @@ mod tests {
             ProviderId::anthropic(),
             ProviderDriverKind::AnthropicMessages,
         );
-        assert_eq!(anth.default_model.as_str(), "claude-sonnet-4-6");
+        assert_eq!(anth.default_model.as_str(), "claude-opus-5-5");
+        assert_eq!(
+            anth.fast_model.as_ref().map(ModelId::as_str),
+            Some("claude-haiku-5-5")
+        );
         let anth_models = anth.effective_models();
-        assert_eq!(anth_models[0].id, "claude-sonnet-4-6");
+        assert_eq!(anth_models[0].id, "claude-opus-5-5");
         assert!(anth_models.iter().any(|m| m.id == "claude-opus-4-6"));
 
         let mut oai = ProviderProfileConfig::builtin(

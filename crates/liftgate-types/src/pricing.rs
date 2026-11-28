@@ -236,6 +236,7 @@ const GEMINI_3_8_FLASH_STANDARD_PRICING_FROM: u64 = 1_798_790_400_000;
 const GEMINI_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 const CLAUDE_PRICING_URL: &str = "https://docs.anthropic.com/en/docs/about-claude/pricing";
 const OPENAI_PRICING_URL: &str = "https://openai.com/api/pricing";
+const XAI_PRICING_URL: &str = "https://docs.x.ai/docs/models";
 const VERTEX_PARTNER_PRICING_URL: &str =
     "https://cloud.google.com/model-garden/partner-models/pricing";
 
@@ -301,15 +302,29 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
     PricingFamily {
         key: "claude-opus-5-5",
         label: "Claude Opus 5.5",
-        aliases: &[],
+        aliases: &["claude-opus-5.5", "claude-opus-5"],
         schedule: &[from_start(price(4.00, 0.20, 5.00, 20.00))],
         source_url: CLAUDE_PRICING_URL,
     },
     PricingFamily {
         key: "claude-sonnet-5-5",
         label: "Claude Sonnet 5.5",
-        aliases: &[],
+        aliases: &["claude-sonnet-5.5", "claude-sonnet-5"],
         schedule: &[from_start(price(2.00, 0.10, 2.50, 10.00))],
+        source_url: CLAUDE_PRICING_URL,
+    },
+    PricingFamily {
+        key: "claude-haiku-5-5",
+        label: "Claude Haiku 5.5",
+        aliases: &["claude-haiku-5.5", "claude-haiku-5"],
+        schedule: &[from_start(price(0.10, 0.01, 0.125, 0.50))],
+        source_url: CLAUDE_PRICING_URL,
+    },
+    PricingFamily {
+        key: "claude-fable-5-2",
+        label: "Claude Fable 5.2",
+        aliases: &["claude-fable-5"],
+        schedule: &[from_start(price(8.00, 0.20, 10.00, 40.00))],
         source_url: CLAUDE_PRICING_URL,
     },
     PricingFamily {
@@ -318,6 +333,34 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
         aliases: &[],
         schedule: &[from_start(price(0.09, 0.09, 0.09, 0.36))],
         source_url: VERTEX_PARTNER_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-6.2-astra",
+        label: "GPT-6.2 Astra",
+        aliases: &["gpt-6-astra"],
+        schedule: &[from_start(price(8.00, 0.40, 8.00, 40.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-6.2-sol",
+        label: "GPT-6.2 Sol",
+        aliases: &["gpt-6.1-sol", "gpt-6-sol"],
+        schedule: &[from_start(price(2.00, 0.10, 2.00, 10.00))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-6-luna",
+        label: "GPT-6 Luna",
+        aliases: &["gpt-5.6-luna"],
+        schedule: &[from_start(price(0.10, 0.01, 0.10, 0.50))],
+        source_url: OPENAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "gpt-5.5",
+        label: "GPT-5.5",
+        aliases: &[],
+        schedule: &[from_start(price(5.00, 0.50, 5.00, 30.00))],
+        source_url: OPENAI_PRICING_URL,
     },
     PricingFamily {
         key: "gpt-5.4",
@@ -404,11 +447,50 @@ pub const DEFAULT_PRICING: &[PricingFamily] = &[
         source_url: GEMINI_PRICING_URL,
     },
     PricingFamily {
+        key: "gemini-3.5-flash-lite",
+        label: "Gemini 3.5 Flash-Lite",
+        aliases: &[],
+        schedule: &[from_start(price(0.30, 0.03, 0.30, 2.50))],
+        source_url: GEMINI_PRICING_URL,
+    },
+    PricingFamily {
         key: "gemini-2.5-flash-lite",
         label: "Gemini 2.5 Flash-Lite",
         aliases: &[],
         schedule: &[from_start(price(0.10, 0.01, 0.10, 0.40))],
         source_url: GEMINI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "grok-4.7",
+        label: "Grok 4.7",
+        aliases: &["grok-4.6", "grok-4.5"],
+        schedule: &[from_start(price(2.00, 0.50, 2.00, 6.00))],
+        source_url: XAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "grok-4.3",
+        label: "Grok 4.3",
+        aliases: &[],
+        schedule: &[from_start(price(1.25, 0.20, 1.25, 2.50))],
+        source_url: XAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "grok-4-1-fast-non-reasoning",
+        label: "Grok 4.1 Fast",
+        aliases: &[
+            "grok-4-1-fast-reasoning",
+            "grok-4-fast-non-reasoning",
+            "grok-4-fast-reasoning",
+        ],
+        schedule: &[from_start(price(0.20, 0.05, 0.20, 0.50))],
+        source_url: XAI_PRICING_URL,
+    },
+    PricingFamily {
+        key: "grok-3-mini",
+        label: "Grok 3 Mini",
+        aliases: &[],
+        schedule: &[from_start(price(0.30, 0.075, 0.30, 0.50))],
+        source_url: XAI_PRICING_URL,
     },
 ];
 
@@ -741,5 +823,19 @@ mod tests {
             .expect("o4-mini price");
         assert!((gpt5_mini.input - 0.25).abs() < 1e-9 && (gpt5_mini.output - 2.00).abs() < 1e-9);
         assert!((o4_mini.input - 1.10).abs() < 1e-9 && (o4_mini.output - 4.40).abs() < 1e-9);
+
+        // Every built-in provider's default primary and fast model has a shipped price.
+        for drv in crate::provider::ProviderDriverKind::ALL {
+            let primary = drv.default_primary_model();
+            let fast = drv.default_fast_model();
+            assert!(
+                family_for_model(primary).is_some(),
+                "missing default pricing for primary model `{primary}` ({drv:?})"
+            );
+            assert!(
+                family_for_model(fast).is_some(),
+                "missing default pricing for fast model `{fast}` ({drv:?})"
+            );
+        }
     }
 }
